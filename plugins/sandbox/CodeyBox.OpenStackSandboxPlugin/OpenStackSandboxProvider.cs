@@ -6,6 +6,7 @@ using CodeyBox.Core;
 using CodeyBox.PluginSdk;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.MultipassRemote;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -57,6 +58,8 @@ public sealed class OpenStackSandboxProvider :
     private readonly ConcurrentDictionary<string, ActiveSandboxEntry> _activeSandboxes = new(StringComparer.Ordinal);
     private IPluginHost? _host;
     private ILogger _log = NullLogger.Instance;
+    private CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions? _trust;
+    private CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? _admission;
 
     /// <summary>DI entry point. Options arrive via <see cref="IPluginInitializer.InitializeAsync"/>.</summary>
     public OpenStackSandboxProvider(TimeProvider? clock = null)
@@ -104,6 +107,12 @@ public sealed class OpenStackSandboxProvider :
         _host = context.Host;
         _log = context.Logger;
         var options = ReadOptions();
+        // Operator-owned artifact provenance from the host's global trust
+        // snapshot (public trust inputs only). When enabled, baseline-baked
+        // executables are admitted through verification before staging.
+        _trust = context.ArtifactTrustConfig?.Get<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>();
+        if (CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(_trust))
+            _admission = new CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService();
         _log.LogInformation(
             "OpenStack sandbox provider initialized (enabled={Enabled}, region={Region})",
             options.Enabled,
@@ -523,7 +532,7 @@ public sealed class OpenStackSandboxProvider :
 
     private OpenStackBaselineBuilder CreateBaselineBuilder(
         OpenStackSandboxOptions opts, OpenStackCredentials credentials) =>
-        new(opts, credentials, CreateClient(opts), _keys, _transports, _environment, _clock, _log);
+        new(opts, credentials, CreateClient(opts), _keys, _transports, _environment, _clock, _log, _trust, _admission);
 
     private async Task<OpenStackImage?> ResolveOwnedImageAsync(
         OpenStackApiClient api, OpenStackCredentials credentials, OpenStackSandboxOptions opts,
@@ -1378,6 +1387,7 @@ public sealed class OpenStackSandboxProvider :
     {
         if (_ownsHttpClient)
             _http.Dispose();
+        _admission?.Dispose();
     }
 
     private sealed record ActiveSandboxEntry(WorkItemId WorkItemId, OpenStackSandbox Sandbox);

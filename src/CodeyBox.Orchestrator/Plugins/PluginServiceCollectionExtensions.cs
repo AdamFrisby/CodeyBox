@@ -1,7 +1,9 @@
+using CodeyBox.Sandbox.ArtifactProvenance;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 namespace CodeyBox.Orchestrator;
 
@@ -30,11 +32,25 @@ public static class PluginServiceCollectionExtensions
     {
         var opts = configuration.GetSection("CodeyBox:Plugins").Get<PluginOptions>() ?? new PluginOptions();
 
+        // Operator-owned artifact provenance (disabled by default). When
+        // enabled, plugin bundles are admitted only after verification of the
+        // exact staged bytes. The pre-container discovery below uses the
+        // startup snapshot; the runtime loader resolves the live policy
+        // (hot-reloadable, like the sandbox providers) and the host admission
+        // singleton, falling back to the instances created here.
+        var trustOptions = configuration.GetSection(ArtifactTrustOptions.SectionName).Get<ArtifactTrustOptions>()
+            ?? new ArtifactTrustOptions();
+        ArtifactAdmissionService? startupAdmission = ArtifactAdmissionService.IsEnforcementEnabled(trustOptions)
+            ? new ArtifactAdmissionService()
+            : null;
+        if (startupAdmission is not null)
+            services.AddSingleton(startupAdmission);
+
         // Discovery runs synchronously before the container is built so plugin
         // types can be registered as singletons now. A NullLogger is used here
         // because the real ILogger<T> is not yet available; the runtime
         // IPluginLoader instance (registered below) uses the proper logger.
-        var tempLoader = new PluginLoader(opts, configuration, NullLogger<PluginLoader>.Instance);
+        var tempLoader = new PluginLoader(opts, configuration, NullLogger<PluginLoader>.Instance, trustOptions: trustOptions, admission: startupAdmission);
         var discovered = tempLoader.DiscoverPlugins();
         tempLoader.RegisterPlugins(services, discovered);
 
@@ -48,7 +64,9 @@ public static class PluginServiceCollectionExtensions
         services.AddSingleton<IPluginLoader>(sp =>
         {
             var logger = sp.GetRequiredService<ILogger<PluginLoader>>();
-            return new PluginLoader(opts, configuration, logger, preloaded: discovered, preloadedStatuses: statuses, preloadedAssemblyReports: assemblyReports);
+            var monitor = sp.GetService<IOptionsMonitor<ArtifactTrustOptions>>();
+            Func<ArtifactTrustOptions>? liveTrust = monitor is null ? null : () => monitor.CurrentValue;
+            return new PluginLoader(opts, configuration, logger, preloaded: discovered, preloadedStatuses: statuses, preloadedAssemblyReports: assemblyReports, trustOptions: trustOptions, trustAccessor: liveTrust, admission: sp.GetService<ArtifactAdmissionService>() ?? startupAdmission);
         });
 
         services.AddSingleton<IPluginToolAvailabilityProbe, PathPluginToolAvailabilityProbe>();

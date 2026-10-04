@@ -1,6 +1,7 @@
 using System.Reflection;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.Sandbox.ArtifactProvenance;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -33,6 +34,9 @@ public sealed class PluginLoader : IPluginLoader
     private readonly IConfiguration _configuration;
     private readonly ILogger<PluginLoader> _logger;
     private readonly IPluginAssemblyLoader _assemblyLoader;
+    private readonly ArtifactTrustOptions? _trustOptions;
+    private readonly Func<ArtifactTrustOptions>? _trustAccessor;
+    private readonly ArtifactAdmissionService? _admission;
     private IReadOnlyList<LoadedPlugin>? _preloaded;
     private List<PluginDiscoveryStatus>? _statuses;
     private List<PluginAssemblyReport>? _assemblyReports;
@@ -44,7 +48,10 @@ public sealed class PluginLoader : IPluginLoader
         IReadOnlyList<LoadedPlugin>? preloaded = null,
         IPluginAssemblyLoader? assemblyLoader = null,
         IReadOnlyList<PluginDiscoveryStatus>? preloadedStatuses = null,
-        IReadOnlyList<PluginAssemblyReport>? preloadedAssemblyReports = null)
+        IReadOnlyList<PluginAssemblyReport>? preloadedAssemblyReports = null,
+        ArtifactTrustOptions? trustOptions = null,
+        Func<ArtifactTrustOptions>? trustAccessor = null,
+        ArtifactAdmissionService? admission = null)
     {
         _options = options;
         _configuration = configuration;
@@ -53,7 +60,20 @@ public sealed class PluginLoader : IPluginLoader
         _assemblyLoader = assemblyLoader ?? new PluginAssemblyLoadContextLoader();
         _statuses = preloadedStatuses is null ? null : new List<PluginDiscoveryStatus>(preloadedStatuses);
         _assemblyReports = preloadedAssemblyReports is null ? null : new List<PluginAssemblyReport>(preloadedAssemblyReports);
+        _trustOptions = trustOptions;
+        _trustAccessor = trustAccessor;
+        _admission = admission;
     }
+
+    /// <summary>
+    /// The effective trust snapshot: the live accessor when the host provides
+    /// one (hot-reloadable like the sandbox providers), otherwise the
+    /// startup snapshot. Enforcement state therefore tracks the current
+    /// policy for every load, not just the process-start value. An accessor
+    /// failure propagates and fails the load closed rather than silently
+    /// falling back to a stale snapshot.
+    /// </summary>
+    private ArtifactTrustOptions? EffectiveTrustOptions => _trustAccessor?.Invoke() ?? _trustOptions;
 
     /// <inheritdoc/>
     public Task<IReadOnlyList<LoadedPlugin>> DiscoverAndLoadAsync(CancellationToken ct)
@@ -330,13 +350,28 @@ public sealed class PluginLoader : IPluginLoader
             return;
         }
 
+        // Provenance gate — enforced after the existing enablement/allowlist/
+        // version gates and before any executable load or initialization. Under
+        // enforcement the loader consumes only the immutable staged bytes the
+        // admission service verified; the source file is never loaded. A
+        // refusal is a visible blocked outcome: no load context is created and
+        // no plugin code runs.
+        var loadPath = absolutePath;
+        var effectiveTrust = EffectiveTrustOptions;
+        if (ArtifactAdmissionService.IsEnforcementEnabled(effectiveTrust))
+        {
+            if (!TryAdmitBundle(absolutePath, effectiveTrust!, loadable, statuses, statusBase, assemblyReports, out var stagedPrimary))
+                return;
+            loadPath = stagedPrimary;
+        }
+
         // Phase 2 — load once, then resolve the approved candidates by metadata
         // type name and re-validate from live attributes (the metadata read is
         // only a loading gate; live attributes are authoritative).
         Assembly assembly;
         try
         {
-            assembly = _assemblyLoader.Load(absolutePath);
+            assembly = _assemblyLoader.Load(loadPath);
         }
         catch (Exception ex)
         {
@@ -472,6 +507,55 @@ public sealed class PluginLoader : IPluginLoader
             .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToList();
+    }
+
+    private bool TryAdmitBundle(
+        string absolutePath,
+        ArtifactTrustOptions trust,
+        List<PluginMetadataCandidate> loadable,
+        List<PluginDiscoveryStatus> statuses,
+        int statusBase,
+        List<PluginAssemblyReport> assemblyReports,
+        out string stagedPrimaryPath)
+    {
+        stagedPrimaryPath = absolutePath;
+        var pluginIds = loadable.Select(static c => c.PluginId).Distinct(StringComparer.Ordinal).ToList();
+        if (_admission is null)
+        {
+            const string detail = "provenance enforcement is enabled but no admission service is wired (unavailable verification)";
+            MarkStatuses(statuses, statusBase, PluginSkipReason.ProvenanceBlocked, detail);
+            assemblyReports.Add(new PluginAssemblyReport(
+                absolutePath, Found: true, Loaded: false, pluginIds, [], PluginSkipReason.ProvenanceBlocked, detail));
+            AuditLog.PluginProvenanceBlocked(absolutePath, ProvenanceOutcome.VerifierUnavailable.ToString(), detail);
+            _logger.LogError(
+                "Plugin bundle {Path} blocked: provenance enforcement is enabled but no admission service is wired",
+                absolutePath);
+            return false;
+        }
+
+        PluginBundleAdmission admission;
+        try
+        {
+            admission = _admission.AdmitPluginBundle(absolutePath, trust, CancellationToken.None);
+        }
+        catch (ArtifactBlockedException ex)
+        {
+            var detail = FirstLine($"provenance {ex.Outcome}: {ex.Message}");
+            MarkStatuses(statuses, statusBase, PluginSkipReason.ProvenanceBlocked, detail);
+            assemblyReports.Add(new PluginAssemblyReport(
+                absolutePath, Found: true, Loaded: false, pluginIds, [], PluginSkipReason.ProvenanceBlocked, detail));
+            AuditLog.PluginProvenanceBlocked(absolutePath, ex.Outcome.ToString(), detail);
+            _logger.LogWarning("Plugin bundle {Path} blocked: {Detail}", absolutePath, detail);
+            return false;
+        }
+
+        var evidence = admission.Evidence;
+        stagedPrimaryPath = admission.StagedPrimaryPath;
+        AuditLog.PluginProvenanceAdmitted(absolutePath, evidence.Digest, evidence.Identity, evidence.Issuer, evidence.Verifier);
+        _logger.LogInformation(
+            "Plugin bundle {Path} provenance admitted: {Digest} verified by {Verifier} as {Identity}/{Issuer}",
+            absolutePath, evidence.Digest, evidence.Verifier, evidence.Identity, evidence.Issuer);
+        return true;
     }
 
     private static void MarkStatuses(

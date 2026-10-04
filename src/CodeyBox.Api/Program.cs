@@ -48,6 +48,7 @@ using CodeyBox.Git;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.ArtifactProvenance;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Incus;
 using CodeyBox.Sandbox.Multipass;
@@ -326,6 +327,18 @@ builder.Services.AddOptions<CodeyBoxOptions>()
     .Bind(builder.Configuration.GetSection("CodeyBox"))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplyTo(opts, builder.Configuration))
     .PostConfigure(opts => AgentClassesOverrideResolver.ApplySandboxClassesTo(opts, builder.Configuration));
+// Artifact provenance: operator-owned, opt-in trust policy for plugin
+// bundles and externally staged tool executables. Disabled by default; when
+// enabled, admission is verified before load/provisioning. Validation fails
+// fast at host start; the options remain hot-reloadable and the admission
+// service keys cached verdicts by the live policy digest. The admission
+// singleton is always registered (it is inert while the policy is disabled)
+// so enabling the policy at runtime takes effect without a restart.
+builder.Services.AddSingleton<IValidateOptions<ArtifactTrustOptions>, ArtifactTrustOptionsValidator>();
+builder.Services.AddOptions<ArtifactTrustOptions>()
+    .Bind(builder.Configuration.GetSection(ArtifactTrustOptions.SectionName))
+    .ValidateOnStart();
+builder.Services.AddSingleton(new ArtifactAdmissionService());
 // Majordomo MCP surface: hot-reloadable policy (autonomy mode, per-turn
 // blast-radius cap, identity name, turn window) mirroring the vocabulary's
 // MajordomoOptions. Validation fails fast at host start rather than silently
@@ -1103,6 +1116,8 @@ static ISandboxProvider BuildIncus(
             IncusOptions = optionsAccessor,
             Timings = timings,
             ResourceUsage = resourceUsageStore,
+            ArtifactTrust = () => sp.GetRequiredService<IOptionsMonitor<ArtifactTrustOptions>>().CurrentValue,
+            ArtifactAdmission = sp.GetService<ArtifactAdmissionService>(),
         });
 
     if (provider is IDiskGuardedSandboxProvider guarded)
@@ -1273,6 +1288,8 @@ static ISandboxProvider BuildMultipass(
             MultipassOptions = optionsAccessor,
             Timings = timings,
             ResourceUsage = resourceUsageStore,
+            ArtifactTrust = () => sp.GetRequiredService<IOptionsMonitor<ArtifactTrustOptions>>().CurrentValue,
+            ArtifactAdmission = sp.GetService<ArtifactAdmissionService>(),
         });
 
     // Startup banner: log free disk for each guarded path so the operator

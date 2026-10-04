@@ -12,6 +12,18 @@ internal sealed record IncusStagedExecutable(
     string ContentSha256);
 
 /// <summary>
+/// Fingerprint-plus-admission result for one Incus provisioning pass:
+/// content fingerprints for baseline hashing, the private staged paths
+/// carrying the exact admitted bytes for the workspace to consume, and the
+/// secret-free evidences binding verified identities into the cache
+/// fingerprint. Empty when enforcement is disabled or no provisions exist.
+/// </summary>
+internal sealed record AdmittedExecutableInputs(
+    IReadOnlyList<string> Fingerprints,
+    IReadOnlyList<ArtifactProvenance.ToolExecutableAdmission> Staged,
+    IReadOnlyList<ArtifactProvenance.ArtifactProvenanceEvidence> Evidences);
+
+/// <summary>
 /// Raised when the per-staging-root coordination lease is momentarily held by
 /// another concurrent provisioning/recovery pass. Distinct from a genuine I/O
 /// fault so callers can treat opportunistic recovery contention as retryable
@@ -71,13 +83,22 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
         string stagingRoot,
         Func<string, string?> environmentVariableReader,
         Func<Guid> newGuid,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<ArtifactProvenance.ToolExecutableAdmission>? admittedExecutables = null,
+        ArtifactProvenance.ArtifactTrustOptions? trust = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(stagingRoot);
         ArgumentNullException.ThrowIfNull(environmentVariableReader);
         ArgumentNullException.ThrowIfNull(newGuid);
         ct.ThrowIfCancellationRequested();
+        var enforced = ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(trust);
+        if (enforced && (admittedExecutables is null || admittedExecutables.Count != options.ExecutableProvisions.Count))
+        {
+            throw new ArtifactProvenance.ArtifactBlockedException(
+                "Artifact provenance enforcement is enabled but executables were staged without admission; refusing to provision.",
+                ArtifactProvenance.ProvenanceOutcome.VerifierUnavailable);
+        }
 
         using var coordinationLease = AcquireCoordinationLease(stagingRoot);
         var workspaceName = $"{DirectoryPrefix}{newGuid():N}";
@@ -101,15 +122,39 @@ internal sealed class IncusProvisioningWorkspace : IDisposable
                 ct.ThrowIfCancellationRequested();
                 var provision = options.ExecutableProvisions[i];
                 var destination = Path.Combine(workspaceRoot, $"executable-{i:D3}");
-                var digest = IncusBaselineProvisioning.CopyExecutableToPrivateStage(
-                    provision.HostSourcePath,
+                if (!enforced)
+                {
+                    var digest = IncusBaselineProvisioning.CopyExecutableToPrivateStage(
+                        provision.HostSourcePath,
+                        destination,
+                        options.MaxExecutableProvisionBytes,
+                        options.MaxAggregateExecutableProvisionBytes,
+                        ref aggregateBytes,
+                        environmentVariableReader,
+                        ct);
+                    staged.Add(new IncusStagedExecutable(provision, destination, digest));
+                    continue;
+                }
+                // Under enforcement the workspace consumes only admitted bytes:
+                // the private staged copy the admission service verified. The
+                // digest is confirmed while copying; any substitution between
+                // admission and consumption fails closed here.
+                var admitted = admittedExecutables![i];
+                var admittedDigest = IncusBaselineProvisioning.CopyExecutableToPrivateStage(
+                    admitted.StagedPath,
                     destination,
                     options.MaxExecutableProvisionBytes,
                     options.MaxAggregateExecutableProvisionBytes,
                     ref aggregateBytes,
                     environmentVariableReader,
                     ct);
-                staged.Add(new IncusStagedExecutable(provision, destination, digest));
+                if (!string.Equals(admittedDigest, admitted.Evidence.Digest, StringComparison.Ordinal))
+                {
+                    throw new ArtifactProvenance.ArtifactBlockedException(
+                        $"Admitted executable bytes changed before workspace consumption; refusing to provision '{provision.VmDestPath}'.",
+                        ArtifactProvenance.ProvenanceOutcome.CryptographicallyInvalid);
+                }
+                staged.Add(new IncusStagedExecutable(provision, destination, admittedDigest));
             }
             var result = new IncusProvisioningWorkspace(
                 stagingRoot,
@@ -447,23 +492,68 @@ internal static class IncusBaselineProvisioning
         Func<string, string?> environmentVariableReader,
         CancellationToken ct)
     {
+        return AdmitAndFingerprintExecutables(options, environmentVariableReader, admission: null, trust: null, ct).Fingerprints;
+    }
+
+    /// <summary>
+    /// Fingerprints executable provisions for baseline hashing, admitting
+    /// each source through artifact provenance when enforcement is enabled.
+    /// Under enforcement every provision must verify: the returned staged
+    /// paths carry the exact admitted bytes for the workspace to consume, a
+    /// refusal throws <see cref="ArtifactProvenance.ArtifactBlockedException"/>
+    /// (visible blocked outcome, never a silent provision), and the returned
+    /// evidences bind verified identities into the baseline cache
+    /// fingerprint. With enforcement disabled the fingerprints — and the
+    /// resulting hashes — are identical to
+    /// <see cref="FingerprintExecutables"/>.
+    /// </summary>
+    internal static AdmittedExecutableInputs AdmitAndFingerprintExecutables(
+        IncusSandboxOptions options,
+        Func<string, string?> environmentVariableReader,
+        ArtifactProvenance.ArtifactAdmissionService? admission,
+        ArtifactProvenance.ArtifactTrustOptions? trust,
+        CancellationToken ct)
+    {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(environmentVariableReader);
-        var result = new List<string>(options.ExecutableProvisions.Count);
+        var fingerprints = new List<string>(options.ExecutableProvisions.Count);
+        var staged = new List<ArtifactProvenance.ToolExecutableAdmission>(options.ExecutableProvisions.Count);
+        var evidences = new List<ArtifactProvenance.ArtifactProvenanceEvidence>(options.ExecutableProvisions.Count);
         var aggregateBytes = 0L;
+        var enforced = ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(trust);
+        if (enforced && admission is null)
+        {
+            throw new ArtifactProvenance.ArtifactBlockedException(
+                "Artifact provenance enforcement is enabled but no admission service is available; refusing to fingerprint executables.",
+                ArtifactProvenance.ProvenanceOutcome.VerifierUnavailable);
+        }
         foreach (var provision in options.ExecutableProvisions)
         {
             ct.ThrowIfCancellationRequested();
-            using var source = OpenRegularFileNoFollow(
-                ResolveHostSourcePath(provision.HostSourcePath, environmentVariableReader));
-            result.Add(HashOpenedFileBounded(
-                source,
-                options.MaxExecutableProvisionBytes,
-                options.MaxAggregateExecutableProvisionBytes,
-                ref aggregateBytes,
-                ct));
+            var source = ResolveHostSourcePath(provision.HostSourcePath, environmentVariableReader);
+            if (!enforced)
+            {
+                using var input = OpenRegularFileNoFollow(source);
+                fingerprints.Add(HashOpenedFileBounded(
+                    input,
+                    options.MaxExecutableProvisionBytes,
+                    options.MaxAggregateExecutableProvisionBytes,
+                    ref aggregateBytes,
+                    ct));
+                continue;
+            }
+            var admitted = admission!.AdmitToolExecutable(source, trust!, ct);
+            staged.Add(admitted);
+            evidences.Add(admitted.Evidence);
+            fingerprints.Add(admitted.Evidence.Digest);
+            var label = string.IsNullOrWhiteSpace(provision.Label) ? provision.VmDestPath : provision.Label;
+            CodeyBox.Core.AuditLog.ToolProvenanceAdmitted(
+                label, admitted.Evidence.Digest, admitted.Evidence.Identity, admitted.Evidence.Issuer, admitted.Evidence.Verifier);
         }
-        return Array.AsReadOnly(result.ToArray());
+        return new AdmittedExecutableInputs(
+            Array.AsReadOnly(fingerprints.ToArray()),
+            Array.AsReadOnly(staged.ToArray()),
+            Array.AsReadOnly(evidences.ToArray()));
     }
 
     internal static string ResolveHostSourcePath(

@@ -206,6 +206,42 @@ public static class BaselineContentHash
         ArgumentNullException.ThrowIfNull(list, name);
         return list;
     }
+
+    /// <summary>
+    /// Computes the provenance fingerprint over admitted executable artifacts:
+    /// SHA-256 over the sorted admitted identities (digest, verified
+    /// publisher/issuer, policy digest). Providers combine this with the
+    /// toolchain hash so verified artifact identities join the baseline cache
+    /// fingerprint. Empty input yields the empty fingerprint (no provenance).
+    /// </summary>
+    public static string ComputeProvenanceFingerprint(IEnumerable<ArtifactProvenance.ArtifactProvenanceEvidence> evidences)
+    {
+        ArgumentNullException.ThrowIfNull(evidences);
+        var identities = evidences
+            .Where(static e => e is not null && e.IsAdmitted)
+            .Select(static e => e.ToFingerprintIdentity())
+            .OrderBy(static identity => identity, StringComparer.Ordinal)
+            .ToArray();
+        if (identities.Length == 0)
+            return string.Empty;
+        var canonical = string.Join("\n", identities) + "\n";
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    /// <summary>
+    /// Combines a toolchain hash with a provenance fingerprint for baseline
+    /// cache keys. A null or empty fingerprint returns the toolchain hash
+    /// unchanged, so disabled-policy behavior is byte-identical; a present
+    /// fingerprint binds the verified identities into the cache identity.
+    /// </summary>
+    public static string CombineToolchainHash(string toolchainHash, string? provenanceFingerprint)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(toolchainHash);
+        if (string.IsNullOrEmpty(provenanceFingerprint))
+            return toolchainHash;
+        return Convert.ToHexStringLower(SHA256.HashData(
+            Encoding.UTF8.GetBytes(toolchainHash + ":" + provenanceFingerprint)));
+    }
 }
 
 /// <summary>

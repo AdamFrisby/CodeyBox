@@ -469,6 +469,51 @@ commands pass. Disabling Incus baselines leaves this bake-only list empty.
 | `CodeyBox:DiskGuard:RecheckIn` | `00:05:00` | Delay reported for deferred work. |
 | `CodeyBox:DiskGuard:AdditionalPaths` | `[]` | Up to 64 extra host paths to probe; the state-database directory and effective Incus staging directory are included automatically, for at most 66 effective Incus host paths. |
 
+## `ArtifactTrust`
+
+Operator-owned, opt-in trust policy for exact plugin bundles and externally
+staged tool executables. Disabled by default: existing installations keep
+existing behavior until the operator enables this section. When enabled,
+artifacts are verified through the official cosign/gh contracts before plugin
+load and before baseline provisioning; a refusal blocks the affected artifact
+visibly and never executes it. See
+[`../concepts/artifact-provenance.md`](../concepts/artifact-provenance.md) for
+the trust model and the supported artifact formats and evidence types.
+
+Validation fails fast at host start; values are hot-reloadable and cached
+verdicts are keyed by the live policy digest. Verification credentials stay in
+the orchestrator process and are never passed to plugin or tool processes.
+
+```json
+"ArtifactTrust": {
+  "Enabled": false,
+  "VerificationTimeoutSeconds": 60,
+  "MaxProvenanceDocumentBytes": 65536,
+  "MaxSignatureBytes": 1048576,
+  "MaxArtifactBytes": 536870912,
+  "MaxCachedVerdicts": 256,
+  "MaxTrustedArtifacts": 64,
+  "CosignBinaryPath": "cosign",
+  "GhBinaryPath": "gh",
+  "AllowNetworkDiscovery": false,
+  "TrustedArtifacts": []
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `false` | Master switch. No enforcement, no behavior change while `false`. |
+| `VerificationTimeoutSeconds` | `60` | Per-verification timeout (1–600) for the cosign/gh processes. |
+| `MaxProvenanceDocumentBytes` | `65536` | Largest provenance statement accepted (1 KiB–4 MiB). |
+| `MaxSignatureBytes` | `1048576` | Largest signature/bundle accepted (512 B–8 MiB). |
+| `MaxArtifactBytes` | `536870912` | Largest single artifact staged for verification; enforced before buffering. |
+| `MaxCachedVerdicts` | `256` | Cached admission verdicts retained process-wide (1–4096). |
+| `MaxTrustedArtifacts` | `64` | Maximum trusted entries (policy validation rejects more). |
+| `CosignBinaryPath` | `cosign` | Verifier binary resolved without a shell (1–512 printable characters). |
+| `GhBinaryPath` | `gh` | Attestation verifier binary, same rules. |
+| `AllowNetworkDiscovery` | `false` | Permit `gh` to discover attestations online; local bundles only while `false`. |
+| `TrustedArtifacts` | `[]` | Exact artifacts. Each entry binds `Sha256` (64 lowercase hex) plus the expected `Publisher`/`Issuer` (exact match, never patterns) and optional exact `Repository`/`Workflow`/`SourceRef`/`PredicateType`. `Evidence` is one of `openssl-local`, `cosign-local-key`, `sigstore-bundle`, `github-attestation`. Key-based entries pin `PublicKeyPem`; `cosign-local-key` additionally requires `Issuer: local-key` and `Publisher: key:<key fingerprint>`. |
+
 ## `WorkerPool`
 
 Controls worker concurrency and spawn pacing.

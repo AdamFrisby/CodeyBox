@@ -1640,6 +1640,56 @@ public static class AuditLog
                 "(CodeyBox.Core/CodeyBox.PluginSdk) and cannot load ({Detail}); rebuild the plugin against the current host",
                 assemblyPath, detail);
 
+    /// <summary>
+    /// Emitted when artifact provenance enforcement refuses a plugin bundle.
+    /// The assembly was never loaded. Properties are secret-free (outcome,
+    /// digest, bounded detail); no key material or evidence payloads are logged.
+    /// </summary>
+    public static void PluginProvenanceBlocked(string assemblyPath, string outcome, string detail) =>
+        Audit("plugin.provenance_blocked")
+            .Error("Plugin bundle {AssemblyPath} blocked by artifact provenance ({Outcome}): {Detail}",
+                assemblyPath, outcome, detail);
+
+    /// <summary>
+    /// Emitted when artifact provenance enforcement admits a plugin bundle.
+    /// Records the verified digest, publisher identity, issuer, and verifier.
+    /// </summary>
+    public static void PluginProvenanceAdmitted(
+        string assemblyPath,
+        string digest,
+        string identity,
+        string issuer,
+        string verifier) =>
+        Audit("plugin.provenance_admitted")
+            .Information(
+                "Plugin bundle {AssemblyPath} provenance admitted: {Digest} verified by {Verifier} as {Identity}/{Issuer}",
+                assemblyPath, digest, verifier, identity, issuer);
+
+    /// <summary>
+    /// Emitted when artifact provenance enforcement refuses an externally
+    /// staged tool executable. The file is never provisioned. Properties are
+    /// secret-free; no key material or evidence payloads are logged.
+    /// </summary>
+    public static void ToolProvenanceBlocked(string label, string hostPath, string outcome, string detail) =>
+        Audit("tool.provenance_blocked")
+            .Error("Tool executable {Label} from {HostPath} blocked by artifact provenance ({Outcome}): {Detail}",
+                label, hostPath, outcome, detail);
+
+    /// <summary>
+    /// Emitted when artifact provenance enforcement admits a tool executable
+    /// to provisioning. Records the verified digest, identity, and verifier.
+    /// </summary>
+    public static void ToolProvenanceAdmitted(
+        string label,
+        string digest,
+        string identity,
+        string issuer,
+        string verifier) =>
+        Audit("tool.provenance_admitted")
+            .Information(
+                "Tool executable {Label} provenance admitted: {Digest} verified by {Verifier} as {Identity}/{Issuer}",
+                label, digest, verifier, identity, issuer);
+
     // ── Hot-reload config ────────────────────────────────────────────────────
 
     /// <summary>

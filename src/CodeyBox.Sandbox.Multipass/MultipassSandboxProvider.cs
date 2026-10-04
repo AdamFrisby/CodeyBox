@@ -84,6 +84,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     private readonly ISandboxResourceUsageStore? _resourceUsageStore;
     private readonly IDiskSpaceProbe _diskProbe;
     private readonly Func<string, Ipv4Subnet?> _bridgeSubnetResolver;
+    private readonly Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? _trustAccessor;
+    private readonly CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? _admission;
     // Per-baseline-name semaphore: serialises bake operations so two
     // concurrent CreateAsync calls for the same profile don't both try to
     // launch the same baseline VM. Lazily populated.
@@ -161,15 +163,19 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     }
 
     public MultipassSandboxProvider(MultipassSandboxOptions opts, ILogger<MultipassSandboxProvider> log,
-        ITimingStore? timings = null, ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => opts, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
+        ITimingStore? timings = null, ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
+        : this(() => opts, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore, trustAccessor: trustAccessor, admission: admission)
     {
     }
 
     public MultipassSandboxProvider(Func<MultipassSandboxOptions> optionsAccessor,
         ILogger<MultipassSandboxProvider> log, ITimingStore? timings = null,
-        ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(optionsAccessor, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore)
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
+        : this(optionsAccessor, log, timings, new DefaultProcessRunner(), resourceUsageStore: resourceUsageStore, trustAccessor: trustAccessor, admission: admission)
     {
     }
 
@@ -187,7 +193,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         MultipassDaemonRetryPolicy? daemonRetryPolicy = null,
         IDiskSpaceProbe? diskProbe = null,
         ISandboxResourceUsageStore? resourceUsageStore = null,
-        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null)
+        Func<string, Ipv4Subnet?>? bridgeSubnetResolver = null,
+        Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
     {
         _optsAccessor = optionsAccessor;
         _log = log;
@@ -197,6 +205,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         _resourceUsageStore = resourceUsageStore;
         _diskProbe = diskProbe ?? new DefaultDiskSpaceProbe();
         _bridgeSubnetResolver = bridgeSubnetResolver ?? TryResolveBridgeSubnet;
+        _trustAccessor = trustAccessor;
+        _admission = admission;
         // StagingDirectory is captured once: the provider keeps the directory open
         // for the lifetime of the process. Re-binding it at runtime would orphan
         // already-staged sandboxes.
@@ -1471,7 +1481,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         // stale pin after baseline-contributing config drift. Unknown stale pins
         // fail closed instead of cloning a work-profile baseline into an
         // audit/rework phase.
-        var liveBaselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+        // Admit executables before naming so verified artifact identities
+        // join the baseline cache fingerprint; a refusal fails the bake
+        // visibly before any VM is launched.
+        var admitted = AdmitExecutableProvisions(opts, ct);
+        var admittedEvidences = admitted.Select(static a => a.Evidence).ToList();
+        var liveBaselineName = ComposeBaselineNameFromLiveConfig(
+            opts,
+            profileName,
+            flavor,
+            admitted.Select(static a => a.Evidence.Digest).ToList(),
+            CodeyBox.Sandbox.BaselineContentHash.ComputeProvenanceFingerprint(admittedEvidences));
         var baselineName = liveBaselineName;
         if (!string.IsNullOrWhiteSpace(pinnedBaselineRef))
         {
@@ -1486,7 +1506,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         {
             if (await BaselineVmExistsAsync(opts, baselineName, workItemId, ct))
                 return baselineName;
-            await BakeBaselineAsync(opts, baselineName, profileName, flavor, workItemId, ct);
+            await BakeBaselineAsync(opts, baselineName, profileName, flavor, workItemId, ct, admitted);
             return baselineName;
         }
         finally
@@ -1622,9 +1642,11 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     internal static string ComposeBaselineNameFromLiveConfig(
         MultipassSandboxOptions opts,
         string profileName,
-        SandboxProfileFlavor flavor)
+        SandboxProfileFlavor flavor,
+        IReadOnlyList<string>? executableFingerprints = null,
+        string? provenanceFingerprint = null)
     {
-        var hash = ComputeBaselineHash(opts, profileName, flavor);
+        var hash = ComputeBaselineHash(opts, profileName, flavor, executableFingerprints, provenanceFingerprint);
         var baselineName = opts.BaselineNamePrefix + hash;
         // multipass instance names cap at 24 chars; the prefix + 12-char hash
         // already fits comfortably under that with the default prefix
@@ -1649,7 +1671,9 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
     internal static string ComputeBaselineHash(
         MultipassSandboxOptions opts,
         string profileName,
-        SandboxProfileFlavor flavor)
+        SandboxProfileFlavor flavor,
+        IReadOnlyList<string>? executableFingerprints = null,
+        string? provenanceFingerprint = null)
     {
         var firstBootRuncmd = BuildFirstBootRuncmd(opts, flavor);
         // The cloud-init body matches what BakeBaselineAsync writes:
@@ -1666,13 +1690,16 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             baselineInstallCommands: opts.ExtraRuncmd,
             includePeakRamSampler: opts.CaptureResourceMetrics);
         var seedsStr = string.Join(";", opts.PackageCacheSeeds.Select(s => $"{s.HostSourcePath}->{s.VmDestPath}({s.MaxSizeMB})"));
-        var execsStr = string.Join(";", opts.ExecutableProvisions.Select(RenderExecutableProvisionForHash));
+        var execs = opts.ExecutableProvisions.Select((exe, index) => RenderExecutableProvisionForHash(
+            exe,
+            executableFingerprints is not null && index < executableFingerprints.Count ? executableFingerprints[index] : null));
+        var execsStr = string.Join(";", execs);
         // Build a canonical, version-prefixed string. The 'v4' prefix lets
         // future schema changes invalidate every existing baseline without
         // ambiguity (bumped from v3 when executable content fingerprints were added).
         // Field separator is '|' which cannot appear in profile names or
         // flavor enum strings.
-        var canon = string.Join("|", new[]
+        var segments = new List<string>
         {
             "v4",
             profileName,
@@ -1683,19 +1710,25 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             opts.ExtraCloudInit ?? string.Empty,
             seedsStr,
             execsStr,
-        });
+        };
+        // Verified artifact identities join the cache fingerprint only when
+        // enforcement produced them; otherwise the canonical string — and the
+        // historical hash — is unchanged.
+        if (!string.IsNullOrEmpty(provenanceFingerprint))
+            segments.Add(provenanceFingerprint);
+        var canon = string.Join("|", segments);
         var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(canon));
         return Convert.ToHexString(hash.AsSpan(0, 6)).ToLowerInvariant();
     }
 
-    private static string RenderExecutableProvisionForHash(BaselineExecutableProvision exe)
+    private static string RenderExecutableProvisionForHash(BaselineExecutableProvision exe, string? fingerprintOverride = null)
     {
         var hostPath = ResolvePath(exe.HostSourcePath);
         return string.Join("\u001f", new[]
         {
             exe.HostSourcePath,
             hostPath,
-            FingerprintExecutableProvisionHostFile(hostPath),
+            fingerprintOverride ?? FingerprintExecutableProvisionHostFile(hostPath),
             exe.VmDestPath,
             string.Join("\u001e", exe.VmSymlinks),
         });
@@ -1728,7 +1761,17 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         var opts = ReadOptions();
         if (!opts.UseBaselineImages) return null;
         if (!opts.NetworkProfiles.ContainsKey(profileName)) return null;
-        var baselineName = ComposeBaselineNameFromLiveConfig(opts, profileName, flavor);
+        // Same admission pass as the bake path so the resolved ref carries
+        // the same provenance-bound fingerprint; without it the resolver
+        // would name a baseline the bake never produces.
+        var admitted = AdmitExecutableProvisions(opts, CancellationToken.None);
+        var baselineName = ComposeBaselineNameFromLiveConfig(
+            opts,
+            profileName,
+            flavor,
+            admitted.Select(static a => a.Evidence.Digest).ToList(),
+            CodeyBox.Sandbox.BaselineContentHash.ComputeProvenanceFingerprint(
+                admitted.Select(static a => a.Evidence).ToList()));
         RememberBaselineTarget(baselineName, profileName, flavor);
         return baselineName;
     }
@@ -1845,7 +1888,8 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         string profileName,
         SandboxProfileFlavor flavor,
         WorkItemId? workItemId,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission>? admittedExecutables = null)
     {
         var bridge = opts.NetworkProfiles[profileName];
         _log.LogInformation(
@@ -1934,7 +1978,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
             // baseline before the binary-verification gate runs. Verification expects
             // the binary on PATH with the executable bit set; doing this here keeps the
             // missing-binary failure mode loud (verify exit 127) instead of dispatch-time.
-            await ProvisionExecutablesAsync(opts, baselineName, workItemId, ct).ConfigureAwait(false);
+            await ProvisionExecutablesAsync(opts, baselineName, workItemId, ct, admittedExecutables).ConfigureAwait(false);
 
             await VerifyBaselineRequiredBinariesAsync(opts, baselineName, workItemId, ct);
 
@@ -2036,14 +2080,108 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
         }
     }
 
+    /// <summary>
+    /// Admits every configured executable provision through artifact
+    /// provenance. Returns the admitted staged copies for the bake to
+    /// transfer. With enforcement disabled returns an empty list. A refusal
+    /// throws <c>ArtifactBlockedException</c> with a visible blocked outcome;
+    /// unverified bytes are never transferred.
+    /// </summary>
+    private IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission> AdmitExecutableProvisions(
+        MultipassSandboxOptions opts,
+        CancellationToken ct)
+    {
+        var trust = _trustAccessor?.Invoke();
+        if (!CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(trust)
+            || opts.ExecutableProvisions.Count == 0)
+            return [];
+        if (_admission is null)
+        {
+            throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                "Artifact provenance enforcement is enabled but no admission service is available; refusing to provision executables.",
+                CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.VerifierUnavailable);
+        }
+        var admitted = new List<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission>(opts.ExecutableProvisions.Count);
+        for (var i = 0; i < opts.ExecutableProvisions.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var exe = opts.ExecutableProvisions[i];
+            var label = string.IsNullOrWhiteSpace(exe.Label) ? $"exe-{i + 1}" : exe.Label!;
+            var sourceForAudit = exe.HostSourcePath ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(exe.HostSourcePath))
+            {
+                throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                    $"ExecutableProvisions[{i}] (label '{label}') has no HostSourcePath; refusing to provision.",
+                    CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.MissingEvidence);
+            }
+            try
+            {
+                var admission = _admission.AdmitToolExecutable(ResolvePath(exe.HostSourcePath), trust!, ct);
+                CodeyBox.Core.AuditLog.ToolProvenanceAdmitted(
+                    label, admission.Evidence.Digest, admission.Evidence.Identity, admission.Evidence.Issuer, admission.Evidence.Verifier);
+                admitted.Add(admission);
+            }
+            catch (CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException ex)
+            {
+                CodeyBox.Core.AuditLog.ToolProvenanceBlocked(label, sourceForAudit, ex.Outcome.ToString(), FirstProvenanceLine(ex.Message));
+                _log.LogError(
+                    "Multipass executable provisioning blocked by artifact provenance ({Outcome}): {Detail}",
+                    ex.Outcome, FirstProvenanceLine(ex.Message));
+                throw;
+            }
+        }
+        return admitted;
+    }
+
+    private static string FirstProvenanceLine(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "(no detail)";
+        var line = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        const int maxLength = 256;
+        return line.Length > maxLength ? line[..maxLength] + "…" : line;
+    }
+
+    /// <summary>
+    /// Re-hashes an admitted staged copy and returns its path for transfer.
+    /// Any substitution between admission and transfer fails closed with
+    /// <c>CryptographicallyInvalid</c> instead of reaching the guest.
+    /// </summary>
+    internal static string VerifyAdmittedTransferSource(
+        CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission admitted,
+        long maxArtifactBytes,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(admitted);
+        var confirmed = CodeyBox.Sandbox.ArtifactProvenance.ArtifactStaging.HashStagedFile(
+            admitted.StagedPath, maxArtifactBytes, ct);
+        if (!string.Equals("sha256:" + confirmed, admitted.Evidence.Digest, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                "Admitted executable bytes changed before transfer; refusing to provision.",
+                CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.CryptographicallyInvalid);
+        }
+        return admitted.StagedPath;
+    }
+
     private async Task ProvisionExecutablesAsync(
         MultipassSandboxOptions opts,
         string baselineName,
         WorkItemId? workItemId,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission>? admittedExecutables = null)
     {
         if (opts.ExecutableProvisions == null || opts.ExecutableProvisions.Count == 0)
             return;
+
+        var trust = _trustAccessor?.Invoke();
+        var enforced = CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(trust);
+        if (enforced && (admittedExecutables is null || admittedExecutables.Count != opts.ExecutableProvisions.Count))
+        {
+            throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                "Artifact provenance enforcement is enabled but executables were staged without admission; refusing to provision.",
+                CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.VerifierUnavailable);
+        }
 
         for (var i = 0; i < opts.ExecutableProvisions.Count; i++)
         {
@@ -2065,6 +2203,14 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
                 throw new InvalidOperationException(
                     $"ExecutableProvisions[{i}] (label '{label}') host file '{hostPath}' does not exist; cannot ship binary into baseline {baselineName}.");
 
+            // Under provenance enforcement only the admitted staged copy is
+            // transferred: the exact verified bytes. The staged file is
+            // re-hashed here; any substitution between admission and transfer
+            // fails closed instead of reaching the guest.
+            var transferSource = hostPath;
+            if (enforced)
+                transferSource = VerifyAdmittedTransferSource(admittedExecutables![i], trust!.MaxArtifactBytes, ct);
+
             // Transfer to a predictable temp path in /home/ubuntu first. Multipass
             // transfers run as the default `ubuntu` user; from there we use sudo
             // install to relocate with mode/owner deterministically. Doing it this
@@ -2081,7 +2227,7 @@ public sealed class MultipassSandboxProvider : ISandboxProvider, IActiveSandboxP
 
             var transfer = await RunAsync(
                 opts,
-                [opts.MultipassBinary, "transfer", hostPath, $"{baselineName}:{vmStagePath}"],
+                [opts.MultipassBinary, "transfer", transferSource, $"{baselineName}:{vmStagePath}"],
                 stdin: null, ct: ct, workItemId: workItemId).ConfigureAwait(false);
             if (transfer.ExitCode != 0)
             {

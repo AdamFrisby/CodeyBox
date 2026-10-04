@@ -1,4 +1,5 @@
 using CodeyBox.HostProcess;
+using CodeyBox.Sandbox.ArtifactProvenance;
 using CodeyBox.Sandbox.Bubblewrap;
 using CodeyBox.Sandbox.Incus;
 using CodeyBox.Sandbox.Multipass;
@@ -48,6 +49,20 @@ public sealed class SandboxProviderBuildArgs
 
     /// <summary>Optional resource-usage store shared by VM-backed providers.</summary>
     public CodeyBox.Core.ISandboxResourceUsageStore? ResourceUsage { get; init; }
+
+    /// <summary>
+    /// Operator-owned artifact-trust accessor (hot-reloadable). Held by
+    /// executable-staging providers; enforcement activates only when the
+    /// policy opts in. Defaults to a disabled policy.
+    /// </summary>
+    public Func<ArtifactTrustOptions> ArtifactTrust { get; init; } = () => new();
+
+    /// <summary>
+    /// Shared admission service for executable provenance. Required when the
+    /// trust policy enables enforcement; providers fail closed without it.
+    /// Lifetime must cover every built provider (host singleton).
+    /// </summary>
+    public ArtifactAdmissionService? ArtifactAdmission { get; init; }
 
     /// <summary>
     /// Builds args whose option accessors read live executor configuration:
@@ -111,13 +126,17 @@ public static class SharedSandboxProviderFactory
                 RequireAccessor(args.MultipassOptions, normalized),
                 loggers.CreateLogger<MultipassSandboxProvider>(),
                 args.Timings,
-                args.ResourceUsage);
+                args.ResourceUsage,
+                trustAccessor: RequireAccessor(args.ArtifactTrust, normalized),
+                admission: args.ArtifactAdmission);
         if (normalized == CodeyBox.Core.HostPlatformSupport.Incus)
             return new IncusSandboxProvider(
                 RequireAccessor(args.IncusOptions, normalized),
                 loggers.CreateLogger<IncusSandboxProvider>(),
                 args.Timings,
-                args.ResourceUsage);
+                args.ResourceUsage,
+                trustAccessor: RequireAccessor(args.ArtifactTrust, normalized),
+                admission: args.ArtifactAdmission);
         if (normalized == CodeyBox.Core.HostPlatformSupport.MultipassRemote)
             return BuildMultipassRemote(args, loggers);
         if (normalized == CodeyBox.Core.HostPlatformSupport.Sprites)

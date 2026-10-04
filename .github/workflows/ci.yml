@@ -30,6 +30,16 @@ jobs:
           dotnet-version: 10.0.x
       - run: dotnet restore CodeyBox.slnx
       - run: dotnet build CodeyBox.slnx --configuration Release --no-restore
+      # The requires_cosign artifact-provenance tests verify committed
+      # fixtures through the real cosign contract. Pinned to the minimum
+      # supported cosign release; TLS protects the download the same way it
+      # protects the pinned action SHAs above. If this step fails the job
+      # fails — the cryptographic leg must run, not silently skip.
+      - name: install cosign for provenance tests
+        run: |
+          curl -fsSL --max-time 120 -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          /tmp/cosign version
       - name: deterministic tests
         run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build --filter 'requires_multipass!=true'
       - name: admin tests

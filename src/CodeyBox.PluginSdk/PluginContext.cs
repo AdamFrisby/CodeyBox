@@ -23,4 +23,14 @@ public sealed record PluginContext(
 
     /// <summary>Convenience accessor — same as <see cref="IPluginHost.ScopedConfig"/>.</summary>
     public IConfigurationSection ScopedConfig => Host.ScopedConfig;
+
+    /// <summary>
+    /// Operator-owned global artifact-trust configuration
+    /// (<c>CodeyBox:ArtifactTrust</c>), or null when the host does not provide
+    /// it. Carries public trust inputs only (digests, identities, public
+    /// keys) — never secrets. Sandbox provider plugins read this to enforce
+    /// executable provenance against the same policy as the host; other
+    /// plugins should ignore it.
+    /// </summary>
+    public IConfigurationSection? ArtifactTrustConfig { get; init; }
 }

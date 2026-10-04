@@ -261,7 +261,14 @@ internal sealed class PluginInitializationService : IHostedService
             HostApiVersion: CodeyBoxApiVersion.Current,
             PluginId: plugin.PluginId,
             PluginDisplayName: plugin.DisplayName,
-            Host: host);
+            Host: host)
+        {
+            // Operator-owned artifact provenance inputs (public trust data
+            // only, never secrets). Sandbox provider plugins enforce
+            // executable provenance from this snapshot.
+            ArtifactTrustConfig = _configuration.GetSection(
+                CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions.SectionName),
+        };
 
         try
         {

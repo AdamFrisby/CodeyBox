@@ -44,7 +44,8 @@ internal static class IncusBaselineNaming
         SandboxProfileFlavor flavor,
         Func<string, string?>? environmentVariableReader = null,
         CancellationToken ct = default,
-        IReadOnlyList<string>? executableContentSha256 = null)
+        IReadOnlyList<string>? executableContentSha256 = null,
+        string? provenanceFingerprint = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         var hash = ComputeConfigHash(
@@ -53,7 +54,8 @@ internal static class IncusBaselineNaming
             flavor,
             environmentVariableReader,
             ct,
-            executableContentSha256);
+            executableContentSha256,
+            provenanceFingerprint);
         return DeriveBaselineNameFromHash(options, profileName, flavor, hash);
     }
 
@@ -127,7 +129,8 @@ internal static class IncusBaselineNaming
     /// </summary>
     internal static string ComputeSharedToolchainHash(
         IncusSandboxOptions options,
-        IReadOnlyList<string>? executableContentSha256 = null)
+        IReadOnlyList<string>? executableContentSha256 = null,
+        IReadOnlyList<ArtifactProvenance.ArtifactProvenanceEvidence>? provenance = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (executableContentSha256 is null)
@@ -146,10 +149,14 @@ internal static class IncusBaselineNaming
                 provision.Label,
                 executableContentSha256[i]);
         }
-        return BaselineContentHash.ComputeToolchainHash(new BaselineToolchainInputs(
+        var toolchainHash = BaselineContentHash.ComputeToolchainHash(new BaselineToolchainInputs(
             options.ExtraRuncmd,
             executables,
             options.BaselineVerificationCommands));
+        return BaselineContentHash.CombineToolchainHash(
+            toolchainHash,
+            BaselineContentHash.ComputeProvenanceFingerprint(
+                provenance ?? (IReadOnlyList<ArtifactProvenance.ArtifactProvenanceEvidence>)[]));
     }
 
     internal static string ComputeConfigHash(
@@ -158,7 +165,8 @@ internal static class IncusBaselineNaming
         SandboxProfileFlavor flavor,
         Func<string, string?>? environmentVariableReader = null,
         CancellationToken ct = default,
-        IReadOnlyList<string>? executableContentSha256 = null)
+        IReadOnlyList<string>? executableContentSha256 = null,
+        string? provenanceFingerprint = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentException.ThrowIfNullOrWhiteSpace(profileName);
@@ -237,7 +245,11 @@ internal static class IncusBaselineNaming
             options.MaxPackageCacheSeedEntries,
         };
         var json = JsonSerializer.Serialize(canonical);
-        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
+        var configHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
+        // Provenance identities join the cache fingerprint only when
+        // enforcement produced them; a null/empty fingerprint returns the
+        // historical hash unchanged, preserving disabled-policy behavior.
+        return BaselineContentHash.CombineToolchainHash(configHash, provenanceFingerprint);
     }
 
     private static bool IsLowerHex(ReadOnlySpan<char> value)
