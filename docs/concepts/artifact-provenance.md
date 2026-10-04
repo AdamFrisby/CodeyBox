@@ -43,6 +43,16 @@ keyed by the live policy digest, so a policy edit never reuses a stale result.
 | `github-attestation`   | `gh attestation verify --bundle <local-bundle> --repo <repo> --signer-workflow <workflow> --predicate-type <type> --cert-identity <publisher> --cert-oidc-issuer <issuer> --source-ref <ref> --format json -- <file>` | local bundle `<file>.attestation.json` where the publisher provides one, otherwise controlled online discovery when `AllowNetworkDiscovery` is set | only inside the `gh` process, only when enabled |
 | `os-package`           | n/a (apt trust)  | n/a — never admits executables | n/a |
 
+Constraint support differs by evidence kind. `cosign verify-blob`
+(`sigstore-bundle` and `cosign-local-key`) attests only the publisher/issuer
+(plus the subject digest, re-checked locally): a policy entry using either
+kind must not set `Repository`/`Workflow`/`SourceRef`/`PredicateType` —
+verification fails closed when any of them is set, because the
+artifact-supplied sidecar can never satisfy them. Use `openssl-local`
+(statement bytes are the signed object) or `github-attestation` (every
+constraint travels as a `gh` flag and the verdict is parsed from `gh`'s
+verified output) for repository/workflow/source-ref/predicate constraints.
+
 The provenance statement is a small JSON document:
 
 ```json

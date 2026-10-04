@@ -535,15 +535,17 @@ public sealed class ArtifactProvenanceTests : IDisposable
 
         var pubPem = File.ReadAllText(Path.Combine(scratch, "tool-fixture.cosign.pub"));
         var digest = Sha256File(source);
+        // cosign verify-blob attests only the pinned key (plus the subject
+        // digest): repository/workflow/source-ref constraints have no
+        // verifier-backed source in this contract, so the entry pins only
+        // the key identity. The fixture sidecar's repository labels are
+        // descriptive only.
         var entry = new TrustedArtifactPolicy
         {
             ArtifactId = "cosign-fixture",
             Sha256 = digest,
             Publisher = "key:" + ArtifactTrustOptions.FingerprintPublicKey(pubPem),
             Issuer = ArtifactEvidenceKinds.LocalKeyIssuer,
-            Repository = "https://codeybox.invalid/provenance-test-fixture",
-            Workflow = "provenance-fixture.yml",
-            SourceRef = "refs/tags/provenance-fixture-v1",
             Evidence = ArtifactEvidenceKinds.CosignLocalKey,
             PublicKeyPem = pubPem,
         };

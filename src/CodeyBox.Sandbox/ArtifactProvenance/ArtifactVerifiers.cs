@@ -258,7 +258,11 @@ public sealed class PlatformEcdsaVerifier : IArtifactVerifier
 /// (<c>cosign verify-blob --bundle … --certificate-identity … --certificate-issuer … -- FILE</c>).
 /// Publisher and issuer travel as exact flag values from policy (never
 /// patterns, never artifact-supplied); the subject digest is re-checked
-/// locally by the admission service. Minimum supported behavior: cosign 2.2.
+/// locally by the admission service. The verify-blob contract attests only
+/// publisher/issuer: repository/workflow/source-ref/predicate have no
+/// verifier-backed source, so a policy setting any of them fails closed
+/// (use github-attestation or openssl-local for those constraints).
+/// Minimum supported behavior: cosign 2.2.
 /// </summary>
 public sealed class CosignVerifier : IArtifactVerifier
 {
@@ -304,6 +308,17 @@ public sealed class CosignVerifier : IArtifactVerifier
                 "provenance statement digest does not match the staged artifact bytes.");
         }
 
+        // verify-blob attests only publisher/issuer. Repository, workflow,
+        // source-ref, and predicate constraints have no verifier-backed
+        // source in this contract, so the artifact-supplied sidecar must
+        // never satisfy them: fail closed when the policy sets any of them.
+        if (policy.Repository is not null || policy.Workflow is not null
+            || policy.SourceRef is not null || policy.PredicateType is not null)
+        {
+            return Unverified(statement,
+                "sigstore-bundle evidence does not attest repository/workflow/source-ref/predicate; remove those constraints or use github-attestation/openssl-local evidence.");
+        }
+
         var version = VerifierVersions.Probe(_runner, options.CosignBinaryPath, ["version", "--json"], options, ct);
         if (!VerifierVersions.MeetsMinimum(version, MinimumMajorVersion))
         {
@@ -343,12 +358,12 @@ public sealed class CosignVerifier : IArtifactVerifier
             return new VerifierVerdict
             {
                 CryptographicallyValid = true,
-                ObservedPublisher = statement.Publisher,
-                ObservedIssuer = statement.Issuer,
-                ObservedRepository = statement.Repository,
-                ObservedWorkflow = statement.Workflow,
-                ObservedSourceRef = statement.SourceRef,
-                ObservedPredicateType = statement.PredicateType,
+                ObservedPublisher = policy.Publisher,
+                ObservedIssuer = policy.Issuer,
+                ObservedRepository = null,
+                ObservedWorkflow = null,
+                ObservedSourceRef = null,
+                ObservedPredicateType = null,
                 Verifier = Name,
                 VerifierVersion = BoundVersion(version),
             };
@@ -396,8 +411,10 @@ public sealed class CosignVerifier : IArtifactVerifier
 /// the bundle and the pinned key authenticate the exact bytes. Publisher and
 /// issuer are derived from the policy's own pinned key
 /// (<c>key:&lt;fingerprint&gt;</c> / <c>local-key</c>), never from
-/// artifact-supplied metadata; the digest-bound provenance statement
-/// contributes only repository/workflow/source-ref/predicate constraints.
+/// artifact-supplied metadata. The verify-blob contract attests only the
+/// pinned key: repository/workflow/source-ref/predicate have no
+/// verifier-backed source, so a policy setting any of them fails closed
+/// (use github-attestation or openssl-local for those constraints).
 /// Minimum supported behavior: cosign 2.2.
 /// </summary>
 public sealed class CosignLocalKeyVerifier : IArtifactVerifier
@@ -450,6 +467,18 @@ public sealed class CosignLocalKeyVerifier : IArtifactVerifier
                 ProvenanceOutcome.MissingEvidence);
         }
 
+        // verify-blob --key attests only the pinned key. Repository,
+        // workflow, source-ref, and predicate constraints have no
+        // verifier-backed source in this contract, so the artifact-supplied
+        // sidecar must never satisfy them: fail closed when the policy sets
+        // any of them.
+        if (policy.Repository is not null || policy.Workflow is not null
+            || policy.SourceRef is not null || policy.PredicateType is not null)
+        {
+            return Unverified(statement,
+                "cosign-local-key evidence does not attest repository/workflow/source-ref/predicate; remove those constraints or use github-attestation/openssl-local evidence.");
+        }
+
         var version = VerifierVersions.Probe(_runner, options.CosignBinaryPath, ["version", "--json"], options, ct);
         if (!VerifierVersions.MeetsMinimum(version, MinimumMajorVersion))
         {
@@ -492,10 +521,10 @@ public sealed class CosignLocalKeyVerifier : IArtifactVerifier
                 CryptographicallyValid = true,
                 ObservedPublisher = "key:" + keyFingerprint,
                 ObservedIssuer = ArtifactEvidenceKinds.LocalKeyIssuer,
-                ObservedRepository = statement.Repository,
-                ObservedWorkflow = statement.Workflow,
-                ObservedSourceRef = statement.SourceRef,
-                ObservedPredicateType = statement.PredicateType,
+                ObservedRepository = null,
+                ObservedWorkflow = null,
+                ObservedSourceRef = null,
+                ObservedPredicateType = null,
                 Verifier = Name,
                 VerifierVersion = BoundVersion(version),
             };
