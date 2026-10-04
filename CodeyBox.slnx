@@ -86,6 +86,7 @@
     <Project Path="plugins/auditors-infrastructure/CodeyBox.ConftestAuditorPlugin/CodeyBox.ConftestAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-licensing/CodeyBox.ScancodeAuditorPlugin/CodeyBox.ScancodeAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.ClangTidyAuditorPlugin/CodeyBox.ClangTidyAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.ClippyAuditorPlugin/CodeyBox.ClippyAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.EslintAuditorPlugin/CodeyBox.EslintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.InspectCodeAuditorPlugin/CodeyBox.InspectCodeAuditorPlugin.csproj" />
