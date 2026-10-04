@@ -539,13 +539,14 @@ public sealed class CosignLocalKeyVerifier : IArtifactVerifier
 
 /// <summary>
 /// GitHub attestation verifier through the official gh contract
-/// (<c>gh attestation verify --repo … --signer-workflow … --predicate-type … --format json -- FILE</c>).
-/// Repository, workflow, and predicate constraints travel as exact flag values
-/// from policy; publisher/issuer/source-ref are enforced by exact comparison
-/// against the digest-bound provenance statement. Network discovery of
-/// attestations happens only inside the gh process and only when the policy
-/// enables it; without a local bundle and without discovery the outcome is
-/// verifier-unavailable, never success. Minimum supported behavior: gh 2.55.
+/// (<c>gh attestation verify --bundle … --repo … --signer-workflow … --predicate-type … --cert-identity … --cert-oidc-issuer … --source-ref … --format json -- FILE</c>).
+/// Every policy constraint travels as an exact flag value so gh itself enforces
+/// it; the success verdict's observed identity is then parsed from gh's
+/// verified <c>--format json</c> stdout (certificate + statement), never from
+/// the artifact-supplied sidecar. Network discovery of attestations happens
+/// only inside the gh process and only when the policy enables it; without a
+/// local bundle and without discovery the outcome is verifier-unavailable,
+/// never success. Minimum supported behavior: gh 2.55.
 /// </summary>
 public sealed class GitHubAttestationVerifier : IArtifactVerifier
 {
@@ -607,6 +608,11 @@ public sealed class GitHubAttestationVerifier : IArtifactVerifier
         }
 
         var arguments = new List<string> { "attestation", "verify" };
+        if (hasLocalBundle)
+        {
+            arguments.Add("--bundle");
+            arguments.Add(localBundle);
+        }
         if (policy.Repository is not null)
         {
             arguments.Add("--repo");
@@ -621,6 +627,15 @@ public sealed class GitHubAttestationVerifier : IArtifactVerifier
         {
             arguments.Add("--predicate-type");
             arguments.Add(policy.PredicateType);
+        }
+        arguments.Add("--cert-identity");
+        arguments.Add(policy.Publisher);
+        arguments.Add("--cert-oidc-issuer");
+        arguments.Add(policy.Issuer);
+        if (policy.SourceRef is not null)
+        {
+            arguments.Add("--source-ref");
+            arguments.Add(policy.SourceRef);
         }
         arguments.Add("--format");
         arguments.Add("json");
@@ -639,18 +654,207 @@ public sealed class GitHubAttestationVerifier : IArtifactVerifier
         {
             return Unverified(statement, "gh attestation verification rejected the artifact.");
         }
+        if (!TryParseVerifiedAttestation(result.StandardOutput, staged.PrimaryDigestHex, out var observed))
+        {
+            return Unverified(statement, "gh attestation output is missing or does not bind the staged bytes.");
+        }
+        if (!string.Equals(observed.Publisher, policy.Publisher, StringComparison.Ordinal)
+            || !string.Equals(observed.Issuer, policy.Issuer, StringComparison.Ordinal))
+        {
+            return Unverified(statement, "gh verified identity does not match the trusted publisher or issuer.");
+        }
+        if ((policy.Repository is not null && !string.Equals(observed.Repository, policy.Repository, StringComparison.Ordinal))
+            || (policy.Workflow is not null && !string.Equals(observed.Workflow, policy.Workflow, StringComparison.Ordinal))
+            || (policy.SourceRef is not null && !string.Equals(observed.SourceRef, policy.SourceRef, StringComparison.Ordinal))
+            || (policy.PredicateType is not null && !string.Equals(observed.PredicateType, policy.PredicateType, StringComparison.Ordinal)))
+        {
+            return Unverified(statement, "gh verified provenance does not match the trusted repository, workflow, source-ref, or predicate.");
+        }
         return new VerifierVerdict
         {
             CryptographicallyValid = true,
-            ObservedPublisher = statement.Publisher,
-            ObservedIssuer = statement.Issuer,
-            ObservedRepository = statement.Repository,
-            ObservedWorkflow = statement.Workflow,
-            ObservedSourceRef = statement.SourceRef,
-            ObservedPredicateType = statement.PredicateType,
+            ObservedPublisher = observed.Publisher,
+            ObservedIssuer = observed.Issuer,
+            ObservedRepository = observed.Repository,
+            ObservedWorkflow = observed.Workflow,
+            ObservedSourceRef = observed.SourceRef,
+            ObservedPredicateType = observed.PredicateType,
             Verifier = Name,
             VerifierVersion = BoundVersion(version),
         };
+    }
+
+    private sealed record GhObservedIdentity(
+        string Publisher,
+        string Issuer,
+        string? Repository,
+        string? Workflow,
+        string? SourceRef,
+        string? PredicateType);
+
+    private static bool TryParseVerifiedAttestation(
+        string? stdout,
+        string stagedDigestHex,
+        out GhObservedIdentity observed)
+    {
+        observed = new GhObservedIdentity(string.Empty, string.Empty, null, null, null, null);
+        if (string.IsNullOrWhiteSpace(stdout) || stdout.Length > 1024 * 1024)
+            return false;
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(stdout);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        using (document)
+        {
+            var root = document.RootElement;
+            IEnumerable<JsonElement> entries = root.ValueKind switch
+            {
+                JsonValueKind.Array => root.EnumerateArray(),
+                JsonValueKind.Object => [root],
+                _ => [],
+            };
+            foreach (var entry in entries)
+            {
+                if (entry.ValueKind != JsonValueKind.Object)
+                    continue;
+                if (TryParseGhEntry(entry, stagedDigestHex, out var candidate)
+                    && candidate is not null)
+                {
+                    observed = candidate;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool TryParseGhEntry(
+        JsonElement entry,
+        string stagedDigestHex,
+        out GhObservedIdentity? observed)
+    {
+        observed = null;
+        var verification = entry;
+        if (entry.TryGetProperty("verificationResult", out var vr) && vr.ValueKind == JsonValueKind.Object)
+            verification = vr;
+        else if (entry.TryGetProperty("verification_result", out var vrSnake) && vrSnake.ValueKind == JsonValueKind.Object)
+            verification = vrSnake;
+
+        var certificate = default(JsonElement);
+        var hasCertificate = false;
+        if (verification.TryGetProperty("signature", out var signature)
+            && signature.ValueKind == JsonValueKind.Object
+            && signature.TryGetProperty("certificate", out var cert)
+            && cert.ValueKind == JsonValueKind.Object)
+        {
+            certificate = cert;
+            hasCertificate = true;
+        }
+        else if (verification.TryGetProperty("certificate", out var directCert)
+            && directCert.ValueKind == JsonValueKind.Object)
+        {
+            certificate = directCert;
+            hasCertificate = true;
+        }
+        if (!hasCertificate)
+            return false;
+
+        JsonElement statement = default;
+        var hasStatement = false;
+        if (verification.TryGetProperty("statement", out var stmt) && stmt.ValueKind == JsonValueKind.Object)
+        {
+            statement = stmt;
+            hasStatement = true;
+        }
+
+        var publisher = FirstString(certificate,
+            ["subjectAlternativeName", "subject", "san", "certIdentity", "identity", "uri", "buildSignerUri", "buildSignerURI", "signerWorkflow"]);
+        var issuer = FirstString(certificate,
+            ["issuer", "oidcIssuer", "certOidcIssuer", "certIssuer"]);
+        if (string.IsNullOrWhiteSpace(publisher) || string.IsNullOrWhiteSpace(issuer))
+            return false;
+        if (publisher.Length > TrustedArtifactPolicy.MaxIdentityLength || issuer.Length > TrustedArtifactPolicy.MaxIdentityLength)
+            return false;
+
+        string? repository = FirstString(certificate,
+            ["sourceRepository", "sourceRepositoryUri", "sourceRepositoryURI", "repository", "repo", "signerRepo"])
+            ?? (hasStatement ? FirstString(statement, ["repository", "repo"]) : null);
+        string? workflow = FirstString(certificate,
+            ["signerWorkflow", "workflow", "buildSignerUri", "buildSignerURI"])
+            ?? (hasStatement ? FirstString(statement, ["workflow"]) : null);
+        string? sourceRef = FirstString(certificate,
+            ["sourceRef", "source_ref", "ref", "gitRef", "sourceBranch", "sourceSha"])
+            ?? (hasStatement ? FirstString(statement, ["sourceRef", "source_ref", "ref"]) : null);
+        string? predicateType = hasStatement
+            ? FirstString(statement, ["predicateType", "predicate_type", "predicateTypeUri"])
+            : null;
+        if (predicateType is null && verification.ValueKind == JsonValueKind.Object)
+            predicateType = FirstString(verification, ["predicateType", "predicate_type"]);
+
+        if (!BindsStagedDigest(statement, hasStatement, stagedDigestHex))
+            return false;
+
+        observed = new GhObservedIdentity(
+            publisher,
+            issuer,
+            BoundIdentityOrNull(repository),
+            BoundIdentityOrNull(workflow),
+            BoundIdentityOrNull(sourceRef),
+            BoundIdentityOrNull(predicateType));
+        return true;
+    }
+
+    private static bool BindsStagedDigest(JsonElement statement, bool hasStatement, string stagedDigestHex)
+    {
+        if (!hasStatement)
+            return false;
+        if (!statement.TryGetProperty("subject", out var subjects) || subjects.ValueKind != JsonValueKind.Array)
+            return false;
+        foreach (var subject in subjects.EnumerateArray())
+        {
+            if (subject.ValueKind != JsonValueKind.Object)
+                continue;
+            if (!subject.TryGetProperty("digest", out var digest) || digest.ValueKind != JsonValueKind.Object)
+                continue;
+            foreach (var digestProperty in digest.EnumerateObject())
+            {
+                if (digestProperty.Value.ValueKind != JsonValueKind.String)
+                    continue;
+                var value = digestProperty.Value.GetString();
+                if (string.Equals(value, stagedDigestHex, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static string? FirstString(JsonElement element, string[] candidates)
+    {
+        foreach (var name in candidates)
+        {
+            if (element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String)
+            {
+                var value = property.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value.Trim();
+            }
+        }
+        return null;
+    }
+
+    private static string? BoundIdentityOrNull(string? value)
+    {
+        if (value is null)
+            return null;
+        var trimmed = value.Trim();
+        if (trimmed.Length == 0 || trimmed.Length > TrustedArtifactPolicy.MaxIdentityLength || trimmed.Any(char.IsControl))
+            return null;
+        return trimmed;
     }
 
     private static VerifierVerdict Unverified(ProvenanceStatement? statement, string detail) => new()
