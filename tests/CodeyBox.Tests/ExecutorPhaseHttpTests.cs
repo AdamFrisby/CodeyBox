@@ -189,7 +189,149 @@ public sealed class ExecutorPhaseHttpTests : IDisposable
         Assert.Contains("cap", phaseFailure.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    // ── 4. fail paths ───────────────────────────────────────────────────────
+    // ── 4. ingress ceilings and upload ownership ────────────────────────────
+
+    [Fact]
+    public async Task PhaseHttp_HugeFailMessage_IsRejectedAtIngress()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        await RegisterExecutorAsync(cts.Token);
+        var broker = _factory.Services.GetRequiredService<ExecutorPhaseBroker>();
+        var dispatch = broker.DispatchAsync("exec-1", NewRequest(WorkItemId.New(), "work", 0),
+            await NewStageInTarAsync(NewRepoDir("f.txt", "x\n"), cts.Token), "testroot", onChunk: null, cts.Token);
+        var channel = NewChannel();
+        var pending = await channel.PollAsync(TimeSpan.FromSeconds(10), cts.Token);
+        Assert.NotNull(pending);
+
+        // 100 KiB far exceeds the fail-route ingress ceiling (~24 KiB) yet is
+        // far below Kestrel's default body limit: an unbounded route would
+        // buffer it fully and truncate to success, while the bounded ingress
+        // rejects it before buffering.
+        using var raw = ClientWith(ExecutorToken);
+        var body = System.Text.Json.JsonSerializer.Serialize(
+            new { dispatchKey = pending.DispatchKey, message = new string('y', 100 * 1024) });
+        using var response = await raw.PostAsync("executors/exec-1/phase/fail",
+            new StringContent(body, System.Text.Encoding.UTF8, "application/json"), cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        // The dispatch is still running: clean up through the normal path.
+        await channel.FailAsync(pending.DispatchKey, "cleanup", cts.Token);
+        await Assert.ThrowsAsync<ExecutorPhaseTransportException>(() =>
+            dispatch.WaitAsync(TimeSpan.FromSeconds(30), cts.Token));
+    }
+
+    [Fact]
+    public async Task PhaseHttp_HugeChunkBody_IsRejectedAtIngress()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        await RegisterExecutorAsync(cts.Token);
+        var broker = _factory.Services.GetRequiredService<ExecutorPhaseBroker>();
+        var dispatch = broker.DispatchAsync("exec-1", NewRequest(WorkItemId.New(), "work", 0),
+            await NewStageInTarAsync(NewRepoDir("f.txt", "x\n"), cts.Token), "testroot", onChunk: null, cts.Token);
+        var channel = NewChannel();
+        var pending = await channel.PollAsync(TimeSpan.FromSeconds(10), cts.Token);
+        Assert.NotNull(pending);
+
+        // 2 MiB of chunk data exceeds the chunk-route ingress ceiling
+        // (~272 KiB) yet is far below Kestrel's default body limit, so only
+        // the bounded read rejects it before buffering.
+        using var raw = ClientWith(ExecutorToken);
+        var body = System.Text.Json.JsonSerializer.Serialize(
+            new { dispatchKey = pending.DispatchKey, sequence = 0, data = new string('x', 2 * 1024 * 1024) });
+        using var response = await raw.PostAsync("executors/exec-1/phase/chunk",
+            new StringContent(body, System.Text.Encoding.UTF8, "application/json"), cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("chunk", await response.Content.ReadAsStringAsync(cts.Token), StringComparison.OrdinalIgnoreCase);
+
+        await channel.FailAsync(pending.DispatchKey, "cleanup", cts.Token);
+        await Assert.ThrowsAsync<ExecutorPhaseTransportException>(() =>
+            dispatch.WaitAsync(TimeSpan.FromSeconds(30), cts.Token));
+    }
+
+    [Fact]
+    public async Task PhaseHttp_StageOutUpload_ForUnknownKey_IsRejectedBeforeDiskWrite()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        await RegisterExecutorAsync(cts.Token);
+        var uploads = _factory.Services.GetRequiredService<ExecutorPhaseStageOutUploads>();
+        Assert.Equal(0, uploads.CountForHost("exec-1"));
+
+        // No dispatch owns this key: the upload must be rejected before a
+        // single byte reaches orchestrator temp disk, leaving no registry entry.
+        using var raw = ClientWith(ExecutorToken);
+        var content = new ByteArrayContent(new byte[] { 1, 2, 3, 4 });
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        using var response = await raw.PostAsync(
+            "executors/exec-1/phase/stageout?dispatchKey=" + Uri.EscapeDataString("no-such-dispatch"),
+            content, cts.Token);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, uploads.CountForHost("exec-1"));
+    }
+
+    [Fact]
+    public void StageOutUploads_PerHostCap_RejectsNewKeysButAllowsReplacement()
+    {
+        using var uploads = new ExecutorPhaseStageOutUploads();
+        var expiry = DateTimeOffset.UtcNow.AddHours(1);
+        var a = Path.Combine(_root, "cap-a.tar");
+        var b = Path.Combine(_root, "cap-b.tar");
+        var c = Path.Combine(_root, "cap-c.tar");
+        var a2 = Path.Combine(_root, "cap-a2.tar");
+        var foreign = Path.Combine(_root, "cap-foreign.tar");
+        File.WriteAllBytes(a, [1]);
+        File.WriteAllBytes(b, [2]);
+        File.WriteAllBytes(c, [3]);
+        File.WriteAllBytes(a2, [4]);
+        File.WriteAllBytes(foreign, [5]);
+
+        uploads.Put("exec-1", "key-a", a, expiry, maxPerHost: 2);
+        uploads.Put("exec-1", "key-b", b, expiry, maxPerHost: 2);
+        var over = Assert.Throws<ExecutorPhaseTransportException>(() =>
+            uploads.Put("exec-1", "key-c", c, expiry, maxPerHost: 2));
+        Assert.Contains("Too many", over.Message, StringComparison.Ordinal);
+
+        // Replacing the same (host, key) never counts against the cap, and
+        // deletes the orphaned file.
+        uploads.Put("exec-1", "key-a", a2, expiry, maxPerHost: 2);
+        Assert.False(File.Exists(a));
+        Assert.Equal(2, uploads.CountForHost("exec-1"));
+
+        // Another host's uploads are counted separately.
+        uploads.Put("exec-2", "key-c", foreign, expiry, maxPerHost: 2);
+        Assert.Equal(1, uploads.CountForHost("exec-2"));
+    }
+
+    [Fact]
+    public async Task Broker_HasRunningDispatch_TracksPollOwnership()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var options = new ExecutorPhaseDispatchOptions
+        {
+            RemotePhaseLeaseTimeout = TimeSpan.FromMinutes(5),
+            RemotePhasePollTimeout = TimeSpan.FromSeconds(5),
+        };
+        using var broker = new ExecutorPhaseBroker(() => options);
+        var tar = Path.Combine(_root, "running-stagein.tar");
+        await File.WriteAllBytesAsync(tar, [9], cts.Token);
+        var request = NewRequest(WorkItemId.New(), "work", 0);
+        var dispatch = broker.DispatchAsync("exec-1", request, tar, "testroot", onChunk: null, cts.Token);
+        var key = ExecutorPhaseProxy.BuildDispatchKey(request);
+
+        // Pending but not yet polled: no running dispatch to upload against.
+        Assert.False(broker.HasRunningDispatch("exec-1", key));
+        var pending = await broker.PollAsync("exec-1", TimeSpan.FromSeconds(10), cts.Token);
+        Assert.NotNull(pending);
+        Assert.True(broker.HasRunningDispatch("exec-1", key));
+        Assert.False(broker.HasRunningDispatch("exec-1", "unknown-key"));
+        Assert.False(broker.HasRunningDispatch("exec-2", key));
+
+        await broker.FailAsync("exec-1", key, "cleanup", cts.Token);
+        Assert.False(broker.HasRunningDispatch("exec-1", key));
+        await Assert.ThrowsAsync<ExecutorPhaseTransportException>(() =>
+            dispatch.WaitAsync(TimeSpan.FromSeconds(10), cts.Token));
+    }
+
+    // ── 5. fail paths ───────────────────────────────────────────────────────
 
     [Fact]
     public async Task PhaseHttp_Fail_SurfacesTransportFailure()

@@ -30,9 +30,16 @@ public sealed class ExecutorPhaseStageOutUploads : IDisposable
     /// orphaned file). An upload from another host for the same dispatch key
     /// is stored separately and never overwrites or deletes this entry, so a
     /// foreign host cannot destroy a dispatch's staged-back tar.
+    /// A per-host pending-upload cap (<paramref name="maxPerHost"/>) bounds
+    /// orchestrator temp disk: replacing the same (host, key) never counts
+    /// against the cap, but a new key beyond the cap throws
+    /// <see cref="ExecutorPhaseTransportException"/> and the caller must
+    /// delete its temp file.
     /// </summary>
-    public void Put(string hostId, string dispatchKey, string tarPath, DateTimeOffset expiresAt)
+    public void Put(string hostId, string dispatchKey, string tarPath, DateTimeOffset expiresAt, int maxPerHost = 64)
     {
+        if (maxPerHost <= 0)
+            throw new InvalidOperationException("maxPerHost must be positive.");
         var host = ExecutorPhaseBroker.NormalizeHostId(hostId);
         var key = ExecutorPhaseBroker.NormalizeDispatchKey(dispatchKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(tarPath);
@@ -41,9 +48,45 @@ public sealed class ExecutorPhaseStageOutUploads : IDisposable
             ThrowIfDisposed();
             SweepExpiredLocked(_clock.GetUtcNow());
             var mapKey = (host, key);
-            if (_uploads.Remove(mapKey, out var prior) && !string.Equals(prior.TarPath, tarPath, StringComparison.Ordinal))
-                DeleteQuietly(prior.TarPath);
+            if (_uploads.Remove(mapKey, out var prior))
+            {
+                if (!string.Equals(prior.TarPath, tarPath, StringComparison.Ordinal))
+                    DeleteQuietly(prior.TarPath);
+            }
+            else
+            {
+                var owned = 0;
+                foreach (var existing in _uploads.Keys)
+                {
+                    if (string.Equals(existing.HostId, host, StringComparison.Ordinal))
+                        owned++;
+                }
+                if (owned >= maxPerHost)
+                    throw new ExecutorPhaseTransportException(host, "phase-stageout", "Too many pending stage-out uploads for this host.");
+            }
             _uploads[mapKey] = new UploadEntry(host, tarPath, expiresAt);
+        }
+    }
+
+    /// <summary>
+    /// Pending stage-out upload count for <paramref name="hostId"/>,
+    /// after sweeping expired entries. Used by tests to assert the
+    /// per-host cap.
+    /// </summary>
+    public int CountForHost(string? hostId)
+    {
+        var host = ExecutorPhaseBroker.NormalizeHostId(hostId);
+        lock (_mutex)
+        {
+            ThrowIfDisposed();
+            SweepExpiredLocked(_clock.GetUtcNow());
+            var owned = 0;
+            foreach (var existing in _uploads.Keys)
+            {
+                if (string.Equals(existing.HostId, host, StringComparison.Ordinal))
+                    owned++;
+            }
+            return owned;
         }
     }
 

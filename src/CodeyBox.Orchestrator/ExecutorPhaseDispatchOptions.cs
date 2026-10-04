@@ -112,6 +112,15 @@ public sealed class ExecutorPhaseDispatchOptions
     public int MaxPendingRemoteDispatchesPerHost { get; set; } = 64;
 
     /// <summary>
+    /// Maximum stage-out uploads held per executor host between the upload
+    /// and completion calls of the two-call complete protocol. Bounds
+    /// orchestrator temp disk when an executor uploads under random keys
+    /// but never completes. Excess uploads are rejected fail-fast before
+    /// any bytes are written. Hot-reloadable.
+    /// </summary>
+    public int MaxPendingStageOutUploadsPerHost { get; set; } = 64;
+
+    /// <summary>
     /// Fails fast on misconfiguration so a bad bound surfaces at dispatch
     /// time instead of silently admitting an unbounded payload.
     /// </summary>
@@ -162,5 +171,8 @@ public sealed class ExecutorPhaseDispatchOptions
         if (MaxPendingRemoteDispatchesPerHost <= 0)
             throw new InvalidOperationException(
                 "CodeyBox:ExecutorPhaseDispatch:MaxPendingRemoteDispatchesPerHost must be > 0.");
+        if (MaxPendingStageOutUploadsPerHost <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:MaxPendingStageOutUploadsPerHost must be > 0.");
     }
 }

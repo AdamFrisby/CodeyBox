@@ -22,6 +22,72 @@ internal static class ExecutorPhaseEndpoints
 {
     private const string PhaseFailureCode = "phase-failure";
 
+    // Ingress JSON ceilings are derived from the hot-reloadable dispatch
+    // options, never literals: each cap is the largest legitimate body for
+    // its route plus envelope slack for field names, the dispatch key, and
+    // JSON structure. The slack also lets small over-limit payloads reach
+    // the broker so near-limit violations keep their downstream
+    // classification (phase failure vs transport failure); far-over
+    // payloads are rejected here before a byte is buffered beyond the cap.
+    // Kestrel's default ~30 MiB ceiling would otherwise buffer the whole
+    // body through model binding before any KB-scale check ran.
+    private const int JsonReadChunkBytes = 16 * 1024;
+    private const int ChunkEnvelopeSlackBytes = 16 * 1024;
+    private const int FailEnvelopeSlackBytes = 16 * 1024;
+    private const int ResultEnvelopeSlackBytes = 256 * 1024;
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private static long MaxChunkRequestBytes(ExecutorPhaseDispatchOptions options) =>
+        (long)options.MaxRemoteStreamChunkChars + ChunkEnvelopeSlackBytes;
+
+    private static long MaxFailRequestBytes(ExecutorPhaseDispatchOptions options) =>
+        (long)options.MaxResultErrorLengthChars + FailEnvelopeSlackBytes;
+
+    private static long MaxResultRequestBytes(ExecutorPhaseDispatchOptions options) =>
+        (long)options.MaxResultFindings * (options.MaxFindingLengthChars + 16L)
+        + options.MaxResultErrorLengthChars
+        + ResultEnvelopeSlackBytes;
+
+    /// <summary>
+    /// Reads a JSON body bounded by <paramref name="maxBytes"/>: a declared
+    /// ContentLength above the cap rejects without reading, and the stream
+    /// read aborts the moment the cap is crossed, so untrusted input is
+    /// never fully buffered before its cap is applied. Returns the value
+    /// (null for an empty body, which the caller reports as missing) or a
+    /// rejection message for over-cap and malformed bodies.
+    /// </summary>
+    private static async Task<(T? Value, string? Rejection)> ReadJsonBoundedAsync<T>(
+        HttpContext httpContext,
+        long maxBytes,
+        string overCapMessage,
+        CancellationToken ct)
+    {
+        if (httpContext.Request.ContentLength > maxBytes)
+            return (default, overCapMessage);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[JsonReadChunkBytes];
+        long total = 0;
+        int read;
+        while ((read = await httpContext.Request.Body.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
+        {
+            total += read;
+            if (total > maxBytes)
+                return (default, overCapMessage);
+            buffer.Write(chunk, 0, read);
+        }
+        if (total == 0)
+            return (default, null);
+        try
+        {
+            return (JsonSerializer.Deserialize<T>(buffer.ToArray(), JsonOptions), null);
+        }
+        catch (JsonException)
+        {
+            return (default, "request body was not valid JSON.");
+        }
+    }
+
     public static void Map(WebApplication app)
     {
         app.MapGet("/executors/{hostId}/phase/next", PollAsync);
@@ -140,9 +206,9 @@ internal static class ExecutorPhaseEndpoints
     }
 
     private static async Task<IResult> PostChunkAsync(
-        ExecutorPhaseChunkDto? dto,
         string hostId,
         ExecutorPhaseBroker broker,
+        Func<ExecutorPhaseDispatchOptions> dispatchOptions,
         HttpContext httpContext,
         CancellationToken ct)
     {
@@ -158,6 +224,13 @@ internal static class ExecutorPhaseEndpoints
 
         if (ExecutorEndpoints.CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
             return callerRejection;
+
+        var options = dispatchOptions();
+        options.Validate();
+        var (dto, rejection) = await ReadJsonBoundedAsync<ExecutorPhaseChunkDto>(
+            httpContext, MaxChunkRequestBytes(options), "Chunk exceeds the configured maximum.", ct).ConfigureAwait(false);
+        if (rejection is not null)
+            return Results.BadRequest(new { error = rejection });
 
         if (dto is null)
             return Results.BadRequest(new { error = "request body is required" });
@@ -200,6 +273,7 @@ internal static class ExecutorPhaseEndpoints
             return callerRejection;
 
         var options = dispatchOptions();
+        options.Validate();
         string key;
         try
         {
@@ -227,6 +301,21 @@ internal static class ExecutorPhaseEndpoints
             }
             return Results.BadRequest(new { error = "Stage-out upload exceeds the archive cap.", code = PhaseFailureCode });
         }
+
+        // Ownership before bytes: a key with no running dispatch owned by
+        // the caller is rejected before a single byte reaches orchestrator
+        // temp disk, so random-key uploads cannot pin disk.
+        bool owned;
+        try
+        {
+            owned = broker.HasRunningDispatch(normalized, key);
+        }
+        catch (ExecutorPhaseTransportException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+        if (!owned)
+            return Results.BadRequest(new { error = "No running dispatch matches this key." });
 
         var tempPath = Path.Combine(Path.GetTempPath(), "codeybox-executor-stageout-" + Guid.NewGuid().ToString("N") + ".tar");
         try
@@ -260,15 +349,23 @@ internal static class ExecutorPhaseEndpoints
             return Results.Problem("Failed to receive the stage-out upload.", statusCode: StatusCodes.Status500InternalServerError);
         }
 
-        uploads.Put(normalized, key, tempPath, clock.GetUtcNow() + options.RemotePhaseLeaseTimeout);
+        try
+        {
+            uploads.Put(normalized, key, tempPath, clock.GetUtcNow() + options.RemotePhaseLeaseTimeout, options.MaxPendingStageOutUploadsPerHost);
+        }
+        catch (ExecutorPhaseTransportException ex)
+        {
+            DeleteQuietly(tempPath);
+            return Results.BadRequest(new { error = ex.Message });
+        }
         return Results.Ok(new { accepted = true });
     }
 
     private static async Task<IResult> CompleteAsync(
-        ExecutorPhaseResultDto? dto,
         string hostId,
         ExecutorPhaseBroker broker,
         ExecutorPhaseStageOutUploads uploads,
+        Func<ExecutorPhaseDispatchOptions> dispatchOptions,
         HttpContext httpContext,
         CancellationToken ct)
     {
@@ -284,6 +381,13 @@ internal static class ExecutorPhaseEndpoints
 
         if (ExecutorEndpoints.CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
             return callerRejection;
+
+        var options = dispatchOptions();
+        options.Validate();
+        var (dto, rejection) = await ReadJsonBoundedAsync<ExecutorPhaseResultDto>(
+            httpContext, MaxResultRequestBytes(options), "Result exceeds the configured maximum.", ct).ConfigureAwait(false);
+        if (rejection is not null)
+            return Results.BadRequest(new { error = rejection });
 
         if (dto is null)
             return Results.BadRequest(new { error = "request body is required" });
@@ -324,9 +428,9 @@ internal static class ExecutorPhaseEndpoints
     }
 
     private static async Task<IResult> FailAsync(
-        ExecutorPhaseFailDto? dto,
         string hostId,
         ExecutorPhaseBroker broker,
+        Func<ExecutorPhaseDispatchOptions> dispatchOptions,
         HttpContext httpContext,
         CancellationToken ct)
     {
@@ -342,6 +446,13 @@ internal static class ExecutorPhaseEndpoints
 
         if (ExecutorEndpoints.CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
             return callerRejection;
+
+        var options = dispatchOptions();
+        options.Validate();
+        var (dto, rejection) = await ReadJsonBoundedAsync<ExecutorPhaseFailDto>(
+            httpContext, MaxFailRequestBytes(options), "Failure message exceeds the configured maximum.", ct).ConfigureAwait(false);
+        if (rejection is not null)
+            return Results.BadRequest(new { error = rejection });
 
         if (dto is null)
             return Results.BadRequest(new { error = "request body is required" });
@@ -357,9 +468,9 @@ internal static class ExecutorPhaseEndpoints
     }
 
     private static async Task<IResult> FailPhaseAsync(
-        ExecutorPhaseFailDto? dto,
         string hostId,
         ExecutorPhaseBroker broker,
+        Func<ExecutorPhaseDispatchOptions> dispatchOptions,
         HttpContext httpContext,
         CancellationToken ct)
     {
@@ -375,6 +486,13 @@ internal static class ExecutorPhaseEndpoints
 
         if (ExecutorEndpoints.CheckExecutorHostCaller(httpContext, normalized) is { } callerRejection)
             return callerRejection;
+
+        var options = dispatchOptions();
+        options.Validate();
+        var (dto, rejection) = await ReadJsonBoundedAsync<ExecutorPhaseFailDto>(
+            httpContext, MaxFailRequestBytes(options), "Failure message exceeds the configured maximum.", ct).ConfigureAwait(false);
+        if (rejection is not null)
+            return Results.BadRequest(new { error = rejection });
 
         if (dto is null)
             return Results.BadRequest(new { error = "request body is required" });

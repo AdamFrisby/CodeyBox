@@ -315,6 +315,27 @@ public sealed class ExecutorPhaseBroker : IDisposable
     }
 
     /// <summary>
+    /// Whether <paramref name="hostId"/> owns a running dispatch for
+    /// <paramref name="dispatchKey"/>. Lets the stage-out upload route
+    /// reject keys with no running dispatch owned by the caller before a
+    /// single byte is written to orchestrator temp disk. Returns false for
+    /// unknown, expired, or foreign keys; invalid host/key shapes throw
+    /// <see cref="ExecutorPhaseTransportException"/>.
+    /// </summary>
+    public bool HasRunningDispatch(string? hostId, string? dispatchKey)
+    {
+        var host = NormalizeHostId(hostId);
+        var key = NormalizeDispatchKey(dispatchKey);
+        lock (_mutex)
+        {
+            ThrowIfDisposedLocked(host, "phase-stageout");
+            SweepExpiredLocked(_clock.GetUtcNow());
+            return _running.TryGetValue(key, out var entry)
+                && string.Equals(entry.HostId, host, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
     /// Executor-side infrastructure failure: the phase never ran (nothing
     /// staged, provisioning or sandbox loss), so the dispatch fails as a
     /// host-attributed transport failure — retried elsewhere, never charged
