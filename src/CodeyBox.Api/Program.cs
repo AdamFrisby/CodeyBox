@@ -1664,7 +1664,9 @@ builder.Services.AddSingleton<QuotaGatePolicy>(sp =>
 builder.Services.AddSingleton<IAgentQuotaGate>(sp => new QuotaGateAvailability(
     sp.GetRequiredService<QuotaGatePolicy>(),
     sp.GetService<IQuotaFailureStore>(),
-    sp.GetRequiredService<QuotaRouterOptions>().ObservedFailureWindow));
+    sp.GetRequiredService<QuotaRouterOptions>().ObservedFailureWindow,
+    sp.GetService<IAgentBurnEstimator>(),
+    sp.GetRequiredService<ILogger<QuotaGateAvailability>>()));
 builder.Services.AddSingleton<IQuotaFailureStore>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -4914,13 +4916,41 @@ app.MapGet("/quota", async (
             .Concat(recentFailuresForProbe.Where(f => f.ModelId is not null).Select(f => f.ModelId!))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        bool WouldAllow(AgentMembership gateMember, bool hasRecentFailure) =>
-            quotaGate.Allows(
+        Task<AgentQuotaGateVerdict> EvaluateGateAsync(
+            AgentMembership gateMember, bool hasRecentFailure) =>
+            quotaGate.EvaluateAsync(
                 gateMember,
                 snapshot,
                 now,
                 hasRecentFailure,
-                "recent observed quota failure");
+                "recent observed quota failure",
+                ct);
+        var defaultMember = member with { ModelId = null };
+        // Refused members surface WHY, including which quota window binds, so
+        // a plan with weekly headroom but an exhausted monthly window reads as
+        // constrained-by-monthly instead of generically out of quota. Allowed
+        // members keep a null reason, as before. The allow bit and the reason
+        // come from ONE verdict so they cannot diverge.
+        var defaultVerdict = paused ? null : await EvaluateGateAsync(defaultMember, recentFailure);
+        var defaultModelVerdict = paused ? null : await EvaluateGateAsync(defaultMember, recentDefaultFailure);
+        var dispatchReason = paused
+            ? $"paused by operator: {pause?.PausedReason}"
+            : defaultVerdict?.RefusalReason;
+        var perModelWouldAllow = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var modelId in modelKeys)
+        {
+            if (paused)
+            {
+                perModelWouldAllow[modelId] = false;
+                continue;
+            }
+            var modelMember = member with { ModelId = modelId };
+            var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
+                f.Agent == member.Agent &&
+                string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
+            perModelWouldAllow[modelId] =
+                (await EvaluateGateAsync(modelMember, modelHasRecentFailure)).Allow;
+        }
         snapshots.Add(new
         {
             agent = member.Agent.Value,
@@ -4951,21 +4981,13 @@ app.MapGet("/quota", async (
             pausedBy = pause?.PausedBy,
             pauseExpiresAt = pause?.ExpiresAt,
             dispatchStatus = paused ? "paused" : "quota",
-            dispatchReason = paused ? $"paused by operator: {pause?.PausedReason}" : null,
-            wouldAllow = !paused && WouldAllow(member with { ModelId = null }, recentFailure),
-            defaultModelWouldAllow = !paused && WouldAllow(member with { ModelId = null }, recentDefaultFailure),
-            perModelWouldAllow = modelKeys.ToDictionary(
-                modelId => modelId,
-                modelId =>
-                {
-                    if (paused) return false;
-                    var modelMember = member with { ModelId = modelId };
-                    var modelHasRecentFailure = recentFailuresForProbe.Any(f =>
-                        f.Agent == member.Agent &&
-                        string.Equals(f.ModelId, modelId, StringComparison.OrdinalIgnoreCase));
-                    return WouldAllow(modelMember, modelHasRecentFailure);
-                },
-                StringComparer.OrdinalIgnoreCase),
+            dispatchReason,
+            bindingWindow = snapshot.BindingWindow,
+            windowSummary = QuotaWindowBinding.FormatWindowSummary(
+                snapshot.Windows, snapshot.AvailablePct),
+            wouldAllow = defaultVerdict?.Allow ?? false,
+            defaultModelWouldAllow = defaultModelVerdict?.Allow ?? false,
+            perModelWouldAllow,
         });
         kindAggregateCounts[member.Agent.Value] =
             kindAggregateCounts.TryGetValue(member.Agent.Value, out var count) ? count + 1 : 1;
@@ -7866,6 +7888,40 @@ namespace CodeyBox.Api
         public Dictionary<string, double> DispatchReservationEstimatePctByAgent { get; set; }
             = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>
+        /// Work-denominated alternative to
+        /// <see cref="DispatchReservationEstimatePct"/>: how many dispatches'
+        /// worth of quota one reservation escrows, converted through the
+        /// member's measured per-item burn. Null (the default) keeps the
+        /// percentage chain. Requires measured burn (which itself needs
+        /// <c>CodeyBox:AgentBurnEstimator:WindowTokenBudget</c> for the agent).
+        /// Hot-reloadable.
+        /// </summary>
+        public double? DispatchReservationEstimateItems { get; set; }
+        /// <summary>
+        /// Per-agent override for <see cref="DispatchReservationEstimateItems"/>,
+        /// keyed by agent kind value. Non-positive or non-finite entries are
+        /// rejected at load. Hot-reloadable.
+        /// </summary>
+        public Dictionary<string, double> DispatchReservationEstimateItemsByAgent { get; set; }
+            = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>
+        /// Safety factor applied to the measured per-item burn when deriving a
+        /// per-dispatch reservation (derived = burn × this). Default 1.5.
+        /// Non-positive disables derivation. Hot-reloadable.
+        /// </summary>
+        public double DispatchReservationBurnMultiplier { get; set; } = 1.5;
+        /// <summary>
+        /// Minimum measured samples before burn-derived reservations (or
+        /// items-denominated estimates/floors) apply. Default 3. Hot-reloadable.
+        /// </summary>
+        public int DispatchReservationBurnMinSamples { get; set; } = 3;
+        /// <summary>
+        /// Work-denominated alternative to <see cref="MinQuotaPct"/>: the
+        /// fallback floor in dispatches' worth of quota. Null (the default)
+        /// keeps the percentage floor. Requires measured burn. Hot-reloadable.
+        /// </summary>
+        public double? MinQuotaItems { get; set; }
+        /// <summary>
         /// Lower bound for any reservation estimate, in quota-percentage
         /// points. A missing, zero, or negative estimate resolves to at least
         /// this — a dispatch must never silently reserve nothing. Default 0.5.
@@ -7949,6 +8005,13 @@ namespace CodeyBox.Api
 
         /// <summary>Optional ramp-window length in seconds for this agent.</summary>
         public int? RampWindowSeconds { get; set; }
+
+        /// <summary>
+        /// Work-denominated fallback floor for this agent, in dispatches'
+        /// worth of quota. Competes with the percentage floor via maximum.
+        /// Requires measured burn. Hot-reloadable.
+        /// </summary>
+        public double? MinQuotaItems { get; set; }
     }
 
     /// <summary>
@@ -7979,6 +8042,16 @@ namespace CodeyBox.Api
         /// reservation estimate. Set explicitly for balance pools.
         /// </summary>
         public double? ReservationEstimate { get; set; }
+
+        /// <summary>
+        /// Work-denominated alternative to <see cref="ReservationEstimate"/>
+        /// for resetting-window pools: how many dispatches' worth of quota one
+        /// reservation escrows (e.g. 1 reserves one item's worth). Converted
+        /// through the member's measured per-item burn; without enough samples
+        /// the percentage chain applies. Rejected on depleting-balance pools.
+        /// Hot-reloadable.
+        /// </summary>
+        public double? ReservationEstimateItems { get; set; }
 
         /// <summary>
         /// Where this pool's probe runs: <c>OrchestratorDirect</c> (the
@@ -8034,6 +8107,14 @@ namespace CodeyBox.Api
         /// Defaults to 0 when unset.
         /// </summary>
         public double? MinBalance { get; set; }
+
+        /// <summary>
+        /// Work-denominated floor for resetting-window pools, in dispatches'
+        /// worth of quota (e.g. 1 keeps headroom for one more dispatch).
+        /// Competes with the percentage floor via maximum. Requires measured
+        /// burn. Rejected on depleting-balance pools. Hot-reloadable.
+        /// </summary>
+        public double? MinQuotaItems { get; set; }
     }
 
     /// <summary>

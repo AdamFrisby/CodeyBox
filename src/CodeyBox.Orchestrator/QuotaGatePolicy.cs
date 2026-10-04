@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
@@ -29,8 +30,9 @@ public sealed class QuotaGatePolicy
         EffectiveQuota quota,
         DateTimeOffset nowUtc,
         bool recentObservedFailure = false,
-        string? observedFailureReason = null) =>
-        Evaluate(_options, member, quota, nowUtc, recentObservedFailure, observedFailureReason);
+        string? observedFailureReason = null,
+        AgentBurnEstimate? measuredBurn = null) =>
+        Evaluate(_options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason, measuredBurn);
 
     /// <summary>
     /// Escrow-aware evaluation: gates on
@@ -50,8 +52,9 @@ public sealed class QuotaGatePolicy
         DateTimeOffset nowUtc,
         double outstandingPct,
         bool recentObservedFailure = false,
-        string? observedFailureReason = null) =>
-        Evaluate(_options, member, quota, nowUtc, outstandingPct, recentObservedFailure, observedFailureReason);
+        string? observedFailureReason = null,
+        AgentBurnEstimate? measuredBurn = null) =>
+        Evaluate(_options, member, quota, nowUtc, outstandingPct, recentObservedFailure, observedFailureReason, measuredBurn);
 
     public double ComputeEffectiveFloorPct(
         AgentKind agent,
@@ -74,8 +77,9 @@ public sealed class QuotaGatePolicy
         EffectiveQuota quota,
         DateTimeOffset nowUtc,
         bool recentObservedFailure = false,
-        string? observedFailureReason = null) =>
-        Evaluate(options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason);
+        string? observedFailureReason = null,
+        AgentBurnEstimate? measuredBurn = null) =>
+        Evaluate(options, member, quota, nowUtc, 0, recentObservedFailure, observedFailureReason, measuredBurn);
 
     /// <summary>
     /// Escrow-aware static evaluation; see the instance overload for the
@@ -85,6 +89,9 @@ public sealed class QuotaGatePolicy
     /// depleting-balance pool gates on the absolute balance (never on a
     /// percentage, never with a reset); a resetting-window pool gates on the
     /// shared percentage reading against the pool-resolved floor.
+    /// Pass the member's measured burn in <paramref name="measuredBurn"/> so
+    /// work-denominated floors (items) compete with the percentage floor;
+    /// without measured history the percentage floor applies unchanged.
     /// </summary>
     public static QuotaGateDecision Evaluate(
         QuotaRouterOptions options,
@@ -93,14 +100,15 @@ public sealed class QuotaGatePolicy
         DateTimeOffset nowUtc,
         double outstandingPct,
         bool recentObservedFailure = false,
-        string? observedFailureReason = null)
+        string? observedFailureReason = null,
+        AgentBurnEstimate? measuredBurn = null)
     {
         if (QuotaPoolResolver.TryResolvePool(options, member, out var poolName, out var pool, out var poolFailure))
         {
             if (pool!.Kind == QuotaPoolKind.DepletingBalance)
                 return EvaluateBalance(options, poolName!, pool, quota, outstandingPct);
             return EvaluateResetting(options, member, quota, nowUtc, outstandingPct,
-                recentObservedFailure, observedFailureReason, poolName);
+                recentObservedFailure, observedFailureReason, poolName, measuredBurn);
         }
         if (poolFailure is not null)
         {
@@ -111,7 +119,7 @@ public sealed class QuotaGatePolicy
         }
 
         return EvaluateResetting(options, member, quota, nowUtc, outstandingPct,
-            recentObservedFailure, observedFailureReason, poolName: null);
+            recentObservedFailure, observedFailureReason, poolName: null, measuredBurn);
     }
 
     /// <summary>
@@ -179,17 +187,20 @@ public sealed class QuotaGatePolicy
         double outstandingPct,
         bool recentObservedFailure,
         string? observedFailureReason,
-        string? poolName)
+        string? poolName,
+        AgentBurnEstimate? measuredBurn = null)
     {
+        var bindingWindow = quota.BindingWindow;
         if (recentObservedFailure)
         {
             return new QuotaGateDecision(
                 false,
                 observedFailureReason ?? "recent observed quota failure",
-                PoolId: poolName);
+                PoolId: poolName,
+                BindingWindow: bindingWindow);
         }
 
-        var floor = ComputeFloorPct(options, member, quota, nowUtc);
+        var floor = ComputeFloorPct(options, member, quota, nowUtc, measuredBurn);
         var availablePct = quota.AvailablePct;
         var escrowed = Math.Max(0, outstandingPct);
         var effectivePct = availablePct - escrowed;
@@ -207,25 +218,28 @@ public sealed class QuotaGatePolicy
                     var windowFloor = ResolveWindowFloorPct(options, member.Agent, window.Name);
                     if (window.AvailablePct < windowFloor)
                     {
+                        var safeWindowName = QuotaWindowBinding.SanitizeWindowName(window.Name);
                         return new QuotaGateDecision(
                             false,
-                            $"quota below window floor ({window.Name}: {window.AvailablePct:F1}% < {windowFloor:F1}%)",
+                            $"quota below window floor ({safeWindowName}: {window.AvailablePct:F1}% < {windowFloor:F1}%)",
                             windowFloor,
-                            window.Name,
-                            PoolId: poolName);
+                            safeWindowName,
+                            PoolId: poolName,
+                            BindingWindow: bindingWindow);
                     }
                 }
             }
 
-            return new QuotaGateDecision(true, "quota available", floor, PoolId: poolName);
+            return new QuotaGateDecision(true, "quota available", floor, PoolId: poolName, BindingWindow: bindingWindow);
         }
 
         if (availablePct >= 0)
         {
+            var windowSuffix = FormatBindingSuffix(quota.Windows, bindingWindow, availablePct);
             var reason = escrowed > 0
-                ? $"quota below floor after outstanding reservations ({effectivePct:F1}% < {floor:F1}%; {escrowed:F1}% escrowed)"
-                : $"quota below floor ({availablePct:F1}% < {floor:F1}%)";
-            return new QuotaGateDecision(false, reason, floor, PoolId: poolName);
+                ? $"quota below floor after outstanding reservations ({effectivePct:F1}% < {floor:F1}%; {escrowed:F1}% escrowed{windowSuffix})"
+                : $"quota below floor ({availablePct:F1}% < {floor:F1}%{windowSuffix})";
+            return new QuotaGateDecision(false, reason, floor, PoolId: poolName, BindingWindow: bindingWindow);
         }
 
         // Safety: when the probe cannot produce a reading, fail CLOSED whenever
@@ -251,6 +265,26 @@ public sealed class QuotaGatePolicy
             QuotaUnknownPolicy.FailCautious => new QuotaGateDecision(false, "quota unknown; fail-cautious", floor, PoolId: poolName),
             _ => new QuotaGateDecision(true, "quota unknown; no recent observed failure", floor, PoolId: poolName),
         };
+    }
+
+    /// <summary>
+    /// Renders the binding-window suffix for aggregate-floor refusals from the
+    /// quota's per-window readings, e.g.
+    /// <c>; monthly 6.0% (binding), weekly 98.0%, rolling 100.0%</c>.
+    /// <paramref name="bindingWindow"/> is the provenance-checked name (null
+    /// when the aggregate reading did not come from a window), so the guard
+    /// also suppresses the summary when no window produced the reading —
+    /// claiming a binding window there would misname the constraint. Empty
+    /// too when the quota carries no usable window readings, so single-window
+    /// providers keep today's reason text byte-for-byte. Pure.
+    /// </summary>
+    private static string FormatBindingSuffix(
+        IReadOnlyList<WindowQuota>? windows, string? bindingWindow, double producedPct)
+    {
+        if (bindingWindow is null) return string.Empty;
+        return QuotaWindowBinding.FormatWindowSummary(windows, producedPct) is { } summary
+            ? $"; {summary}"
+            : string.Empty;
     }
 
     /// <summary>
@@ -407,7 +441,7 @@ public sealed class QuotaGatePolicy
         {
             foreach (var window in windows)
             {
-                if (string.Equals(window.Name, decision.WindowName, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(QuotaWindowBinding.SanitizeWindowName(window.Name), decision.WindowName, StringComparison.OrdinalIgnoreCase))
                     return window.ResetAt ?? quota.ResetAt;
             }
         }
@@ -501,36 +535,67 @@ public sealed class QuotaGatePolicy
     /// <see cref="QuotaRouterOptions.FloorByPool"/> entry, the effective floor
     /// is the higher of the pool-resolved and agent-resolved floors so neither
     /// reserve can be undercut; with only one present it applies directly.
-    /// Throws for members of a depleting-balance pool, whose floor is absolute
+    /// Work-denominated floors (<c>MinQuotaItems</c> at global, agent, or pool
+    /// scope, converted through <paramref name="measuredBurn"/>) compete via
+    /// the same maximum — with no items configured, or no measured history,
+    /// the result is identical to the percentage floor. Throws for members of
+    /// a depleting-balance pool, whose floor is absolute
     /// (see <see cref="ResolveBalanceFloor"/>).
     /// </summary>
     public static double ComputeFloorPct(
         QuotaRouterOptions options,
         AgentMembership member,
         EffectiveQuota quota,
-        DateTimeOffset nowUtc)
+        DateTimeOffset nowUtc,
+        AgentBurnEstimate? measuredBurn = null)
     {
         if (member.Billing != AgentBilling.Subscription)
             return options.MinQuotaPct;
         var agentFloor = ComputeEffectiveFloorPct(options, member.Agent, quota, nowUtc);
-        if (QuotaPoolResolver.TryResolvePool(options, member, out var poolName, out var pool, out _)
+        double floor;
+        string? poolName = null;
+        QuotaPoolFloorOptions? poolFloor = null;
+        if (QuotaPoolResolver.TryResolvePool(options, member, out poolName, out var pool, out _)
             && poolName is not null)
         {
             if (pool!.Kind == QuotaPoolKind.DepletingBalance)
                 throw new InvalidOperationException(
                     $"Quota pool '{poolName}' is a depleting-balance pool; its floor " +
                     $"is absolute — use ResolveBalanceFloor, not a percentage floor.");
-            if (options.FloorByPool.TryGetValue(poolName, out var poolFloor) && poolFloor is not null)
+            if (options.FloorByPool.TryGetValue(poolName, out poolFloor) && poolFloor is not null)
             {
                 var poolResolved = ComputeRampedFloor(
                     ResolvePoolFloorSettings(options, poolFloor),
                     SelectRampResetAt(quota),
                     nowUtc);
-                return Math.Max(agentFloor, poolResolved);
+                floor = Math.Max(agentFloor, poolResolved);
+            }
+            else
+            {
+                floor = agentFloor;
             }
         }
-        return agentFloor;
+        else
+        {
+            floor = agentFloor;
+        }
+
+        if (measuredBurn is not null)
+        {
+            var minSamples = options.DispatchReservationBurnMinSamples;
+            TryGetFloorOverride(options, member.Agent, out var perAgent);
+            floor = MaxWithItemsFloor(floor, perAgent?.MinQuotaItems ?? options.MinQuotaItems, measuredBurn, minSamples);
+            if (poolName is not null && poolFloor?.MinQuotaItems is { } poolItems)
+                floor = MaxWithItemsFloor(floor, poolItems, measuredBurn, minSamples);
+        }
+        return floor;
     }
+
+    private static double MaxWithItemsFloor(
+        double floor, double? items, AgentBurnEstimate measuredBurn, int minSamples) =>
+        measuredBurn.ToItemsPct(items, minSamples) is { } itemsFloor
+            ? Math.Max(floor, itemsFloor)
+            : floor;
 
     private static AgentFloorSettings ResolvePoolFloorSettings(
         QuotaRouterOptions options,
@@ -598,6 +663,8 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     private readonly QuotaGatePolicy _policy;
     private readonly IQuotaFailureStore? _failureStore;
     private readonly TimeSpan _observedFailureWindow;
+    private readonly IAgentBurnEstimator? _burnEstimator;
+    private readonly ILogger<QuotaGateAvailability>? _log;
 
     public QuotaGateAvailability(QuotaGatePolicy policy)
         : this(policy, failureStore: null, observedFailureWindow: TimeSpan.Zero) { }
@@ -605,30 +672,32 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
     public QuotaGateAvailability(
         QuotaGatePolicy policy,
         IQuotaFailureStore? failureStore,
-        TimeSpan observedFailureWindow)
+        TimeSpan observedFailureWindow,
+        IAgentBurnEstimator? burnEstimator = null,
+        ILogger<QuotaGateAvailability>? log = null)
     {
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _failureStore = failureStore;
         _observedFailureWindow = observedFailureWindow;
+        _burnEstimator = burnEstimator;
+        _log = log;
     }
 
-    public bool Allows(
+    /// <inheritdoc cref="IAgentQuotaGate.EvaluateAsync(AgentMembership, AgentQuotaSnapshot, DateTimeOffset, bool, string?, CancellationToken)"/>
+    public Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
-        bool recentObservedFailure = false,
-        string? observedFailureReason = null)
+        bool recentObservedFailure,
+        string? observedFailureReason,
+        CancellationToken ct = default)
     {
         var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
-        return _policy.Evaluate(
-            member,
-            quota,
-            nowUtc,
-            recentObservedFailure,
-            observedFailureReason).Allow;
+        return EvaluateCoreAsync(member, quota, nowUtc, recentObservedFailure, observedFailureReason, ct);
     }
 
-    public async Task<bool> AllowsAsync(
+    /// <inheritdoc cref="IAgentQuotaGate.EvaluateAsync(AgentMembership, AgentQuotaSnapshot, DateTimeOffset, CancellationToken)"/>
+    public async Task<AgentQuotaGateVerdict> EvaluateAsync(
         AgentMembership member,
         AgentQuotaSnapshot snapshot,
         DateTimeOffset nowUtc,
@@ -645,10 +714,11 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
         if (_failureStore is not null
             && _observedFailureWindow > TimeSpan.Zero
             && !quota.IsKnown
+            && !quota.IsBalanceKnown
             && _policy.UnknownPolicy == QuotaUnknownPolicy.UseObservedFailures)
         {
             var observedAt = await _failureStore.GetMostRecentAsync(
-                member.Agent, member.ModelId, _observedFailureWindow, nowUtc, ct);
+                member.Agent, member.ModelId, _observedFailureWindow, nowUtc, ct).ConfigureAwait(false);
             if (observedAt is { } seenAt)
             {
                 recentObservedFailure = true;
@@ -656,8 +726,48 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
             }
         }
 
-        return _policy.Evaluate(member, quota, nowUtc, recentObservedFailure, observedFailureReason).Allow;
+        return await EvaluateCoreAsync(
+            member, quota, nowUtc, recentObservedFailure, observedFailureReason, ct)
+            .ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Single evaluation producing the allow bit and refusal reason together.
+    /// The member's measured burn is fetched so work-denominated floors
+    /// (items) compete with the percentage floor on this advisory surface
+    /// exactly as they do on the dispatch path — without history the
+    /// percentage floor applies unchanged.
+    /// </summary>
+    private async Task<AgentQuotaGateVerdict> EvaluateCoreAsync(
+        AgentMembership member,
+        EffectiveQuota quota,
+        DateTimeOffset nowUtc,
+        bool recentObservedFailure,
+        string? observedFailureReason,
+        CancellationToken ct)
+    {
+        var measuredBurn = await GetMeasuredBurnAsync(member, ct).ConfigureAwait(false);
+        var decision = _policy.Evaluate(
+            member,
+            quota,
+            nowUtc,
+            recentObservedFailure,
+            observedFailureReason,
+            measuredBurn);
+        return decision.Allow
+            ? AgentQuotaGateVerdict.Allowed()
+            : AgentQuotaGateVerdict.Denied(decision.Reason);
+    }
+
+    /// <summary>
+    /// Same estimator fetch the dispatch router applies
+    /// (<see cref="AgentBurnEstimatorExtensions.GetEstimateOrNullAsync"/>):
+    /// null when no estimator is wired or it throws — the percentage chain
+    /// then applies unchanged — and cancellation propagates.
+    /// </summary>
+    private Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
+        AgentMembership member, CancellationToken ct) =>
+        _burnEstimator.GetEstimateOrNullAsync(member.Agent, _log, ct);
 }
 
 /// <summary>
@@ -667,6 +777,9 @@ public sealed class QuotaGateAvailability : IAgentQuotaGate
 /// misread an absolute value). <see cref="QuotaGateDecision.Terminal"/> marks
 /// a refusal that will never clear by waiting (depleting-balance exhaustion:
 /// no reset will replenish it); callers must fail rather than park for reset.
+/// <see cref="QuotaGateDecision.BindingWindow"/> names the quota window that
+/// produced the aggregate reading (the scarcest known window), so status
+/// surfaces can show which window binds without parsing <see cref="QuotaGateDecision.Reason"/>.
 /// </summary>
 public sealed record QuotaGateDecision(
     bool Allow,
@@ -675,4 +788,5 @@ public sealed record QuotaGateDecision(
     string? WindowName = null,
     string? PoolId = null,
     double? BalanceFloor = null,
-    bool Terminal = false);
+    bool Terminal = false,
+    string? BindingWindow = null);

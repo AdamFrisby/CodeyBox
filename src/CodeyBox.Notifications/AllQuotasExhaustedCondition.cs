@@ -6,10 +6,12 @@ namespace CodeyBox.Notifications;
 /// <summary>
 /// Evaluates true when every configured agent with a subscription quota probe
 /// is denied by the shared quota gate. Clears when at least one agent is
-/// routable. Routes through <see cref="IAgentQuotaGate.AllowsAsync"/> so the
-/// gate's observed-failure breaker (consulted internally) gates this evaluation
-/// the same way it gates dispatch — without it the condition could report
-/// quotas available while every dispatch candidate is blocked by the breaker.
+/// routable. Routes through
+/// <see cref="IAgentQuotaGate.EvaluateAsync(AgentMembership, AgentQuotaSnapshot, DateTimeOffset, CancellationToken)"/>
+/// so the gate's observed-failure breaker (consulted internally) gates this
+/// evaluation the same way it gates dispatch — without it the condition could
+/// report quotas available while every dispatch candidate is blocked by the
+/// breaker.
 /// </summary>
 public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
 {
@@ -66,7 +68,7 @@ public sealed class AllQuotasExhaustedCondition : ICondition, IDisposable
                 continue;
             }
 
-            if (await _quotaGate.AllowsAsync(member, snapshot, now, ct))
+            if ((await _quotaGate.EvaluateAsync(member, snapshot, now, ct)).Allow)
                 return false;
         }
 

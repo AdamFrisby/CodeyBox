@@ -797,7 +797,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             if (commitDispatchSideEffects)
                 AuditLog.QuotaProbed(member.Agent, member.RouteKey, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
 
-            var knownQuotaUsable = KnownQuotaMeetsFloor(member, quota, nowUtc);
+            var knownQuotaUsable = KnownQuotaMeetsFloor(
+                member, quota, nowUtc, await GetMeasuredBurnAsync(member, ct));
             RefreshExhaustionFromProbe(member, quota, knownQuotaUsable, nowUtc);
 
             var gate = await EvaluateGateAsync(member, item.ProjectId, quota, nowUtc, ct);
@@ -858,10 +859,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     && member.Billing == AgentBilling.Subscription
                     && (quota.IsKnown || quota.IsBalanceKnown))
                 {
-                    var reserveBaseline = ResolveReserveBaseline(member, quota);
+                    // Measured burn lets items-denominated reservations and the
+                    // burn-derived estimate displace the configured default;
+                    // without history the percentage chain applies unchanged.
+                    var measuredBurn = await GetMeasuredBurnAsync(member, ct);
+                    var reserveBaseline = ResolveReserveBaseline(member, quota, measuredBurn);
                     if (reserveBaseline is { } baseline)
                     {
-                        var attempt = _reservationLedger.TryReserve(member, baseline.Available, baseline.Floor);
+                        var attempt = _reservationLedger.TryReserve(
+                            member, baseline.Available, baseline.Floor,
+                            measuredBurn: measuredBurn, windows: quota.Windows);
                         if (!attempt.Allowed)
                         {
                             slotGate?.Release(member);
@@ -1802,7 +1809,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         var quota = _quotaGatePolicy.ResolvePoolQuota(snapshot, member);
         quota = (await ApplyBudgetAsync(member, quota, ct).ConfigureAwait(false)).Quota;
-        if (!KnownQuotaMeetsFloor(member, quota, nowUtc))
+        if (!KnownQuotaMeetsFloor(member, quota, nowUtc, await GetMeasuredBurnAsync(member, ct).ConfigureAwait(false)))
             return false;
 
         if (_exhausted.TryClear(member, out var removed))
@@ -2297,11 +2304,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     /// <summary>
     /// The atomic reserve baseline (available, floor) in the member's native
     /// pool unit, or null when the quota carries no usable baseline to escrow
-    /// against. Pure apart from the options read.
+    /// against. Pass the member's measured burn so the floor matches the
+    /// advisory gate's work-denominated floors. Pure apart from the options read.
     /// </summary>
     private (double Available, double Floor)? ResolveReserveBaseline(
         AgentMembership member,
-        EffectiveQuota quota)
+        EffectiveQuota quota,
+        AgentBurnEstimate? measuredBurn = null)
     {
         if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
         {
@@ -2314,7 +2323,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
         if (!quota.IsKnown)
             return null;
-        return (quota.AvailablePct, QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, _time.GetUtcNow()));
+        return (quota.AvailablePct, QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, _time.GetUtcNow(), measuredBurn));
     }
 
     private async Task<List<ScoredMember>> ApplyIntraKindPolicyAsync(
@@ -2336,7 +2345,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             await PrecomputeQuotaForPolicyAsync(sorted, precomputedQuotas, poolSnapshots, includeSingleMemberGroups: true, ct);
 
         if (policy == IntraKindRoutingPolicy.DeadlineAwareDrain)
-            return OrderDeadlineAwareDrain(sorted, precomputedQuotas, _time.GetUtcNow());
+            return OrderDeadlineAwareDrain(
+                sorted, precomputedQuotas, _time.GetUtcNow(),
+                await PrefetchMeasuredBurnsAsync(sorted, ct));
 
         var buckets = sorted
             .GroupBy(x => x.Member.Agent)
@@ -2390,15 +2401,39 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
     }
 
+    /// <summary>
+    /// Fetches the measured burn for each distinct subscription agent in
+    /// <paramref name="sorted"/> so the synchronous drain ordering can gate on
+    /// the same work-denominated floors dispatch applies. Empty when no
+    /// estimator is wired. The estimator caches per agent, so repeat passes
+    /// stay cheap.
+    /// </summary>
+    private async Task<Dictionary<AgentKind, AgentBurnEstimate>> PrefetchMeasuredBurnsAsync(
+        List<ScoredMember> sorted, CancellationToken ct)
+    {
+        var burns = new Dictionary<AgentKind, AgentBurnEstimate>();
+        if (_burnEstimator is null) return burns;
+        foreach (var entry in sorted)
+        {
+            var member = entry.Member;
+            if (member.Billing != AgentBilling.Subscription || burns.ContainsKey(member.Agent))
+                continue;
+            if (await GetMeasuredBurnAsync(member, ct) is { } burn)
+                burns[member.Agent] = burn;
+        }
+        return burns;
+    }
+
     private List<ScoredMember> OrderDeadlineAwareDrain(
         List<ScoredMember> sorted,
         Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
-        DateTimeOffset nowUtc)
+        DateTimeOffset nowUtc,
+        IReadOnlyDictionary<AgentKind, AgentBurnEstimate> measuredBurns)
     {
         var ranked = sorted
             .Select(entry =>
             {
-                var signal = ComputeDeadlineDrainSignal(entry.Member, precomputedQuotas, nowUtc);
+                var signal = ComputeDeadlineDrainSignal(entry.Member, precomputedQuotas, nowUtc, measuredBurns);
                 return new
                 {
                     Entry = entry,
@@ -2572,10 +2607,12 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             // Skip unknown (probe failed / no data) and members above their
             // effective floor (they would be routable, so they don't need to
             // gate park-time). Use the same per-agent/window policy as dispatch
+            // — including measured burn so work-denominated floors compete —
             // so reset hints don't drift from the router's actual availability
             // decision.
             if (!quota.IsKnown) continue;
-            var gate = _quotaGatePolicy.Evaluate(member, quota, nowUtc);
+            var gate = _quotaGatePolicy.Evaluate(
+                member, quota, nowUtc, measuredBurn: await GetMeasuredBurnAsync(member, ct));
             if (gate.Allow) continue;
             var resetAt = QuotaGatePolicy.ResolveResetHint(quota, gate);
             if (string.IsNullOrEmpty(gate.WindowName)
@@ -2607,13 +2644,19 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             ? await ResolveRecentObservedFailureReasonAsync(member, ct)
             : null;
         var outstanding = _reservationLedger?.GetOutstandingPct(member) ?? 0;
+        // Measured burn lets work-denominated floors (items) compete with the
+        // percentage floor on this advisory gate, matching the commit-time
+        // floor the reservation ledger re-checks. Without history the
+        // percentage floor applies unchanged.
+        var measuredBurn = await GetMeasuredBurnAsync(member, ct);
         var gate = _quotaGatePolicy.Evaluate(
             member,
             quota,
             nowUtc,
             outstanding,
             recentObservedFailure: recentObservedFailureReason is not null,
-            observedFailureReason: recentObservedFailureReason);
+            observedFailureReason: recentObservedFailureReason,
+            measuredBurn: measuredBurn);
         if (!gate.Allow || !quota.IsKnown)
             return gate;
         if (quota.PoolKind == QuotaPoolKind.DepletingBalance)
@@ -2671,7 +2714,9 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         _lastEffectiveQuota[key] = quota;
     }
 
-    private bool KnownQuotaMeetsFloor(AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc)
+    private bool KnownQuotaMeetsFloor(
+        AgentMembership member, EffectiveQuota quota, DateTimeOffset nowUtc,
+        AgentBurnEstimate? measuredBurn = null)
     {
         // Balance pools gate on the absolute reading with strict headroom
         // above the floor (mirroring the gate: at-or-below is exhausted).
@@ -2694,8 +2739,10 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (!quota.IsKnown)
             return false;
 
+        // Same work-denominated floors as the advisory gate: with no items
+        // configured, or no measured history, this is the percentage floor.
         var floor = member.Billing == AgentBilling.Subscription
-            ? QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc)
+            ? QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc, measuredBurn)
             : _opts.MinQuotaPct;
         if (availablePct < floor)
             return false;
@@ -2744,7 +2791,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
     private DeadlineDrainSignal ComputeDeadlineDrainSignal(
         AgentMembership member,
         Dictionary<AgentQuotaMemberKey, PrecomputedQuota> precomputedQuotas,
-        DateTimeOffset nowUtc)
+        DateTimeOffset nowUtc,
+        IReadOnlyDictionary<AgentKind, AgentBurnEstimate> measuredBurns)
     {
         if (member.Billing != AgentBilling.Subscription)
             return DeadlineDrainSignal.None;
@@ -2771,7 +2819,11 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         if (hoursToReset <= 0 || double.IsNaN(hoursToReset) || double.IsInfinity(hoursToReset))
             return DeadlineDrainSignal.None;
 
-        var floor = QuotaGatePolicy.ComputeFloorPct(_opts, member, quota, nowUtc);
+        // Same work-denominated floors as dispatch: an items floor must shrink
+        // the drainable headroom exactly as it does the commit-time gate.
+        var floor = QuotaGatePolicy.ComputeFloorPct(
+            _opts, member, quota, nowUtc,
+            measuredBurns.TryGetValue(member.Agent, out var burn) ? burn : null);
         var headroom = Math.Max(0.0, quota.AvailablePct - floor);
         if (headroom <= 0)
             return DeadlineDrainSignal.None;
@@ -2995,6 +3047,20 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         => QuotaGatePolicy.ResolveWindowFloorPct(opts, agent, windowName);
 
     /// <summary>
+    /// Fetches the member's measured per-item burn for work-denominated quota
+    /// math (items floors, items reservations, burn-derived estimates). Returns
+    /// null when no estimator is wired or it throws — the percentage chain
+    /// then applies unchanged. Validity (enough samples, positive burn) is
+    /// decided by the pure consumers (<see cref="AgentBurnEstimate.HasMeasuredBurn"/>),
+    /// not here, so every caller shares one threshold. The fetch policy lives
+    /// in <see cref="AgentBurnEstimatorExtensions.GetEstimateOrNullAsync"/> so
+    /// the dispatch path and advisory surfaces cannot drift.
+    /// </summary>
+    private Task<AgentBurnEstimate?> GetMeasuredBurnAsync(
+        AgentMembership member, CancellationToken ct) =>
+        _burnEstimator.GetEstimateOrNullAsync(member.Agent, _log, ct);
+
+    /// <summary>
     /// Rate-aware gate: returns a denying <see cref="QuotaGateDecision"/> when
     /// the number of items already running on <paramref name="member"/>'s agent
     /// already meets or exceeds the number of additional concurrent burns that
@@ -3019,7 +3085,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
         AgentBurnEstimate estimate;
         try { estimate = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex,
                 "Rate-aware gate: burn estimator threw for {Agent}; treating as no-data fallback",
@@ -3087,7 +3153,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
 
             AgentBurnEstimate est;
             try { est = await _burnEstimator.GetEstimateAsync(member.Agent, ct); }
-            catch
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 est = new AgentBurnEstimate
                 {
@@ -3355,6 +3421,17 @@ public sealed record EffectiveQuota(
     /// </summary>
     public bool IsBalanceKnown =>
         BalanceRemaining is { } b && double.IsFinite(b) && b >= 0;
+
+    /// <summary>
+    /// Name of the binding window: the known window with the least remaining
+    /// availability, reported only when that window's reading equals
+    /// <see cref="AvailablePct"/>. Null when the quota carries no per-window
+    /// readings or when the aggregate came from a non-window source (a
+    /// per-model fallback to account windows, the "auto" best-model pick, or a
+    /// budget composite) — naming a window that did not produce the reading
+    /// would misreport the constraint. Pure.
+    /// </summary>
+    public string? BindingWindow => QuotaWindowBinding.ResolveBindingWindow(Windows, AvailablePct);
 }
 
 /// <summary>
@@ -3738,6 +3815,58 @@ public sealed class QuotaRouterOptions
         = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Work-denominated alternative to <see cref="DispatchReservationEstimatePct"/>:
+    /// how many dispatches' worth of quota one reservation escrows, converted
+    /// to percentage points through the member's measured per-item burn (see
+    /// <see cref="DispatchReservationBurnMultiplier"/>). Lets an operator say
+    /// "reserve one item's worth" instead of naming a percentage that means
+    /// different absolute work on different plans. Null (the default) keeps the
+    /// percentage chain. A non-positive value is ignored. Requires measured
+    /// burn — without enough samples the percentage chain applies unchanged.
+    /// Hot-reloadable.
+    /// </summary>
+    public double? DispatchReservationEstimateItems { get; set; }
+
+    /// <summary>
+    /// Per-agent override for <see cref="DispatchReservationEstimateItems"/>,
+    /// keyed by <see cref="AgentKind.Value"/>. Non-positive or non-finite
+    /// entries are rejected at load. Hot-reloadable.
+    /// </summary>
+    public Dictionary<string, double> DispatchReservationEstimateItemsByAgent { get; set; }
+        = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Safety factor applied to the measured per-item burn when deriving a
+    /// per-dispatch reservation (derived estimate = measured burn × this).
+    /// Covers burn variance between items so the escrow rarely undershoots the
+    /// real cost. Applies only to the derived tier — explicitly configured
+    /// estimates are used verbatim. A non-positive or non-finite value disables
+    /// derivation (the configured constant applies). Default 1.5.
+    /// Hot-reloadable.
+    /// </summary>
+    public double DispatchReservationBurnMultiplier { get; set; } = 1.5;
+
+    /// <summary>
+    /// Minimum measured samples before the per-dispatch reservation may be
+    /// derived from burn history (or an items-denominated estimate/floor may
+    /// be converted to percentage points). Below this count the estimate has
+    /// not converged, so the configured percentage constant applies and
+    /// behaviour is identical to a pool with no history. Default 3.
+    /// Hot-reloadable.
+    /// </summary>
+    public int DispatchReservationBurnMinSamples { get; set; } = 3;
+
+    /// <summary>
+    /// Work-denominated alternative to <see cref="MinQuotaPct"/>: the fallback
+    /// floor expressed in dispatches' worth of quota, converted through the
+    /// member's measured per-item burn. Null (the default) keeps the percentage
+    /// floor. Requires measured burn — without enough samples the percentage
+    /// floor applies unchanged. Applies only to subscription-billed members,
+    /// like the ramped and per-member floors it competes with. Hot-reloadable.
+    /// </summary>
+    public double? MinQuotaItems { get; set; }
+
+    /// <summary>
     /// Lower bound for any reservation estimate, in quota-percentage points.
     /// A missing, zero, or negative estimate resolves to at least this — a
     /// dispatch must never silently reserve nothing. Default 0.5.
@@ -3819,6 +3948,16 @@ public sealed class QuotaFloorOverrideOptions
 
     /// <summary>Optional per-agent ramp-window length.</summary>
     public TimeSpan? RampWindow { get; set; }
+
+    /// <summary>
+    /// Per-agent work-denominated fallback floor, in dispatches' worth of
+    /// quota, converted through the member's measured per-item burn. Competes
+    /// with the percentage floor via maximum (neither reserve can be
+    /// undercut). Requires measured burn — without enough samples the
+    /// percentage floor applies unchanged. Applies only to subscription-billed
+    /// members.
+    /// </summary>
+    public double? MinQuotaItems { get; set; }
 }
 
 /// <summary>

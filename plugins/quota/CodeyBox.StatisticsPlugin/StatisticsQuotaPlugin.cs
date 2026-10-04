@@ -208,7 +208,13 @@ public sealed class StatisticsQuotaPlugin
             {
                 try
                 {
-                    wouldAllow = _quotaGate?.Allows(member, snapshot, sampledAt) ?? snapshot.AvailablePct > 0;
+                    wouldAllow = _quotaGate is null
+                        ? snapshot.AvailablePct > 0
+                        : (await _quotaGate.EvaluateAsync(member, snapshot, sampledAt, ct)).Allow;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {

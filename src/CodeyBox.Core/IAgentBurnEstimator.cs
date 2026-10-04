@@ -62,6 +62,37 @@ public sealed record AgentBurnEstimate
     /// back to <see cref="SampleCount"/> and <see cref="AvgBurnPctPerItem"/>.
     /// </summary>
     public AgentBurnEstimateStatus Status { get; init; }
+
+    /// <summary>
+    /// True when this estimate is usable as measured history for
+    /// work-denominated quota math: a positive finite burn backed by at least
+    /// <paramref name="minSamples"/> samples (and at least one sample no
+    /// matter how low the threshold is set). Guards the quota reservation and
+    /// absolute-floor paths so unmeasured agents keep today's configured
+    /// constants instead of deriving from noise. Pure.
+    /// </summary>
+    public bool HasMeasuredBurn(int minSamples) =>
+        SampleCount >= Math.Max(1, minSamples)
+        && double.IsFinite(AvgBurnPctPerItem)
+        && AvgBurnPctPerItem > 0;
+
+    /// <summary>
+    /// Converts a work-denominated quantity (<paramref name="items"/> dispatches)
+    /// into quota-percentage points using the measured per-item burn, e.g. one
+    /// item at 0.6% burn reserves 0.6 points. Returns null when the quantity is
+    /// not a positive finite count or no measured burn is available (see
+    /// <see cref="HasMeasuredBurn"/>), so callers fall through to the
+    /// percentage-denominated tier instead of escrowing a guess. Pure.
+    /// </summary>
+    public double? ToItemsPct(double? items, int minSamples)
+    {
+        if (items is not { } count || !double.IsFinite(count) || count <= 0)
+            return null;
+        if (!HasMeasuredBurn(minSamples))
+            return null;
+        var pct = count * AvgBurnPctPerItem;
+        return double.IsFinite(pct) && pct > 0 ? pct : null;
+    }
 }
 
 /// <summary>Source/status for an <see cref="AgentBurnEstimate"/>.</summary>
