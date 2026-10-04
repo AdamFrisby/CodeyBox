@@ -113,6 +113,7 @@
     <Project Path="plugins/sast/CodeyBox.CodeqlAuditorPlugin/CodeyBox.CodeqlAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.DevSkimAuditorPlugin/CodeyBox.DevSkimAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.BrakemanAuditorPlugin/CodeyBox.BrakemanAuditorPlugin.csproj" />
+    <Project Path="plugins/sast/CodeyBox.BanditAuditorPlugin/CodeyBox.BanditAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.SemgrepAuditorPlugin/CodeyBox.SemgrepAuditorPlugin.csproj" />
     <Project Path="plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
     <Project Path="plugins/quota/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
