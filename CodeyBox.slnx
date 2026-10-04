@@ -112,6 +112,7 @@
     <Project Path="plugins/auditors-secrets/CodeyBox.DetectSecretsAuditorPlugin/CodeyBox.DetectSecretsAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.BetterleaksAuditorPlugin/CodeyBox.BetterleaksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-schema/CodeyBox.SpectralAuditorPlugin/CodeyBox.SpectralAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-schema/CodeyBox.SqlfluffAuditorPlugin/CodeyBox.SqlfluffAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-schema/CodeyBox.SquawkAuditorPlugin/CodeyBox.SquawkAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-scripting/CodeyBox.PsScriptAnalyzerAuditorPlugin/CodeyBox.PsScriptAnalyzerAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-scripting/CodeyBox.ShellcheckAuditorPlugin/CodeyBox.ShellcheckAuditorPlugin.csproj" />
