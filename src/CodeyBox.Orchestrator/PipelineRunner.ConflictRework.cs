@@ -235,8 +235,9 @@ public sealed partial class PipelineRunner
         }
 
         // Anti-abandonment guard: the file-set the work agent touched
-        // (relative to `baseTip`) must remain reflected in the rework's diff
-        // against the same base. A clean rebase preserves these — the SHAs
+        // (relative to the fork point — the merge-base, or baseTip on
+        // fallback) must remain reflected in the rework's diff against the
+        // refreshed base tip. A clean rebase preserves these — the SHAs
         // change but the files do not. A destructive `git reset --hard
         // origin/<base>` produces an empty diff and trips this check.
         if (priorChangedFiles.Count > 0)
