@@ -117,7 +117,12 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     /// agent-neutral sets. The devin CLI wraps provider refusals in its own
     /// <c>Agent error: Client error: Protocol error (unimplemented)</c>
     /// envelope (verified), which is devin-shaped rather than
-    /// provider-relayed. Operator extras from
+    /// provider-relayed. The ACP startup transport failure
+    /// (<see cref="DevinTeamSettingsTimeoutDetector"/>: <c>fatal</c>
+    /// <c>session/new</c> team-settings fetch timeout, code -32603) is
+    /// checked first as a structured envelope — never a bare timeout or
+    /// code — so only that startup shape parks for transient retry.
+    /// Operator extras from
     /// <c>CodeyBox:ProviderTransientSignatures:devin</c> are appended at
     /// detect time via <see cref="ProviderTransientSignatureStore"/>.
     /// </summary>
@@ -133,5 +138,16 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     ];
 
     public ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary)
-        => ProviderTransientDetectorCore.Detect(Kind.Value, stderr, stdout, summary, DevinTransientSignatures);
+    {
+        try
+        {
+            if (DevinTeamSettingsTimeoutDetector.TryDetect(stderr, stdout, summary) is { } startupTransient)
+                return startupTransient;
+        }
+        catch (Exception)
+        {
+        }
+
+        return ProviderTransientDetectorCore.Detect(Kind.Value, stderr, stdout, summary, DevinTransientSignatures);
+    }
 }
