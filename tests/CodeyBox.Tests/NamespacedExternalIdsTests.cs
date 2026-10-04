@@ -538,6 +538,42 @@ public sealed class NamespacedExternalIdsTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 
+    [Fact]
+    public async Task Post_ReservedBaseFixNamespace_Returns400()
+    {
+        // The base-fix marker is orchestrator-owned: callers must not file
+        // items carrying it, or they could squat the dedupe marker and
+        // exempt their own item from the base-broken dispatch hold.
+        var resp = await _client.PostAsJsonAsync("/workitems", new
+        {
+            projectId = "test-project",
+            title = "t",
+            prompt = "p",
+            externalIds = new Dictionary<string, string> { ["base-fix"] = new string('a', 40) },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var err = await resp.Content.ReadFromJsonAsync<ErrorResp>();
+        Assert.Contains("reserved", err!.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Patch_ReservedBaseFixNamespace_Returns400_AndExistingIdsUntouched()
+    {
+        var created = await CreateAsync(new() { ["github"] = "PATCH-RSV-1" });
+        var resp = await _client.PatchAsJsonAsync($"/workitems/{created.Id}/external-ids", new
+        {
+            externalIds = new Dictionary<string, string?> { ["base-fix"] = new string('b', 40) },
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        var err = await resp.Content.ReadFromJsonAsync<ErrorResp>();
+        Assert.Contains("reserved", err!.Error, StringComparison.OrdinalIgnoreCase);
+
+        var get = await _client.GetAsync($"/workitems/{created.Id}");
+        var fetched = await get.Content.ReadFromJsonAsync<CreateResp>();
+        Assert.Single(fetched!.ExternalIds);
+        Assert.Equal("PATCH-RSV-1", fetched.ExternalIds["github"]);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     private async Task<CreateResp> CreateAsync(Dictionary<string, string> externalIds)

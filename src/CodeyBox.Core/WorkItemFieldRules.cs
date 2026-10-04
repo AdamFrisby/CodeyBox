@@ -122,10 +122,13 @@ public static class WorkItemFieldRules
     /// <summary>
     /// Namespaced external identifiers: namespace keys and values pass
     /// <see cref="Validation.ValidateExternalIdNamespace"/> /
-    /// <see cref="Validation.ValidateExternalId"/>; null values are rejected
-    /// (deletion is the dedicated PATCH surface's job, not create's). The map
-    /// is copied case-insensitively so namespace casing collapses the same way
-    /// on every entry point. Null input normalises to the empty map.
+    /// <see cref="Validation.ValidateExternalId"/>; system-reserved
+    /// namespaces (e.g. <c>base-fix</c>) are rejected on every caller-facing
+    /// write funnel so only orchestrator code can mark auto-filed repair
+    /// items; null values are rejected (deletion is the dedicated PATCH
+    /// surface's job, not create's). The map is copied case-insensitively
+    /// so namespace casing collapses the same way on every entry point.
+    /// Null input normalises to the empty map.
     /// </summary>
     public static (IReadOnlyDictionary<string, string>? Value, string? Error) NormalizeExternalIds(
         IReadOnlyDictionary<string, string>? value,
@@ -143,6 +146,8 @@ public static class WorkItemFieldRules
             var nsLabel = Validation.DescribeUntrustedValue(ns);
             if (CheckExternalIdNamespace(ns, $"{field} key '{nsLabel}'") is { } nsError)
                 return (null, nsError);
+            if (Validation.IsSystemExternalIdNamespace(ns))
+                return (null, $"{field} key '{nsLabel}' is reserved for system use and cannot be set by callers");
             if (id is null)
                 return (null, $"{field}['{nsLabel}'] must not be null — to delete a namespace, omit it from the replacement map (REST: PATCH /workitems/{{id}}/external-ids)");
             if (CheckExternalId(id, $"{field}['{nsLabel}']") is { } idError)

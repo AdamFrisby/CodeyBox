@@ -96,4 +96,48 @@ public sealed class ExternalIdNamespaceValidationTests
         Assert.Null(ns);
         Assert.Equal(input, value);
     }
+
+    // ── System-reserved namespaces ─────────────────────────────────────────
+
+    [Theory]
+    [InlineData("base-fix")]
+    [InlineData("BASE-FIX")]          // case-insensitive: ExternalIds keys collapse case
+    [InlineData("Base-Fix")]
+    public void SystemNamespaces_DetectedCaseInsensitively(string ns)
+        => Assert.True(Validation.IsSystemExternalIdNamespace(ns));
+
+    [Theory]
+    [InlineData("github")]
+    [InlineData("jobtrack")]
+    [InlineData("legacy")]
+    [InlineData("")]
+    public void OrdinaryNamespaces_NotSystemReserved(string? ns)
+        => Assert.False(Validation.IsSystemExternalIdNamespace(ns));
+
+    [Fact]
+    public void ThrowIfSystemNamespace_RejectsBaseFix_AcceptsOrdinary()
+    {
+        Assert.Throws<ArgumentException>(
+            () => Validation.ThrowIfSystemExternalIdNamespace("base-fix", "externalIds"));
+        Validation.ThrowIfSystemExternalIdNamespace("github", "externalIds");
+    }
+
+    [Fact]
+    public void NormalizeExternalIds_RejectsReservedNamespace()
+    {
+        var (value, error) = WorkItemFieldRules.NormalizeExternalIds(
+            new Dictionary<string, string> { ["base-fix"] = new string('a', 40) });
+        Assert.Null(value);
+        Assert.Contains("reserved", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void NormalizeExternalIds_AcceptsOrdinaryNamespace()
+    {
+        var (value, error) = WorkItemFieldRules.NormalizeExternalIds(
+            new Dictionary<string, string> { ["github"] = "gh-issue:1" });
+        Assert.Null(error);
+        Assert.NotNull(value);
+        Assert.Equal("gh-issue:1", value!["github"]);
+    }
 }

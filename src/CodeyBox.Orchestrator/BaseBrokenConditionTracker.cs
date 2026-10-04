@@ -31,9 +31,14 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
     /// <summary>
     /// ExternalIds namespace marking the auto-filed base-fix item; the value
     /// is the broken base tip SHA. The store's (project, namespace, value)
-    /// uniqueness makes concurrent filings collapse to one row.
+    /// uniqueness makes concurrent filings collapse to one row. Single source
+    /// of truth lives in <see cref="Validation.SystemBaseFixExternalIdNamespace"/>;
+    /// callers cannot write this namespace (rejected at every caller-facing
+    /// validation funnel) and <see cref="IsOpenFixItem"/> additionally
+    /// requires system provenance, so a caller-planted marker can neither be
+    /// filed nor adopted as the fix item.
     /// </summary>
-    public const string FixMarkerNamespace = "base-fix";
+    public const string FixMarkerNamespace = Validation.SystemBaseFixExternalIdNamespace;
 
     private readonly IBaseBrokenConditionStore _store;
     private readonly IWorkItemStore _items;
@@ -221,14 +226,18 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
                     condition.BaseBranch,
                     condition.BaseSha,
                     condition.ErrorSummary,
-                    sourceItem.Title,
                     sourceItem.Id),
                 BaseBranch = condition.BaseBranch,
                 DependsOn = [],
                 QueuePosition = now.Ticks,
                 Priority = priority,
                 PushUpstream = sourceItem.PushUpstream,
-                Initiator = sourceItem.Initiator,
+                // System provenance: caller-facing creation always stamps a
+                // non-null initiator (server-resolved from auth), so a null
+                // initiator marks this row as orchestrator-filed. IsOpenFixItem
+                // requires it — a caller-planted marker row carries the
+                // caller's initiator and is never adopted as the fix item.
+                Initiator = null,
                 ExternalIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
                     [FixMarkerNamespace] = condition.BaseSha,
@@ -241,17 +250,44 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
             }
             catch (WorkItemExternalIdConflictException)
             {
-                // A concurrent detector filed the fix for this SHA first —
-                // adopt it instead of duplicating.
+                // Usually a concurrent detector filed the fix for this SHA
+                // first — adopt it instead of duplicating.
                 var winner = FindFixItem(allItems, condition.ProjectId, condition.BaseSha)
                     ?? await ScanForFixItemAsync(condition, ct).ConfigureAwait(false);
-                if (winner is null)
+                if (winner is not null)
+                {
+                    await _store.AttachFixItemAsync(
+                        condition.ProjectId, condition.BaseSha, winner.Id, winner.Id.ToString(), ct)
+                        .ConfigureAwait(false);
+                    RegisterFixItem(condition.ProjectId, condition.BaseSha, winner.Id);
+                    return winner.Id;
+                }
+
+                // Otherwise the conflicting row carries the reserved marker
+                // without system provenance (caller-planted before the
+                // write-time reservation): it can never be adopted, and
+                // leaving it in place would suppress the genuine repair item
+                // via the unique (project, namespace, value) constraint.
+                // Reclaim the reserved namespace from that row, then file.
+                if (!await ReclaimReservedMarkerAsync(condition, ct).ConfigureAwait(false))
                     throw;
-                await _store.AttachFixItemAsync(
-                    condition.ProjectId, condition.BaseSha, winner.Id, winner.Id.ToString(), ct)
-                    .ConfigureAwait(false);
-                RegisterFixItem(condition.ProjectId, condition.BaseSha, winner.Id);
-                return winner.Id;
+                try
+                {
+                    await _items.CreateAsync(fix, ct).ConfigureAwait(false);
+                }
+                catch (WorkItemExternalIdConflictException)
+                {
+                    // A concurrent genuine filing landed between the reclaim
+                    // and the retry — adopt it when visible, else surface.
+                    var retryWinner = await ScanForFixItemAsync(condition, ct).ConfigureAwait(false);
+                    if (retryWinner is null)
+                        throw;
+                    await _store.AttachFixItemAsync(
+                        condition.ProjectId, condition.BaseSha, retryWinner.Id, retryWinner.Id.ToString(), ct)
+                        .ConfigureAwait(false);
+                    RegisterFixItem(condition.ProjectId, condition.BaseSha, retryWinner.Id);
+                    return retryWinner.Id;
+                }
             }
 
             await _store.AttachFixItemAsync(
@@ -369,6 +405,36 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
         return null;
     }
 
+    /// <summary>
+    /// Removes the reserved fix marker from the row currently holding it
+    /// when that row fails fix-item provenance (caller-planted, never
+    /// adoptable), so the genuine fix item can be filed. Returns false when
+    /// there is nothing reclaimable: no holding row, or the holder is a
+    /// genuine system row the caller should adopt instead (a concurrent
+    /// filing that landed after the scan). Only the reserved namespace is
+    /// removed — every other external id on the row is preserved.
+    /// </summary>
+    private async Task<bool> ReclaimReservedMarkerAsync(
+        BaseBrokenCondition condition,
+        CancellationToken ct)
+    {
+        var blocker = await _items.GetByNamespacedExternalIdAsync(
+            condition.ProjectId, FixMarkerNamespace, condition.BaseSha, ct).ConfigureAwait(false);
+        if (blocker is null || IsOpenFixItem(blocker, condition.ProjectId, condition.BaseSha))
+            return false;
+        var cleaned = new Dictionary<string, string>(blocker.ExternalIds, StringComparer.OrdinalIgnoreCase);
+        if (!cleaned.Remove(FixMarkerNamespace))
+            return false;
+        var updated = await _items.ReplaceExternalIdsAsync(
+            blocker.Id, cleaned, _time.GetUtcNow(), ct).ConfigureAwait(false);
+        if (updated is null)
+            return false;
+        _log.LogWarning(
+            "Reclaimed reserved '{Namespace}' marker from work item {BlockerId} for project {ProjectId} (base tip {Sha}); the marker lacked system provenance",
+            FixMarkerNamespace, blocker.Id, condition.ProjectId.Value, condition.BaseSha);
+        return true;
+    }
+
     internal static WorkItem? FindFixItem(
         IReadOnlyList<WorkItem> allItems,
         ProjectId projectId,
@@ -382,9 +448,34 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
         return null;
     }
 
+    /// <summary>
+    /// True for an open (non-terminal) item in this project carrying this
+    /// SHA under the fix marker. Provenance-guarded: only orchestrator-filed
+    /// rows qualify — caller-facing creation always stamps a non-null
+    /// initiator, so a null initiator plus a well-formed base-SHA marker
+    /// value (exact ordinal match, commit-SHA shape) marks system provenance.
+    /// A caller-planted <c>base-fix</c> marker (rejected at write time going
+    /// forward, but possibly present in pre-reservation rows) never
+    /// satisfies this and is therefore never adopted as the fix item nor
+    /// exempted from the dispatch hold.
+    /// </summary>
     private static bool IsOpenFixItem(WorkItem item, ProjectId projectId, string baseSha) =>
         item.ProjectId == projectId
+        && item.Initiator is null
         && !WorkItemDependencies.TerminalStates.Contains(item.State)
         && item.ExternalIds.TryGetValue(FixMarkerNamespace, out var sha)
+        && IsWellFormedBaseShaMarker(sha)
         && string.Equals(sha, baseSha, StringComparison.Ordinal);
+
+    private static bool IsWellFormedBaseShaMarker(string? sha)
+    {
+        if (string.IsNullOrEmpty(sha) || sha.Length is < 40 or > 64)
+            return false;
+        foreach (var c in sha)
+        {
+            if (!Uri.IsHexDigit(c))
+                return false;
+        }
+        return true;
+    }
 }

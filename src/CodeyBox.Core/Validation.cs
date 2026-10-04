@@ -239,6 +239,37 @@ public static partial class Validation
     }
 
     /// <summary>
+    /// External-ID namespace reserved for the orchestrator's auto-filed
+    /// base-build repair items. Only orchestrator code may write it (direct
+    /// store writes that bypass caller-facing validation); every
+    /// caller-facing write funnel must reject it via
+    /// <see cref="ThrowIfSystemExternalIdNamespace"/>. Reads and lookups are
+    /// unaffected so operators can still query the filed fix item.
+    /// </summary>
+    public const string SystemBaseFixExternalIdNamespace = "base-fix";
+
+    /// <summary>
+    /// True for system-owned external-ID namespaces no caller may write.
+    /// Case-insensitive because <c>WorkItem.ExternalIds</c> keys collapse
+    /// case-insensitively.
+    /// </summary>
+    public static bool IsSystemExternalIdNamespace(string? value) =>
+        string.Equals(value, SystemBaseFixExternalIdNamespace, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Rejects a caller-supplied external-ID namespace reserved for system
+    /// use. Shape validation (<see cref="ValidateExternalIdNamespace"/>) stays
+    /// separate so reads keep resolving reserved namespaces.
+    /// </summary>
+    public static void ThrowIfSystemExternalIdNamespace(string value, string fieldName)
+    {
+        if (IsSystemExternalIdNamespace(value))
+            throw new ArgumentException(
+                $"{fieldName} namespace '{SystemBaseFixExternalIdNamespace}' is reserved for system use and cannot be set by callers",
+                fieldName);
+    }
+
+    /// <summary>
     /// Parses a namespaced external-ID reference of the form <c>namespace:value</c>.
     /// On a successful split with a non-empty namespace and value, sets
     /// <paramref name="ns"/> and <paramref name="value"/> and returns true. When
