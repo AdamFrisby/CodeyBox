@@ -1447,6 +1447,48 @@ See [docs/concepts/projects.md](../concepts/projects.md).
 
 See [docs/reference/webhooks.md](webhooks.md).
 
+## `AuditRuns`
+
+Standalone tool-only audit runs (`POST /audit-runs`, `codeybox audit-run`).
+Disabled by default: queue implementation only until the operator enables a
+supported sandbox provider with real installed tools. All values are
+hot-reloadable; the resolved config digest is frozen into each run's
+provenance at create time.
+
+```json
+"AuditRuns": {
+  "Enabled": false,
+  "MaxConcurrentRuns": 2,
+  "MaxQueuedRuns": 50,
+  "PerAuditorTimeoutSeconds": 600,
+  "TotalRunTimeoutSeconds": 3600,
+  "MaxLogCharsPerAuditor": 200000,
+  "MaxArtifactBytes": 5242880,
+  "MaxArtifactsPerRun": 16,
+  "MaxRawOutputChars": 262144,
+  "RetentionDays": 30,
+  "MaxAttemptsPerAuditor": 2,
+  "Profiles": {
+    "quick": [ "process:build-script" ]
+  }
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `Enabled` | `false` | Master switch. Creates are rejected while disabled. |
+| `MaxConcurrentRuns` | `2` | Max concurrently executing runs (bounded capacity). |
+| `MaxQueuedRuns` | `50` | Max non-terminal runs; overflow creates are rejected. |
+| `PerAuditorTimeoutSeconds` | `600` | Per-auditor wall-clock timeout; overruns record `TimedOut` with partial findings preserved. |
+| `TotalRunTimeoutSeconds` | `3600` | Total run deadline. |
+| `MaxLogCharsPerAuditor` | `200000` | Log capture bound, enforced before buffering, then redacted. |
+| `MaxArtifactBytes` | `5242880` | Per-artifact cap; oversized output is not stored and gains a warning finding. |
+| `MaxArtifactsPerRun` | `16` | Max stored artifacts per run. |
+| `MaxRawOutputChars` | `262144` | Truncated redacted log excerpt kept per auditor; full logs live in the artifact store. |
+| `RetentionDays` | `30` | Retention for completed runs and artifacts. |
+| `MaxAttemptsPerAuditor` | `2` | Bounded per-auditor retries; attempts are recorded, provenance never overwritten. |
+| `Profiles` | `{}` | Named profile → explicit auditor IDs. Unknown profile names are rejected, never defaulted to the project panel. |
+
 ## Environment variables used by CodeyBox
 
 | Variable | Purpose |

@@ -303,6 +303,71 @@ internal sealed class CodeyBoxClient
         return await GetRawAsync($"/audit/test-selection/soundness{qs}", ct);
     }
 
+    internal async Task<string> CreateAuditRunAsync(
+        AuditRunCreateRequest req,
+        string? idempotencyKey = null,
+        CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/audit-runs");
+        request.Content = JsonContent.Create(req, CliJsonContext.Default.AuditRunCreateRequest);
+        if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            request.Headers.Add("Idempotency-Key", idempotencyKey.Trim());
+        var resp = await SendAsync(token => _http.SendAsync(request, token), ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
+    internal async Task<string> GetAuditRunsAsync(string? project = null, int? limit = null, CancellationToken ct = default)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(project)) parts.Add($"project={Uri.EscapeDataString(project.Trim())}");
+        if (limit is not null) parts.Add($"limit={limit}");
+        var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+        return await GetRawAsync($"/audit-runs{qs}", ct);
+    }
+
+    internal async Task<string> GetAuditRunAsync(string id, string? project = null, CancellationToken ct = default)
+    {
+        var qs = string.IsNullOrWhiteSpace(project) ? "" : $"?project={Uri.EscapeDataString(project.Trim())}";
+        return await GetRawAsync($"/audit-runs/{Uri.EscapeDataString(id)}{qs}", ct);
+    }
+
+    internal async Task<string> GetAuditRunReportsAsync(string id, string? project = null, CancellationToken ct = default)
+    {
+        var qs = string.IsNullOrWhiteSpace(project) ? "" : $"?project={Uri.EscapeDataString(project.Trim())}";
+        return await GetRawAsync($"/audit-runs/{Uri.EscapeDataString(id)}/reports{qs}", ct);
+    }
+
+    internal async Task<string> GetAuditRunLogsAsync(string id, string? project = null, string? auditor = null, CancellationToken ct = default)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(project)) parts.Add($"project={Uri.EscapeDataString(project.Trim())}");
+        if (!string.IsNullOrWhiteSpace(auditor)) parts.Add($"auditor={Uri.EscapeDataString(auditor.Trim())}");
+        var qs = parts.Count > 0 ? "?" + string.Join("&", parts) : "";
+        return await GetRawAsync($"/audit-runs/{Uri.EscapeDataString(id)}/logs{qs}", ct);
+    }
+
+    internal async Task<string> GetAuditRunArtifactsAsync(string id, string? project = null, CancellationToken ct = default)
+    {
+        var qs = string.IsNullOrWhiteSpace(project) ? "" : $"?project={Uri.EscapeDataString(project.Trim())}";
+        return await GetRawAsync($"/audit-runs/{Uri.EscapeDataString(id)}/artifacts{qs}", ct);
+    }
+
+    internal async Task<string> GetAuditRunArtifactAsync(string id, string name, string? project = null, CancellationToken ct = default)
+    {
+        var qs = string.IsNullOrWhiteSpace(project) ? "" : $"?project={Uri.EscapeDataString(project.Trim())}";
+        return await GetRawAsync($"/audit-runs/{Uri.EscapeDataString(id)}/artifacts/{Uri.EscapeDataString(name)}{qs}", ct);
+    }
+
+    internal async Task<string> CancelAuditRunAsync(string id, CancellationToken ct = default)
+    {
+        var resp = await SendAsync(
+            token => _http.PostAsync($"/audit-runs/{Uri.EscapeDataString(id)}/cancel", null, token),
+            ct);
+        await HttpResponseGuards.EnsureSuccessAsync(resp, ct);
+        return await resp.Content.ReadAsStringAsync(ct);
+    }
+
     internal async Task ReorderQueueAsync(string[] ids, CancellationToken ct = default)
     {
         var resp = await SendAsync(

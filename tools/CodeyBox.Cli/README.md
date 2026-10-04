@@ -233,6 +233,32 @@ codeybox audit test-selection-soundness --limit 100 --selector coverage
 codeybox audit test-selection-soundness --limit 100 --json
 ```
 
+### `codeybox audit-run ...`
+
+Queue and inspect standalone tool-only audit runs at pinned SHAs
+(`POST /audit-runs`). Disabled by default server-side
+(`CodeyBox:AuditRuns:Enabled`); the create call returns 400 until the
+operator enables it and configures a supported sandbox provider with real
+installed tools. Exactly one selection mechanism per run: repeatable
+`--auditor` IDs or a single `--profile`. Diff-based auditors require
+`--base-ref`; LLM auditors and agent-credential requirements are reported
+as `Unsupported` with reasons, never silently dropped.
+
+```bash
+codeybox audit-run run --project myapp --ref <40-hex-sha> --auditor tool:lint --wait --json
+codeybox audit-run run --project myapp --ref <sha> --profile quick --base-ref <base-sha> --idempotency-key k1
+codeybox audit-run list --project myapp --limit 20
+codeybox audit-run show <id> --project myapp
+codeybox audit-run report <id> --project myapp
+codeybox audit-run logs <id> --project myapp
+codeybox audit-run artifacts <id> --project myapp
+codeybox audit-run artifact <id> auditor-tool.log --project myapp
+codeybox audit-run cancel <id>
+```
+
+`--project` on read commands scopes authorization: a run read with a
+non-owning project is denied (403).
+
 ## Common workflows
 
 ```bash

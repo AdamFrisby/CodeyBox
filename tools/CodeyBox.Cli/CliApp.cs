@@ -73,6 +73,7 @@ internal static class CliApp
         root.AddCommand(FleetCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(AgentsCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(AuditCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
+        root.AddCommand(AuditRunCommand.Build(apiUrlOpt, apiKeyOpt, clientFactory));
         root.AddCommand(ConfigureCommand.Build());
         root.AddCommand(VersionCommand.Build());
 

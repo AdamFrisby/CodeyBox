@@ -1,0 +1,6 @@
+Standalone audit fixture. INTENTIONAL VIOLATION BELOW.
+The marker line is detected by the standalone-audit acceptance test's
+real shell auditor (grep for STANDALONE_AUDIT_VIOLATION, non-zero exit
+when absent). Do not remove: the test copies this tree, proves Findings
+on the violation, then proves Pass on a fixed copy at a distinct SHA.
+STANDALONE_AUDIT_VIOLATION: hardcoded-secret = "forbidden-in-fixture"
