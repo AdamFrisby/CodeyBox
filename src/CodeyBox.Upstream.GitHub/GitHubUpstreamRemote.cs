@@ -152,6 +152,22 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             }
             catch (Exception ex)
             {
+                // Preserve the typed reconcile-conflict contract across the
+                // GitHub boundary so the pipeline can route into bounded
+                // conflict rework instead of generic push retries. Only a
+                // typed UpstreamPushReconcileConflictException in the chain
+                // qualifies — arbitrary message text never does. The new
+                // instance carries only validated, token-scrubbed branch and
+                // strategy; the raw exception (which may echo credentials) is
+                // never attached, logged, or serialized.
+                if (TryBuildSafeReconcileConflict(ex, token, out var safeConflict))
+                {
+                    _log.LogDebug(
+                        "Work-branch push to upstream hit reconcile conflict: {Message} (full exception withheld; may contain credentials)",
+                        safeConflict.Message);
+                    throw safeConflict;
+                }
+
                 // Log only the scrubbed message at Debug; the raw exception object is
                 // withheld because git can echo credential material on auth failures.
                 var scrubbed = Scrub(ex.Message, token);
@@ -1747,7 +1763,49 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private string RepoUrl() => $"https://github.com/{_opts.Owner}/{_opts.Repository}.git";
 
     private static string Scrub(string message, string token) =>
-        message.Replace(token, "***", StringComparison.Ordinal);
+        string.IsNullOrEmpty(token)
+            ? message
+            : message.Replace(token, "***", StringComparison.Ordinal);
+
+    private static bool TryFindReconcileConflict(Exception ex, out UpstreamPushReconcileConflictException conflict)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is UpstreamPushReconcileConflictException typed)
+            {
+                conflict = typed;
+                return true;
+            }
+        }
+
+        conflict = null!;
+        return false;
+    }
+
+    private static bool TryBuildSafeReconcileConflict(
+        Exception ex, string token, out UpstreamPushReconcileConflictException safeConflict)
+    {
+        safeConflict = null!;
+        if (!TryFindReconcileConflict(ex, out var typed))
+            return false;
+
+        if (!typed.Strategy.Equals("merge", StringComparison.Ordinal)
+            && !typed.Strategy.Equals("rebase", StringComparison.Ordinal))
+            return false;
+
+        var scrubbedBranch = Scrub(typed.Branch, token);
+        try
+        {
+            Validation.ValidateBranchName(scrubbedBranch, nameof(typed.Branch));
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
+        safeConflict = new UpstreamPushReconcileConflictException(scrubbedBranch, typed.Strategy);
+        return true;
+    }
 
     private static string SanitizeForLog(string? value) =>
         value?.Replace("\n", "\\n", StringComparison.Ordinal)
