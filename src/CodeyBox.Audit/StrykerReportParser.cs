@@ -192,12 +192,14 @@ public static class StrykerReportParser
         if (!item.TryGetProperty("mutatorName", out var mutator)
             || mutator.ValueKind != JsonValueKind.String
             || string.IsNullOrWhiteSpace(mutator.GetString())
-            || mutator.GetString()!.Length > MaxTokenLength)
+            || mutator.GetString()!.Length > MaxTokenLength
+            || ContainsControl(mutator.GetString()!))
             return false;
         if (!item.TryGetProperty("status", out var status)
             || status.ValueKind != JsonValueKind.String
             || string.IsNullOrWhiteSpace(status.GetString())
-            || status.GetString()!.Length > 64)
+            || status.GetString()!.Length > 64
+            || ContainsControl(status.GetString()!))
             return false;
         if (!item.TryGetProperty("location", out var location)
             || location.ValueKind != JsonValueKind.Object
@@ -214,6 +216,13 @@ public static class StrykerReportParser
             replacement = replacementElement.GetString() ?? "";
         if (replacement.Length > MaxTokenLength)
             replacement = replacement[..MaxTokenLength];
+        // Report strings echo attacker-influenceable repo content (mutated
+        // source text) and reach findings/RawOutput, hence the rework prompt:
+        // reject control characters (newlines, ANSI escapes) rather than
+        // embedding them. The report is then reported as malformed, never
+        // silently trimmed into a passing score.
+        if (ContainsControl(replacement))
+            return false;
         var coveredBy = 0;
         if (item.TryGetProperty("coveredBy", out var coveredByElement)
             && coveredByElement.ValueKind == JsonValueKind.Array)
@@ -225,4 +234,14 @@ public static class StrykerReportParser
 
     private static StrykerParseResult Fail(string error) =>
         new(false, Report: null, Error: error);
+
+    private static bool ContainsControl(string value)
+    {
+        foreach (var c in value)
+        {
+            if (char.IsControl(c))
+                return true;
+        }
+        return false;
+    }
 }

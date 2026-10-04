@@ -92,7 +92,7 @@ public sealed partial class StrykerMutationRunner
         if (!parsed.Success)
             throw new StrykerRunFailedException(
                 $"Stryker report at '{reportPath}' is unusable: {parsed.Error} The console output " +
-                $"cannot substitute for the machine-readable report: {Truncate(CombineOutput(run), 1200)}")
+                $"cannot substitute for the machine-readable report: {StrykerPaths.SanitizeForLog(CombineOutput(run), 1200)}")
             {
                 Kind = StrykerFailureKind.Report,
             };
@@ -101,7 +101,7 @@ public sealed partial class StrykerMutationRunner
         {
             Parsed = parsed.Report!,
             ToolVersion = toolVersion,
-            ConsoleTail = $"[exit {run.ExitCode}]\n" + Tail(CombineOutput(run), ConsoleTailChars),
+            ConsoleTail = $"[exit {run.ExitCode}]\n" + StrykerPaths.SanitizeForLog(CombineOutput(run), ConsoleTailChars),
             ChangedSet = group.ChangedFiles.ToHashSet(StringComparer.OrdinalIgnoreCase),
             ReportProjectRoot = parsed.Report!.ReportProjectRoot,
             ReportBytes = System.Text.Encoding.UTF8.GetByteCount(report.Stdout),
@@ -179,7 +179,17 @@ public sealed partial class StrykerMutationRunner
         if (!match.Success)
             return null;
         var version = match.Groups[1].Value.Trim();
-        return version.Length is >= 1 and <= 64 ? version : null;
+        // The banner echoes tool output that reaches findings/provenance:
+        // accept only a plausible version token so ANSI escapes or control
+        // characters can never flow downstream. Anything else is "unknown".
+        if (version.Length is < 1 or > 64)
+            return null;
+        foreach (var c in version)
+        {
+            if (!(char.IsLetterOrDigit(c) || c is '.' or '-' or '+' or '_'))
+                return null;
+        }
+        return version;
     }
 
     private async Task MakeOutputDirectoryAsync(
@@ -200,7 +210,7 @@ public sealed partial class StrykerMutationRunner
         if (!mkdir.Success)
             throw new StrykerRunFailedException(
                 $"Stryker could not create its transient output directory '{outputDir}' " +
-                $"(mkdir exited {mkdir.ExitCode}): {Truncate(CombineOutput(mkdir), 500)}")
+                $"(mkdir exited {mkdir.ExitCode}): {StrykerPaths.SanitizeForLog(CombineOutput(mkdir), 500)}")
             {
                 Kind = StrykerFailureKind.Tool,
             };
@@ -233,7 +243,10 @@ public sealed partial class StrykerMutationRunner
     private static StrykerRunFailedException ClassifyNoReport(
         int exitCode, string consoleOutput, string prefix)
     {
-        var tail = Truncate(consoleOutput, 1500);
+        // consoleOutput is raw tool stdout/stderr reflecting repo content and
+        // reaches the finding Description, hence the rework prompt: sanitize
+        // (control characters become '?', bounded length) before embedding.
+        var tail = StrykerPaths.SanitizeForLog(consoleOutput, 1500);
         if (exitCode == 0)
             return new StrykerRunFailedException(
                 $"{prefix} Stryker exited 0, but a zero exit without the machine-readable report " +
@@ -445,7 +458,7 @@ public sealed partial class StrykerMutationRunner
         builder.Append("  tool: dotnet-stryker ").Append(toolVersion)
             .Append(" (expected ").Append(expectedVersion).AppendLine(")");
         builder.Append("  source SHA: ").AppendLine(sourceSha);
-        builder.Append("  selection: ").AppendLine(Truncate(selection, SelectionMaxChars));
+        builder.Append("  selection: ").AppendLine(StrykerPaths.SanitizeForLog(selection, SelectionMaxChars));
         builder.Append("  config digest: ").AppendLine(digest);
         builder.AppendLine("  scope: changed-files-only (overall-project score unavailable by design)");
         builder.Append("  engine totals: valid=").Append(totalValid)
@@ -457,8 +470,11 @@ public sealed partial class StrykerMutationRunner
             .Append(" score=").Append(changedScore.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))
             .Append("% survivors=").Append(survivorCount).AppendLine();
         builder.AppendLine("  overall: unavailable (a changed-files-only run does not establish it)");
+        // Console tails are raw tool output and land in RawOutput, which the
+        // orchestrator surfaces to operators and rework prompts: re-sanitize
+        // (idempotent) so no control characters or ANSI escapes survive.
         foreach (var tail in consoleTails)
-            builder.AppendLine(Truncate(tail, ConsoleTailChars));
+            builder.AppendLine(StrykerPaths.SanitizeForLog(tail, ConsoleTailChars));
         var text = builder.ToString();
         return text.Length <= RawOutputMaxChars ? text : text[^RawOutputMaxChars..];
     }
@@ -479,17 +495,20 @@ public sealed partial class StrykerMutationRunner
 
     private static SurvivingMutant DescribeSurvivor(string repoPath, StrykerParsedMutant mutant)
     {
-        var replacement = mutant.Replacement.Length > 120
-            ? mutant.Replacement[..120] + "…"
-            : mutant.Replacement;
+        // Mutator/replacement echo report JSON strings (mutated source text)
+        // and reach the finding Title/Description, hence the rework prompt:
+        // sanitize before embedding even though the parser already rejects
+        // control characters (defense in depth against future callers).
+        var mutator = StrykerPaths.SanitizeForLog(mutant.Mutator, 120);
+        var replacement = StrykerPaths.SanitizeForLog(mutant.Replacement, 120);
         var detail = mutant.Status.Equals("NoCoverage", StringComparison.OrdinalIgnoreCase)
-            ? $"{mutant.Mutator} '{replacement}' has no covering test (uncovered)"
+            ? $"{mutator} '{replacement}' has no covering test (uncovered)"
             : mutant.CoveredBy > 0
-                ? $"{mutant.Mutator} '{replacement}' survived; covered by {mutant.CoveredBy} test(s), none killed it"
-                : $"{mutant.Mutator} '{replacement}' survived; no covering test recorded";
+                ? $"{mutator} '{replacement}' survived; covered by {mutant.CoveredBy} test(s), none killed it"
+                : $"{mutator} '{replacement}' survived; no covering test recorded";
         if (detail.Length > SurvivorDescriptionMaxChars)
             detail = detail[..SurvivorDescriptionMaxChars] + "…";
-        return new SurvivingMutant(repoPath, mutant.Line, mutant.Mutator, detail);
+        return new SurvivingMutant(repoPath, mutant.Line, mutator, detail);
     }
 
     private async Task KillAndCleanupAsync(ISandbox sandbox, string root, string outputDir)
@@ -534,10 +553,4 @@ public sealed partial class StrykerMutationRunner
             return result.Stderr;
         return result.Stdout + "\n" + result.Stderr;
     }
-
-    private static string Tail(string value, int maxLength) =>
-        value.Length <= maxLength ? value : value[^maxLength..];
-
-    private static string Truncate(string value, int maxLength) =>
-        value.Length <= maxLength ? value : value[..maxLength] + "…";
 }

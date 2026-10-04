@@ -71,11 +71,14 @@ public sealed partial class StrykerMutationRunner
             var reason = probe.ExitCode is 126 or 127
                 ? "the binary is not on PATH in the audit sandbox"
                 : $"the probe exited {probe.ExitCode}";
+            // Probe output is raw tool stderr/stdout reflecting repo content
+            // and reaches the finding Description, hence the rework prompt:
+            // sanitize before embedding.
             throw new StrykerToolMissingException(
                 $"Stryker tool unavailable: {reason}. {ProvisioningHint(opts)} " +
-                $"Probe output: {Truncate(CombineOutput(probe), 1000)}",
+                $"Probe output: {StrykerPaths.SanitizeForLog(CombineOutput(probe), 1000)}",
                 probe.ExitCode,
-                Truncate(CombineOutput(probe), 2000));
+                StrykerPaths.SanitizeForLog(CombineOutput(probe), 2000));
         }
     }
 
@@ -105,9 +108,9 @@ public sealed partial class StrykerMutationRunner
         if (!find.Success)
             throw new StrykerRunFailedException(
                 $"Stryker project discovery failed (find exited {find.ExitCode}). " +
-                $"Output: {Truncate(CombineOutput(find), 1000)}",
+                $"Output: {StrykerPaths.SanitizeForLog(CombineOutput(find), 1000)}",
                 find.ExitCode,
-                Truncate(CombineOutput(find), 2000))
+                StrykerPaths.SanitizeForLog(CombineOutput(find), 2000))
             {
                 Kind = StrykerFailureKind.Tool,
             };

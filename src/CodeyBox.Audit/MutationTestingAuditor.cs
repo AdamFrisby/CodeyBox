@@ -110,15 +110,18 @@ public sealed class MutationTestingAuditor : IAuditor
             // files" as "no changed files" would let a misconfigured base ref,
             // missing remote, or shallow clone silently green-light the gate
             // this whole feature is built to make un-gameable.
+            // Stderr is tool output reflecting repo content and reaches the
+            // finding Description, hence the rework prompt: sanitize first.
+            var safeEnumerationError = StrykerPaths.SanitizeForLog(enumerationError, 2000);
             return new AuditResult(false,
             [
                 new AuditFinding(
                     Name, AuditSeverity.Error,
                     "could not enumerate changed files",
                     "git diff failed twice (with and without the 'origin/' prefix) so the mutation-testing " +
-                    $"auditor cannot determine which files are in scope. Stderr: {enumerationError}"),
+                    $"auditor cannot determine which files are in scope. Stderr: {safeEnumerationError}"),
             ],
-            RawOutput: enumerationError);
+            RawOutput: safeEnumerationError);
         }
         var scoped = FilterToInScopeFiles(opts, listing.Files);
         if (scoped.Count == 0)
@@ -187,15 +190,22 @@ public sealed class MutationTestingAuditor : IAuditor
         foreach (var mutant in report.SurvivingMutantsInChangedCode)
         {
             if (!scopedSet.Contains(mutant.FilePath)) continue;
+            // Mutator/detail echo report JSON strings and reach the finding
+            // Title/Description, hence the rework prompt: sanitize (the
+            // runner already sanitizes, this is defense in depth for any
+            // future IMutationRunner implementation). FilePath is a validated
+            // repo-relative path (control-free by construction).
+            var safeMutator = StrykerPaths.SanitizeForLog(mutant.Mutator, 120);
+            var safeDetail = StrykerPaths.SanitizeForLog(mutant.Description, 240);
             findings.Add(new AuditFinding(
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
-                Title: $"surviving mutant: {mutant.Mutator}",
+                Title: $"surviving mutant: {safeMutator}",
                 Description:
-                    $"A '{mutant.Mutator}' mutation at {mutant.FilePath}:{mutant.Line} survived the test suite — " +
+                    $"A '{safeMutator}' mutation at {mutant.FilePath}:{mutant.Line} survived the test suite — " +
                     "no test failed when the mutation was applied, so the code path is effectively unverified. " +
                     "Tighten an existing assertion or add a test that would fail under this mutation. " +
-                    $"Mutator detail: {mutant.Description}",
+                    $"Mutator detail: {safeDetail}",
                 Location: $"{mutant.FilePath}:{mutant.Line}"));
         }
 
@@ -384,7 +394,11 @@ public sealed class MutationTestingAuditor : IAuditor
         };
         return new AuditFinding(
             auditorName, AuditSeverity.Error, title,
-            $"The mutation-testing engine produced no scores: {ex.GetType().Name}: {ex.Message}");
+            // ex.Message embeds sanitized tool/report output plus static
+            // runner text, but defensively re-sanitize (idempotent): finding
+            // Descriptions are embedded verbatim in the tool-bearing rework
+            // prompt, so no control characters or ANSI escapes may survive.
+            $"The mutation-testing engine produced no scores: {ex.GetType().Name}: {StrykerPaths.SanitizeForLog(ex.Message, 4000)}");
     }
 
     private static string Fmt(double percent)

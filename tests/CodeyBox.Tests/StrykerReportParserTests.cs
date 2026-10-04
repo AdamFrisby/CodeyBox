@@ -255,4 +255,27 @@ public sealed class StrykerReportParserTests
         Assert.Null(result.Report!.ScorePercent);
         Assert.Equal(["a.cs"], result.Report.Files);
     }
+
+    [Fact]
+    public void ControlCharactersInMutant_FailClosed()
+    {
+        // Report strings echo attacker-influenceable repo content (mutated
+        // source text) and flow into finding Titles/Descriptions, hence the
+        // rework prompt: control characters (newlines, ANSI escapes) must
+        // fail the parse, never embed.
+        var hostile = new[]
+        {
+            """{ "schemaVersion": 2, "files": { "a.cs": { "mutants": [ { "id": "0", "mutatorName": "Bad\nmutator", "location": { "start": { "line": 1, "column": 1 } }, "status": "Survived" } ] } } }""",
+            """{ "schemaVersion": 2, "files": { "a.cs": { "mutants": [ { "id": "0", "mutatorName": "M", "replacement": "x\u001b[31m", "location": { "start": { "line": 1, "column": 1 } }, "status": "Survived" } ] } } }""",
+            """{ "schemaVersion": 2, "files": { "a.cs": { "mutants": [ { "id": "0", "mutatorName": "M", "location": { "start": { "line": 1, "column": 1 } }, "status": "Survived\nKilled" } ] } } }""",
+        };
+
+        foreach (var json in hostile)
+        {
+            var result = StrykerReportParser.TryParse(json);
+
+            Assert.False(result.Success);
+            Assert.Null(result.Report);
+        }
+    }
 }
