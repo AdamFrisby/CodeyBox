@@ -335,7 +335,7 @@ public sealed class ExecutorPhaseBroker : IDisposable
             _running.Remove(key);
             RemoveFromPendingLocked(entry);
         }
-        var detail = string.IsNullOrWhiteSpace(message) ? "executor reported an infrastructure failure" : Truncate(message.Trim(), 2048);
+        var detail = string.IsNullOrWhiteSpace(message) ? "executor reported an infrastructure failure" : Truncate(message.Trim(), MaxFailureMessageChars);
         entry.Completion.TrySetException(new ExecutorPhaseTransportException(host, "run-phase", detail));
         DeleteQuietly(entry.StageInTarPath);
         return Task.CompletedTask;
@@ -362,7 +362,7 @@ public sealed class ExecutorPhaseBroker : IDisposable
             _running.Remove(key);
             RemoveFromPendingLocked(entry);
         }
-        var detail = string.IsNullOrWhiteSpace(message) ? "executor reported a phase failure" : Truncate(message.Trim(), 2048);
+        var detail = string.IsNullOrWhiteSpace(message) ? "executor reported a phase failure" : Truncate(message.Trim(), MaxFailureMessageChars);
         entry.Completion.TrySetException(new ExecutorPhaseException(detail));
         DeleteQuietly(entry.StageInTarPath);
         return Task.CompletedTask;
@@ -422,8 +422,42 @@ public sealed class ExecutorPhaseBroker : IDisposable
         return trimmed;
     }
 
-    private static string Truncate(string value, int maxLength) =>
-        value.Length <= maxLength ? value : value[..maxLength] + "…";
+    /// <summary>
+    /// Maximum executor-supplied failure message length kept in the
+    /// dispatch exception. Bounds how much untrusted text reaches logs.
+    /// </summary>
+    internal const int MaxFailureMessageChars = 2048;
+
+    private static string Truncate(string value, int maxLength)
+    {
+        var sanitized = SanitizeForLog(value);
+        return sanitized.Length <= maxLength ? sanitized : sanitized[..maxLength] + "…";
+    }
+
+    /// <summary>
+    /// Replaces CR/LF and other control characters with a space so
+    /// executor-supplied text cannot inject new log lines (CWE-117).
+    /// Applied at the fail-message sink, so every current and future
+    /// caller of <see cref="Truncate"/> is protected.
+    /// </summary>
+    private static string SanitizeForLog(string value)
+    {
+        var replaced = false;
+        var chars = (char[]?)null;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (char.IsControl(value[i]))
+            {
+                if (!replaced)
+                {
+                    chars = value.ToCharArray();
+                    replaced = true;
+                }
+                chars![i] = ' ';
+            }
+        }
+        return replaced ? new string(chars!) : value;
+    }
 
     private void ThrowIfDisposedLocked(string host, string operation)
     {

@@ -437,9 +437,29 @@ public sealed class ExecutorPhaseProxy : IExecutorPhaseRunner
 
     private static string TruncateForLog(string value, int maxLength = 256)
     {
-        if (value.Length <= maxLength)
-            return value;
-        return value[..maxLength] + "…";
+        var sanitized = SanitizeForLog(value);
+        if (sanitized.Length <= maxLength)
+            return sanitized;
+        return sanitized[..maxLength] + "…";
+    }
+
+    private static string SanitizeForLog(string value)
+    {
+        var replaced = false;
+        var chars = (char[]?)null;
+        for (var i = 0; i < value.Length; i++)
+        {
+            if (char.IsControl(value[i]))
+            {
+                if (!replaced)
+                {
+                    chars = value.ToCharArray();
+                    replaced = true;
+                }
+                chars![i] = ' ';
+            }
+        }
+        return replaced ? new string(chars!) : value;
     }
 
     private async Task<IReadOnlyList<string>> SelectExecutorChainAsync(

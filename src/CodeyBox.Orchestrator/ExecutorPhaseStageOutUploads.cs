@@ -6,15 +6,15 @@ namespace CodeyBox.Orchestrator;
 /// Holds executor-uploaded stage-out tars between the upload call and the
 /// completion call of the two-call complete protocol
 /// (<c>POST phase/stageout</c> then <c>POST phase/complete</c>). Keyed by
-/// dispatch key with exact host ownership: one host can never complete with
-/// another host's upload. Entries expire under the lease clock and are swept
-/// on every operation so an executor that uploads but never completes cannot
-/// pin orchestrator temp disk forever.
+/// (host, dispatch key) with exact host ownership: one host can never
+/// overwrite or complete with another host's upload. Entries expire under
+/// the lease clock and are swept on every operation so an executor that
+/// uploads but never completes cannot pin orchestrator temp disk forever.
 /// </summary>
 public sealed class ExecutorPhaseStageOutUploads : IDisposable
 {
     private readonly object _mutex = new();
-    private readonly Dictionary<string, UploadEntry> _uploads = new(StringComparer.Ordinal);
+    private readonly Dictionary<(string HostId, string DispatchKey), UploadEntry> _uploads = new();
     private readonly TimeProvider _clock;
     private bool _disposed;
 
@@ -26,7 +26,10 @@ public sealed class ExecutorPhaseStageOutUploads : IDisposable
     /// <summary>
     /// Stores <paramref name="tarPath"/> for (<paramref name="hostId"/>,
     /// <paramref name="dispatchKey"/>), expiring at <paramref name="expiresAt"/>.
-    /// Replaces any prior upload for the same key (deleting the orphaned file).
+    /// Replaces any prior upload for the same (host, key) pair (deleting the
+    /// orphaned file). An upload from another host for the same dispatch key
+    /// is stored separately and never overwrites or deletes this entry, so a
+    /// foreign host cannot destroy a dispatch's staged-back tar.
     /// </summary>
     public void Put(string hostId, string dispatchKey, string tarPath, DateTimeOffset expiresAt)
     {
@@ -37,9 +40,10 @@ public sealed class ExecutorPhaseStageOutUploads : IDisposable
         {
             ThrowIfDisposed();
             SweepExpiredLocked(_clock.GetUtcNow());
-            if (_uploads.Remove(key, out var prior) && !string.Equals(prior.TarPath, tarPath, StringComparison.Ordinal))
+            var mapKey = (host, key);
+            if (_uploads.Remove(mapKey, out var prior) && !string.Equals(prior.TarPath, tarPath, StringComparison.Ordinal))
                 DeleteQuietly(prior.TarPath);
-            _uploads[key] = new UploadEntry(host, tarPath, expiresAt);
+            _uploads[mapKey] = new UploadEntry(host, tarPath, expiresAt);
         }
     }
 
@@ -47,7 +51,8 @@ public sealed class ExecutorPhaseStageOutUploads : IDisposable
     /// Takes the uploaded tar for (<paramref name="hostId"/>,
     /// <paramref name="dispatchKey"/>), removing the entry. Ownership is
     /// exact-match; unknown, expired, or foreign entries throw
-    /// <see cref="ExecutorPhaseTransportException"/>.
+    /// <see cref="ExecutorPhaseTransportException"/> without touching any
+    /// other host's upload.
     /// </summary>
     public string Take(string? hostId, string? dispatchKey)
     {
@@ -57,13 +62,8 @@ public sealed class ExecutorPhaseStageOutUploads : IDisposable
         {
             ThrowIfDisposed();
             SweepExpiredLocked(_clock.GetUtcNow());
-            if (!_uploads.Remove(key, out var entry))
+            if (!_uploads.Remove((host, key), out var entry))
                 throw new ExecutorPhaseTransportException(host, "phase-complete", "No stage-out upload matches this dispatch key.");
-            if (!string.Equals(entry.HostId, host, StringComparison.Ordinal))
-            {
-                DeleteQuietly(entry.TarPath);
-                throw new ExecutorPhaseTransportException(host, "phase-complete", "No stage-out upload matches this dispatch key.");
-            }
             return entry.TarPath;
         }
     }
