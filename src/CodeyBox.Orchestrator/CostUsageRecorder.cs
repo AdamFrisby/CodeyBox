@@ -12,9 +12,18 @@ namespace CodeyBox.Orchestrator;
 /// capture never fails a pipeline phase.
 /// Extracted mechanically from <see cref="PipelineRunner"/>; behavior is unchanged.
 /// </summary>
-internal sealed class CostUsageRecorder
+public sealed class CostUsageRecorder
 {
     internal const string ElapsedFallbackMetadataSource = "elapsed_fallback";
+    internal const string ExecutorUsageMetadataSource = "executor";
+
+    /// <summary>
+    /// Largest USD figure ever attributed to one executor phase. Bounds the
+    /// legacy micro-dollar conversion so a hostile usage report cannot
+    /// overflow it: 9e12 USD converts to 9e18 micro-dollars, just under
+    /// <see cref="long.MaxValue"/>.
+    /// </summary>
+    internal const decimal MaxAttributableUsd = 9_000_000_000_000m;
 
     private readonly IWorkItemCostStore? _costStore;
     private readonly IAgentUsageStore? _usageStore;
@@ -144,6 +153,129 @@ internal sealed class CostUsageRecorder
                 _log.LogWarning(ex, "Usage: failed to persist completion event for work item {Id} phase '{Phase}'",
                     item.Id, phase);
             }
+        }
+    }
+
+    /// <summary>
+    /// Best-effort cost capture: extracts token counts from agent output, calculates
+    /// estimated USD, and persists a cost row. Any failure is swallowed with a warning
+    /// so cost capture never aborts a pipeline phase.
+    /// </summary>
+    public async Task TryRecordExecutorUsageAsync(
+        ExecutorPhaseRequest request,
+        ExecutorPhaseResult result,
+        string hostId,
+        DateTimeOffset startedAt,
+        DateTimeOffset endedAt,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(result);
+        if (_costStore is null && _usageStore is null)
+            return;
+        if (result.Usage is null)
+            return;
+
+        try
+        {
+            // The executor reports pre-extracted token counts (there is no
+            // stdout to parse orchestrator-side), so they land in the same
+            // cost/usage tables with the same row shape the local path
+            // writes — colocated and remote phases attribute identically
+            // because both flow through this one method. The agent kind is
+            // the phase's required credential when one was required,
+            // otherwise the executor fallback; the instance is the host that
+            // actually ran the phase.
+            var kindValue = string.IsNullOrWhiteSpace(request.RequiredCredential)
+                ? "executor"
+                : request.RequiredCredential.Trim();
+            var agentKind = new AgentKind(kindValue);
+            var instanceId = string.IsNullOrWhiteSpace(hostId) ? null : hostId.Trim();
+            var snapshot = new AgentCostSnapshot(
+                InputTokens: (int)Math.Min(Math.Max(0, result.Usage.InputTokens), int.MaxValue),
+                CachedInputTokens: 0,
+                OutputTokens: (int)Math.Min(Math.Max(0, result.Usage.OutputTokens), int.MaxValue),
+                ModelId: null);
+            var usd = Math.Min(Math.Max(0m, result.Usage.CostUsd), MaxAttributableUsd);
+            var iteration = request.Attempt == int.MaxValue ? int.MaxValue : request.Attempt + 1;
+
+            if (_costStore is not null)
+            {
+                try
+                {
+                    await _costStore.RecordAsync(new WorkItemCost
+                    {
+                        Id = Guid.NewGuid().ToString(),
+                        WorkItemId = request.WorkItemId,
+                        Phase = request.Phase,
+                        Iteration = iteration,
+                        AgentKind = agentKind.Value,
+                        AgentInstanceId = instanceId,
+                        ModelId = null,
+                        InputTokens = snapshot.InputTokens,
+                        CachedInputTokens = 0,
+                        OutputTokens = snapshot.OutputTokens,
+                        EstimatedUsd = (double)usd,
+                        StartedAt = startedAt,
+                        EndedAt = endedAt,
+                        RawMetadataJson = JsonSerializer.Serialize(new
+                        {
+                            source = ExecutorUsageMetadataSource,
+                            host = instanceId,
+                            outcome = result.Outcome.ToString(),
+                        }),
+                        HasExtractedTokenUsage = true,
+                    }, ct).ConfigureAwait(false);
+
+                    var agentTag = new KeyValuePair<string, object?>("agent.kind", agentKind.Value);
+                    var agentInstanceTag = new KeyValuePair<string, object?>("agent.instance", instanceId ?? agentKind.Value);
+                    var modelTag = new KeyValuePair<string, object?>("model", "(default)");
+                    CodeyBoxMeters.AgentTokens.Add(snapshot.InputTokens, agentTag, agentInstanceTag, modelTag,
+                        new KeyValuePair<string, object?>("token_type", "input"));
+                    CodeyBoxMeters.AgentTokens.Add(snapshot.OutputTokens, agentTag, agentInstanceTag, modelTag,
+                        new KeyValuePair<string, object?>("token_type", "output"));
+                    CodeyBoxMeters.AgentCostUsd.Add((double)usd, agentTag, agentInstanceTag, modelTag);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Cost: failed to persist executor row for work item {Id} phase '{Phase}'",
+                        request.WorkItemId, request.Phase);
+                }
+            }
+
+            if (_usageStore is not null)
+            {
+                try
+                {
+                    await _usageStore.RecordAsync(new AgentUsageEvent
+                    {
+                        Id = Guid.NewGuid().ToString(),
+                        TimeUtc = endedAt,
+                        AgentKind = agentKind.Value,
+                        AgentInstanceId = instanceId,
+                        ModelId = null,
+                        Phase = request.Phase,
+                        StartedUtc = startedAt,
+                        EndedUtc = endedAt,
+                        ElapsedMs = (long)Math.Max(0, (endedAt - startedAt).TotalMilliseconds),
+                        InputTokens = snapshot.InputTokens,
+                        CachedInputTokens = 0,
+                        OutputTokens = snapshot.OutputTokens,
+                        CostMicroCents = AgentUsageEvent.UsdToMicroCents(usd),
+                        WorkItemId = request.WorkItemId,
+                    }, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Usage: failed to persist executor event for work item {Id} phase '{Phase}'",
+                        request.WorkItemId, request.Phase);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Cost: failed to attribute executor usage for work item {Id} phase '{Phase}'",
+                request.WorkItemId, request.Phase);
         }
     }
 

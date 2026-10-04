@@ -185,7 +185,21 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
         get { lock (_mutex) return _activeCount; }
     }
 
-    public async Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct)
+    public async Task<ExecutorPhaseResult> ExecutePhaseAsync(ExecutorPhaseRequest request, CancellationToken ct) =>
+        await ExecutePhaseAsync(request, onChunk: null, ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// Executes one dispatched phase like <see cref="ExecutePhaseAsync(ExecutorPhaseRequest, CancellationToken)"/>
+    /// while forwarding <paramref name="onChunk"/> to a streaming handler as
+    /// live agent output is produced. A null callback behaves exactly like
+    /// the non-streaming overload; a non-streaming handler ignores the
+    /// callback. The callback never fails the phase: a throwing callback is
+    /// swallowed here and only degrades observability.
+    /// </summary>
+    public async Task<ExecutorPhaseResult> ExecutePhaseAsync(
+        ExecutorPhaseRequest request,
+        Func<ExecutorStreamChunk, CancellationToken, Task>? onChunk,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
         var dispatchOptions = _dispatchOptionsAccessor();
@@ -220,7 +234,7 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
                 EnforceCacheLimitLocked();
                 var entry = new PhaseEntry(bodyHash);
                 _entries[dispatchKey] = entry;
-                entry.Execution = ExecuteAndCacheAsync(request, dispatchKey, dispatchOptions, entry, ct);
+                entry.Execution = ExecuteAndCacheAsync(request, dispatchKey, dispatchOptions, entry, onChunk, ct);
                 execution = entry.Execution;
             }
         }
@@ -232,6 +246,15 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
         string dispatchKey,
         ExecutorPhaseDispatchOptions dispatchOptions,
         PhaseEntry entry,
+        CancellationToken ct) =>
+        await ExecuteAndCacheAsync(request, dispatchKey, dispatchOptions, entry, onChunk: null, ct).ConfigureAwait(false);
+
+    private async Task<ExecutorPhaseResult> ExecuteAndCacheAsync(
+        ExecutorPhaseRequest request,
+        string dispatchKey,
+        ExecutorPhaseDispatchOptions dispatchOptions,
+        PhaseEntry entry,
+        Func<ExecutorStreamChunk, CancellationToken, Task>? onChunk,
         CancellationToken ct)
     {
         ExecutorPhaseResult result;
@@ -247,7 +270,7 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
                     "capacity",
                     "This executor declares MaxConcurrentSandboxes=0 and never accepts phases.");
             using var _ = await AcquireCapacityAsync(options.MaxConcurrentSandboxes, ct).ConfigureAwait(false);
-            result = await ExecuteCoreAsync(request, dispatchKey, options, dispatchOptions, ct).ConfigureAwait(false);
+            result = await ExecuteCoreAsync(request, dispatchKey, options, dispatchOptions, onChunk, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -274,6 +297,15 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
         string dispatchKey,
         ExecutorOptions options,
         ExecutorPhaseDispatchOptions dispatchOptions,
+        CancellationToken ct) =>
+        await ExecuteCoreAsync(request, dispatchKey, options, dispatchOptions, onChunk: null, ct).ConfigureAwait(false);
+
+    private async Task<ExecutorPhaseResult> ExecuteCoreAsync(
+        ExecutorPhaseRequest request,
+        string dispatchKey,
+        ExecutorOptions options,
+        ExecutorPhaseDispatchOptions dispatchOptions,
+        Func<ExecutorStreamChunk, CancellationToken, Task>? onChunk,
         CancellationToken ct)
     {
         var hostId = options.HostId.Trim();
@@ -318,7 +350,10 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
             ExecutorPhaseResult? raw;
             try
             {
-                raw = await _handler.ExecuteAsync(request, repoPath, sandbox, ct).ConfigureAwait(false);
+                if (onChunk is not null && _handler is IStreamingExecutorPhaseHandler streaming)
+                    raw = await streaming.ExecuteAsync(request, repoPath, sandbox, GuardChunkCallback(onChunk), ct).ConfigureAwait(false);
+                else
+                    raw = await _handler.ExecuteAsync(request, repoPath, sandbox, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -347,6 +382,25 @@ public sealed class ExecutorHostPhaseRunner : IExecutorPhaseRunner
             await ExecutorPhaseExecution.DisposeQuietAsync(sandbox, _log).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// Wraps an executor-side stream callback so a throwing observer only
+    /// degrades observability: chunk delivery never fails the phase.
+    /// </summary>
+    private Func<ExecutorStreamChunk, CancellationToken, Task> GuardChunkCallback(
+        Func<ExecutorStreamChunk, CancellationToken, Task> onChunk) =>
+        async (chunk, ct) =>
+        {
+            try
+            {
+                if (chunk is not null)
+                    await onChunk(chunk, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Executor stream chunk observer failed; continuing the phase without it");
+            }
+        };
 
     private async Task<IDisposable> AcquireCapacityAsync(int? capacity, CancellationToken ct)
     {

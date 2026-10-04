@@ -78,6 +78,49 @@ public sealed class ExecutorPhaseDispatchOptions
     public TimeSpan RuntimeUnhealthyBackoff { get; set; } = TimeSpan.FromMinutes(1);
 
     /// <summary>
+    /// How long an executor's outbound phase poll waits for a pending remote
+    /// dispatch before returning empty. The executor holds no inbound port:
+    /// it polls the orchestrator over its existing outbound channel, so this
+    /// bound keeps poll buffering finite on both ends. Hot-reloadable.
+    /// </summary>
+    public TimeSpan RemotePhasePollTimeout { get; set; } = TimeSpan.FromSeconds(25);
+
+    /// <summary>
+    /// Maximum time a remote dispatch may run before the orchestrator fails
+    /// it as a host-attributed transport failure (lease expiry) instead of
+    /// charging the work item with an agent failure. Bounds the broker's
+    /// per-dispatch state so a dead executor cannot pin orchestrator memory
+    /// or temp disk forever. Hot-reloadable.
+    /// </summary>
+    public TimeSpan RemotePhaseLeaseTimeout { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Largest single stream-chunk post accepted from a remote executor.
+    /// Larger posts are rejected at ingress before buffering. The relay's
+    /// <see cref="MaxStreamChunkChars"/> split still applies downstream, so
+    /// one hostile chunk cannot force an unbounded allocation through the
+    /// capture or the broadcast. Hot-reloadable.
+    /// </summary>
+    public int MaxRemoteStreamChunkChars { get; set; } = 256 * 1024;
+
+    /// <summary>
+    /// Maximum remote dispatches queued per executor host. Bounds broker
+    /// memory and temp disk when an executor stops polling. Excess dispatches
+    /// fail fast as host-attributed transport failures so the proxy fails
+    /// over elsewhere. Hot-reloadable.
+    /// </summary>
+    public int MaxPendingRemoteDispatchesPerHost { get; set; } = 64;
+
+    /// <summary>
+    /// Maximum stage-out uploads held per executor host between the upload
+    /// and completion calls of the two-call complete protocol. Bounds
+    /// orchestrator temp disk when an executor uploads under random keys
+    /// but never completes. Excess uploads are rejected fail-fast before
+    /// any bytes are written. Hot-reloadable.
+    /// </summary>
+    public int MaxPendingStageOutUploadsPerHost { get; set; } = 64;
+
+    /// <summary>
     /// Fails fast on misconfiguration so a bad bound surfaces at dispatch
     /// time instead of silently admitting an unbounded payload.
     /// </summary>
@@ -116,5 +159,20 @@ public sealed class ExecutorPhaseDispatchOptions
         if (RuntimeUnhealthyBackoff <= TimeSpan.Zero)
             throw new InvalidOperationException(
                 "CodeyBox:ExecutorPhaseDispatch:RuntimeUnhealthyBackoff must be positive.");
+        if (RemotePhasePollTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:RemotePhasePollTimeout must be positive.");
+        if (RemotePhaseLeaseTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:RemotePhaseLeaseTimeout must be positive.");
+        if (MaxRemoteStreamChunkChars <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:MaxRemoteStreamChunkChars must be > 0.");
+        if (MaxPendingRemoteDispatchesPerHost <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:MaxPendingRemoteDispatchesPerHost must be > 0.");
+        if (MaxPendingStageOutUploadsPerHost <= 0)
+            throw new InvalidOperationException(
+                "CodeyBox:ExecutorPhaseDispatch:MaxPendingStageOutUploadsPerHost must be > 0.");
     }
 }
