@@ -85,6 +85,7 @@
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.MypyAuditorPlugin\CodeyBox.MypyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.OxlintAuditorPlugin\CodeyBox.OxlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.GolangciLintAuditorPlugin\CodeyBox.GolangciLintAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.ClippyAuditorPlugin\CodeyBox.ClippyAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.RuffAuditorPlugin\CodeyBox.RuffAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.RubocopAuditorPlugin\CodeyBox.RubocopAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.CppcheckAuditorPlugin\CodeyBox.CppcheckAuditorPlugin.csproj" />
