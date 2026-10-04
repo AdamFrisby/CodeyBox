@@ -18,7 +18,13 @@ namespace CodeyBox.Orchestrator;
 ///   condition (deduped by base SHA) and emit detection events once.</item>
 ///   <item><see cref="EnsureFixItemAsync"/> — file ONE highest-priority fix
 ///   item per broken SHA (deduped via the marker external id and the store's
-///   unique (project, namespace, value) constraint).</item>
+///   unique (project, namespace, value) constraint), parked for explicit
+///   operator approval: it is created in
+///   <see cref="WorkItemState.NeedsOperatorInput"/> and never auto-enqueued,
+///   so no tool-bearing agent consumes the filed item until an operator
+///   reviews the captured failure and retries it. The captured build
+///   excerpt lives on the condition record and the item's operator note —
+///   never in the agent-consumed prompt.</item>
 ///   <item><see cref="HoldsBuildPhasesAsync"/> — dispatcher hold check:
 ///   an active condition exists for the project and the candidate is not
 ///   the filed fix item.</item>
@@ -184,6 +190,19 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
     /// marker-marked item for the same SHA, then a fresh create — losing a
     /// create race to the unique-external-id constraint collapses back to
     /// the concurrent winner.
+    ///
+    /// A freshly filed item is parked in
+    /// <see cref="WorkItemState.NeedsOperatorInput"/> and is NOT enqueued:
+    /// the build log that triggered it is untrusted repo-derived content,
+    /// so the repair must not auto-dispatch to a tool-bearing agent. The
+    /// agent-consumed prompt carries no build output at all (the agent
+    /// reproduces the failure itself); the captured excerpt is available to
+    /// the operator on the condition record and the item's note. An
+    /// operator approves dispatch by retrying the item, which returns it to
+    /// the queue — at which point the dispatch-hold exemption (it is the
+    /// repair path) lets it through while ordinary items stay held.
+    /// Adopted pre-existing items keep their current state: adoption means
+    /// a concurrent filing already owns this SHA.
     /// </summary>
     public async Task<WorkItemId?> EnsureFixItemAsync(
         BaseBrokenCondition condition,
@@ -225,13 +244,24 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
                 Prompt = BaseBrokenFixItemPolicy.BuildPrompt(
                     condition.BaseBranch,
                     condition.BaseSha,
-                    condition.ErrorSummary,
                     sourceItem.Id),
                 BaseBranch = condition.BaseBranch,
                 DependsOn = [],
                 QueuePosition = now.Ticks,
                 Priority = priority,
                 PushUpstream = sourceItem.PushUpstream,
+                // Parked for explicit operator approval (never auto-enqueued):
+                // the triggering build log is untrusted repo-derived content
+                // and must not auto-dispatch to a tool-bearing agent. The
+                // dispatch-eligible query excludes this state, so no worker
+                // picks it up; the operator retry path resumes it to Queued
+                // after reviewing the excerpt. The excerpt lives on LastError
+                // (operator surface, never composed into an agent prompt).
+                State = WorkItemState.NeedsOperatorInput,
+                LastError = BaseBrokenFixItemPolicy.BuildOperatorNote(
+                    condition.BaseBranch,
+                    condition.BaseSha,
+                    condition.ErrorSummary),
                 // System provenance: caller-facing creation always stamps a
                 // non-null initiator (server-resolved from auth), so a null
                 // initiator marks this row as orchestrator-filed. IsOpenFixItem
@@ -296,11 +326,9 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
             RegisterFixItem(condition.ProjectId, condition.BaseSha, fix.Id);
             AuditLog.WorkItemCreated(fix.Id, fix.ProjectId, fix.Title, fix.Initiator);
             _log.LogWarning(
-                "Auto-filed base-fix item {FixId} for project {ProjectId} (base '{Base}' tip {Sha})",
+                "Auto-filed base-fix item {FixId} for project {ProjectId} (base '{Base}' tip {Sha}); held for operator approval, not enqueued",
                 fix.Id, condition.ProjectId.Value, condition.BaseBranch, condition.BaseSha);
 
-            if (_queue is not null)
-                await _queue.EnqueueAsync(fix.Id, ct).ConfigureAwait(false);
             return fix.Id;
         }
         finally
