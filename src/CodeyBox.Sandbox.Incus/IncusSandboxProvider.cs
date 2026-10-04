@@ -100,6 +100,8 @@ public sealed class IncusSandboxProvider :
     private readonly TimeProvider _timeProvider;
     private readonly Func<Guid> _newGuid;
     private readonly Func<string, string?> _environmentVariableReader;
+    private readonly Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? _trustAccessor;
+    private readonly CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? _admission;
     private readonly string _lifecycleProjectName;
     private readonly string _lifecycleStagingRootPath;
     private readonly SemaphoreSlim _hostPreflightLock = new(1, 1);
@@ -130,8 +132,10 @@ public sealed class IncusSandboxProvider :
         IncusSandboxOptions options,
         ILogger<IncusSandboxProvider> log,
         ITimingStore? timings = null,
-        ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(() => options, log, timings, new IncusCliProcessRunner(() => options), resourceUsageStore)
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
+        : this(() => options, log, timings, new IncusCliProcessRunner(() => options), resourceUsageStore, trustAccessor: trustAccessor, admission: admission)
     {
     }
 
@@ -139,8 +143,10 @@ public sealed class IncusSandboxProvider :
         Func<IncusSandboxOptions> optionsAccessor,
         ILogger<IncusSandboxProvider> log,
         ITimingStore? timings = null,
-        ISandboxResourceUsageStore? resourceUsageStore = null)
-        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(optionsAccessor), resourceUsageStore)
+        ISandboxResourceUsageStore? resourceUsageStore = null,
+        Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
+        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(optionsAccessor), resourceUsageStore, trustAccessor: trustAccessor, admission: admission)
     {
     }
 
@@ -154,7 +160,9 @@ public sealed class IncusSandboxProvider :
         TimeProvider? timeProvider = null,
         Func<Guid>? newGuid = null,
         Func<string, string?>? environmentVariableReader = null,
-        IIncusInstanceStateReader? stateReader = null)
+        IIncusInstanceStateReader? stateReader = null,
+        Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
     {
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log ?? throw new ArgumentNullException(nameof(log));
@@ -164,6 +172,8 @@ public sealed class IncusSandboxProvider :
         _timeProvider = timeProvider ?? TimeProvider.System;
         _newGuid = newGuid ?? Guid.NewGuid;
         _environmentVariableReader = environmentVariableReader ?? Environment.GetEnvironmentVariable;
+        _trustAccessor = trustAccessor;
+        _admission = admission;
         _cli = new IncusCliRunner(runner, _timeProvider);
         _stateReader = stateReader ?? new DefaultIncusInstanceStateReader(_cli, _timeProvider);
         var initialOptions = ReadValidatedOptions();
@@ -373,13 +383,19 @@ public sealed class IncusSandboxProvider :
                 await RunExtraRuncmdAsync(options, name, ct).ConfigureAwait(false);
                 var launchSteps = launchFallbackPlan?.Steps
                     ?? throw new InvalidOperationException("A full-launch Incus VM requires a fallback provisioning plan.");
+                // Full-launch VMs provision executables without baseline
+                // naming, but admission still applies: unverified bytes never
+                // reach the guest.
+                var launchInputs = FingerprintExecutableInputs(options, ct);
                 await RunProvisioningWithPrivateWorkspaceAsync(
                     options,
                     name,
                     expectedExecutableContentSha256: null,
                     launchSteps,
                     mountGuestPaths: requestedMountPaths,
-                    ct)
+                    ct,
+                    launchInputs.Staged,
+                    _trustAccessor?.Invoke())
                     .ConfigureAwait(false);
             }
             await ApplyGuestLocalMountsAsync(options, name, mountPlan.Mounts, ct).ConfigureAwait(false);
@@ -822,16 +838,18 @@ public sealed class IncusSandboxProvider :
         SandboxProfileFlavor flavor,
         CancellationToken ct)
     {
-        var fingerprints = FingerprintExecutableInputs(options, ct);
+        var inputs = FingerprintExecutableInputs(options, ct);
+        var provenance = BaselineContentHash.ComputeProvenanceFingerprint(inputs.Evidences);
         var baselineHash = IncusBaselineNaming.ComputeConfigHash(
             options,
             profileName,
             flavor,
             environmentVariableReader: null,
             ct,
-            fingerprints);
+            inputs.Fingerprints,
+            provenance);
         var liveName = IncusBaselineNaming.DeriveBaselineNameFromHash(options, profileName, flavor, baselineHash);
-        var toolchainHash = IncusBaselineNaming.ComputeSharedToolchainHash(options, fingerprints);
+        var toolchainHash = IncusBaselineNaming.ComputeSharedToolchainHash(options, inputs.Fingerprints, inputs.Evidences);
         return BaselinePin.FormatScopedPin(ProviderId, toolchainHash, liveName);
     }
 
@@ -841,20 +859,21 @@ public sealed class IncusSandboxProvider :
         SandboxProfileFlavor flavor,
         CancellationToken ct)
     {
-        var fingerprints = FingerprintExecutableInputs(options, ct);
+        var inputs = FingerprintExecutableInputs(options, ct);
         return IncusBaselineNaming.DeriveBaselineName(
             options,
             profileName,
             flavor,
-            executableContentSha256: fingerprints);
+            executableContentSha256: inputs.Fingerprints,
+            provenanceFingerprint: BaselineContentHash.ComputeProvenanceFingerprint(inputs.Evidences));
     }
 
-    private IReadOnlyList<string> FingerprintExecutableInputs(
+    private AdmittedExecutableInputs FingerprintExecutableInputs(
         IncusSandboxOptions options,
         CancellationToken ct)
     {
         if (options.ExecutableProvisions.Count == 0)
-            return [];
+            return new AdmittedExecutableInputs([], [], []);
 
         using var timeoutCancellation = new CancellationTokenSource(
             options.ImageProvisioningTimeout,
@@ -867,10 +886,30 @@ public sealed class IncusSandboxProvider :
         {
             _hostProvisioningInputGate.Wait(deadline.Token);
             gateHeld = true;
-            return IncusBaselineProvisioning.FingerprintExecutables(
-                options,
-                _environmentVariableReader,
-                deadline.Token);
+            try
+            {
+                return IncusBaselineProvisioning.AdmitAndFingerprintExecutables(
+                    options,
+                    _environmentVariableReader,
+                    _admission,
+                    _trustAccessor?.Invoke(),
+                    deadline.Token);
+            }
+            catch (CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException ex)
+            {
+                // Visible blocked/unavailable outcome for the affected
+                // artifact; the bake/provisioning fails instead of silently
+                // shipping unverified bytes.
+                CodeyBox.Core.AuditLog.ToolProvenanceBlocked(
+                    "(incus executable provisions)",
+                    options.ExecutableProvisions.Count > 0 ? options.ExecutableProvisions[0].HostSourcePath : string.Empty,
+                    ex.Outcome.ToString(),
+                    FirstProvenanceLine(ex.Message));
+                _log.LogError(
+                    "Incus executable provisioning blocked by artifact provenance ({Outcome}): {Detail}",
+                    ex.Outcome, FirstProvenanceLine(ex.Message));
+                throw;
+            }
         }
         catch (OperationCanceledException ex) when (
             !ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
@@ -885,6 +924,15 @@ public sealed class IncusSandboxProvider :
             if (gateHeld)
                 _hostProvisioningInputGate.Release();
         }
+    }
+
+    private static string FirstProvenanceLine(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "(no detail)";
+        var line = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        const int maxLength = 256;
+        return line.Length > maxLength ? line[..maxLength] + "…" : line;
     }
 
     public static bool IsOwnedBaselineRef(
@@ -1450,8 +1498,8 @@ public sealed class IncusSandboxProvider :
             }
         }
 
-        var fingerprints = FingerprintExecutableInputs(options, ct);
-        var liveToolchainHash = IncusBaselineNaming.ComputeSharedToolchainHash(options, fingerprints);
+        var inputs = FingerprintExecutableInputs(options, ct);
+        var liveToolchainHash = IncusBaselineNaming.ComputeSharedToolchainHash(options, inputs.Fingerprints, inputs.Evidences);
         if (!string.Equals(
                 BaselineContentHash.ToShortHash(liveToolchainHash),
                 pinToolchainHash,
@@ -1466,7 +1514,14 @@ public sealed class IncusSandboxProvider :
             options,
             profileName,
             flavor,
-            IncusBaselineNaming.ComputeConfigHash(options, profileName, flavor, null, ct, fingerprints));
+            IncusBaselineNaming.ComputeConfigHash(
+                options,
+                profileName,
+                flavor,
+                null,
+                ct,
+                inputs.Fingerprints,
+                BaselineContentHash.ComputeProvenanceFingerprint(inputs.Evidences)));
         return await EnsureBaselineAsync(
             options,
             profileName,
@@ -1510,14 +1565,17 @@ public sealed class IncusSandboxProvider :
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var executableFingerprints = FingerprintExecutableInputs(options, ct);
+            var executableInputs = FingerprintExecutableInputs(options, ct);
+            var executableFingerprints = executableInputs.Fingerprints;
+            var provenanceFingerprint = BaselineContentHash.ComputeProvenanceFingerprint(executableInputs.Evidences);
             var baselineHash = IncusBaselineNaming.ComputeConfigHash(
                 options,
                 profileName,
                 flavor,
                 _environmentVariableReader,
                 ct,
-                executableFingerprints);
+                executableFingerprints,
+                provenanceFingerprint);
             if (!string.Equals(
                     IncusBaselineNaming.DeriveBaselineNameFromHash(options, profileName, flavor, baselineHash),
                     baselineName,
@@ -1562,7 +1620,7 @@ public sealed class IncusSandboxProvider :
                     initArgs,
                     BaselineToolchainHashKey,
                     BaselineContentHash.ToShortHash(
-                        IncusBaselineNaming.ComputeSharedToolchainHash(options, executableFingerprints)));
+                        IncusBaselineNaming.ComputeSharedToolchainHash(options, executableFingerprints, executableInputs.Evidences)));
                 AddConfig(initArgs, BakeTokenKey, bakeToken);
                 candidateMayExist = true;
                 await _cli.RunCheckedAsync(
@@ -1590,7 +1648,9 @@ public sealed class IncusSandboxProvider :
                     executableFingerprints,
                     IncusNuGetFallback.PlanBakeSteps(options),
                     mountGuestPaths: [],
-                    ct).ConfigureAwait(false);
+                    ct,
+                    executableInputs.Staged,
+                    _trustAccessor?.Invoke()).ConfigureAwait(false);
                 // A copied VM receives a fresh cloud-init instance ID. Replacing user-data
                 // and cleaning cloud-init state prevents installer data and logs from
                 // persisting in the shared snapshot or commands re-running on clones.
@@ -2080,7 +2140,9 @@ public sealed class IncusSandboxProvider :
         IReadOnlyList<string>? expectedExecutableContentSha256,
         IReadOnlyList<SeedProvisioningStep> seedSteps,
         IReadOnlyList<string> mountGuestPaths,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission>? admittedExecutables = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions? trust = null)
     {
         if (options.ExecutableProvisions.Count == 0
             && options.BaselineVerificationCommands.Count == 0
@@ -2109,7 +2171,9 @@ public sealed class IncusSandboxProvider :
                     stagingRoot,
                     _environmentVariableReader,
                     _newGuid,
-                    provisioningCt);
+                    provisioningCt,
+                    admittedExecutables,
+                    trust);
             }
             finally
             {

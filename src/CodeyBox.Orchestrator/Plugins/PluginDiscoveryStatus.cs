@@ -41,6 +41,13 @@ public enum PluginSkipReason
 
     /// <summary>Plugin type loaded but its <c>IPluginInitializer</c> threw during startup.</summary>
     InitializationFailed,
+
+    /// <summary>
+    /// Artifact provenance enforcement refused the bundle (unknown digest,
+    /// failed verification, identity/provenance mismatch, missing evidence,
+    /// or unavailable verifier). The assembly was never loaded.
+    /// </summary>
+    ProvenanceBlocked,
 }
 
 /// <summary>

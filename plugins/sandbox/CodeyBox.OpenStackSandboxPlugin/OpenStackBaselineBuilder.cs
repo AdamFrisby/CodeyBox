@@ -32,6 +32,8 @@ internal sealed class OpenStackBaselineBuilder
     private readonly Func<string, string?> _environment;
     private readonly TimeProvider _clock;
     private readonly ILogger _log;
+    private readonly CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions? _trust;
+    private readonly CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? _admission;
 
     internal OpenStackBaselineBuilder(
         OpenStackSandboxOptions options,
@@ -41,7 +43,9 @@ internal sealed class OpenStackBaselineBuilder
         IOpenStackTransportFactory transports,
         Func<string, string?> environment,
         TimeProvider clock,
-        ILogger log)
+        ILogger log,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions? trust = null,
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
     {
         _options = options;
         _credentials = credentials;
@@ -51,6 +55,8 @@ internal sealed class OpenStackBaselineBuilder
         _environment = environment;
         _clock = clock;
         _log = log;
+        _trust = trust;
+        _admission = admission;
     }
 
     /// <summary>Computes the live scoped pin without building anything.</summary>
@@ -120,11 +126,14 @@ internal sealed class OpenStackBaselineBuilder
         string FullHash,
         string ShortHash,
         string ImageName,
-        IReadOnlyList<string> Fingerprints);
+        IReadOnlyList<string> Fingerprints,
+        string ProvenanceFingerprint,
+        IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission> Admitted);
 
     internal BaselinePlan Plan()
     {
-        var fingerprints = FingerprintExecutables();
+        var fingerprinted = FingerprintExecutables();
+        var fingerprints = fingerprinted.Fingerprints;
         var executables = new BaselineToolchainExecutable[_options.ExecutableProvisions.Count];
         for (var i = 0; i < _options.ExecutableProvisions.Count; i++)
         {
@@ -139,19 +148,40 @@ internal sealed class OpenStackBaselineBuilder
             _options.ExtraRuncmd,
             executables,
             _options.BaselineVerificationCommands);
-        var fullHash = BaselineContentHash.ComputeToolchainHash(inputs);
+        // Verified artifact identities join the image fingerprint only when
+        // enforcement produced them; otherwise the historical hash is unchanged.
+        var provenanceFingerprint = BaselineContentHash.ComputeProvenanceFingerprint(fingerprinted.Evidences);
+        var fullHash = BaselineContentHash.CombineToolchainHash(
+            BaselineContentHash.ComputeToolchainHash(inputs),
+            provenanceFingerprint);
         var shortHash = BaselineContentHash.ToShortHash(fullHash);
         return new BaselinePlan(
             inputs,
             fullHash,
             shortHash,
             OpenStackBaselineNaming.DeriveImageName(_options.BaselineImagePrefix, shortHash),
-            fingerprints);
+            fingerprints,
+            provenanceFingerprint,
+            fingerprinted.Admitted);
     }
 
-    private IReadOnlyList<string> FingerprintExecutables()
+    private sealed record FingerprintedInputs(
+        IReadOnlyList<string> Fingerprints,
+        IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ArtifactProvenanceEvidence> Evidences,
+        IReadOnlyList<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission> Admitted);
+
+    private FingerprintedInputs FingerprintExecutables()
     {
-        var result = new List<string>(_options.ExecutableProvisions.Count);
+        var fingerprints = new List<string>(_options.ExecutableProvisions.Count);
+        var evidences = new List<CodeyBox.Sandbox.ArtifactProvenance.ArtifactProvenanceEvidence>(_options.ExecutableProvisions.Count);
+        var admitted = new List<CodeyBox.Sandbox.ArtifactProvenance.ToolExecutableAdmission>(_options.ExecutableProvisions.Count);
+        var enforced = CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(_trust);
+        if (enforced && _admission is null)
+        {
+            throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                "Artifact provenance enforcement is enabled but no admission service is available; refusing to fingerprint executables.",
+                CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.VerifierUnavailable);
+        }
         var aggregateBytes = 0L;
         for (var i = 0; i < _options.ExecutableProvisions.Count; i++)
         {
@@ -165,23 +195,54 @@ internal sealed class OpenStackBaselineBuilder
                 throw new InvalidOperationException(
                     $"OpenStack baseline ExecutableProvisions[{i}].VmDestPath cannot be blank.");
             var hostPath = ExpandHostSourcePath(provision.HostSourcePath);
-            string fingerprint;
+            if (!enforced)
+            {
+                string fingerprint;
+                try
+                {
+                    fingerprint = BaselineContentHash.HashHostFile(
+                        hostPath,
+                        _options.MaxExecutableProvisionBytes,
+                        _options.MaxAggregateExecutableProvisionBytes,
+                        ref aggregateBytes);
+                }
+                catch (IOException ex)
+                {
+                    throw new InvalidOperationException(
+                        $"OpenStack baseline ExecutableProvisions[{i}]: cannot read host file '{hostPath}'.", ex);
+                }
+                fingerprints.Add(fingerprint);
+                continue;
+            }
             try
             {
-                fingerprint = BaselineContentHash.HashHostFile(
-                    hostPath,
-                    _options.MaxExecutableProvisionBytes,
-                    _options.MaxAggregateExecutableProvisionBytes,
-                    ref aggregateBytes);
+                var admission = _admission!.AdmitToolExecutable(hostPath, _trust!, CancellationToken.None);
+                var label = provision.Label ?? $"ExecutableProvisions[{i}]";
+                AuditLog.ToolProvenanceAdmitted(
+                    label, admission.Evidence.Digest, admission.Evidence.Identity, admission.Evidence.Issuer, admission.Evidence.Verifier);
+                admitted.Add(admission);
+                evidences.Add(admission.Evidence);
+                fingerprints.Add(admission.Evidence.Digest);
             }
-            catch (IOException ex)
+            catch (CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException ex)
             {
-                throw new InvalidOperationException(
-                    $"OpenStack baseline ExecutableProvisions[{i}]: cannot read host file '{hostPath}'.", ex);
+                AuditLog.ToolProvenanceBlocked(provision.Label ?? $"ExecutableProvisions[{i}]", hostPath, ex.Outcome.ToString(), FirstLine(ex.Message));
+                _log.LogError(
+                    "OpenStack executable provisioning blocked by artifact provenance ({Outcome}): {Detail}",
+                    ex.Outcome, FirstLine(ex.Message));
+                throw;
             }
-            result.Add(fingerprint);
         }
-        return result;
+        return new FingerprintedInputs(fingerprints, evidences, admitted);
+    }
+
+    private static string FirstLine(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "(no detail)";
+        var line = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        const int maxLength = 256;
+        return line.Length > maxLength ? line[..maxLength] + "…" : line;
     }
 
     private string ExpandHostSourcePath(string configuredPath)
@@ -473,14 +534,37 @@ internal sealed class OpenStackBaselineBuilder
     private async Task ProvisionAsync(
         IRemoteHostTransport transport, BaselinePlan plan, CancellationToken ct)
     {
+        var enforced = CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService.IsEnforcementEnabled(_trust);
+        if (enforced && plan.Admitted.Count != _options.ExecutableProvisions.Count)
+        {
+            throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                "Artifact provenance enforcement is enabled but executables were staged without admission; refusing to provision.",
+                CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.VerifierUnavailable);
+        }
         for (var i = 0; i < plan.Fingerprints.Count; i++)
         {
             var provision = _options.ExecutableProvisions[i];
             var hostPath = ExpandHostSourcePath(provision.HostSourcePath);
+            var stageSource = hostPath;
+            if (enforced)
+            {
+                // Stage only the admitted bytes: re-hash the staged copy and
+                // require the verified digest before it reaches the guest.
+                var admitted = plan.Admitted[i];
+                var confirmed = CodeyBox.Sandbox.ArtifactProvenance.ArtifactStaging.HashStagedFile(
+                    admitted.StagedPath, _trust!.MaxArtifactBytes, ct);
+                if (!string.Equals("sha256:" + confirmed, admitted.Evidence.Digest, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new CodeyBox.Sandbox.ArtifactProvenance.ArtifactBlockedException(
+                        $"Admitted executable bytes changed before staging; refusing to provision '{provision.VmDestPath}'.",
+                        CodeyBox.Sandbox.ArtifactProvenance.ProvenanceOutcome.CryptographicallyInvalid);
+                }
+                stageSource = admitted.StagedPath;
+            }
             var remoteStaged = $"{StageDirectory}/{i}";
             try
             {
-                await transport.StageInAsync(hostPath, remoteStaged, ct).ConfigureAwait(false);
+                await transport.StageInAsync(stageSource, remoteStaged, ct).ConfigureAwait(false);
             }
             catch (RemoteSshTransportException ex)
             {
