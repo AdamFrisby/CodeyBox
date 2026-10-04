@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodeyBox.PluginSdk.Tools;
+using static CodeyBox.PluginSdk.Tools.ExternalToolJsonHelpers;
 
 namespace CodeyBox.ClippyAuditorPlugin;
 
@@ -22,10 +23,18 @@ namespace CodeyBox.ClippyAuditorPlugin;
 /// findings. The rule id is the diagnostic's <c>code.code</c> (e.g.
 /// <c>clippy::needless_return</c>, <c>E0308</c>); the location is the first
 /// primary span's <c>file_name</c> plus <c>line_start</c> when positive —
-/// clippy emits paths relative to the process working directory, which the
-/// auditor sets to the audited worktree root, so relative paths need no
-/// relativization while absolute ones are resolved against
-/// <see cref="ExternalToolParseInput.ScanRoot"/>.</para>
+/// resolved through the shared
+/// <see cref="ExternalToolJsonHelpers.NormalizeReportedPath"/> policy
+/// against <see cref="ExternalToolParseInput.ScanRoot"/> (the directory the
+/// scan actually ran in): clippy emits paths relative to the process working
+/// directory, which the auditor sets to the audited worktree root, so
+/// in-tree paths arrive repository-relative while absolute or
+/// traversal-carrying span paths the audited repository can influence
+/// (Cargo <c>#[path]</c> attributes, symlinks, out-of-tree manifests) are
+/// collapsed and — when they cannot be made repository-relative — re-marked
+/// with an explicit <c>file://</c> scheme so the base's finding-path filter
+/// cannot misread them as repository-relative and silently drop or
+/// misattribute findings.</para>
 ///
 /// <para>Identical diagnostics emitted for several targets (e.g. a binary and
 /// its test harness both compiling <c>src/main.rs</c> under
@@ -145,7 +154,8 @@ internal sealed class ClippyJsonOutputParser : IExternalToolOutputParser
         if (chosen is null)
             return null;
 
-        var path = Relativize(GetString(chosen.Value, "file_name"u8), input.ScanRoot);
+        var path = NormalizeReportedPath(
+            GetString(chosen.Value, "file_name"u8), input.ScanRoot, input.WorkingDirectory);
         int? line = null;
         if (chosen.Value.TryGetProperty("line_start"u8, out var lineElement)
             && lineElement.ValueKind == JsonValueKind.Number
@@ -173,32 +183,4 @@ internal sealed class ClippyJsonOutputParser : IExternalToolOutputParser
             return inner.GetString();
         return null;
     }
-
-    private static string? Relativize(string? raw, string? scanRoot)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-            return null;
-        var path = raw.Trim().Replace('\\', '/');
-        while (path.StartsWith("./", StringComparison.Ordinal))
-            path = path[2..];
-        if (!path.StartsWith("/", StringComparison.Ordinal))
-            return string.IsNullOrWhiteSpace(path) ? null : path;
-        if (!string.IsNullOrWhiteSpace(scanRoot))
-        {
-            var root = scanRoot.Trim().Replace('\\', '/').TrimEnd('/');
-            if (path.Equals(root, StringComparison.Ordinal))
-                return null;
-            if (path.StartsWith(root + "/", StringComparison.Ordinal))
-                return path[(root.Length + 1)..];
-        }
-        return string.IsNullOrWhiteSpace(path) ? null : path;
-    }
-
-    private static string? GetString(JsonElement element, ReadOnlySpan<byte> name)
-        => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : null;
-
-    private static string Truncate(string value, int maxChars)
-        => value.Length <= maxChars ? value : value[..maxChars] + "...";
 }

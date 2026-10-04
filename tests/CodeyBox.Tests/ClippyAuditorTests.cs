@@ -487,6 +487,58 @@ public sealed class ClippyAuditorTests
     }
 
     [Fact]
+    public async Task ScopedManifestPathPlusExtraArgumentsFlag_IsDeterministicInfrastructure()
+    {
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, JsonClean, ""));
+        });
+
+        var auditor = new ClippyAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ManifestPath"] = "crates/demo/Cargo.toml",
+                ["Scoped:ExtraArguments"] = "--manifest-path=other/Cargo.toml",
+            }),
+            CancellationToken.None);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("--manifest-path", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task OutOfRootSpanPaths_AreMarkedNotRepoRelative()
+    {
+        const string json = """
+            {"reason":"compiler-message","package_id":"p","manifest_path":"/work/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"demo","src_path":"/work/src/main.rs","edition":"2021","doctest":false,"test":true},"message":{"rendered":"warning: x\n","$message_type":"diagnostic","children":[],"level":"warning","message":"absolute escape","spans":[{"file_name":"/outside/evil.rs","line_start":1,"line_end":1,"column_start":1,"column_end":5,"is_primary":true}],"code":{"code":"clippy::needless_return","explanation":null}}}
+            {"reason":"compiler-message","package_id":"p","manifest_path":"/work/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"demo","src_path":"/work/src/main.rs","edition":"2021","doctest":false,"test":true},"message":{"rendered":"warning: x\n","$message_type":"diagnostic","children":[],"level":"warning","message":"dot-dot escape","spans":[{"file_name":"vendor/../../escape.rs","line_start":5,"line_end":5,"column_start":1,"column_end":5,"is_primary":true}],"code":{"code":"clippy::needless_return","explanation":null}}}
+            {"reason":"build-finished","success":true}
+            """;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec) || IsVersionProbe(exec) || IsScanRootProbe(exec))
+                return Task.FromResult(Ok(exec));
+            return Task.FromResult(new SandboxExecResult(0, json, ""));
+        });
+
+        IAuditor auditor = new ClippyAuditor();
+        var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.Equal(2, result.Findings.Count);
+        foreach (var finding in result.Findings)
+            Assert.StartsWith("file://", finding.Location, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ScopedConfiguration_Offline_PassesOfflineFlag_AndDropsNetworkCapability()
     {
         SandboxExec? scanExec = null;

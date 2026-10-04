@@ -107,6 +107,8 @@ public sealed class ClippyAuditor : ExternalToolAuditorBase, IPluginInitializer
     /// <summary>Scoped-config key for <c>--manifest-path</c> — the <c>Cargo.toml</c> the scan is rooted at.</summary>
     public const string ManifestPathKey = "ManifestPath";
 
+    private const string ManifestPathFlag = "--manifest-path";
+
     /// <summary>Scoped-config boolean for <c>--offline</c>: no network access of any kind.</summary>
     public const string OfflineKey = "Offline";
 
@@ -206,15 +208,53 @@ public sealed class ClippyAuditor : ExternalToolAuditorBase, IPluginInitializer
             && !ExtraArgumentsSupplyFlag(options, "--offline", "--frozen"))
             args.Add("--offline");
 
-        var manifestPath = _manifestPath();
-        if (!string.IsNullOrWhiteSpace(manifestPath)
-            && !ExtraArgumentsSupplyFlag(options, "--manifest-path"))
+        if (EffectiveManifestPath(options, out var fromScopedKey) is { } manifestPath
+            && fromScopedKey)
         {
-            args.Add("--manifest-path");
-            args.Add(manifestPath.Trim());
+            args.Add(ManifestPathFlag);
+            args.Add(manifestPath);
         }
 
         return args;
+    }
+
+    /// <summary>
+    /// The manifest path the scan will actually consult: the scoped
+    /// <see cref="ManifestPathKey"/> value, or an operator-supplied
+    /// <c>--manifest-path</c> in <c>ExtraArguments</c> (which the base
+    /// appends verbatim, so this method never re-emits it). Both channels
+    /// carry values to the tool as argv entries, so both pass through the
+    /// shared argv guard — <see cref="ValidatedScopedValue"/> for the
+    /// scoped key, <see cref="ValidatedArgumentValue"/> for the
+    /// <c>ExtraArguments</c> value — and configuring both at once is a
+    /// deterministic configuration failure rather than a silent override at
+    /// the clap layer.
+    /// </summary>
+    /// <param name="fromScopedKey">
+    /// True when the returned value came from the scoped key — callers
+    /// emitting the flag themselves must not re-emit an
+    /// ExtraArguments-supplied one (the base appends those verbatim).
+    /// </param>
+    private string? EffectiveManifestPath(ExternalToolAuditorOptions options, out bool fromScopedKey)
+    {
+        var scoped = ValidatedScopedValue(_manifestPath(), ManifestPathKey);
+        var extraSupplied = TryGetExtraArgumentsFlagValue(options, ManifestPathFlag, out var extra);
+        fromScopedKey = scoped is not null;
+        if (scoped is not null && extraSupplied)
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' has --manifest-path configured in both "
+                + $"CodeyBox:Plugins:{PluginId}:{ManifestPathKey} and ExtraArguments — set it "
+                + "in exactly one place.")
+            { IsDeterministic = true };
+        if (scoped is not null || !extraSupplied)
+            return scoped;
+        if (extra is null)
+            throw new AuditUnavailableException(
+                $"could-not-verify: auditor '{Name}' ExtraArguments supplies '{ManifestPathFlag}' "
+                + "with no following value — pass it as '--manifest-path <path>' or "
+                + "'--manifest-path=<path>'.")
+            { IsDeterministic = true };
+        return ValidatedArgumentValue(extra, $"ExtraArguments '{ManifestPathFlag}'");
     }
 
     /// <summary>
