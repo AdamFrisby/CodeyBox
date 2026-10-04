@@ -126,6 +126,22 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
                 CurrentWorkItem: current);
         }
 
+        if (ShutdownCheckpointGuard.IsCheckpointed(current.Id))
+        {
+            // A graceful-shutdown checkpoint is authoritative for the rest of
+            // the process lifetime: refuse the terminal write so a slower
+            // worker path racing teardown cannot overwrite the resumable
+            // state with Failed. The next process starts with an empty guard
+            // and may still fail the item legitimately after restart.
+            _log.LogInformation(
+                "Work item {Id} was checkpointed on graceful shutdown; refusing terminal Failed transition to preserve resumable state {State}",
+                current.Id, current.State);
+            return new WorkItemTerminalTransitionResult(
+                Updated: false,
+                FailedWorkItem: null,
+                CurrentWorkItem: current);
+        }
+
         var attributed = command.ClearAgent
             ? current with
             {

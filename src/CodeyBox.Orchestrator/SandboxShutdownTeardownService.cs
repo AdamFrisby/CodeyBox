@@ -379,6 +379,7 @@ public sealed class SandboxShutdownTeardownService : IHostedLifecycleService
                     continue;
                 if (await _store.TryUpdateIfStateAsync(interrupted, item.State, CancellationToken.None))
                 {
+                    ShutdownCheckpointGuard.MarkCheckpointed(workItemId);
                     _log.LogInformation(
                         "Shutdown checkpoint: work item {WorkItemId} {FromState} -> {ToState} (interrupted; clean restart on next boot)",
                         workItemId, item.State, interrupted.State);

@@ -170,6 +170,17 @@ public sealed class WorkItemRepoReaper : BackgroundService
         if (!WorkItemStates.IsTerminal(item.State))
             return false;
 
+        if (ShutdownCheckpointGuard.IsCheckpointed(item.Id))
+        {
+            // The row reads terminal only because a worker racing shutdown
+            // teardown overwrote the shutdown checkpoint; the checkpoint is
+            // authoritative, so the clone must survive for the clean restart.
+            _log.LogInformation(
+                "WorkItemRepoReaper: work item {WorkItemId} was checkpointed on graceful shutdown; clone survives even though the row reads terminal ({State})",
+                item.Id, item.State);
+            return false;
+        }
+
         var now = _time.GetUtcNow();
         var grace = opts.GracePeriod < TimeSpan.Zero ? TimeSpan.Zero : opts.GracePeriod;
         var age = now - item.UpdatedAt;
@@ -330,6 +341,19 @@ public sealed class WorkItemRepoReaper : BackgroundService
                     continue;
                 }
 
+                if (ShutdownCheckpointGuard.IsCheckpointed(workItemId))
+                {
+                    // The row reads terminal only because a worker racing
+                    // shutdown teardown overwrote the shutdown checkpoint; the
+                    // checkpoint is authoritative, so the clone must survive
+                    // for the clean restart.
+                    summary.SkippedShutdownCheckpoint++;
+                    _log.LogInformation(
+                        "WorkItemRepoReaper: work item {WorkItemId} was checkpointed on graceful shutdown; clone survives even though the row reads terminal ({State})",
+                        workItemId, item.State);
+                    continue;
+                }
+
                 var age = now - item.UpdatedAt;
                 if (grace > TimeSpan.Zero && age < grace)
                 {
@@ -352,6 +376,17 @@ public sealed class WorkItemRepoReaper : BackgroundService
                 if (refreshed is null || !WorkItemStates.IsTerminal(refreshed.State))
                 {
                     summary.SkippedNonTerminal++;
+                    continue;
+                }
+
+                if (ShutdownCheckpointGuard.IsCheckpointed(workItemId))
+                {
+                    // Re-check after the refresh: the checkpoint mark may have
+                    // landed while the sweep was reading the row.
+                    summary.SkippedShutdownCheckpoint++;
+                    _log.LogInformation(
+                        "WorkItemRepoReaper: work item {WorkItemId} was checkpointed on graceful shutdown; clone survives even though the row reads terminal ({State})",
+                        workItemId, refreshed.State);
                     continue;
                 }
 
@@ -456,5 +491,6 @@ public sealed class RepoReapSummary
     public int SkippedNonTerminal { get; set; }
     public int SkippedWithinGrace { get; set; }
     public int SkippedUnknown { get; set; }
+    public int SkippedShutdownCheckpoint { get; set; }
     public int Errors { get; set; }
 }

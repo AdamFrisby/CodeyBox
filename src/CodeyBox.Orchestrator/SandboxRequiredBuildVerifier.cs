@@ -419,6 +419,15 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         }
         catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
+            if (ShutdownCheckpointGuard.IsShutdownVmStartInterruption(ex))
+            {
+                // The sandbox-create/VM-start died with exit 143: SIGTERMed by
+                // host shutdown, not an infrastructure defect. Rethrow so the
+                // worker's host-shutdown handling leaves the shutdown
+                // checkpoint alone instead of reporting "could not verify
+                // required build" as an infrastructure failure.
+                throw;
+            }
             return RequiredBuildVerificationResult.Unavailable(
                 $"could not verify required build: {SingleLineSummary(ex.Message)}",
                 output: string.Empty);
