@@ -606,6 +606,13 @@ public sealed partial class PipelineRunner
     internal const int MergeSandboxStagingRestoreAttempts = 2;
 
     /// <summary>
+    /// Prefix for the short-lived branch pointing at a merge-result commit
+    /// while the landing queue verifies it builds. The full branch is this
+    /// prefix plus the work-item id.
+    /// </summary>
+    internal const string MergeVerifyBranchPrefix = "codeybox/merge-verify/";
+
+    /// <summary>
     /// Creates a sandbox for the merge / conflict-rework phase, recovering once
     /// from a mid-mount disappearance of the staging clone by re-running
     /// <c>git clone --bare</c> into <paramref name="stagingPath"/> and retrying
@@ -741,7 +748,7 @@ public sealed partial class PipelineRunner
             // short-lived branch at the merge commit so the sandbox checks
             // out the exact merge-result tree. Removed in the finally below
             // on every exit path.
-            var verifyBranch = $"codeybox/merge-verify/{item.Id}";
+            var verifyBranch = $"{MergeVerifyBranchPrefix}{item.Id}";
             await _gitHost.SetBranchToCommitAsync(repoId, verifyBranch, mergeSha, ct);
             try
             {
@@ -787,8 +794,8 @@ public sealed partial class PipelineRunner
     /// Deletes only when the ref still points at <paramref name="mergeSha"/>:
     /// if anything repointed it after verification (a TOCTOU race with an
     /// out-of-band writer reusing the name), the foreign ref is left alone
-    /// and the orphaned label — pointing at an already-landed merge commit
-    /// — is harmless.
+    /// and the orphaned label — pointing at the verified merge commit
+    /// (landed or refused) — is harmless.
     /// </summary>
     private async Task DeleteMergeVerifyBranchBestEffortAsync(
         string repoId,
