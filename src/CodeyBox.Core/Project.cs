@@ -102,6 +102,14 @@ public sealed record Project
     public ProjectAudit Audit { get; init; } = new();
 
     /// <summary>
+    /// Opt-in audit check-run publication for this project. Default: disabled.
+    /// Even when enabled, publication only reports structured audit findings for
+    /// the exact audited commit — it never approves merges or changes gating.
+    /// See <c>docs/concepts/audit-checks.md</c>.
+    /// </summary>
+    public ProjectAuditChecks AuditChecks { get; init; } = new();
+
+    /// <summary>
     /// Override the git commit author name for this project. When set, takes
     /// precedence over the host's global git identity. Falls back to the host
     /// identity, then to "CodeyBox".
