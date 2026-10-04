@@ -254,6 +254,17 @@ public sealed record AgentQuotaSnapshot
     /// reset-credit-expiry tracker and reset advisor.
     /// </summary>
     public int? ResetCreditsAvailable { get; init; }
+
+    /// <summary>
+    /// Signed overage/spend ledger in micro-dollars, when the provider exposes
+    /// one (Devin's <c>plan_status.overage_balance_micros</c>). Negative means
+    /// the account owes money (post-paid overage debt); positive means prepaid
+    /// top-up credit; null means the field was absent. Purely informational —
+    /// it does not gate routing today; it is the foundation for a future spend
+    /// guard. Deliberately separate from <see cref="BalanceRemaining"/>: that
+    /// field drives depleting-balance pool gating, which must not apply here.
+    /// </summary>
+    public long? OverageBalanceMicros { get; init; }
 }
 
 public sealed record ModelQuota

@@ -281,7 +281,8 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
 
     // Proto field numbers on GetUserStatusResponse / PlanStatus — verified by
     // decoding a live response (devin 3000.11.1, 2026-09-21). Unset int64
-    // fields arrive as ulong.MaxValue and are filtered by TryGetRealVarint.
+    // fields arrive as ulong.MaxValue and are filtered by TryGetRealVarint
+    // (TryGetSignedVarint for the signed overage ledger, field 16).
     private const int FieldUserStatus = 1;
     private const int FieldPlanInfo = 2;
     private const int PlanStatusField = 13;
@@ -299,6 +300,21 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
     {
         var value = message.TryGetVarint(field);
         return value is null or ulong.MaxValue ? null : value;
+    }
+
+    /// <summary>
+    /// Reads a standard (non-zigzag) proto <c>int64</c> field as its
+    /// two's-complement signed value. The live payload shape proves plain
+    /// <c>int64</c>: unset fields arrive as <c>ulong.MaxValue</c>, i.e. the
+    /// 10-byte varint encoding of -1 — a <c>sint64</c> zigzag encoding would
+    /// carry -1 as varint 1 instead. The -1 sentinel still counts as absent.
+    /// </summary>
+    private static long? TryGetSignedVarint(DevinProtoWire.Message message, int field)
+    {
+        var value = message.TryGetVarint(field);
+        if (value is null or ulong.MaxValue)
+            return null;
+        return unchecked((long)value.Value);
     }
 
     internal static AgentQuotaSnapshot ParseResponse(byte[] body)
@@ -370,9 +386,17 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
         var notes = new List<string>(2);
         if (planName is not null)
             notes.Add($"plan {planName}");
-        var overageMicros = TryGetRealVarint(planStatus, PlanStatusOverageMicrosField);
-        if (overageMicros is > 0)
-            notes.Add($"overage balance ${overageMicros.Value / 1_000_000.0:0.##}");
+        // Semantics of overage_balance_micros (signed ledger, micro-dollars):
+        // negative = the account OWES money (post-paid overage debt — Devin
+        // non-free models are paid, so this is real spend); positive = prepaid
+        // top-up credit remaining; zero/absent = nothing to report. Decoding
+        // must stay signed: a negative int64 read as unsigned wraps to ~1.8e19
+        // micros and renders as trillions of dollars of fake credit.
+        var overageMicros = TryGetSignedVarint(planStatus, PlanStatusOverageMicrosField);
+        if (overageMicros is < 0)
+            notes.Add($"overage balance -${-overageMicros.Value / 1_000_000.0:0.##} (owed)");
+        else if (overageMicros is > 0)
+            notes.Add($"overage balance ${overageMicros.Value / 1_000_000.0:0.##} (credit)");
 
         return new AgentQuotaSnapshot
         {
@@ -380,6 +404,7 @@ public sealed class DevinQuotaProbe : IAgentQuotaProbe, IAgentQuotaCacheInvalida
             ResetAt = binding.ResetAt,
             Notes = notes.Count == 0 ? null : string.Join("; ", notes),
             Windows = windows,
+            OverageBalanceMicros = overageMicros,
         };
     }
 
