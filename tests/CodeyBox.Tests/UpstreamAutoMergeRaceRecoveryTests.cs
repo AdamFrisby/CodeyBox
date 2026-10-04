@@ -520,7 +520,7 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
             mergeStrategy: [MergeStrategy.RealMerge, MergeStrategy.RealMerge],
             gitHostDecorator: inner =>
             {
-                wrapper = new SetBranchThrowingGitHost(inner);
+                wrapper = new SetBranchThrowingGitHost(inner, failBranch: "feature/race-setbranch-throws");
                 return wrapper;
             });
         remote.BareRepoRoot = tp.GitRoot;
@@ -681,15 +681,25 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
 internal sealed class SetBranchThrowingGitHost : IGitHost
 {
     private readonly IGitHost _inner;
+    private readonly string? _failBranch;
     public int SetBranchInvocations { get; private set; }
 
-    public SetBranchThrowingGitHost(IGitHost inner) { _inner = inner; }
+    public SetBranchThrowingGitHost(IGitHost inner, string? failBranch = null)
+    {
+        _inner = inner;
+        _failBranch = failBranch;
+    }
 
     public Task SetBranchToCommitAsync(string repositoryId, string branch, string sha, CancellationToken ct = default)
     {
         SetBranchInvocations++;
-        throw new InvalidOperationException(
-            $"simulated update-ref failure for branch '{branch}' at {sha}");
+        // Scoped to the branch under test: the merge-result verification
+        // points a short-lived branch at the merge commit before landing,
+        // which must keep working for the race-recovery path to be reached.
+        if (_failBranch is null || string.Equals(branch, _failBranch, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"simulated update-ref failure for branch '{branch}' at {sha}");
+        return _inner.SetBranchToCommitAsync(repositoryId, branch, sha, ct);
     }
 
     // Delegate everything else to the real host.

@@ -212,6 +212,17 @@ git push origin <baseBranch>:<baseBranch>
 Two parents means the work branch stays visible in history, exactly as
 `git merge --no-ff` would leave it.
 
+Before the base ref moves, the merge queue builds the exact merge-result
+tree with the project's required build (the same command as the
+required-build gate) in a sandbox, serialized per base branch so each
+verification runs against the base it will land on. A clean textual merge
+of two branches that each built on their own base can still fail to compile
+when combined — that tree is not landed. Instead the item takes
+conflict-rework turns against the refreshed base, briefed with the build
+errors. If the base moves during verification, the merge is recomposed and
+re-verified; an unverified tree never lands. Disable with
+`CodeyBox:PipelineTuning:MergeResultBuildVerificationEnabled` (default on).
+
 **Conflicts — the agent resolves them in its own sandbox.** The merge sandbox
 runs under the project's `merge` network profile. The agent reads the
 conflicted files from the working tree, writes resolutions, and stages them

@@ -96,7 +96,7 @@ public sealed partial class PipelineRunner
                 await VerifyMergeResultAgainstHostAsync(
                     item.Id, repoId, preMergeSha, workTipSha, cleanMergeSha, hostMerge,
                     project.Audit.MergeScopeBufferLines, ct);
-                await UpdateHostBaseRefAsync(repoId, baseBranch, cleanMergeSha, preMergeSha, ct);
+                await VerifyMergeBuildAndLandAsync(item, project, repoId, baseBranch, cleanMergeSha, preMergeSha, ct);
             }
             CodeyBoxMeters.AgentDuration.Record(cleanMergeScope.ElapsedMs,
                 new KeyValuePair<string, object?>("agent.kind", runner.Kind.Value),
@@ -453,7 +453,7 @@ public sealed partial class PipelineRunner
                             chosenMergeCredential,
                             sandbox,
                             conflictsResolvedByConstrainedResolver: true);
-                        await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, preMergeSha, ct);
+                        await VerifyMergeBuildAndLandAsync(item, project, repoId, baseBranch, mergeSha, preMergeSha, ct);
                     }
                     finally
                     {
@@ -674,6 +674,145 @@ public sealed partial class PipelineRunner
                 ex,
                 "Could not record merge retry for work item {Id}; continuing with the retry",
                 id);
+        }
+    }
+
+    /// <summary>
+    /// Merge queue: builds the exact merge-result tree with the project's
+    /// required build (the same sandbox command as the required-build gate)
+    /// before advancing the base branch, and only lands the tree when the
+    /// build passes. A clean textual merge of two branches that each built
+    /// on their own base can still fail to compile when combined — landing
+    /// it would break the base for every subsequent item.
+    ///
+    /// <para>
+    /// Verification runs inside the shared per-base-branch landing queue
+    /// (the same <see cref="MergeLandingGate"/> the upstream landing
+    /// observes), so each verification builds the tree against the actual
+    /// base it will land on. The merge itself was composed before entering
+    /// the queue: when the base moved in between, the merge is re-queued
+    /// against the fresh base (<see cref="MergeBaseMovedException"/>) and
+    /// re-verified instead of landing a stale tree. The final
+    /// <see cref="UpdateHostBaseRefAsync"/> compare-and-set closes the race
+    /// with an out-of-band writer that moved the base during verification.
+    /// </para>
+    ///
+    /// <para>
+    /// A failed build is a semantic conflict, not a broken item: the work
+    /// branch already passed the audit gate on its own base, so the
+    /// combination is at fault. The tree is not landed; a
+    /// <see cref="MergeResultBuildFailedException"/> carrying the build
+    /// errors routes the item to conflict rework against the refreshed
+    /// base. Verifier infrastructure failures propagate untouched (parked
+    /// as infrastructure, never landed, never misattributed to the diff).
+    /// </para>
+    /// </summary>
+    private async Task VerifyMergeBuildAndLandAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string mergeSha,
+        string expectedBaseSha,
+        CancellationToken ct)
+    {
+        if (!_pipelineTuning.Current.MergeResultBuildVerificationEnabled)
+        {
+            await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, expectedBaseSha, ct);
+            return;
+        }
+
+        var landingKey = MergeLandingGate.KeyFor(
+            project.Upstream.Kind,
+            project.RepositoryUrl,
+            baseBranch);
+        var landingSlot = _mergeLandingGate.Retain(landingKey);
+        var landingAcquired = false;
+        try
+        {
+            await landingSlot.Semaphore.WaitAsync(ct);
+            landingAcquired = true;
+
+            var queuedBaseSha = await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct);
+            if (!string.Equals(queuedBaseSha, expectedBaseSha, StringComparison.Ordinal))
+                throw new MergeBaseMovedException(repoId, baseBranch, expectedBaseSha, queuedBaseSha);
+
+            // The verifier builds branches, not bare shas: point a
+            // short-lived branch at the merge commit so the sandbox checks
+            // out the exact merge-result tree. Removed in the finally below
+            // on every exit path.
+            var verifyBranch = $"codeybox/merge-verify/{item.Id}";
+            await _gitHost.SetBranchToCommitAsync(repoId, verifyBranch, mergeSha, ct);
+            try
+            {
+                var timeout = _pipelineTuning.Current.MergeResultBuildVerificationTimeout;
+                using var timeoutCts = new CancellationTokenSource(timeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                RequiredBuildVerificationResult result;
+                try
+                {
+                    result = await _requiredBuildGate.VerifyMergeResultAsync(
+                        item, project, repoId, baseBranch, verifyBranch, linkedCts.Token);
+                }
+                catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+                {
+                    throw new MergeConflictResolutionFailedException(
+                        $"merge-result build verification timed out after {timeout} without proving the merged tree; refusing to land an unverified tree",
+                        ex);
+                }
+
+                if (result.Status == RequiredBuildVerificationStatus.Failed)
+                {
+                    var summary = RequiredBuildGate.BuildFailureSummary(result);
+                    throw new MergeResultBuildFailedException(
+                        $"merge result failed required build (semantic conflict against '{baseBranch}'): {summary}",
+                        result.Output);
+                }
+            }
+            finally
+            {
+                await DeleteMergeVerifyBranchBestEffortAsync(repoId, verifyBranch, mergeSha);
+            }
+
+            await UpdateHostBaseRefAsync(repoId, baseBranch, mergeSha, expectedBaseSha, ct);
+        }
+        finally
+        {
+            _mergeLandingGate.Release(landingKey, landingSlot, landingAcquired);
+        }
+    }
+
+    /// <summary>
+    /// Best-effort removal of the short-lived merge-verification branch.
+    /// Deletes only when the ref still points at <paramref name="mergeSha"/>:
+    /// if anything repointed it after verification (a TOCTOU race with an
+    /// out-of-band writer reusing the name), the foreign ref is left alone
+    /// and the orphaned label — pointing at an already-landed merge commit
+    /// — is harmless.
+    /// </summary>
+    private async Task DeleteMergeVerifyBranchBestEffortAsync(
+        string repoId,
+        string verifyBranch,
+        string mergeSha)
+    {
+        try
+        {
+            var current = await _gitHost.ResolveCommitAsync(repoId, verifyBranch, CancellationToken.None);
+            if (!string.Equals(current, mergeSha, StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    "Merge verification branch '{Branch}' no longer points at the verified merge; leaving the foreign ref in place",
+                    verifyBranch);
+                return;
+            }
+
+            await DeleteHostRefBestEffortAsync(repoId, $"refs/heads/{verifyBranch}", CancellationToken.None);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Best-effort cleanup of merge verification branch '{Branch}' failed",
+                verifyBranch);
         }
     }
 

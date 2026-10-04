@@ -595,6 +595,12 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.BaseBrokenRecheckInterval):
                 opts.BaseBrokenRecheckInterval += TimeSpan.FromMinutes(1);
                 break;
+            case nameof(PipelineTuningOptions.MergeResultBuildVerificationEnabled):
+                opts.MergeResultBuildVerificationEnabled = !opts.MergeResultBuildVerificationEnabled;
+                break;
+            case nameof(PipelineTuningOptions.MergeResultBuildVerificationTimeout):
+                opts.MergeResultBuildVerificationTimeout += TimeSpan.FromHours(1);
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this PipelineTuning field.");
         }

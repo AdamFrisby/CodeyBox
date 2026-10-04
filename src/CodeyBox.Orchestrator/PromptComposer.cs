@@ -276,6 +276,78 @@ Original merge-phase failure (JSON string, for context only):
     }
 
     /// <summary>
+    /// Builds the semantic-conflict rework prompt: the textual merge and
+    /// rebase were clean, but the combined tree fails the required build, so
+    /// there are no conflict markers to resolve. Briefs the agent with the
+    /// merge-result build errors and asks for an in-place repair of the work
+    /// branch against the refreshed base. Unlike
+    /// <see cref="BuildConflictReworkPrompt"/> no rebase is in progress, so
+    /// the agent commits normally instead of running
+    /// <c>git rebase --continue</c>. Keeps the same
+    /// <c># Conflict-resolution mode (third-line fallback)</c> header so
+    /// agent harnesses route it to the conflict-rework path.
+    /// </summary>
+    internal string BuildSemanticConflictReworkPrompt(
+        string originalPrompt,
+        string baseBranch,
+        string workBranch,
+        string mergeResultBuildOutput)
+    {
+        var buildOutputContext = JsonSerializer.Serialize(mergeResultBuildOutput);
+        return $"""
+{originalPrompt}
+
+# Conflict-resolution mode (third-line fallback)
+
+Your previous work on this task produced commits on the work branch
+`{workBranch}`. Upstream `{baseBranch}` has since advanced with sibling
+work that merges cleanly with your branch at the textual level, but the
+combined tree fails the required build — a semantic conflict. Each side
+built on its own base; the combination does not compile.
+
+The repository is NOT in a rebase-in-progress state: your work branch has
+already been rebased onto the refreshed `{baseBranch}` tip and HEAD is the
+rebased tip. There are no conflict markers to resolve. The work tree is at
+$PWD.
+
+Your job is to repair the combination IN PLACE, preserving:
+  - All of your original feature changes (the diff you produced).
+  - The intent of the new commits on upstream `{baseBranch}` (the diff
+    that landed after you forked).
+
+Workflow:
+  1. Read the merge-result build errors quoted below. They describe the
+     combined tree, so reproduce them first with the project build.
+  2. Edit the work-branch files (only) so both intents coexist and the
+     combined tree builds. Read `git log` on `{baseBranch}` for the
+     sibling change's context.
+  3. Run the project build + tests after the repair.
+  4. Commit the repair on the work branch with `git commit`. Do NOT run
+     `git rebase --continue` (no rebase is in progress), `git reset --hard`,
+     `git rebase --abort`, or anything else that throws away your prior
+     commits. We want to KEEP the work.
+
+Do NOT:
+  - Refactor unrelated areas.
+  - Change anything outside the work-branch files needed for the combined
+    tree to compile.
+
+If — after careful analysis — the two intents are genuinely incompatible
+at a semantic level (one truly cannot coexist with the other), print a
+single line to stdout starting with `{SemanticIncompatibleMarker}` followed
+by a one-line reason, for example:
+
+    {SemanticIncompatibleMarker} events have diverged
+
+The operator will decide whether to abandon the PR or restructure either
+side. Do NOT silently produce a half-resolution.
+
+Merge-result build errors (JSON string, for context only):
+{buildOutputContext}
+""";
+    }
+
+    /// <summary>
     /// Builds the delegation prompt: the composed convergence brief plus the
     /// latitude instruction that distinguishes this phase from the constrained
     /// work/rework cycle. The delegate may change approach, restructure the

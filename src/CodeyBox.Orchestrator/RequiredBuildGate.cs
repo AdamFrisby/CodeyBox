@@ -276,6 +276,34 @@ internal sealed class RequiredBuildGate
         }
     }
 
+    /// <summary>
+    /// Builds the exact merge-result tree (<paramref name="verificationBranch"/>
+    /// must point at the merge commit) with the same sandbox command as every
+    /// other required-build call site. Returns the raw verifier outcome —
+    /// the merge landing (not this gate) decides: <c>Passed</c>/<c>Skipped</c>
+    /// lands, <c>Failed</c> routes to conflict rework as a semantic conflict.
+    /// <c>Unavailable</c> and toolchain faults throw exactly as in
+    /// <see cref="VerifyAsync"/> (infrastructure, never diff-attributable).
+    /// No audit report is persisted (<c>iteration: null</c>): this is a
+    /// landing gate, not an audit iteration.
+    /// </summary>
+    public Task<RequiredBuildVerificationResult> VerifyMergeResultAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        string verificationBranch,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(project);
+        ArgumentException.ThrowIfNullOrWhiteSpace(repoId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(baseBranch);
+        ArgumentException.ThrowIfNullOrWhiteSpace(verificationBranch);
+        return VerifyAsync(
+            item, project, repoId, baseBranch, verificationBranch, phase: "merge", iteration: null, ct);
+    }
+
     private async Task<RequiredBuildVerificationResult> VerifyAsync(
         WorkItem item,
         Project project,
@@ -548,7 +576,7 @@ internal sealed class RequiredBuildGate
             TestFailureAttributions: result.TestFailureAttributions ?? []);
     }
 
-    private static string BuildFailureSummary(RequiredBuildVerificationResult result)
+    internal static string BuildFailureSummary(RequiredBuildVerificationResult result)
     {
         var detail = string.IsNullOrWhiteSpace(result.Output)
             ? "(no build output captured)"
