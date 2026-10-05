@@ -28,13 +28,75 @@ public interface IMutationRunner
 
 /// <summary>
 /// Structured result of one mutation-testing run. Percent values are 0-100.
+/// A null score means the run produced no evidence for that scope — never a
+/// fabricated value. In particular a run scoped to changed files (via the
+/// engine's file filter) does NOT establish an overall-project score, so
+/// <see cref="OverallMutationScorePercent"/> is null and <see cref="Scope"/>
+/// is <see cref="MutationRunScope.ChangedFilesOnly"/> for such runs; the
+/// auditor must not compare or ratchet a null overall score.
 /// </summary>
 public sealed record MutationRunReport(
-    double ChangedCodeMutationScorePercent,
-    double OverallMutationScorePercent,
+    double? ChangedCodeMutationScorePercent,
+    double? OverallMutationScorePercent,
     IReadOnlyList<SurvivingMutant> SurvivingMutantsInChangedCode,
     TimeSpan Duration,
-    string? RawOutput = null);
+    string? RawOutput = null,
+    MutationRunStatus Status = MutationRunStatus.Completed,
+    string? StatusDetail = null,
+    string? ToolVersion = null,
+    string? SourceCommitSha = null,
+    string? ProjectSelection = null,
+    string? ConfigDigest = null,
+    MutationRunScope Scope = MutationRunScope.FullProject);
+
+/// <summary>
+/// Outcome of a mutation-runner invocation. Only <see cref="Completed"/>
+/// carries scores. <see cref="NoApplicableCode"/> and
+/// <see cref="UnsupportedProject"/> are explicit "no evidence" outcomes the
+/// auditor surfaces without blocking the merge; <see cref="NoCoveringTests"/>
+/// blocks it (untested production code is a rigor failure, not missing
+/// evidence).
+/// </summary>
+public enum MutationRunStatus
+{
+    /// <summary>The engine ran and produced scores.</summary>
+    Completed,
+
+    /// <summary>
+    /// The tree has no production code to mutate for the changed files
+    /// (non-.NET tree, or changes confined to test/docs/unmapped files).
+    /// </summary>
+    NoApplicableCode,
+
+    /// <summary>
+    /// The changed code is in a language/project the runner does not support.
+    /// </summary>
+    UnsupportedProject,
+
+    /// <summary>
+    /// Changed production code has no covering test project, so mutation
+    /// cannot run. Unlike <see cref="NoApplicableCode"/> this blocks the
+    /// gate: untested production code is exactly what the rigor gate exists
+    /// to catch.
+    /// </summary>
+    NoCoveringTests,
+}
+
+/// <summary>
+/// Scope the engine actually mutated. Only <see cref="FullProject"/> runs
+/// establish an overall-project score the ratchet may compare and advance;
+/// <see cref="ChangedFilesOnly"/> runs leave the overall baseline untouched.
+/// Reports constructed without scope information (legacy runners) default to
+/// <see cref="FullProject"/>, preserving the previous contract.
+/// </summary>
+public enum MutationRunScope
+{
+    /// <summary>Only the changed files were mutated; no overall score exists.</summary>
+    ChangedFilesOnly,
+
+    /// <summary>The whole project was mutated; the overall score is complete.</summary>
+    FullProject,
+}
 
 /// <summary>One mutant the test suite did NOT kill.</summary>
 public sealed record SurvivingMutant(

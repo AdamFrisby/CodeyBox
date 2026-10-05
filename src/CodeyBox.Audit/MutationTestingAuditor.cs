@@ -30,6 +30,10 @@ namespace CodeyBox.Audit;
 /// flipped per project. When enabled but no real engine is wired (the runner
 /// is <see cref="NullMutationRunner"/>), the auditor emits a non-blocking
 /// Warning so the operator notices rather than getting a false-green.
+/// Reports scoped to changed files (<see
+/// cref="MutationRunScope.ChangedFilesOnly"/>) establish no overall score,
+/// so they skip the ratchet entirely instead of advancing it on partial
+/// evidence.
 /// </summary>
 public sealed class MutationTestingAuditor : IAuditor
 {
@@ -106,15 +110,18 @@ public sealed class MutationTestingAuditor : IAuditor
             // files" as "no changed files" would let a misconfigured base ref,
             // missing remote, or shallow clone silently green-light the gate
             // this whole feature is built to make un-gameable.
+            // Stderr is tool output reflecting repo content and reaches the
+            // finding Description, hence the rework prompt: sanitize first.
+            var safeEnumerationError = StrykerPaths.SanitizeForLog(enumerationError, 2000);
             return new AuditResult(false,
             [
                 new AuditFinding(
                     Name, AuditSeverity.Error,
                     "could not enumerate changed files",
                     "git diff failed twice (with and without the 'origin/' prefix) so the mutation-testing " +
-                    $"auditor cannot determine which files are in scope. Stderr: {enumerationError}"),
+                    $"auditor cannot determine which files are in scope. Stderr: {safeEnumerationError}"),
             ],
-            RawOutput: enumerationError);
+            RawOutput: safeEnumerationError);
         }
         var scoped = FilterToInScopeFiles(opts, listing.Files);
         if (scoped.Count == 0)
@@ -125,22 +132,54 @@ public sealed class MutationTestingAuditor : IAuditor
         {
             report = await _runner.RunAsync(sandbox, workingDirectory, scoped, opts.Budget, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
+        catch (Exception ex) when (SandboxDeferralGuard.ShouldWrap(ex))
         {
             return new AuditResult(false,
             [
-                new AuditFinding(
-                    Name, AuditSeverity.Error,
-                    "mutation-testing run failed",
-                    $"The mutation-testing engine threw: {ex.GetType().Name}: {ex.Message}"),
+                RunnerFailureFinding(Name, ex),
             ]);
         }
 
+        if (report.Status != MutationRunStatus.Completed)
+        {
+            if (report.Status == MutationRunStatus.NoCoveringTests)
+            {
+                return new AuditResult(false,
+                [
+                    new AuditFinding(
+                        Name, AuditSeverity.Error,
+                        "changed production code has no covering test project",
+                        report.StatusDetail ?? "The mutation runner found no test project for the changed code."),
+                ],
+                RawOutput: report.RawOutput);
+            }
+            return new AuditResult(true,
+            [
+                new AuditFinding(
+                    Name, AuditSeverity.Info,
+                    report.Status == MutationRunStatus.UnsupportedProject
+                        ? "mutation testing not applicable: unsupported project"
+                        : "mutation testing not applicable: no mutable code",
+                    report.StatusDetail ?? "The mutation runner reported no applicable code."),
+            ],
+            RawOutput: report.RawOutput);
+        }
+
         var findings = new List<AuditFinding>();
+
+        if (report.ChangedCodeMutationScorePercent is not double changedScore)
+        {
+            findings.Add(new AuditFinding(
+                AuditorName: Name,
+                Severity: AuditSeverity.Error,
+                Title: "mutation-testing run produced no changed-code score",
+                Description:
+                    "The mutation-testing engine completed but reported no score for the changed " +
+                    "code, so the gate cannot be evaluated. Treat the engine output as missing " +
+                    "evidence, not as a pass.",
+                Location: null));
+            return new AuditResult(false, findings, RawOutput: report.RawOutput);
+        }
 
         // Un-gameable conformance: every surviving mutant in changed code is a
         // missing test branch. One Error per mutant so the rework prompt cites
@@ -151,19 +190,26 @@ public sealed class MutationTestingAuditor : IAuditor
         foreach (var mutant in report.SurvivingMutantsInChangedCode)
         {
             if (!scopedSet.Contains(mutant.FilePath)) continue;
+            // Mutator/detail echo report JSON strings and reach the finding
+            // Title/Description, hence the rework prompt: sanitize (the
+            // runner already sanitizes, this is defense in depth for any
+            // future IMutationRunner implementation). FilePath is a validated
+            // repo-relative path (control-free by construction).
+            var safeMutator = StrykerPaths.SanitizeForLog(mutant.Mutator, 120);
+            var safeDetail = StrykerPaths.SanitizeForLog(mutant.Description, 240);
             findings.Add(new AuditFinding(
                 AuditorName: Name,
                 Severity: AuditSeverity.Error,
-                Title: $"surviving mutant: {mutant.Mutator}",
+                Title: $"surviving mutant: {safeMutator}",
                 Description:
-                    $"A '{mutant.Mutator}' mutation at {mutant.FilePath}:{mutant.Line} survived the test suite — " +
+                    $"A '{safeMutator}' mutation at {mutant.FilePath}:{mutant.Line} survived the test suite — " +
                     "no test failed when the mutation was applied, so the code path is effectively unverified. " +
                     "Tighten an existing assertion or add a test that would fail under this mutation. " +
-                    $"Mutator detail: {mutant.Description}",
+                    $"Mutator detail: {safeDetail}",
                 Location: $"{mutant.FilePath}:{mutant.Line}"));
         }
 
-        if (report.ChangedCodeMutationScorePercent < opts.ChangedCodeThresholdPercent - Epsilon)
+        if (changedScore < opts.ChangedCodeThresholdPercent - Epsilon)
         {
             findings.Add(new AuditFinding(
                 AuditorName: Name,
@@ -171,35 +217,57 @@ public sealed class MutationTestingAuditor : IAuditor
                 Title: "changed-code mutation score below threshold",
                 Description:
                     $"Mutation score on the changed code is " +
-                    $"{Fmt(report.ChangedCodeMutationScorePercent)}%, below the configured threshold of " +
+                    $"{Fmt(changedScore)}%, below the configured threshold of " +
                     $"{Fmt(opts.ChangedCodeThresholdPercent)}%. Add or strengthen tests on the affected " +
                     "functions so plausible bugs would fail at least one test.",
                 Location: null));
         }
 
-        var ratchetKey = ResolveRatchetKey(opts, context);
-        var previous = await _ratchet.TryGetAsync(ratchetKey, ct).ConfigureAwait(false);
-        if (previous is double baseline
-            && report.OverallMutationScorePercent < baseline - opts.RatchetTolerancePercent - Epsilon)
+        // A changed-files-only run does not establish an overall-project score:
+        // the ratchet is skipped entirely (no compare, no advance) and the gap
+        // is stated explicitly instead of copying the changed score across.
+        var overallScore = report.Scope == MutationRunScope.FullProject
+            ? report.OverallMutationScorePercent
+            : null;
+        var ratchetKey = ResolveRatchetKey(opts, context, report.ConfigDigest);
+        if (overallScore is double overall)
+        {
+            var previous = await _ratchet.TryGetAsync(ratchetKey, ct).ConfigureAwait(false);
+            if (previous is double baseline
+                && overall < baseline - opts.RatchetTolerancePercent - Epsilon)
+            {
+                findings.Add(new AuditFinding(
+                    AuditorName: Name,
+                    Severity: AuditSeverity.Error,
+                    Title: "overall mutation score regressed",
+                    Description:
+                        $"Overall mutation score dropped from {Fmt(baseline)}% to " +
+                        $"{Fmt(overall)}% (tolerance " +
+                        $"{Fmt(opts.RatchetTolerancePercent)}%). The ratchet does not permit regressions — " +
+                        "either restore the lost coverage or escalate to the operator to reset the baseline.",
+                    Location: null));
+            }
+        }
+        else
         {
             findings.Add(new AuditFinding(
                 AuditorName: Name,
-                Severity: AuditSeverity.Error,
-                Title: "overall mutation score regressed",
+                Severity: AuditSeverity.Info,
+                Title: "overall mutation score unavailable in scoped run",
                 Description:
-                    $"Overall mutation score dropped from {Fmt(baseline)}% to " +
-                    $"{Fmt(report.OverallMutationScorePercent)}% (tolerance " +
-                    $"{Fmt(opts.RatchetTolerancePercent)}%). The ratchet does not permit regressions — " +
-                    "either restore the lost coverage or escalate to the operator to reset the baseline.",
+                    "This run mutated only the changed files, so no overall-project mutation score " +
+                    "was established and the no-regression baseline was left untouched. The gate " +
+                    "verdict rests on the changed-code score and surviving mutants alone.",
                 Location: null));
         }
 
         var passed = !findings.Any(f => f.Severity >= AuditSeverity.Error);
-        if (passed)
+        if (passed && overallScore is double passingOverall)
         {
-            // Only ratchet up on green. A failing run that nonetheless raised
-            // the overall score must NOT lower the bar via a partial save.
-            await _ratchet.SaveAsync(ratchetKey, report.OverallMutationScorePercent, ct).ConfigureAwait(false);
+            // Only ratchet up on green AND on a complete overall score. A failing
+            // run — or a passing run with only scoped evidence — must NOT move
+            // the baseline.
+            await _ratchet.SaveAsync(ratchetKey, passingOverall, ct).ConfigureAwait(false);
         }
 
         return new AuditResult(passed, findings, RawOutput: report.RawOutput);
@@ -270,10 +338,11 @@ public sealed class MutationTestingAuditor : IAuditor
         return new ChangedFileListing(files, Error: null);
     }
 
-    private static string ResolveRatchetKey(MutationTestingAuditorOptions opts, AuditContext context)
+    private static string ResolveRatchetKey(
+        MutationTestingAuditorOptions opts, AuditContext context, string? configDigest)
     {
         if (!string.IsNullOrWhiteSpace(opts.RatchetKey))
-            return opts.RatchetKey!;
+            return AppendDigest(opts.RatchetKey!, configDigest);
         // Default key prefixes the base branch with the work item's project id
         // when the orchestrator has plumbed one through. Multi-project hosts
         // commonly share a singleton auditor + ratchet store; without this
@@ -283,7 +352,53 @@ public sealed class MutationTestingAuditor : IAuditor
         var projectPrefix = string.IsNullOrWhiteSpace(context.ProjectId)
             ? ""
             : $"{context.ProjectId}:";
-        return $"{projectPrefix}{context.BaseBranch}";
+        return AppendDigest($"{projectPrefix}{context.BaseBranch}", configDigest);
+    }
+
+    /// <summary>
+    /// Scopes the baseline to the engine configuration that produced it: runs
+    /// under different tool versions, flags, or project selections carry
+    /// different digests and must never compare against (or overwrite) each
+    /// other's baselines. Reports without a digest (legacy runners) keep the
+    /// undigested key, preserving the previous behavior.
+    /// </summary>
+    private static string AppendDigest(string key, string? configDigest) =>
+        string.IsNullOrWhiteSpace(configDigest) ? key : $"{key}~{configDigest}";
+
+    /// <summary>
+    /// Maps a runner failure to a fail-closed Error finding. Threshold failure
+    /// never reaches this path — below-threshold scores arrive as a normal
+    /// report the gate evaluates above. Sandbox-provisioning deferrals,
+    /// execution-transport loss, and cooperative cancellation never reach it
+    /// either: the catch filter lets them propagate to the pipeline.
+    /// </summary>
+    private static AuditFinding RunnerFailureFinding(string auditorName, Exception ex)
+    {
+        var title = ex switch
+        {
+            StrykerRunFailedException failed => failed.Kind switch
+            {
+                StrykerFailureKind.Build =>
+                    "mutation-testing run failed: project does not build",
+                StrykerFailureKind.Test =>
+                    "mutation-testing run failed: test suite does not pass",
+                StrykerFailureKind.Timeout =>
+                    "mutation-testing run failed: budget exceeded",
+                StrykerFailureKind.Report =>
+                    "mutation-testing run failed: no usable report",
+                _ => "mutation-testing run failed: tool failure",
+            },
+            StrykerToolMissingException =>
+                "mutation-testing run failed: engine not provisioned",
+            _ => "mutation-testing run failed",
+        };
+        return new AuditFinding(
+            auditorName, AuditSeverity.Error, title,
+            // ex.Message embeds sanitized tool/report output plus static
+            // runner text, but defensively re-sanitize (idempotent): finding
+            // Descriptions are embedded verbatim in the tool-bearing rework
+            // prompt, so no control characters or ANSI escapes may survive.
+            $"The mutation-testing engine produced no scores: {ex.GetType().Name}: {StrykerPaths.SanitizeForLog(ex.Message, 4000)}");
     }
 
     private static string Fmt(double percent)
@@ -362,4 +477,12 @@ public sealed record MutationTestingAuditorOptions
     /// trunk-vs-release-branch baselines can diverge cleanly.
     /// </summary>
     public string? RatchetKey { get; init; }
+
+    /// <summary>
+    /// Stryker.NET engine configuration (<c>CodeyBox:Mutation:Stryker</c>).
+    /// The concrete <see cref="StrykerMutationRunner"/> reads this per audit
+    /// so edits hot-reload. Disabled by default — the gate stays inert until
+    /// both <see cref="Enabled"/> and this section's <c>Enabled</c> are set.
+    /// </summary>
+    public StrykerMutationRunnerOptions Stryker { get; init; } = new();
 }
