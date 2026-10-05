@@ -15,7 +15,8 @@ public sealed record TartWritableMountSync(string HostDirectory, string GuestDir
 /// becomes a no-op and the clone directory survives for a later resume.
 /// </summary>
 public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSandbox,
-    IShutdownTeardownSandbox, IProviderOwnedSandbox, IPreserveOnDisposeSandbox, ITartSoftnetPolicyReport
+    IShutdownTeardownSandbox, IProviderOwnedSandbox, IPreserveOnDisposeSandbox, ITartSoftnetPolicyReport,
+    IEgressFilterHealth
 {
     private readonly ITartProcessRunner _runner;
     private readonly TartSshGuestTransport _transport;
@@ -114,6 +115,42 @@ public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSan
         _writableMounts = mounts ?? throw new ArgumentNullException(nameof(mounts));
 
     internal void AttachVmProcess(ITartDetachedProcess? process) => _vmProcess = process;
+
+    /// <summary>
+    /// Provider-host filter liveness for the host verifier: in Softnet mode
+    /// the Softnet filter is hosted by the <c>tart run</c> process, so a
+    /// positively-exited run process means the filter is gone. False only on
+    /// that positive evidence — NAT mode (no filter), a missing handle
+    /// (suspended, or resumed where the provider releases the handle), a
+    /// disposed sandbox, or a throwing probe all report alive/unknown and
+    /// leave the verdict to the guest canary.
+    /// </summary>
+    bool IEgressFilterHealth.IsFilterAlive
+    {
+        get
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return true;
+            TartNetworkMode mode;
+            lock (_policySync)
+                mode = _networkMode;
+            if (mode != TartNetworkMode.Softnet)
+                return true;
+            var process = Volatile.Read(ref _vmProcess);
+            if (process is null)
+                return true;
+            try
+            {
+                return !process.HasExited;
+            }
+            catch (Exception)
+            {
+                // A throwing liveness probe is not positive evidence of
+                // filter death; the guest canary stays the authority.
+                return true;
+            }
+        }
+    }
 
     internal void RefreshIp(string guestIp)
     {
@@ -357,6 +394,7 @@ public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSan
         ThrowIfDisposed();
         var opts = _readOptions();
         await StopVmAsync(opts, ct).ConfigureAwait(false);
+        DetachSpentVmProcess();
         _preserveOnDispose = true;
         IsSuspended = true;
     }
@@ -366,6 +404,7 @@ public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSan
         ThrowIfDisposed();
         var opts = _readOptions();
         await StopVmAsync(opts, ct).ConfigureAwait(false);
+        DetachSpentVmProcess();
         _preserveOnDispose = true;
     }
 
@@ -416,6 +455,28 @@ public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSan
             stdoutChunk: null, stderrChunk: null, maxOutputBytes: 65536, ct).ConfigureAwait(false);
         if (result.ExitCode != 0 && !IsNotFound(result.Stderr))
             throw TartFailureClassification.ForExit(opts.TartBinaryPath, ["delete", VmName], result.ExitCode, result.Stderr);
+    }
+
+    /// <summary>
+    /// Drops the <c>tart run</c> handle after a stop/suspend without killing:
+    /// the CLI stop already ended the process, and the spent handle must not
+    /// condemn a later resume (which reinstalls the filter under a new,
+    /// provider-released handle). After this the health signal reports
+    /// unknown-alive and the guest canary stays the authority.
+    /// </summary>
+    private void DetachSpentVmProcess()
+    {
+        var process = Interlocked.Exchange(ref _vmProcess, null);
+        if (process is null)
+            return;
+        try
+        {
+            process.Dispose();
+        }
+        catch (Exception)
+        {
+            // Best effort; the CLI stop above owns guest teardown.
+        }
     }
 
     private void KillVmProcessBestEffort()

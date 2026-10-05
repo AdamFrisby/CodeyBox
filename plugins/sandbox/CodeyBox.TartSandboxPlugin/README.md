@@ -40,15 +40,19 @@ What isolation this provider **does** give:
 
 What it **does not** give:
 
-- No host-enforced egress filtering. In the default `nat` mode, guest
-  egress follows the Mac host's network, not any CodeyBox network profile.
-  `softnet` mode (below) adds a per-VM Softnet packet filter, but the host
-  still classifies the kind `NotEnforced` — this never becomes an enforced
-  network profile. The provider refuses any sandbox naming a network
-  profile, and placement never routes profiled work here — but an operator
-  choosing this provider for unprofiled work is accepting host-default
-  egress (NAT) or a best-effort guest filter (Softnet), not a CodeyBox
-  allowlist.
+- No static host-enforced egress filtering. In the default `nat` mode,
+  guest egress follows the Mac host's network, not any CodeyBox network
+  profile. `softnet` mode (below) adds a per-VM Softnet packet filter, but
+  the host still classifies the kind `NotEnforced` — statically this never
+  becomes an enforced network profile. The provider refuses any sandbox
+  naming a network profile, and placement never routes profiled work here
+  **unless** the operator opts `tart` into host-owned per-sandbox canary
+  verification (`CodeyBox:EgressVerification`, below): then each sandbox is
+  handed over only after its own canary passes, and the verified grant is
+  deliberately never stronger than orchestrator-host nftables enforcement.
+  An operator choosing this provider for unprofiled work is accepting
+  host-default egress (NAT) or a guest filter without a passing canary,
+  not a CodeyBox allowlist.
 - Suspend is stop/start: a suspended VM keeps its clone directory but
   running processes do not survive; the pipeline replays from its
   checkpoint, so this is expected, not data loss.
@@ -179,6 +183,72 @@ tart run --help | grep -A2 softnet
 #    creates fail with TartSoftnetUnavailableException (no NAT fallback).
 ```
 
+### Serving profiled work: per-sandbox canary verification (opt-in)
+
+Softnet alone never changes the static `NotEnforced` classification. To let
+profiled work run on `tart` sandboxes, the operator additionally opts the
+kind into host-owned canary verification. The decision is host code, not
+plugin code: after placement creates the sandbox (with the named profile
+translated to the Softnet allowlist — `AllowedHosts`, never a host bridge)
+and before any work phase runs, the host probes the sandbox through the
+normal exec path:
+
+- a TCP connect to `AllowedHost` (which must be on the allowlist) succeeds;
+- a TCP connect to `BlockedHost` — a dedicated canary IP the operator
+  guarantees is NOT on any allowlist (use a TEST-NET address or an
+  operator-owned sink, never a third-party host) — fails within the bound;
+- a TCP connect to a global IPv6 address (`Ipv6Host`, default a TEST-NET-6
+  documentation address) fails — Softnet documents IPv4 only, so IPv6 must
+  be proven blocked;
+- a TCP connect to the Mac host's own LAN address (`LanHost`) fails.
+
+```json
+{
+  "CodeyBox": {
+    "EgressVerification": {
+      "Kinds": ["tart"],
+      "AllowedHost": "192.0.2.10",
+      "AllowedPort": 443,
+      "BlockedHost": "198.51.100.7",
+      "BlockedPort": 443,
+      "LanHost": "192.168.1.2",
+      "LanPort": 22,
+      "PerCheckTimeout": "00:00:05",
+      "Cooldown": "00:15:00",
+      "ReverifyInterval": "00:00:00",
+      "MaxProbeOutputBytes": 4096
+    }
+  }
+}
+```
+
+(`Ipv6Host`/`Ipv6Port` default to `2001:db8::1:443`.) All values are
+hot-reloadable. Every check needs its endpoint configured — a missing
+endpoint fails the canary closed, and the kind is then treated as
+`NotEnforced` until configured. `ReverifyInterval` `00:00:00` disables
+periodic re-verification; set it (for example `00:05:00`) on long-lived
+sandboxes so a filter that dies mid-run is caught. A failed canary
+disposes the sandbox, emits a critical alert event, demotes `tart` to
+`NotEnforced` for `Cooldown`, and re-places the item on an enforced
+provider. The sandbox also exposes its filter liveness
+(`IEgressFilterHealth`, backed by the `tart run` process hosting the
+filter): a dead filter fails verification without running guest probes.
+
+Extend the Mac procedure above with these canary steps (also Mac-only,
+also not CI-verified):
+
+```bash
+# 6. Configure CodeyBox:EgressVerification as above (BlockedHost a TEST-NET
+#    address, LanHost this Mac's LAN IP on the guest network). Queue a
+#    profiled item and confirm the "egress canary passed" event with timings.
+# 7. Negative: set BlockedHost to an allowlisted host and confirm the item
+#    is re-placed on an enforced provider while "tart" stays demoted until
+#    the cool-down lapses (critical alert in the log).
+# 8. IPv6: confirm the guest has no global IPv6 route reaching past the
+#    filter (the canary's IPv6 probe must fail); re-run step 6 after any
+#    network change on the Mac.
+```
+
 ## What it costs
 
 Every `CreateAsync` clones a full VM image (tens of GB disk; macOS images
@@ -189,7 +259,9 @@ Silicon hosts only — there is no Linux-hosted path.
 
 ## What it cannot do
 
-- Enforced-egress network profiles (refused at placement and at create).
+- Static enforced-egress network profiles (refused at placement and at
+  create). Profiled work reaches this provider only through the host-owned
+  per-sandbox canary above — never by static classification.
 - Graphical sandboxes and recovery-lease adopt (refused explicitly,
   naming `tart`, rather than provisioning something different).
 - Baseline bake, cache seeding, disk guard, port publishing (not
@@ -202,7 +274,10 @@ Silicon hosts only — there is no Linux-hosted path.
 - Unit and recorded-shape tests: `dotnet test --filter
   "FullyQualifiedName~CodeyBox.Tests.Tart"` (kind resolution,
   `NotEnforced` classification, capability honesty, failure taxonomy,
-  capacity accounting, `tart list` JSON/text fixtures).
+  capacity accounting, `tart list` JSON/text fixtures) plus
+  `FullyQualifiedName~EgressVerificationTests` (host-owned canary,
+  demotion cool-down, re-placement, periodic re-verification — all against
+  fakes, no Mac needed).
 - Live integration (`TartIntegrationTests`, tagged `requires_tart`,
   skipped unless `CODEYBOX_RUN_TART_INTEGRATION=1` with
   `TART_SSH_PASSWORD` on a macOS host): create → exec → file round-trip
