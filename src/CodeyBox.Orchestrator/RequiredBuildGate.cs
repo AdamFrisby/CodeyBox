@@ -284,6 +284,8 @@ internal sealed class RequiredBuildGate
     /// lands, <c>Failed</c> routes to conflict rework as a semantic conflict.
     /// <c>Unavailable</c> and toolchain faults throw exactly as in
     /// <see cref="VerifyAsync"/> (infrastructure, never diff-attributable).
+    /// A base-broken attribution parks at <see cref="WorkItemState.AuditPassed"/>
+    /// (the merge-resume gate) with the branch preserved.
     /// No audit report is persisted (<c>iteration: null</c>): this is a
     /// landing gate, not an audit iteration.
     /// </summary>
@@ -301,7 +303,8 @@ internal sealed class RequiredBuildGate
         ArgumentException.ThrowIfNullOrWhiteSpace(baseBranch);
         ArgumentException.ThrowIfNullOrWhiteSpace(verificationBranch);
         return VerifyAsync(
-            item, project, repoId, baseBranch, verificationBranch, phase: "merge", iteration: null, ct);
+            item, project, repoId, baseBranch, verificationBranch, phase: "merge", iteration: null,
+            baseBrokenResumeState: WorkItemState.AuditPassed, ct);
     }
 
     private async Task<RequiredBuildVerificationResult> VerifyAsync(
