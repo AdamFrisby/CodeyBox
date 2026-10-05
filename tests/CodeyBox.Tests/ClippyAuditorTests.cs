@@ -840,6 +840,11 @@ public sealed class ClippyAuditorTests
     /// spec's own entries). Entries are passed only when set on the test
     /// host, so a system-wide toolchain without rustup shims is unaffected.
     /// </summary>
+    // ProcessSandboxProvider clears the environment and points HOME at the
+    // sandbox root, so a rustup-managed cargo-clippy proxy can no longer find
+    // its toolchain through ~/.rustup. Forward the toolchain locations
+    // explicitly, falling back to rustup's default directories under the real
+    // HOME when the variables are not exported (as on GitHub's runners).
     private static IReadOnlyDictionary<string, string> ClippyToolEnvironment()
     {
         var environment = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -850,7 +855,21 @@ public sealed class ClippyAuditorTests
                 environment[name] = value;
         }
 
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            AddDefaultToolchainDirectory(environment, "RUSTUP_HOME", Path.Combine(home, ".rustup"));
+            AddDefaultToolchainDirectory(environment, "CARGO_HOME", Path.Combine(home, ".cargo"));
+        }
+
         return environment;
+    }
+
+    private static void AddDefaultToolchainDirectory(
+        Dictionary<string, string> environment, string name, string defaultDirectory)
+    {
+        if (!environment.ContainsKey(name) && Directory.Exists(defaultDirectory))
+            environment[name] = defaultDirectory;
     }
 
     private static string? ProbeInstalledClippyVersion()
@@ -865,6 +884,15 @@ public sealed class ClippyAuditorTests
                 UseShellExecute = false,
             };
             psi.ArgumentList.Add("--version");
+            // Probe under the same environment ProcessSandboxProvider gives the
+            // auditor (cleared, PATH kept, HOME relocated, toolchain forwarded),
+            // so a toolchain that only works with the real HOME skips these
+            // tests instead of failing them.
+            psi.Environment.Clear();
+            psi.Environment["PATH"] = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin";
+            psi.Environment["HOME"] = Path.GetTempPath();
+            foreach (var (name, value) in ClippyToolEnvironment())
+                psi.Environment[name] = value;
             using var process = Process.Start(psi)!;
             var stdout = process.StandardOutput.ReadToEnd();
             if (!process.WaitForExit(milliseconds: 10_000))
