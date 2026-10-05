@@ -44,14 +44,28 @@ public enum EgressEnforcementLocation
 /// Declares which sandbox providers are supported on which orchestrator-host
 /// operating systems, and where their egress enforcement lives.
 ///
-/// <para>Assessment (2026-09, recorded in docs/concepts/host-platforms.md):
+/// <para>Assessment (2026-10, recorded in docs/concepts/host-platforms.md):
 /// host-side egress equivalent to the nftables allowlist is not achievable on
 /// macOS (<c>pf</c>) or Windows (WFP) at equivalent strength — per-VM
 /// bridge attachment with an unbypassable host-kernel drop path does not
 /// exist there, and in-guest filtering is bypassable by a root agent. Local
-/// VM sandboxes are therefore Linux-only. On macOS/Windows only the
-/// remote-executor topology is supported: the orchestrator runs locally while
-/// VMs execute on a Linux executor host where the nftables enforcement holds.
+/// VM sandboxes on Linux stay the fully enforced path, and on macOS/Windows
+/// the remote-executor topology is supported: the orchestrator runs locally
+/// while VMs execute on a Linux executor host where the nftables enforcement
+/// holds.
+/// </para>
+/// <para>macOS + Tart is VM isolation: the provider reports
+/// <c>SandboxIsolationLevel.DedicatedKernel</c> (own guest kernel via Apple's
+/// Virtualization.framework), which is the primary boundary. Egress for the
+/// <c>tart</c> kind is statically
+/// <see cref="EgressEnforcementLocation.NotEnforced"/> — the static switch in
+/// <see cref="GetEgressEnforcement"/> never promotes a plugin kind, and a
+/// plugin can never promote itself. Per-sandbox egress enforcement exists only
+/// as <see cref="EgressEnforcementLocation.EnforcedOnProviderHostVerified"/>:
+/// Softnet mode on, the kind opted in through host-owned config
+/// (<c>CodeyBox:EgressVerification:Kinds</c>), and the host's canary
+/// verification passed for that sandbox (resolved per sandbox through
+/// <see cref="SandboxEgressPolicy.EffectiveEnforcement"/>).
 /// </para>
 /// </summary>
 public static class HostPlatformSupport

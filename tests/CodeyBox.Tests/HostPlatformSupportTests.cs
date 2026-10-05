@@ -97,6 +97,50 @@ public sealed class HostPlatformSupportTests
     }
 
     [Fact]
+    public void TartPluginKind_SupportedOnMacOS_ViaHostRegisteredPluginKinds()
+    {
+        var pluginKinds = new HashSet<string>(StringComparer.Ordinal) { "tart" };
+        // The host (not the plugin) registers the kind; support is per OS.
+        Assert.True(HostPlatformSupport.IsProviderSupportedOnHost("tart", MacOS, pluginKinds));
+        Assert.True(HostPlatformSupport.IsProviderSupportedOnHost("tart", Linux, pluginKinds));
+        // Without host registration the kind is unknown everywhere.
+        Assert.False(HostPlatformSupport.IsProviderSupportedOnHost("tart", MacOS));
+        Assert.False(HostPlatformSupport.IsProviderSupportedOnHost("tart", Linux));
+    }
+
+    [Fact]
+    public void TartPluginKind_StaticEgressIsNeverEnforced()
+    {
+        // macOS + Tart is VM isolation (DedicatedKernel, reported by the
+        // provider), never static egress enforcement: the switch cannot be
+        // promoted by anything the plugin returns or configures.
+        Assert.Equal(EgressEnforcementLocation.NotEnforced, HostPlatformSupport.GetEgressEnforcement("tart"));
+        Assert.False(SandboxEgressPolicy.IsEnforced("tart"));
+        Assert.False(HostPlatformSupport.ClaimsNetworkIsolation("tart", MacOS));
+        Assert.False(HostPlatformSupport.ClaimsNetworkIsolation("tart", Linux));
+    }
+
+    [Fact]
+    public void TartPluginKind_VerifiedOnlyWithSoftnetOptIn()
+    {
+        // EnforcedOnProviderHostVerified is per sandbox: Softnet mode on, the
+        // kind opted in through host-owned config, and the host's canary
+        // passing (the canary itself is covered by EgressVerificationTests).
+        var optedIn = new EgressVerificationGate(
+            () => new EgressVerificationOptions { Kinds = ["tart"] });
+        Assert.Equal(
+            EgressEnforcementLocation.EnforcedOnProviderHostVerified,
+            SandboxEgressPolicy.EffectiveEnforcement("tart", optedIn));
+        Assert.True(SandboxEgressPolicy.IsEffectivelyEnforced("tart", optedIn));
+
+        var notOptedIn = new EgressVerificationGate(() => new EgressVerificationOptions());
+        Assert.Equal(
+            EgressEnforcementLocation.NotEnforced,
+            SandboxEgressPolicy.EffectiveEnforcement("tart", notOptedIn));
+        Assert.False(SandboxEgressPolicy.IsEffectivelyEnforced("tart", notOptedIn));
+    }
+
+    [Fact]
     public void IsolationClaimed_OnlyWhereEnforcementExercised()
     {
         // Local VMs claim isolation only on Linux (nftables bridges present).
@@ -123,6 +167,10 @@ public sealed class HostPlatformSupportTests
         foreach (var id in HostPlatformSupport.AllProviderIds)
             Assert.Contains(id, doc, StringComparison.Ordinal);
         Assert.Contains("multipass-remote", doc, StringComparison.Ordinal);
+        // The Tart plugin kind is part of the documented matrix even though it
+        // is host-registered rather than built in.
+        Assert.Contains("tart", doc, StringComparison.Ordinal);
+        Assert.Contains("EnforcedOnProviderHostVerified", doc, StringComparison.Ordinal);
     }
 
     [Fact]

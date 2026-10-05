@@ -177,7 +177,10 @@ a prompt-injected or actively malicious agent has to defeat all of them:
   sandbox still can't reach your LAN, cloud-metadata endpoints, or anything off
   its allowlist — it can't flush a firewall it can't see. Providers that can't
   enforce this are labelled *egress not enforced*, and work that requires an
-  enforced network profile is never placed on them.
+  enforced network profile is never placed on them. One concession exists: a
+  provider-host filter outside the guest (Tart Softnet on a Mac) may serve
+  profiled work per sandbox, only after the host's own canary passes — and it
+  is never ranked above host enforcement.
 - **Least-privilege credentials.** Audit-tool sandboxes get no agent secrets at
   all. Your upstream/GitHub credentials never leave the orchestrator process. An
   injected agent has nothing to exfiltrate beyond its own scoped token.
@@ -482,19 +485,25 @@ sandbox install command, and its known quirks.
 | Orchestrator host | `incus` | `multipass` (local) | `tart` (plugin) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (dev-only) |
 |---|---|---|---|---|---|---|---|
 | Linux | ✅ VM, egress enforced on host | ✅ VM, egress enforced on host | ❌ macOS only | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ⚠️ shared kernel, no egress | ⚠️ no isolation, dev only |
-| macOS | ❌ | ❌ | ✅ VM (macOS or Linux guests), ⚠️ egress not enforced | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ❌ | ❌ |
+| macOS | ❌ | ❌ | ✅ VM (macOS or Linux guests), egress verified per sandbox via Softnet (see below) | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ❌ | ❌ |
 | Windows | ❌ | ❌ | ❌ | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ❌ | ❌ |
 
 **On a Mac**, run the orchestrator locally (`./build.sh`) and give agents
 local VMs with the [Tart](docs/extending/tart-sandbox-plugin.md) plugin — a
 fresh VM with its own kernel per work item, with macOS guests as well as Linux
-ones, so Apple-platform work can run too. What a Mac host doesn't yet give you
-is the host-enforced egress allowlist: a Tart guest's network follows the
-Mac's, so treat it as able to reach anything your Mac can. Use Tart for the
+ones, so Apple-platform work can run too. A Tart VM is VM isolation (its own
+kernel — the primary boundary), but its egress is `NotEnforced` by default:
+guest network follows the Mac's. Opt into Softnet mode plus host-owned
+per-sandbox canary verification (`CodeyBox:EgressVerification` with `tart`
+opted in) and each sandbox is handed over only after its own canary passes —
+the verified grant (`EnforcedOnProviderHostVerified`) is deliberately never
+stronger than host enforcement. The fail-closed and IPv6 properties are
+established only by the Mac-only operator procedure
+(`scripts/verify-tart-softnet.sh`); until it has run on real hardware the path
+is documented as unverified. Use Tart for the
 work you would trust with that, and a Linux host or a remote Linux executor for
 the rest — work that requires an enforced network profile is placed there
-automatically. Enforced egress for Tart through its Softnet packet filter is in
-progress.
+automatically.
 
 **On Windows**, run the orchestrator locally (`./build.ps1`) with VMs on a
 remote Linux executor host, where the allowlist holds.
@@ -523,7 +532,9 @@ local microVMs with **BoxLite** and **microsandbox**, and macOS guests with
 **Tart**. Their egress is classified *not enforced* — the host can't put its
 firewall in front of a machine it doesn't own — so placement keeps any work that
 requires an enforced network profile on a host-enforced provider, and each
-plugin's doc says exactly what isolation it does and doesn't give.
+plugin's doc says exactly what isolation it does and doesn't give. The one
+exception is Tart in Softnet mode with host-owned canary verification (above):
+a per-sandbox verified grant, never above host enforcement.
 → [`docs/extending/sandbox-plugins.md`](docs/extending/sandbox-plugins.md)
 
 Choose explicitly: prefer `incus` for persistent or high-throughput headless
