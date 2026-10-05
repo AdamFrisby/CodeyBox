@@ -5,22 +5,47 @@
   </picture>
 </p>
 
-**An autonomous coding orchestrator.** Hand it a task — a title and a prompt
-against one of your repos — and CodeyBox picks a coding agent, runs it inside a
-throwaway VM, reviews the result, resolves merge conflicts, and lands the change
-on your branch (and on GitHub, if you point it there). You stay in the loop for
-product decisions; it handles the delivery grind.
+**An autonomous coding orchestrator you can hand work to and walk away
+from.** Give it a task — a title and a prompt against one of your repos — and
+CodeyBox picks a coding agent, runs it inside a throwaway VM, and then does the
+part that makes walking away possible: it puts the change in front of a panel
+of auditors, sends every failing finding back to the agent as rework, and only
+lands the change on your branch (and on GitHub, if you point it there) once
+every auditor on the panel passes. You stay in the loop for product decisions;
+it handles the delivery grind.
 
-It drives a *fleet* of two dozen agent CLIs — Claude Code, OpenAI Codex, GitHub
-Copilot, Cursor, Devin, Gemini, opencode, Aider, Goose and more — and routes
-each task to whichever one is best and available, falling back automatically
-when a provider hits a rate limit. No coding agent ever runs on your host:
-every model call that touches a repository happens through an agent CLI inside
-a sandbox.
+**The audit panel is why you don't have to watch it.** An agent that says it is
+done is not trusted to be done. Every item goes through a default panel of
+sixteen auditors, each an independent hard gate — no averaging into "good
+enough", no single reviewer to talk round:
 
-Every agent is boxed in a real VM behind a host-enforced firewall, because the
-point is to be able to leave it running — see
-[Security: defense in depth](#security-defense-in-depth).
+- **The code has to work.** A warnings-as-errors build, the full test suite, a
+  diff-scoped coverage gate, and mutation testing that checks the new tests
+  would actually catch a broken implementation.
+- **It can't be faked.** A dedicated *cheating* review plus deterministic diff
+  checks hunt for the shortcuts agents take to get to green — stubbed returns,
+  deleted or skipped tests, suppressed warnings, assertions that can't fail —
+  alongside a scan for test patterns that make suites flaky.
+- **It has to be safe.** Secret scanning (gitleaks) and SAST (semgrep) on every
+  diff, and an LLM security review.
+- **It has to be good.** Separate LLM reviewers for architecture, quality,
+  completeness and test meaningfulness, plus a check that the code matches the
+  plan it was approved against.
+
+On top of that panel sit **64 auditor plugins** you can switch on for the stack
+you actually have — linters for a dozen languages, SAST, dependency
+vulnerabilities, secrets, infrastructure-as-code, licensing, schema and API
+compatibility, documentation — and language presets for C#, Python, Node, Go
+and Rust. Plugins are off until you enable them, so audit time tracks what you
+chose to check. See [Quality gates you control](#quality-gates-you-control).
+
+It drives a *fleet* of twenty-five agent CLIs — Claude Code, OpenAI Codex,
+GitHub Copilot, Cursor, Devin, Gemini, opencode, Aider, Goose and more — and
+routes each task to whichever one is best and available, falling back
+automatically when a provider hits a rate limit. No coding agent ever runs on
+your host: every model call that touches a repository happens through an agent
+CLI inside a sandbox, boxed in a real VM behind a host-enforced firewall —
+see [Security: defense in depth](#security-defense-in-depth).
 
 > Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go, Rust,
 > C#, or your own — through config-driven auditors.
@@ -313,17 +338,60 @@ Recovery procedures are in
   [Agnes](https://github.com/AdamFrisby/Agnes) if you want a remote front end.
   → [`docs/reference/api.md`](docs/reference/api.md),
   [`docs/reference/webhooks.md`](docs/reference/webhooks.md)
-- **Pluggable everything.** Ship custom auditors, upstream remotes, credential
-  providers, or sandbox backends as NuGet plugins — no fork.
+- **A majordomo beside the map.** An LLM assistant docked next to the fleet
+  map that you talk to about the queue — "what's blocking the executor chain?",
+  "file this as three dependent items" — whose only hands are the queue's own
+  validated tools. It runs in a sandbox with read-only access to the project
+  repos, never touches the host, and works either proposal-and-approve or fully
+  autonomous; you pick with a switch.
+- **Remote executors.** Run sandbox phases on other machines: the orchestrator
+  keeps state, git, merges and auditing, and dispatches phases to registered
+  executor hosts with the repo staged in and out, with the same supervision and
+  agent streams as local work.
+  → [`docs/operating/remote-executors.md`](docs/operating/remote-executors.md)
+- **Pluggable everything, with a catalogue to start from.** Beyond the auditors:
+  forges (GitLab, Bitbucket, Gitea, Forgejo, Azure DevOps — GitHub is built
+  in), work sources that sync issues in and status back (Jira, Linear, Plane,
+  Shortcut, YouTrack), notifications (Slack, Teams, Discord, ntfy, Gotify),
+  credential backends (1Password, Bitwarden, Doppler, Infisical, OpenBao), and
+  sandbox backends (below). All plugins, all off by default — or ship your own
+  as a NuGet package, no fork.
   → [`docs/extending/plugins.md`](docs/extending/plugins.md)
 
 ## Quality gates you control
 
 Auditors stack. You choose exactly which checks gate a merge — built-in tool
-auditors (formatting, build, the full test suite, gitleaks secret scanning,
-semgrep SAST) and LLM reviewers over six audit types (security, architecture,
-quality, completeness, cheating, tests) — or bring your own. Each runs in its own
-capability-scoped sandbox, and the tool-only ones hold no agent credentials.
+auditors (formatting, build, the full test suite, coverage, mutation rigor,
+gitleaks secret scanning, semgrep SAST) and LLM reviewers over six audit types
+(security, architecture, quality, completeness, cheating, tests) — plus any of
+the plugin catalogue, or your own. Each runs in its own capability-scoped
+sandbox, and the tool-only ones hold no agent credentials.
+
+The plugin catalogue (each one disabled until you enable it):
+
+| Category | Auditors |
+|---|---|
+| Linting (22) | Biome, clang-tidy, Clippy, Cppcheck, Credo, detekt, ESLint, golangci-lint, ReSharper InspectCode, Knip, mypy, Oxlint, PHPStan, PMD, Pyright, Roslynator, RuboCop, Ruff, SpotBugs, Staticcheck, SwiftLint, and a SARIF example to build your own |
+| SAST (5) | Bandit, Brakeman, CodeQL, DevSkim, Semgrep |
+| Dependency vulnerabilities (8) | cargo-audit, cargo-deny, OWASP Dependency-Check, govulncheck, Grype, OSV-Scanner, Socket, Trivy |
+| Secrets (4) | Betterleaks, detect-secrets, Gitleaks, TruffleHog (with live credential verification) |
+| Infrastructure (10) | actionlint, cfn-lint, Checkov, Conftest, Hadolint, KICS, KubeLinter, kubeconform, TFLint, zizmor |
+| Schema (3) | Spectral, SQLFluff, Squawk |
+| API compatibility (3) | Buf breaking, cargo-semver-checks, GraphQL Inspector |
+| Architecture (3) | dependency-cruiser, Import Linter, file-size limits |
+| Documentation (3) | lychee, markdownlint, Vale |
+| Scripting (2) | PSScriptAnalyzer, ShellCheck |
+| Licensing (2) | REUSE, ScanCode Toolkit |
+
+Enabling one adds its tool to the sandbox baseline; disabling it takes it back
+out. → [`docs/extending/auditor-plugins.md`](docs/extending/auditor-plugins.md)
+
+Test-heavy suites can opt into **regression test selection**: after every
+merge CodeyBox records which lines each test covers, and audits run only the
+tests a change can reach. It ships shadow-first — the full suite still runs and
+the would-be selection is scored — and only switches to enforcing once a
+calibration window shows it never skips a test that would have failed.
+→ [`docs/quality/test-selection.md`](docs/quality/test-selection.md)
 
 The gate is hard: when any auditor fails, its findings go straight back to the
 agent, which reworks and resubmits — the loop repeats until **every** gate passes
@@ -385,12 +453,12 @@ items); `--json` / `--quiet` make every command pipe-friendly.
 
 ## The agent fleet
 
-Twenty-four agent CLIs are supported today:
+Twenty-five agent CLIs are supported today:
 
 `claude` · `codex` · `copilot` · `cursor` · `devin` · `gemini` · `opencode` ·
 `antigravity` · `crock` · `aider` · `goose` · `pi` · `prime` · `autohand` ·
 `vibe` · `cline` · `kilo` · `omp` · `continue` · `qwen` · `cmd` · `crush` ·
-`caveman` · `dotnet-opencode`
+`caveman` · `dotnet-opencode` · `unreal`
 
 Each lives in `src/CodeyBox.Agents.<Name>` and implements `IAgentRunner` — a
 subclass of `CliAgentRunnerBase` that builds one non-interactive invocation.
@@ -434,6 +502,16 @@ Pick with `CodeyBox.SandboxProvider`:
 | `sprites`          | a Fly.io Sprites account               | Firecracker microVMs over an HTTP/WebSocket API; writable host mounts sync back at teardown, not per exec |
 | `bubblewrap`       | `apt install bubblewrap`               | namespaces, shared kernel; integration-tested          |
 | `process`          | none                                   | **none — testing only, never with untrusted prompts**  |
+
+More backends ship as plugins (disabled by default): cloud VMs on any
+**OpenStack** cloud (`openstack`, with a sample config for Infomaniak Public Cloud),
+hosted sandboxes on **Daytona**, **E2B**, **Modal**, **Runloop** and **Blaxel**,
+local microVMs with **BoxLite** and **microsandbox**, and macOS guests with
+**Tart**. Their egress is classified *not enforced* — the host can't put its
+firewall in front of a machine it doesn't own — so placement keeps any work that
+requires an enforced network profile on a host-enforced provider, and each
+plugin's doc says exactly what isolation it does and doesn't give.
+→ [`docs/extending/sandbox-plugins.md`](docs/extending/sandbox-plugins.md)
 
 Choose explicitly: prefer `incus` for persistent or high-throughput headless
 installations, and `multipass` for the simplest setup. Multipass baseline clones
@@ -507,9 +585,13 @@ recommended for persistent, high-throughput headless deployments; Multipass is
 the simpler option. The `process` provider is for constrained testing only and
 gives no isolation. Issues and contributions are welcome.
 
-Because CodeyBox builds itself, its roadmap is its own work queue. The threads
-currently moving: finishing the plan-first flow (plan-reviewer panel and
-plan-adherence checking), test selection that runs only the tests a change can
-affect, a diff-scoped coverage gate and flake attribution, multi-host sandbox
-pools, autonomous exploratory testing that emits replayable regression
-artifacts, and smarter quota drain scheduling.
+Because CodeyBox builds itself, its roadmap is its own work queue — and most of
+what's described above was built that way, by agents working through this same
+audit panel. Recently landed: the plugin catalogue (64 auditors plus forges,
+work sources, notifications, credential and sandbox backends), the majordomo,
+remote executors, and the coverage-baseline producer for test selection. The
+threads currently moving: calibrating test selection toward enforcement,
+verifying a merge's combined result builds before it lands, counting audit
+sessions against per-agent concurrency caps, autonomous exploratory testing
+that emits replayable regression artifacts, and smarter quota drain
+scheduling.
