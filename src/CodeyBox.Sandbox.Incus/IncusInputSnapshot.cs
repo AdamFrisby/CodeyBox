@@ -18,7 +18,7 @@ internal static class IncusInputSnapshot
         ArgumentNullException.ThrowIfNull(source);
         ValidateRequiredBoundedText(source.ImageReference, 4096, nameof(SandboxSpec.ImageReference));
         ValidateRequiredBoundedText(source.WorkingDirectory, 4096, nameof(SandboxSpec.WorkingDirectory));
-        ValidateOptionalBoundedText(source.BaselineImageRef, 63, nameof(SandboxSpec.BaselineImageRef));
+        ValidateBaselineImageRef(source.BaselineImageRef);
         ValidateOptionalBoundedText(source.TimingPhase, 128, nameof(SandboxSpec.TimingPhase));
         var mounts = SnapshotList(
             source.Mounts,
@@ -53,6 +53,28 @@ internal static class IncusInputSnapshot
             Network = network with { AllowedHosts = allowedHosts },
         };
     }
+
+    /// <summary>
+    /// A baseline ref is either a bare Incus image name, bounded by Incus's
+    /// 63-byte instance-name limit, or a provider-scoped pin
+    /// (<c>{provider}/tc-{hash}/{incus-name}</c>, see <see cref="BaselinePin"/>)
+    /// that the provider unwraps later during baseline resolution. A scoped
+    /// pin is bounded by the pin format's own limit, and its inner Incus name
+    /// by the same 63 bytes, so the effective guarantee is unchanged.
+    /// </summary>
+    private static void ValidateBaselineImageRef(string? baselineImageRef)
+    {
+        if (BaselinePin.TryParseScopedPin(baselineImageRef, out _, out _, out var providerRef))
+        {
+            ValidateRequiredBoundedText(baselineImageRef!, BaselinePin.MaximumPinLength, nameof(SandboxSpec.BaselineImageRef));
+            ValidateRequiredBoundedText(providerRef, IncusInstanceNameMaxBytes, nameof(SandboxSpec.BaselineImageRef));
+            return;
+        }
+
+        ValidateOptionalBoundedText(baselineImageRef, IncusInstanceNameMaxBytes, nameof(SandboxSpec.BaselineImageRef));
+    }
+
+    private const int IncusInstanceNameMaxBytes = 63;
 
     internal static SandboxExec CaptureExec(SandboxExec source)
     {

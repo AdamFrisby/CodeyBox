@@ -117,6 +117,37 @@ public sealed class IncusInputSnapshotTests
     }
 
     [Fact]
+    public void CaptureSpec_AcceptsProviderScopedBaselinePinLongerThanAnIncusName()
+    {
+        // Regression: provider-scoped pins ({provider}/tc-{hash}/{incus-name})
+        // exceed 63 bytes as a whole; only the inner Incus name is bound by it.
+        const string scoped = "incus/tc-4e61023ae4fb/cb-incus-baseline-internet-only-headless-4149f045e7ee";
+        Assert.True(scoped.Length > 63);
+        var source = new SandboxSpec { ImageReference = "local-image", BaselineImageRef = scoped };
+
+        var snapshot = IncusInputSnapshot.CaptureSpec(source);
+
+        Assert.Equal(scoped, snapshot.BaselineImageRef);
+    }
+
+    [Fact]
+    public void CaptureSpec_RejectsScopedPinWhoseInnerIncusNameExceeds63Bytes()
+    {
+        var scoped = "incus/tc-4e61023ae4fb/" + new string('a', 64);
+        var source = new SandboxSpec { ImageReference = "local-image", BaselineImageRef = scoped };
+
+        Assert.Throws<ArgumentException>(() => IncusInputSnapshot.CaptureSpec(source));
+    }
+
+    [Fact]
+    public void CaptureSpec_StillRejectsBareBaselineRefLongerThan63Bytes()
+    {
+        var source = new SandboxSpec { ImageReference = "local-image", BaselineImageRef = new string('a', 64) };
+
+        Assert.Throws<ArgumentException>(() => IncusInputSnapshot.CaptureSpec(source));
+    }
+
+    [Fact]
     public void CaptureSpec_RejectsHugeEnvironmentKeyBeforeDictionaryInsertion()
     {
         var environment = new DeceptiveReadOnlyDictionary(
