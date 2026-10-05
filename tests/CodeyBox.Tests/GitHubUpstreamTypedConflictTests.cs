@@ -24,13 +24,9 @@ internal sealed class GitHubUrlRewriteShim : IDisposable
 {
     public string ShimPath { get; }
     public string LogPath { get; }
-    private readonly string _githubUrl;
-    private readonly string _localPath;
 
     public GitHubUrlRewriteShim(string workspace, string githubUrl, string localPath)
     {
-        _githubUrl = githubUrl;
-        _localPath = localPath;
         var realGit = ResolveRealGit();
         ShimPath = Path.Combine(workspace, "git-shim-" + Guid.NewGuid().ToString("N")[..8] + ".sh");
         LogPath = Path.Combine(workspace, "git-shim-log-" + Guid.NewGuid().ToString("N")[..8] + ".txt");
@@ -56,6 +52,20 @@ internal sealed class GitHubUrlRewriteShim : IDisposable
 
     public void Dispose()
     {
+        foreach (var path in new[] { ShimPath, LogPath })
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
     }
 
     private static void MakeExecutable(string path)
@@ -123,7 +133,7 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
     };
 
     private async Task<(LocalGitHost Host, string RepoId, string UpstreamBare, GitHubUrlRewriteShim Shim, string GithubUrl, string Token, FakeHttpMessageHandler Handler)> SetupDivergedAsync(
-        string workBranch, string mergeMethod, string localContent, string remoteContent)
+        string workBranch, string localContent, string remoteContent)
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var upstreamBare = Path.Combine(_workspace, "upstream-" + Guid.NewGuid().ToString("N")[..8] + ".git");
@@ -149,23 +159,28 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
     private static async Task CommitBranchFileAsync(string barePath, string branch, string file, string content, string message)
     {
         var clone = Path.Combine(Path.GetTempPath(), "codeybox-tc-" + Guid.NewGuid().ToString("N")[..8]);
-        await TestSupport.RunGit(Path.GetTempPath(), "clone", barePath, clone);
-        await TestSupport.RunGit(clone, "config", "user.email", "t@t");
-        await TestSupport.RunGit(clone, "config", "user.name", "T");
-        await TestSupport.RunGit(clone, "checkout", "-b", branch);
-        await File.WriteAllTextAsync(Path.Combine(clone, file), content);
-        await TestSupport.RunGit(clone, "add", file);
-        await TestSupport.RunGit(clone, "commit", "-m", message);
-        await TestSupport.RunGit(clone, "push", "origin", branch);
-        Directory.Delete(clone, recursive: true);
+        try
+        {
+            await TestSupport.RunGit(Path.GetTempPath(), "clone", barePath, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "t@t");
+            await TestSupport.RunGit(clone, "config", "user.name", "T");
+            await TestSupport.RunGit(clone, "checkout", "-b", branch);
+            await File.WriteAllTextAsync(Path.Combine(clone, file), content);
+            await TestSupport.RunGit(clone, "add", file);
+            await TestSupport.RunGit(clone, "commit", "-m", message);
+            await TestSupport.RunGit(clone, "push", "origin", branch);
+        }
+        finally
+        {
+            if (Directory.Exists(clone))
+                Directory.Delete(clone, recursive: true);
+        }
     }
 
     private static GitHubUpstreamRemote BuildRemote(
         IGitHost host, FakeHttpMessageHandler handler, string owner, string repo, string token, string mergeMethod)
     {
         var factory = new FakeHttpClientFactory(handler);
-        var parts = new Uri($"https://github.com/{owner}/{repo}.git");
-        _ = parts;
         return new GitHubUpstreamRemote(
             host,
             factory,
@@ -184,7 +199,7 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
     public async Task RebaseConflict_PreservesTypedBranchAndStrategyWithoutInnerOrToken()
     {
         var workBranch = NewBranch();
-        var (host, repoId, _, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "rebase", "local\n", "remote\n");
+        var (host, repoId, _, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "local\n", "remote\n");
         using (shim)
         {
             var (owner, repo) = SplitGithubUrl(githubUrl);
@@ -204,7 +219,7 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
     public async Task MergeConflict_PreservesTypedMergeIdentity()
     {
         var workBranch = NewBranch();
-        var (host, repoId, _, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "merge", "local\n", "remote\n");
+        var (host, repoId, _, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "local\n", "remote\n");
         using (shim)
         {
             var (owner, repo) = SplitGithubUrl(githubUrl);
@@ -361,20 +376,50 @@ public sealed class GitHubUpstreamTypedConflictPipelineTests : IDisposable
         var upstreamBare = Path.Combine(workspace, "upstream-" + Guid.NewGuid().ToString("N")[..8] + ".git");
         await TestSupport.RunGit(workspace, "clone", "--bare", "--local", seed, upstreamBare);
         var clone = Path.Combine(workspace, "up-pre-" + Guid.NewGuid().ToString("N")[..8]);
-        await TestSupport.RunGit(workspace, "clone", upstreamBare, clone);
-        await TestSupport.RunGit(clone, "config", "user.email", "t@t");
-        await TestSupport.RunGit(clone, "config", "user.name", "T");
-        await TestSupport.RunGit(clone, "checkout", "-b", workBranch);
-        await File.WriteAllTextAsync(Path.Combine(clone, "push-conflict.txt"), remoteContent);
-        await TestSupport.RunGit(clone, "add", "push-conflict.txt");
-        await TestSupport.RunGit(clone, "commit", "-m", "remote conflicting work");
-        await TestSupport.RunGit(clone, "push", "origin", workBranch);
-        Directory.Delete(clone, recursive: true);
+        try
+        {
+            await TestSupport.RunGit(workspace, "clone", upstreamBare, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "t@t");
+            await TestSupport.RunGit(clone, "config", "user.name", "T");
+            await TestSupport.RunGit(clone, "checkout", "-b", workBranch);
+            await File.WriteAllTextAsync(Path.Combine(clone, "push-conflict.txt"), remoteContent);
+            await TestSupport.RunGit(clone, "add", "push-conflict.txt");
+            await TestSupport.RunGit(clone, "commit", "-m", "remote conflicting work");
+            await TestSupport.RunGit(clone, "push", "origin", workBranch);
+        }
+        finally
+        {
+            if (Directory.Exists(clone))
+                Directory.Delete(clone, recursive: true);
+        }
+
         return upstreamBare;
     }
 
-    [Fact]
-    public async Task PushConflictThroughRealAdapter_RoutesToConflictReworkWithSinglePushAttempt()
+    /// <summary>
+    /// Shared fixture for the pipeline tests below: a seed repo, an upstream
+    /// bare repo whose work branch genuinely conflicts with the agent's
+    /// planned file, and the transport shim + real hosts wiring the
+    /// <see cref="GitHubUpstreamRemote"/> to that upstream with no network.
+    /// One helper so the setup cannot drift between the routing,
+    /// disabled/cap, and resolution tests.
+    /// </summary>
+    private sealed record PipelineFixture(
+        string Seed,
+        string WorkBranch,
+        string UpstreamBare,
+        string Owner,
+        string Repo,
+        string Token,
+        GitHubUrlRewriteShim Shim,
+        LocalGitHost ShimHost,
+        FakeHttpMessageHandler Handler,
+        GitHubUpstreamOptions UpstreamOptions) : IDisposable
+    {
+        public void Dispose() => Shim.Dispose();
+    }
+
+    private async Task<PipelineFixture> SetupPipelineFixtureAsync(string mergeMethod)
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var workBranch = "feature/gh-typed-" + Guid.NewGuid().ToString("N")[..8];
@@ -384,31 +429,66 @@ public sealed class GitHubUpstreamTypedConflictPipelineTests : IDisposable
         var repo = "r" + Guid.NewGuid().ToString("N")[..12];
         var githubUrl = $"https://github.com/{owner}/{repo}.git";
         var token = "tok_canary_" + Guid.NewGuid().ToString("N")[..12];
-        using var shim = new GitHubUrlRewriteShim(_workspace, githubUrl, upstreamBare);
+        var shim = new GitHubUrlRewriteShim(_workspace, githubUrl, upstreamBare);
         var shimRoot = Path.Combine(_workspace, "shim-repos-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(shimRoot);
         var shimHost = new LocalGitHost(
             new LocalGitHostOptions { RootDirectory = shimRoot, GitExecutable = shim.ShimPath },
             NullLogger<LocalGitHost>.Instance);
         var handler = new FakeHttpMessageHandler();
-        var opts = new GitHubUpstreamOptions { Owner = owner, Repository = repo, Token = token, MergeMethod = "rebase", AutoMerge = false };
-        var factory = new GitHubTypedConflictTestFactory(_ => new GitHubUpstreamRemote(
-            shimHost, new FakeHttpClientFactory(handler),
-            NullLogger<GitHubUpstreamRemote>.Instance, opts));
+        var opts = new GitHubUpstreamOptions { Owner = owner, Repository = repo, Token = token, MergeMethod = mergeMethod, AutoMerge = false };
+        return new PipelineFixture(seed, workBranch, upstreamBare, owner, repo, token, shim, shimHost, handler, opts);
+    }
 
-        using var tp = TestSupport.BuildPipeline(
-            _workspace, seed,
-            upstream: new ProjectUpstream { Kind = "github", MergeMethod = "rebase" },
+    private static GitHubTypedConflictTestFactory BuildFactory(PipelineFixture fx) =>
+        new(_ => new GitHubUpstreamRemote(
+            fx.ShimHost, new FakeHttpClientFactory(fx.Handler),
+            NullLogger<GitHubUpstreamRemote>.Instance, fx.UpstreamOptions));
+
+    private static TestPipeline BuildTestPipeline(
+        string workspace,
+        string seed,
+        string mergeMethod,
+        GitHubTypedConflictTestFactory factory,
+        LocalGitHost shimHost,
+        bool routeToConflictRework,
+        int maxReworkAttempts,
+        int upstreamPushMaxAttempts = 5,
+        IEnumerable<IAuditor>? auditors = null,
+        IRequiredBuildVerifier? requiredBuildVerifier = null)
+    {
+        return TestSupport.BuildPipeline(
+            workspace, seed,
+            auditors: auditors,
+            upstream: new ProjectUpstream { Kind = "github", MergeMethod = mergeMethod },
             upstreamFactory: factory,
             pipelineOptions: new PipelineOptions
             {
                 SandboxImageReference = "ignored",
                 AgentAllowedHosts = [],
-                UpstreamPushMaxAttempts = 5,
+                UpstreamPushMaxAttempts = upstreamPushMaxAttempts,
                 UpstreamPushBackoff = TimeSpan.Zero,
             },
             gitHostDecorator: _ => shimHost,
-            staleBaseReworkOptions: new StalePullRequestSweeperOptions { RouteToConflictRework = true, MaxReworkAttempts = 2 });
+            requiredBuildVerifier: requiredBuildVerifier,
+            staleBaseReworkOptions: new StalePullRequestSweeperOptions { RouteToConflictRework = routeToConflictRework, MaxReworkAttempts = maxReworkAttempts });
+    }
+
+    [Fact]
+    public async Task PushConflictThroughRealAdapter_RoutesToConflictReworkWithSinglePushAttempt()
+    {
+        using var fx = await SetupPipelineFixtureAsync("rebase");
+        var seed = fx.Seed;
+        var workBranch = fx.WorkBranch;
+        var upstreamBare = fx.UpstreamBare;
+        var token = fx.Token;
+        var shimHost = fx.ShimHost;
+        var handler = fx.Handler;
+        var factory = BuildFactory(fx);
+
+        using var tp = BuildTestPipeline(
+            _workspace, seed, "rebase", factory, shimHost,
+            routeToConflictRework: true, maxReworkAttempts: 2);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("push-conflict.txt", "work content\n"));
 
         var item = NewItem(workBranch);
@@ -423,7 +503,7 @@ public sealed class GitHubUpstreamTypedConflictPipelineTests : IDisposable
         Assert.Empty(handler.Requests);
         var queue = Assert.IsType<InMemoryTaskQueue>(tp.Queue);
         Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
-        var upstreamPushes = shim.Invocations.Count(line =>
+        var upstreamPushes = fx.Shim.Invocations.Count(line =>
             line.Contains("push", StringComparison.Ordinal) && line.Contains("github.com", StringComparison.Ordinal));
         Assert.Equal(1, upstreamPushes);
 
@@ -437,39 +517,18 @@ public sealed class GitHubUpstreamTypedConflictPipelineTests : IDisposable
     [Fact]
     public async Task PushConflictThroughRealAdapter_DisabledPreservesHistoricalParkWithoutDelivery()
     {
-        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var workBranch = "feature/gh-typed-" + Guid.NewGuid().ToString("N")[..8];
-        var upstreamBare = await CreateUpstreamWithConflictingWorkBranchAsync(_workspace, seed, workBranch, "remote content\n");
+        using var fx = await SetupPipelineFixtureAsync("merge");
+        var seed = fx.Seed;
+        var workBranch = fx.WorkBranch;
+        var upstreamBare = fx.UpstreamBare;
+        var token = fx.Token;
+        var shimHost = fx.ShimHost;
+        var handler = fx.Handler;
+        var factory = BuildFactory(fx);
 
-        var owner = "o" + Guid.NewGuid().ToString("N")[..12];
-        var repo = "r" + Guid.NewGuid().ToString("N")[..12];
-        var githubUrl = $"https://github.com/{owner}/{repo}.git";
-        var token = "tok_canary_" + Guid.NewGuid().ToString("N")[..12];
-        using var shim = new GitHubUrlRewriteShim(_workspace, githubUrl, upstreamBare);
-        var shimRoot = Path.Combine(_workspace, "shim-repos-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(shimRoot);
-        var shimHost = new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = shimRoot, GitExecutable = shim.ShimPath },
-            NullLogger<LocalGitHost>.Instance);
-        var handler = new FakeHttpMessageHandler();
-        var opts = new GitHubUpstreamOptions { Owner = owner, Repository = repo, Token = token, MergeMethod = "merge", AutoMerge = false };
-        var factory = new GitHubTypedConflictTestFactory(_ => new GitHubUpstreamRemote(
-            shimHost, new FakeHttpClientFactory(handler),
-            NullLogger<GitHubUpstreamRemote>.Instance, opts));
-
-        using var tp = TestSupport.BuildPipeline(
-            _workspace, seed,
-            upstream: new ProjectUpstream { Kind = "github", MergeMethod = "merge" },
-            upstreamFactory: factory,
-            pipelineOptions: new PipelineOptions
-            {
-                SandboxImageReference = "ignored",
-                AgentAllowedHosts = [],
-                UpstreamPushMaxAttempts = 5,
-                UpstreamPushBackoff = TimeSpan.Zero,
-            },
-            gitHostDecorator: _ => shimHost,
-            staleBaseReworkOptions: new StalePullRequestSweeperOptions { RouteToConflictRework = false, MaxReworkAttempts = 2 });
+        using var tp = BuildTestPipeline(
+            _workspace, seed, "merge", factory, shimHost,
+            routeToConflictRework: false, maxReworkAttempts: 2);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("push-conflict.txt", "work content\n"));
 
         var item = NewItem(workBranch);
@@ -491,42 +550,205 @@ public sealed class GitHubUpstreamTypedConflictPipelineTests : IDisposable
         Assert.False(string.IsNullOrWhiteSpace(upstreamTip));
     }
 
+    /// <summary>
+    /// Counts audit invocations while always passing. Proves the audit phase
+    /// genuinely ran (not skipped) on the first pickup.
+    /// </summary>
+    private sealed class CountingPassAuditor : IAuditor
+    {
+        public int Calls;
+        public string Name => "counting-pass";
+        public string Kind => "tool";
+        public AuditCapabilities Required => AuditCapabilities.None;
+        public Task<AuditResult> RunAsync(ISandbox sandbox, string workingDirectory, AuditContext context, CancellationToken ct = default)
+        {
+            _ = sandbox;
+            _ = workingDirectory;
+            _ = context;
+            _ = ct;
+            Calls++;
+            return Task.FromResult(new AuditResult(true, []));
+        }
+    }
+
+    /// <summary>
+    /// Required-build verifier that always applies/passes while recording the
+    /// work-branch tip it observed on every verification. Lets the
+    /// resolution test prove the post-resolution pickup re-verified the
+    /// CHANGED tip instead of reusing the pre-resolution approval.
+    /// </summary>
+    private sealed class TipRecordingBuildVerifier : IRequiredBuildVerifier
+    {
+        private readonly LocalGitHost _host;
+
+        public TipRecordingBuildVerifier(LocalGitHost host) => _host = host;
+
+        public int VerifyCalls;
+        public List<string> ObservedTips { get; } = [];
+
+        public Task<RequiredBuildProbeResult> ProbeAsync(RequiredBuildProbeRequest request, CancellationToken ct)
+        {
+            _ = request;
+            _ = ct;
+            return Task.FromResult(RequiredBuildProbeResult.Applies);
+        }
+
+        public async Task<RequiredBuildVerificationResult> VerifyAsync(RequiredBuildVerificationRequest request, CancellationToken ct)
+        {
+            _ = ct;
+            VerifyCalls++;
+            try
+            {
+                var tip = (await TestSupport.RunGit(_host.GetRepoPath(request.RepositoryId), "rev-parse", "--verify", request.WorkBranch)).stdout.Trim();
+                ObservedTips.Add(tip);
+            }
+            catch (InvalidOperationException)
+            {
+                ObservedTips.Add("unresolvable:" + request.WorkBranch);
+            }
+
+            return RequiredBuildVerificationResult.Passed(0, "ok");
+        }
+    }
+
+    private static async Task AssertAncestorAsync(string ancestor, string descendant, string repoPath)
+    {
+        var rc = await TestSupport.RunGitNoThrow(repoPath, "merge-base", "--is-ancestor", ancestor, descendant);
+        Assert.Equal(0, rc.code);
+    }
+
+    /// <summary>
+    /// Deterministically resolves the upstream work-branch divergence with
+    /// real git: merges the upstream work-branch history into the local work
+    /// branch, keeping both file contents under a fixed message. Returns the
+    /// resolved tip. Throws (fails the test) when the merge is unexpectedly
+    /// clean — the whole point is a genuine conflict.
+    /// </summary>
+    private static async Task<string> MergeUpstreamWorkBranchIntoLocalAsync(string localBare, string upstreamBare, string workBranch)
+    {
+        var clone = Path.Combine(Path.GetTempPath(), "codeybox-resolve-" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            await TestSupport.RunGit(Path.GetTempPath(), "clone", localBare, clone);
+            await TestSupport.RunGit(clone, "config", "user.email", "t@t");
+            await TestSupport.RunGit(clone, "config", "user.name", "T");
+            await TestSupport.RunGit(clone, "checkout", workBranch);
+            await TestSupport.RunGit(clone, "fetch", upstreamBare, workBranch);
+            var merge = await TestSupport.RunGitNoThrow(clone, "merge", "FETCH_HEAD", "-m", "deterministic reconcile: keep remote and work");
+            Assert.NotEqual(0, merge.code);
+            await File.WriteAllTextAsync(Path.Combine(clone, "push-conflict.txt"), "remote content\nwork content\n");
+            await TestSupport.RunGit(clone, "add", "push-conflict.txt");
+            await TestSupport.RunGit(clone, "commit", "-m", "deterministic reconcile: keep remote and work");
+            await TestSupport.RunGit(clone, "push", "origin", workBranch);
+            return (await TestSupport.RunGit(clone, "rev-parse", "--verify", workBranch)).stdout.Trim();
+        }
+        finally
+        {
+            if (Directory.Exists(clone))
+                Directory.Delete(clone, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// Successful-resolution test through the real adapter route. A genuine
+    /// upstream work-branch conflict enters bounded conflict rework (one push
+    /// attempt, not generic retries); the divergence is then resolved
+    /// deterministically with real git (both histories retained under a
+    /// merge); the requeued pickup must re-verify the build against the
+    /// CHANGED tip — the pre-resolution approval is not carried forward —
+    /// and deliver: Done with the PR opened, the exact resolved tip upstream,
+    /// and no credential material in observable surfaces.
+    /// </summary>
+    [Fact]
+    public async Task PushConflictThroughRealAdapter_ResolvesDeterministicallyWithFreshGatesAndDelivers()
+    {
+        using var fx = await SetupPipelineFixtureAsync("rebase");
+        var token = fx.Token;
+        var workBranch = fx.WorkBranch;
+        var upstreamBare = fx.UpstreamBare;
+        var shimHost = fx.ShimHost;
+
+        var auditor = new CountingPassAuditor();
+        var buildGate = new TipRecordingBuildVerifier(shimHost);
+        var factory = BuildFactory(fx);
+        using var tp = BuildTestPipeline(
+            _workspace, fx.Seed, "rebase", factory, shimHost,
+            routeToConflictRework: true, maxReworkAttempts: 2,
+            auditors: [auditor],
+            requiredBuildVerifier: buildGate);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("push-conflict.txt", "work content\n"));
+
+        var item = NewItem(workBranch);
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var parked = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.ReworkingForConflict, parked!.State);
+        Assert.Equal(1, parked.ConflictReworkAttempts);
+        Assert.Equal(1, parked.UpstreamPushAttempts);
+        Assert.True(auditor.Calls >= 1);
+        var preResolutionVerifications = buildGate.VerifyCalls;
+        Assert.True(preResolutionVerifications >= 1);
+
+        var localRepo = shimHost.GetRepoPath(item.Id.ToString());
+        var workTipBefore = (await TestSupport.RunGit(localRepo, "rev-parse", "--verify", workBranch)).stdout.Trim();
+        var upstreamTipBefore = (await TestSupport.RunGit(upstreamBare, "rev-parse", "--verify", workBranch)).stdout.Trim();
+        Assert.NotEqual(workTipBefore, upstreamTipBefore);
+        Assert.Contains(workTipBefore, buildGate.ObservedTips.Take(preResolutionVerifications));
+
+        var resolvedTip = await MergeUpstreamWorkBranchIntoLocalAsync(localRepo, upstreamBare, workBranch);
+        Assert.NotEqual(workTipBefore, resolvedTip);
+        await AssertAncestorAsync(workTipBefore, resolvedTip, localRepo);
+        await AssertAncestorAsync(upstreamTipBefore, resolvedTip, localRepo);
+        var (_, resolvedFile, _) = await TestSupport.RunGit(localRepo, "show", $"{resolvedTip}:push-conflict.txt");
+        Assert.Contains("remote content", resolvedFile);
+        Assert.Contains("work content", resolvedFile);
+
+        fx.Handler.Enqueue(new HttpResponseMessage(HttpStatusCode.Created)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new { number = 12, html_url = $"https://github.com/{fx.Owner}/{fx.Repo}/pull/12" }), Encoding.UTF8, "application/json"),
+        });
+        var queue = Assert.IsType<InMemoryTaskQueue>(tp.Queue);
+        Assert.Equal(item.Id, await queue.DequeueAsync(CancellationToken.None));
+        var resume = await tp.Store.GetAsync(item.Id);
+        await tp.Pipeline.RunAsync(resume!, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Equal(12, final.MergedPrNumber);
+        Assert.NotNull(final.MergedPrUrl);
+        Assert.Equal(1, final.UpstreamPushAttempts);
+
+        var postResolutionTips = buildGate.ObservedTips.Skip(preResolutionVerifications).ToList();
+        Assert.True(buildGate.VerifyCalls > preResolutionVerifications);
+        Assert.Contains(resolvedTip, postResolutionTips);
+        Assert.DoesNotContain(workTipBefore, postResolutionTips);
+
+        var upstreamTipAfter = (await TestSupport.RunGit(upstreamBare, "rev-parse", "--verify", workBranch)).stdout.Trim();
+        Assert.Equal(resolvedTip, upstreamTipAfter);
+        var (_, upstreamFile, _) = await TestSupport.RunGit(upstreamBare, "show", $"{upstreamTipAfter}:push-conflict.txt");
+        Assert.Contains("remote content", upstreamFile);
+        Assert.Contains("work content", upstreamFile);
+
+        Assert.DoesNotContain(token, final.LastError ?? string.Empty);
+        Assert.DoesNotContain(token, JsonSerializer.Serialize(final));
+        Assert.DoesNotContain(token, string.Join("\n", fx.Shim.Invocations));
+    }
+
     [Fact]
     public async Task PushConflictThroughRealAdapter_CapExhaustedParksAtMergeConflictTerminal()
     {
-        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        var workBranch = "feature/gh-typed-" + Guid.NewGuid().ToString("N")[..8];
-        var upstreamBare = await CreateUpstreamWithConflictingWorkBranchAsync(_workspace, seed, workBranch, "remote content\n");
+        using var fx = await SetupPipelineFixtureAsync("rebase");
+        var seed = fx.Seed;
+        var workBranch = fx.WorkBranch;
+        var token = fx.Token;
+        var shimHost = fx.ShimHost;
+        var handler = fx.Handler;
+        var factory = BuildFactory(fx);
 
-        var owner = "o" + Guid.NewGuid().ToString("N")[..12];
-        var repo = "r" + Guid.NewGuid().ToString("N")[..12];
-        var githubUrl = $"https://github.com/{owner}/{repo}.git";
-        var token = "tok_canary_" + Guid.NewGuid().ToString("N")[..12];
-        using var shim = new GitHubUrlRewriteShim(_workspace, githubUrl, upstreamBare);
-        var shimRoot = Path.Combine(_workspace, "shim-repos-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(shimRoot);
-        var shimHost = new LocalGitHost(
-            new LocalGitHostOptions { RootDirectory = shimRoot, GitExecutable = shim.ShimPath },
-            NullLogger<LocalGitHost>.Instance);
-        var handler = new FakeHttpMessageHandler();
-        var opts = new GitHubUpstreamOptions { Owner = owner, Repository = repo, Token = token, MergeMethod = "rebase", AutoMerge = false };
-        var factory = new GitHubTypedConflictTestFactory(_ => new GitHubUpstreamRemote(
-            shimHost, new FakeHttpClientFactory(handler),
-            NullLogger<GitHubUpstreamRemote>.Instance, opts));
-
-        using var tp = TestSupport.BuildPipeline(
-            _workspace, seed,
-            upstream: new ProjectUpstream { Kind = "github", MergeMethod = "rebase" },
-            upstreamFactory: factory,
-            pipelineOptions: new PipelineOptions
-            {
-                SandboxImageReference = "ignored",
-                AgentAllowedHosts = [],
-                UpstreamPushMaxAttempts = 5,
-                UpstreamPushBackoff = TimeSpan.Zero,
-            },
-            gitHostDecorator: _ => shimHost,
-            staleBaseReworkOptions: new StalePullRequestSweeperOptions { RouteToConflictRework = true, MaxReworkAttempts = 2 });
+        using var tp = BuildTestPipeline(
+            _workspace, seed, "rebase", factory, shimHost,
+            routeToConflictRework: true, maxReworkAttempts: 2);
         tp.Agent.WorkPlan.Enqueue(new FileWrite("push-conflict.txt", "work content\n"));
 
         var item = NewItem(workBranch, conflictAttempts: 2);

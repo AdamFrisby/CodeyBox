@@ -1021,19 +1021,4 @@ public sealed partial class PipelineRunner
             }, ct);
     }
 
-    private static bool TryGetUpstreamReconcileConflict(Exception ex, out UpstreamPushReconcileConflictException conflict)
-    {
-        for (var current = ex; current is not null; current = current.InnerException)
-        {
-            if (current is UpstreamPushReconcileConflictException typed)
-            {
-                conflict = typed;
-                return true;
-            }
-        }
-
-        conflict = null!;
-        return false;
-    }
-
 }

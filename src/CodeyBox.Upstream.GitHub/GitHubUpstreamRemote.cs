@@ -1767,26 +1767,11 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             ? message
             : message.Replace(token, "***", StringComparison.Ordinal);
 
-    private static bool TryFindReconcileConflict(Exception ex, out UpstreamPushReconcileConflictException conflict)
-    {
-        for (var current = ex; current is not null; current = current.InnerException)
-        {
-            if (current is UpstreamPushReconcileConflictException typed)
-            {
-                conflict = typed;
-                return true;
-            }
-        }
-
-        conflict = null!;
-        return false;
-    }
-
     private static bool TryBuildSafeReconcileConflict(
         Exception ex, string token, out UpstreamPushReconcileConflictException safeConflict)
     {
         safeConflict = null!;
-        if (!TryFindReconcileConflict(ex, out var typed))
+        if (!UpstreamPushReconcileConflictException.TryFindIn(ex, out var typed))
             return false;
 
         if (!typed.Strategy.Equals("merge", StringComparison.Ordinal)
