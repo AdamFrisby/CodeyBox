@@ -209,6 +209,39 @@ public interface IUpstreamRemote
     Task<UpstreamRepositoryMetadata?> GetRepositoryMetadataAsync(
         CancellationToken ct = default)
         => Task.FromResult<UpstreamRepositoryMetadata?>(null);
+
+    /// <summary>
+    /// Forge capability seam for audit check-run publication. Returns whether
+    /// this remote can publish structured audit findings as forge check runs.
+    /// The default reports unsupported so non-GitHub forges (noop,
+    /// git-generic, plugins that do not override) stay explicit rather than
+    /// silently dropping publication. Callers must check support before
+    /// publishing and record unsupported forges as
+    /// <see cref="AuditCheckUnavailabilityReason.UnsupportedForge"/> — never
+    /// as successful coverage.
+    /// </summary>
+    Task<AuditCheckPublicationSupport> GetAuditCheckPublicationSupportAsync(
+        CancellationToken ct = default)
+        => Task.FromResult(AuditCheckPublicationSupport.No(
+            $"Upstream kind '{Name}' does not publish audit check runs."));
+
+    /// <summary>
+    /// Publishes structured audit findings as a forge check run for the exact
+    /// audited commit in <paramref name="request"/>. The default throws
+    /// <see cref="AuditCheckUnsupportedException"/>; only forges with a real
+    /// Checks implementation (GitHub) override this.
+    ///
+    /// <para>Publishing is not permission: a published check never approves a
+    /// merge, bypasses required checks, enables a deployment, or grants token
+    /// scopes. It reports what the audit found, nothing more.</para>
+    /// </summary>
+    Task<AuditCheckPublicationResult> PublishAuditCheckAsync(
+        AuditCheckPublicationRequest request,
+        AuditCheckPublicationOptions options,
+        CancellationToken ct = default)
+        => Task.FromException<AuditCheckPublicationResult>(
+            new AuditCheckUnsupportedException(
+                $"Upstream kind '{Name}' does not publish audit check runs."));
 }
 
 public sealed record UpstreamPullRequestState(

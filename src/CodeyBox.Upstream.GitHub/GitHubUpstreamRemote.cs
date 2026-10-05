@@ -1704,6 +1704,32 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private static bool IsSquashMerge(string mergeMethod)
         => mergeMethod.Equals("squash", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Audit check-run publication is supported on GitHub via the Checks API
+    /// (<c>checks:write</c> for GitHub App tokens, or Checks read+write on a
+    /// fine-grained PAT / <c>repo</c> scope on a classic PAT). The caller owns
+    /// the opt-in decision; this only reports capability.
+    /// </summary>
+    public Task<AuditCheckPublicationSupport> GetAuditCheckPublicationSupportAsync(
+        CancellationToken ct = default)
+        => Task.FromResult(AuditCheckPublicationSupport.Yes);
+
+    /// <summary>
+    /// Publishes structured audit findings as a GitHub check run for the exact
+    /// audited commit. Reuses this remote's token plumbing and
+    /// <c>github-upstream</c> client; reconciliation by <c>external_id</c>
+    /// converges concurrent delivery, restarts, and lost create responses
+    /// instead of duplicating check runs.
+    /// </summary>
+    public Task<AuditCheckPublicationResult> PublishAuditCheckAsync(
+        AuditCheckPublicationRequest request,
+        AuditCheckPublicationOptions options,
+        CancellationToken ct = default)
+    {
+        var client = new GitHubCheckRunsClient(_httpClientFactory, _tokenProvider, _opts.Owner, _opts.Repository, _log);
+        return new GitHubAuditCheckPublisher(client).PublishAsync(request, options, ct);
+    }
+
     private async Task<HttpRequestMessage> BuildRequestAsync(
         HttpMethod method,
         string url,

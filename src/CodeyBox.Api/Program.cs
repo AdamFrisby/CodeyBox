@@ -3541,6 +3541,31 @@ builder.Services.AddSingleton<IAuditReportStore>(sp =>
         opts.StateDatabasePath,
         sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
 });
+// Opt-in audit check-run publication (forge Checks API). Disabled by default
+// at both the global section and the per-project flag; the singletons below
+// are inert until an operator enables them, so registration changes no live
+// behavior, merge gating, or credentials. Options hot-reload via the monitor.
+builder.Services.AddSingleton<IValidateOptions<AuditCheckPublicationOptions>, AuditCheckPublicationOptionsValidator>();
+builder.Services.AddOptions<AuditCheckPublicationOptions>()
+    .Bind(builder.Configuration.GetSection(AuditCheckPublicationOptions.SectionName))
+    .ValidateOnStart();
+builder.Services.AddSingleton<IAuditCheckPublicationStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAuditCheckPublicationStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddSingleton<AuditCheckPublicationService>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<AuditCheckPublicationOptions>>();
+    return new AuditCheckPublicationService(
+        sp.GetRequiredService<IAuditReportStore>(),
+        sp.GetRequiredService<IAuditCheckPublicationStore>(),
+        () => monitor.CurrentValue,
+        TimeProvider.System,
+        sp.GetRequiredService<ILogger<AuditCheckPublicationService>>());
+});
 builder.Services.AddSingleton<ITimingStore>(sp =>
 {
     // Timing rows have a foreign key to work_items. Ensure the primary store
