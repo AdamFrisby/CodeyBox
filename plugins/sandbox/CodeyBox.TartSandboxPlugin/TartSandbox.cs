@@ -15,7 +15,7 @@ public sealed record TartWritableMountSync(string HostDirectory, string GuestDir
 /// becomes a no-op and the clone directory survives for a later resume.
 /// </summary>
 public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSandbox,
-    IShutdownTeardownSandbox, IProviderOwnedSandbox, IPreserveOnDisposeSandbox
+    IShutdownTeardownSandbox, IProviderOwnedSandbox, IPreserveOnDisposeSandbox, ITartSoftnetPolicyReport
 {
     private readonly ITartProcessRunner _runner;
     private readonly TartSshGuestTransport _transport;
@@ -27,7 +27,10 @@ public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSan
     private readonly Action<string> _untrack;
     private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _inFlightExecs = new();
     private readonly object _ipSync = new();
+    private readonly object _policySync = new();
     private List<TartWritableMountSync> _writableMounts = [];
+    private TartNetworkMode _networkMode = TartNetworkMode.Nat;
+    private List<string> _effectiveAllowCidrs = [];
 
     private int _disposed;
     private bool _preserveOnDispose;
@@ -75,6 +78,37 @@ public sealed class TartSandbox : ISandbox, ISuspendableSandbox, IPreemptibleSan
     void IPreserveOnDisposeSandbox.DisablePreserveOnDispose() => _preserveOnDispose = false;
 
     public bool IsSuspended { get; private set; }
+
+    /// <summary>Guest-network backend the VM was launched with (default NAT).</summary>
+    public TartNetworkMode NetworkMode
+    {
+        get { lock (_policySync) return _networkMode; }
+    }
+
+    /// <summary>
+    /// Exact CIDR allowlist installed via <c>--net-softnet-allow</c>
+    /// (gateway first, then resolved <c>/32</c>s); empty in NAT mode.
+    /// </summary>
+    public IReadOnlyList<string> EffectiveAllowCidrs
+    {
+        get { lock (_policySync) return _effectiveAllowCidrs.ToList(); }
+    }
+
+    /// <summary>
+    /// Records the effective Softnet policy at create time so the host
+    /// verifier and operators can read exactly what the VM's filter allows.
+    /// Called once by the provider before <c>tart run</c>; NAT keeps the
+    /// defaults (empty allowlist).
+    /// </summary>
+    internal void SetNetworkPolicy(TartNetworkMode mode, IReadOnlyList<string> allowCidrs)
+    {
+        ArgumentNullException.ThrowIfNull(allowCidrs);
+        lock (_policySync)
+        {
+            _networkMode = mode;
+            _effectiveAllowCidrs = allowCidrs.ToList();
+        }
+    }
 
     internal void SetWritableMounts(List<TartWritableMountSync> mounts) =>
         _writableMounts = mounts ?? throw new ArgumentNullException(nameof(mounts));

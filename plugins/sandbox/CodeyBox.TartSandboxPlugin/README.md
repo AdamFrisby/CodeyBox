@@ -40,11 +40,15 @@ What isolation this provider **does** give:
 
 What it **does not** give:
 
-- No host-enforced egress filtering. Guest egress follows the Mac host's
-  network, not any CodeyBox network profile. The provider refuses any
-  sandbox naming a network profile, and placement never routes profiled
-  work here — but an operator choosing this provider for unprofiled work
-  is accepting host-default egress, not a CodeyBox allowlist.
+- No host-enforced egress filtering. In the default `nat` mode, guest
+  egress follows the Mac host's network, not any CodeyBox network profile.
+  `softnet` mode (below) adds a per-VM Softnet packet filter, but the host
+  still classifies the kind `NotEnforced` — this never becomes an enforced
+  network profile. The provider refuses any sandbox naming a network
+  profile, and placement never routes profiled work here — but an operator
+  choosing this provider for unprofiled work is accepting host-default
+  egress (NAT) or a best-effort guest filter (Softnet), not a CodeyBox
+  allowlist.
 - Suspend is stop/start: a suspended VM keeps its clone directory but
   running processes do not survive; the pipeline replays from its
   checkpoint, so this is expected, not data loss.
@@ -124,6 +128,56 @@ operation. Operational values are config knobs, never literals in source.
 | `MaxStageFileBytes` | `48 MiB` | Largest single staged file or sync-back file. |
 | `AllowPersistentTmpfsDowngrade` | `false` | Downgrade non-secret tmpfs mounts to persistent guest dirs; credential tmpfs is always refused. |
 | `ProvisioningRecheckSeconds` | `60` | Backoff floor on provisioning-deferred failures; throttling suggests a longer wait. |
+| `Network:Mode` | `nat` | Guest-network backend: `nat` (today's behaviour) or `softnet` (per-VM packet filter; see below). |
+| `Network:GatewayCidr` | `192.168.64.1/32` | vmnet gateway CIDR the guest needs for DHCP/DNS; always allowed in Softnet mode, even with an empty acquisition allowlist. Override to match this Mac's Softnet subnet. Never `@host` or the LAN. |
+| `Network:MaxAllowCidrs` | `64` | Cap on resolved allowlist CIDRs (1–4096, gateway extra); overflows fail the create. |
+| `Network:DnsTimeoutSeconds` | `5` | Per-host DNS bound in seconds (1–30) for allowlist resolution. |
+| `Network:SoftnetBinaryPath` | `softnet` | Softnet helper binary probed at preflight (absolute path recommended). |
+
+## Softnet egress filtering (`Network:Mode=softnet`, default off)
+
+Tart supports [Softnet](https://github.com/cirruslabs/softnet): a userspace
+packet filter that runs on the Mac host, outside the guest, giving each VM
+its own vmnet network with a private `/30` subnet. In Softnet mode every
+`tart run` is launched as an argv array with `--net-softnet`,
+`--net-softnet-block=0.0.0.0/0`, and
+`--net-softnet-allow=<gateway>,<resolved /32s>`, where the allowlist is the
+acquisition's `AllowedHosts` resolved to IPv4 at create time (bounded per-host
+DNS timeout; unresolvable hosts are logged and skipped while block-all holds
+for them) plus the vmnet gateway (DHCP/DNS). An empty allowlist means no
+egress beyond DNS. The effective policy (mode + exact CIDRs) is recorded on
+the sandbox (`ITartSoftnetPolicyReport`, readable via `SandboxCapability`)
+and in the create log, so the host verifier and operators see exactly what
+each VM may reach.
+
+Rules the provider enforces: preflight (macOS only) probes the Softnet binary
+before any clone and refuses the create with a typed
+`TartSoftnetUnavailableException` naming the setup step when Softnet is
+missing or unprivileged — never a silent NAT fallback. Resume reinstalls the
+stored create-time allowlist; a VM whose policy is unknown (provider
+restarted) refuses resume fail-closed: delete it and let the pipeline
+provision a fresh sandbox.
+
+Prerequisites (Mac host only): Softnet installed with its setuid bit or a
+passwordless-sudoers entry (it drops privileges after initialisation).
+
+### Operator verification (needs a real Mac — not verified in CI)
+
+No CI or dev machine here is a Mac, so run this scripted check on the target
+Mac after enabling Softnet mode:
+
+```bash
+# 1. Probe the helper the provider preflights.
+softnet --version || sudo -n softnet --version
+# 2. Confirm the vmnet gateway matches Network:GatewayCidr.
+tart run --help | grep -A2 softnet
+# 3. Launch one sandbox and confirm the filter flags in the log
+#    ("Softnet egress policy installed (block 0.0.0.0/0, allow [...])").
+# 4. From inside the guest: allowed host reaches, other hosts time out, and
+#    DNS resolves (gateway DNS) while TCP to a non-allowlisted IP hangs.
+# 5. Negative: point Network:SoftnetBinaryPath at a missing binary and confirm
+#    creates fail with TartSoftnetUnavailableException (no NAT fallback).
+```
 
 ## What it costs
 
