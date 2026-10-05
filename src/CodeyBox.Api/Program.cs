@@ -425,6 +425,14 @@ builder.Services.AddOptions<TestSelectionSoundnessOptions>()
     .Validate(
         static opts => TestSelectionSoundnessOptions.IsValid(opts),
         $"{TestSelectionSoundnessOptions.SectionName} is invalid");
+// Standalone audit-run knobs (CodeyBox:AuditRuns). Disabled by default:
+// queue implementation only until the operator enables a supported
+// sandbox provider with real installed tools.
+builder.Services.AddOptions<AuditRunOptions>()
+    .Bind(builder.Configuration.GetSection(AuditRunOptions.SectionName))
+    .Validate(
+        static opts => AuditRunOptions.IsValid(opts),
+        $"{AuditRunOptions.SectionName} is invalid");
 // Post-merge baseline-production knobs
 // (Audit:TestSelection:BaselineProduction). Bound through AddOptions so
 // IOptionsMonitor<TestSelectionBaselineProductionOptions> hot-reloads the
@@ -3539,6 +3547,31 @@ builder.Services.AddSingleton<AuditCheckPublicationService>(sp =>
         TimeProvider.System,
         sp.GetRequiredService<ILogger<AuditCheckPublicationService>>());
 });
+// Standalone audit runs: durable run store shares state.db; artifacts live
+// on disk next to it. The workspace factory defaults to visibly-unavailable
+// (missing provider fails the run, never passes it); the executor default
+// below only runs registered tool auditors through caller-provided sandboxes
+// and is reached solely via the disabled-by-default standalone path.
+builder.Services.AddSingleton<IAuditRunStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    return new SqliteAuditRunStore(
+        opts.StateDatabasePath,
+        sp.GetRequiredService<SqliteDatabaseWriteGateFactory>());
+});
+builder.Services.AddSingleton<IAuditRunArtifactStore>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
+    var monitor = sp.GetRequiredService<IOptionsMonitor<AuditRunOptions>>();
+    var dir = Path.Combine(Path.GetDirectoryName(opts.StateDatabasePath) ?? ".", "audit-run-artifacts");
+    return new FileAuditRunArtifactStore(dir, monitor.CurrentValue.MaxArtifactBytes);
+});
+builder.Services.AddSingleton<IStandaloneAuditRefResolver, ExplicitShaAuditRefResolver>();
+builder.Services.AddSingleton<IAuditorRegistry>(sp => new AuditorRegistry(sp.GetServices<IAuditor>()));
+builder.Services.AddSingleton<IStandaloneAuditWorkspaceFactory>(sp =>
+    new UnavailableAuditWorkspaceFactory("No standalone-audit workspace provider is configured."));
+builder.Services.AddSingleton<IStandaloneAuditExecutor, DirectSandboxAuditExecutor>();
+builder.Services.AddSingleton<StandaloneAuditService>();
 builder.Services.AddSingleton<ITimingStore>(sp =>
 {
     // Timing rows have a foreign key to work_items. Ensure the primary store
@@ -4875,6 +4908,7 @@ SuggestionEndpoints.Map(app);
 GitHubAppConnectEndpoints.Map(app);
 AuditReportEndpoints.Map(app);
 AuditProgressEndpoints.Map(app);
+AuditRunEndpoints.Map(app);
 AgentStreamEndpoints.Map(app);
 SseEndpoints.Map(app);
 ChangelogEndpoints.Map(app);

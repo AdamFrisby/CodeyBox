@@ -2004,6 +2004,49 @@ all hot-reloadable).
 When `CodeyBox:TransitionHealth:Enabled` is `false`, the endpoint returns
 `404` with `{ "error": "transition-health is disabled" }`.
 
-## Local Development
+## Standalone audit runs
 
+Tool-only audits at pinned SHAs, independent of any work item. Disabled by
+default (`CodeyBox:AuditRuns:Enabled`); creates return 400 until enabled.
+Runs never transition to plan/work/rework/commit/merge/upstream delivery,
+never mount coding-agent or git push credentials, and never mutate work-item
+state. Refs resolve once to immutable SHAs frozen in provenance; only
+explicit 40-hex SHAs are accepted by the built-in resolver. Selection is
+exactly one mechanism: explicit `auditors` IDs or a named `profile`
+(operator-configured under `CodeyBox:AuditRuns:Profiles`); unknown names are
+rejected, never defaulted. LLM auditors and agent-credential requirements
+are recorded as `Unsupported` with exact reasons. Aggregate outcomes are
+`Pass` (every selected tool auditor completed with sufficient evidence),
+`Findings`, `Unsupported`, `MissingTool`, `InfrastructureFailure`, or
+`Cancelled` — empty/skipped/partial execution never reads as a pass.
+
+### `POST /audit-runs`
+
+Idempotent create. Accepts `Idempotency-Key` header or `idempotencyKey`
+body field; same key + same body replays the original run, same key +
+different body returns 409.
+
+### `GET /audit-runs`
+
+List runs, optional `?project=` filter and `?limit=`.
+
+### `GET /audit-runs/{id}`
+
+Run detail with frozen provenance, per-auditor outcomes, and artifact
+digests. `?project=` scopes authorization: a mismatched project returns 403.
+
+### `GET /audit-runs/{id}/reports`, `/logs`, `/artifacts`
+
+Per-auditor reports (findings, exit, timing, tool version), bounded
+redacted log excerpts, and named artifact refs (content digest, size).
+
+### `GET /audit-runs/{id}/artifacts/{name}`
+
+Authorized artifact content bytes.
+
+### `POST /audit-runs/{id}/cancel`
+
+Cancels a non-terminal run, preserving completed findings.
+
+## Local Development
 For local dev, create your own `local/run-e2e.sh` and run it from the repo root to boot the orchestrator on http://127.0.0.1:5050 — the `/local/` directory is gitignored (see `.gitignore`) for per-developer dev/test helpers, so no script ships in the tree.
