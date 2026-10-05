@@ -582,6 +582,10 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
     /// <c>Network:MaxAllowCidrs</c>. Host entries are normalised
     /// (trimmed, blank-skipped, case-insensitive dedupe, sorted) so the argv
     /// is deterministic; each lookup carries the configured DNS timeout.
+    /// Only global-unicast addresses are admitted: DNS answers pointing at
+    /// loopback, private, link-local, CGNAT, multicast, reserved or
+    /// unspecified space are logged and skipped per address, so a poisoned
+    /// answer can never plant an allow for host-internal targets.
     /// </summary>
     internal async Task<IReadOnlyList<string>> ResolveSoftnetAllowCidrsAsync(
         TartSandboxOptions opts, IReadOnlyList<string> allowedHosts, CancellationToken ct)
@@ -629,7 +633,12 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
                 .ToArray();
             if (ipv4.Length == 0)
                 TartSoftnetPolicy.LogSkippedHost(_log, host, "no IPv4 address resolved (Softnet policy is IPv4-only)");
-            resolved.AddRange(ipv4);
+            foreach (var ip in ipv4)
+            {
+                if (!TartSoftnetPolicy.IsGlobalUnicastIPv4(ip))
+                    TartSoftnetPolicy.LogSkippedHost(_log, host, $"resolved address {ip} is not global-unicast (loopback/private/link-local/reserved) and is skipped");
+            }
+            resolved.AddRange(ipv4.Where(TartSoftnetPolicy.IsGlobalUnicastIPv4));
         }
         return TartSoftnetPolicy.BuildAllowCidrs(resolved, opts.Network.GatewayCidr.Trim(), opts.Network.MaxAllowCidrs);
     }

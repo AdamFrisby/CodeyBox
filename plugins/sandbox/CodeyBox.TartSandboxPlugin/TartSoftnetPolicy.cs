@@ -42,6 +42,11 @@ public static class TartSoftnetPolicy
     /// DHCP/DNS path — an empty acquisition allowlist still resolves to just
     /// this), then the resolved <c>/32</c>s sorted ordinally for a
     /// deterministic argv. Enforces the configured CIDR bound fail-closed.
+    /// Only global-unicast IPv4 addresses are admitted: loopback, private
+    /// (RFC1918), link-local/cloud-metadata, CGNAT, multicast, reserved and
+    /// unspecified addresses are dropped here as defense-in-depth (the
+    /// provider also logs-and-skips them per host). The gateway CIDR is the
+    /// sole exception — it is the vmnet network's own address by design.
     /// </summary>
     public static IReadOnlyList<string> BuildAllowCidrs(
         IReadOnlyList<IPAddress> resolvedIPv4,
@@ -56,6 +61,8 @@ public static class TartSoftnetPolicy
         foreach (var ip in resolvedIPv4)
         {
             if (ip is null)
+                continue;
+            if (!IsGlobalUnicastIPv4(ip))
                 continue;
             distinct.Add(ip.ToString() + "/32");
         }
@@ -80,5 +87,50 @@ public static class TartSoftnetPolicy
             "Tart Softnet: skipping unresolvable AllowedHosts entry '{Host}': {Reason}. " +
             "The sandbox keeps its block-all default for this host.",
             host, reason);
+    }
+
+    /// <summary>
+    /// True only for globally-routable IPv4 unicast addresses — the only
+    /// addresses DNS answers may contribute to the Softnet allowlist. Drops
+    /// loopback (127/8), RFC1918 private (10/8, 172.16/12, 192.168/16),
+    /// link-local and cloud-metadata (169.254/16), CGNAT (100.64/10),
+    /// multicast (224/4), reserved (240/4, including broadcast), unspecified
+    /// (0/8), IETF/test documentation ranges and benchmarking space. Mirrors
+    /// the Linux host's nftables drop list (scripts/setup-host-networks.sh)
+    /// while the vmnet gateway stays allowed via the GatewayCidr knob.
+    /// A poisoned or hijacked DNS answer must never plant an allow for
+    /// host-internal targets, and a resolved Mac-LAN address must never
+    /// re-open the LAN access Softnet mode forbids blanket-allowing.
+    /// </summary>
+    public static bool IsGlobalUnicastIPv4(IPAddress ip)
+    {
+        if (ip is null || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            return false;
+        var b = ip.GetAddressBytes();
+        if (b.Length != 4)
+            return false;
+        if (b[0] == 0)
+            return false;
+        if (b[0] == 10)
+            return false;
+        if (b[0] == 127)
+            return false;
+        if (b[0] == 169 && b[1] == 254)
+            return false;
+        if (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+            return false;
+        if (b[0] == 192 && b[1] == 168)
+            return false;
+        if (b[0] == 100 && b[1] >= 64 && b[1] <= 127)
+            return false;
+        if (b[0] >= 224)
+            return false;
+        if (b[0] == 192 && b[1] == 0 && (b[2] == 0 || b[2] == 2))
+            return false;
+        if (b[0] == 198 && ((b[1] == 18) || (b[1] == 51 && b[2] == 100)))
+            return false;
+        if (b[0] == 203 && b[1] == 0 && b[2] == 113)
+            return false;
+        return true;
     }
 }

@@ -84,7 +84,7 @@ public sealed class TartSoftnetTests
         var runner = new FakeTartProcessRunner();
         var dns = new TableDnsResolver(new Dictionary<string, IReadOnlyList<IPAddress>>(StringComparer.OrdinalIgnoreCase)
         {
-            ["api.example.com"] = [IPAddress.Parse("10.1.2.3"), IPAddress.Parse("10.1.2.4")],
+            ["api.example.com"] = [IPAddress.Parse("93.184.216.35"), IPAddress.Parse("93.184.216.36")],
         });
         var provider = NewProvider(runner, SoftnetOptions(), dns, (_, _) => Task.CompletedTask);
 
@@ -101,7 +101,7 @@ public sealed class TartSoftnetTests
         Assert.Contains($"{TartSoftnetPolicy.BlockFlagPrefix}{TartSoftnetPolicy.BlockAllCidr}", run.Argv, StringComparer.Ordinal);
         var allow = Assert.Single(run.Argv, a => a.StartsWith(TartSoftnetPolicy.AllowFlagPrefix, StringComparison.Ordinal));
         Assert.Equal(
-            $"{TartSoftnetPolicy.AllowFlagPrefix}{Gateway},10.1.2.3/32,10.1.2.4/32,93.184.216.34/32",
+            $"{TartSoftnetPolicy.AllowFlagPrefix}{Gateway},93.184.216.34/32,93.184.216.35/32,93.184.216.36/32",
             allow);
         foreach (var arg in run.Argv)
             Assert.DoesNotContain("@host", arg, StringComparison.Ordinal);
@@ -145,7 +145,7 @@ public sealed class TartSoftnetTests
         var dns = new TableDnsResolver(
             new Dictionary<string, IReadOnlyList<IPAddress>>(StringComparer.OrdinalIgnoreCase)
             {
-                ["api.example.com"] = [IPAddress.Parse("10.9.9.9")],
+                ["api.example.com"] = [IPAddress.Parse("93.184.216.35")],
             },
             delay: TimeSpan.FromSeconds(10),
             delayHosts: ["slow.example"]);
@@ -158,7 +158,7 @@ public sealed class TartSoftnetTests
 
         Assert.True(elapsed < TimeSpan.FromSeconds(9), $"Resolution took {elapsed}: DNS was not bounded.");
         var firstAllow = RunAllowFlag(runner, first.Id);
-        Assert.Equal($"{TartSoftnetPolicy.AllowFlagPrefix}{Gateway},10.9.9.9/32", firstAllow);
+        Assert.Equal($"{TartSoftnetPolicy.AllowFlagPrefix}{Gateway},93.184.216.35/32", firstAllow);
         await first.DisposeAsync();
 
         await using var second = await provider.CreateAsync(spec, CancellationToken.None);
@@ -201,6 +201,90 @@ public sealed class TartSoftnetTests
     }
 
     [Fact]
+    public async Task NonGlobalUnicastAddresses_AreSkippedAndLogged()
+    {
+        var runner = new FakeTartProcessRunner();
+        var logger = new CapturingLogger();
+        var dns = new TableDnsResolver(new Dictionary<string, IReadOnlyList<IPAddress>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["mixed.example.com"] = [
+                IPAddress.Parse("127.0.0.1"),
+                IPAddress.Parse("10.0.0.5"),
+                IPAddress.Parse("172.16.9.9"),
+                IPAddress.Parse("192.168.1.10"),
+                IPAddress.Parse("169.254.169.254"),
+                IPAddress.Parse("100.64.0.1"),
+                IPAddress.Parse("224.0.0.1"),
+                IPAddress.Parse("0.0.0.0"),
+                IPAddress.Parse("93.184.216.35"),
+            ],
+        });
+        var provider = NewProvider(runner, SoftnetOptions(), dns, (_, _) => Task.CompletedTask, logger);
+
+        await using var sandbox = await provider.CreateAsync(
+            SpecWithHosts("mixed.example.com"), CancellationToken.None);
+
+        Assert.Equal(
+            $"{TartSoftnetPolicy.AllowFlagPrefix}{Gateway},93.184.216.35/32",
+            RunAllowFlag(runner, sandbox.Id));
+        Assert.Contains(logger.Messages, m => m.Contains("127.0.0.1", StringComparison.Ordinal));
+        Assert.Contains(logger.Messages, m => m.Contains("mixed.example.com", StringComparison.Ordinal));
+        await sandbox.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task LiteralPrivateIpHost_IsSkipped_GatewayOnly()
+    {
+        var runner = new FakeTartProcessRunner();
+        var logger = new CapturingLogger();
+        var provider = NewProvider(runner, SoftnetOptions(), new TableDnsResolver(), (_, _) => Task.CompletedTask, logger);
+
+        await using var sandbox = await provider.CreateAsync(
+            SpecWithHosts("127.0.0.1", "10.1.2.3"), CancellationToken.None);
+
+        Assert.Equal($"{TartSoftnetPolicy.AllowFlagPrefix}{Gateway}", RunAllowFlag(runner, sandbox.Id));
+        Assert.Contains(logger.Messages, m => m.Contains("127.0.0.1", StringComparison.Ordinal));
+        await sandbox.DisposeAsync();
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1")]
+    [InlineData("10.0.0.1")]
+    [InlineData("172.16.0.1")]
+    [InlineData("172.31.255.255")]
+    [InlineData("192.168.1.1")]
+    [InlineData("169.254.169.254")]
+    [InlineData("100.64.0.1")]
+    [InlineData("224.0.0.1")]
+    [InlineData("240.0.0.1")]
+    [InlineData("255.255.255.255")]
+    [InlineData("0.0.0.0")]
+    public void IsGlobalUnicastIPv4_RejectsNonRoutable(string address)
+    {
+        Assert.False(TartSoftnetPolicy.IsGlobalUnicastIPv4(IPAddress.Parse(address)));
+    }
+
+    [Theory]
+    [InlineData("93.184.216.34")]
+    [InlineData("142.250.80.14")]
+    [InlineData("8.8.8.8")]
+    public void IsGlobalUnicastIPv4_AcceptsPublic(string address)
+    {
+        Assert.True(TartSoftnetPolicy.IsGlobalUnicastIPv4(IPAddress.Parse(address)));
+    }
+
+    [Fact]
+    public void BuildAllowCidrs_DropsNonGlobal_DefenseInDepth()
+    {
+        var allow = TartSoftnetPolicy.BuildAllowCidrs(
+            [IPAddress.Parse("127.0.0.1"), IPAddress.Parse("93.184.216.34")],
+            Gateway,
+            64);
+
+        Assert.Equal([Gateway, "93.184.216.34/32"], allow);
+    }
+
+    [Fact]
     public async Task NatMode_RunArgv_Unchanged_Regression()
     {
         var runner = new FakeTartProcessRunner();
@@ -233,7 +317,7 @@ public sealed class TartSoftnetTests
         var runner = new FakeTartProcessRunner();
         var dns = new TableDnsResolver(new Dictionary<string, IReadOnlyList<IPAddress>>(StringComparer.OrdinalIgnoreCase)
         {
-            ["api.example.com"] = [IPAddress.Parse("10.1.2.3")],
+            ["api.example.com"] = [IPAddress.Parse("93.184.216.35")],
         });
         var provider = NewProvider(runner, SoftnetOptions(), dns, (_, _) => Task.CompletedTask);
 
@@ -243,7 +327,7 @@ public sealed class TartSoftnetTests
         var report = Assert.IsAssignableFrom<ITartSoftnetPolicyReport>(sandbox);
         Assert.Equal(TartNetworkMode.Softnet, report.NetworkMode);
         Assert.Equal(
-            [$"{Gateway}", "10.1.2.3/32"],
+            [$"{Gateway}", "93.184.216.35/32"],
             report.EffectiveAllowCidrs);
         Assert.Equal(
             $"{TartSoftnetPolicy.AllowFlagPrefix}{string.Join(",", report.EffectiveAllowCidrs)}",
@@ -293,8 +377,8 @@ public sealed class TartSoftnetTests
         var runner = new FakeTartProcessRunner();
         var dns = new TableDnsResolver(new Dictionary<string, IReadOnlyList<IPAddress>>(StringComparer.OrdinalIgnoreCase)
         {
-            ["a.example.com"] = [IPAddress.Parse("10.0.0.1")],
-            ["b.example.com"] = [IPAddress.Parse("10.0.0.2")],
+            ["a.example.com"] = [IPAddress.Parse("93.184.216.35")],
+            ["b.example.com"] = [IPAddress.Parse("93.184.216.36")],
         });
         var provider = NewProvider(runner, SoftnetOptions(maxAllowCidrs: 1), dns, (_, _) => Task.CompletedTask);
 
