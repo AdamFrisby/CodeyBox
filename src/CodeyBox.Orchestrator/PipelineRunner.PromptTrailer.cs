@@ -38,13 +38,8 @@ public sealed partial class PipelineRunner
     }
 
     /// <summary>
-    /// Builds the trailer block to append to an orchestrator-emitted commit
-    /// message. Always includes <c>CodeyBox-WorkItem</c>, <c>CodeyBox-Agent</c>,
-    /// and the terminal <c>Co-Authored-By</c> trailer; conditionally includes
-    /// <c>CodeyBox-Fallbacks</c> when fallback events occurred for this work
-    /// item. Failures to load fallback history degrade silently — the trailer
-    /// block is still emitted, just without the optional fallbacks line, so a
-    /// SQLite hiccup never blocks a commit.
+    /// Resolves the effective attribution for a project (project override wins
+    /// over the live host default, so hot-reload applies to the next commit).
     /// </summary>
     internal CommitAttribution ResolveAttribution(Project? project)
         => _attribution.Resolve(project);
@@ -62,6 +57,16 @@ public sealed partial class PipelineRunner
         }
     }
 
+    /// <summary>
+    /// Builds the trailer block to append to an orchestrator-emitted commit
+    /// message. Includes each trailer group (<c>CodeyBox-WorkItem</c>,
+    /// <c>CodeyBox-Agent</c>, the terminal <c>Co-Authored-By</c> trailer)
+    /// unless disabled by the attribution flags; conditionally includes
+    /// <c>CodeyBox-Fallbacks</c> when fallback events occurred for this work
+    /// item. Failures to load fallback history degrade silently — the trailer
+    /// block is still emitted, just without the optional fallbacks line, so a
+    /// SQLite hiccup never blocks a commit.
+    /// </summary>
     internal async Task<string> ComposeCommitTrailerBlockAsync(
         WorkItemId workItemId,
         AgentKind finalAgent,

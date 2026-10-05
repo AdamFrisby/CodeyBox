@@ -145,8 +145,6 @@ public sealed class CommitAttributionPolicy
         if (string.IsNullOrWhiteSpace(line))
             return false;
         var trimmed = line.Trim();
-        if (trimmed.Length == 0)
-            return false;
         if (trimmed.StartsWith("*", StringComparison.Ordinal))
             trimmed = trimmed[1..].TrimStart();
         var colon = trimmed.IndexOf(':');
@@ -179,12 +177,20 @@ public sealed class CommitAttributionPolicy
     /// caller that embedded agent text still enforces the policy.
     /// </summary>
     public string ComposeMessage(string subject, string trailerBlock, CommitAttribution attribution)
+        => ComposeMessageStatic(subject, trailerBlock, attribution);
+
+    /// <summary>
+    /// Static join used by static call sites (e.g. conflict-resolution commit)
+    /// that already hold a resolved <see cref="CommitAttribution"/> but have no
+    /// policy instance. Same single source of truth as the instance overload.
+    /// </summary>
+    public static string ComposeMessageStatic(string subject, string trailerBlock, CommitAttribution attribution)
     {
         subject ??= string.Empty;
         trailerBlock ??= string.Empty;
         string message = string.IsNullOrWhiteSpace(trailerBlock)
             ? subject.TrimEnd()
             : $"{subject.TrimEnd()}\n\n{trailerBlock.Trim()}";
-        return StripDisabledTrailers(message, attribution);
+        return StripDisabledTrailers(message, attribution.IncludeCoAuthoredBy, attribution.IncludeCodeyBoxTrailers);
     }
 }

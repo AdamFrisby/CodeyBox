@@ -1290,7 +1290,8 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         };
     }
 
-    private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)    {
+    private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)
+    {
         if (c is null) return new();
         var defaults = new ProjectReleaseConfig();
         TimeSpan? syncInterval = c.AutoSyncMainIntervalMinutes.HasValue

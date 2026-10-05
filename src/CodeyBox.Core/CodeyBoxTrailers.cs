@@ -50,8 +50,8 @@ public static class CodeyBoxTrailers
 
     /// <summary>
     /// Build the trailer block to append to a CodeyBox-emitted commit message.
-    /// Lines are joined with '\n', no leading or trailing newline; the final
-    /// line is always the canonical <see cref="CoAuthoredBy"/> trailer.
+    /// Lines are joined with '\n', no leading or trailing newline; when
+    /// includeCoAuthoredBy is true, the final line is the canonical <see cref="CoAuthoredBy"/> trailer.
     /// <see cref="FallbacksTrailerKey"/> is included only when at least one
     /// fallback record was provided. Attribution flags gate the block:
     /// <paramref name="includeCodeyBoxTrailers"/> omits every

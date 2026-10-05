@@ -1220,6 +1220,54 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task FinalizeConflictResolutionAsync_StripsDisabledTrailersViaPolicy()
+    {
+        const string path = "src/ok.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, "resolved content\n");
+        const string trailerBlock =
+            "CodeyBox-WorkItem: wi-1\nCodeyBox-Prompt-Revision: 1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>";
+
+        await PipelineRunner.FinalizeConflictResolutionAsync(
+            sandbox,
+            [new ConflictHunk(path, StartLine: 1, EndLine: 3)],
+            "codeybox/work",
+            trailerBlock,
+            CancellationToken.None,
+            new CommitAttribution(includeCoAuthoredBy: false, includeCodeyBoxTrailers: false, includePullRequestFooter: true));
+
+        Assert.NotNull(sandbox.LastCommitStdin);
+        var committed = sandbox.LastCommitStdin!;
+        Assert.Contains("codeybox: merge codeybox/work", committed, StringComparison.Ordinal);
+        Assert.DoesNotContain("CodeyBox-WorkItem", committed, StringComparison.Ordinal);
+        Assert.DoesNotContain("CodeyBox-Prompt-Revision", committed, StringComparison.Ordinal);
+        Assert.DoesNotContain("Co-Authored-By", committed, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FinalizeConflictResolutionAsync_KeepsTrailersWhenAttributionEnabled()
+    {
+        const string path = "src/ok.cs";
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile(path, "resolved content\n");
+        const string trailerBlock =
+            "CodeyBox-WorkItem: wi-1\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>";
+
+        await PipelineRunner.FinalizeConflictResolutionAsync(
+            sandbox,
+            [new ConflictHunk(path, StartLine: 1, EndLine: 3)],
+            "codeybox/work",
+            trailerBlock,
+            CancellationToken.None,
+            CommitAttribution.Default);
+
+        Assert.NotNull(sandbox.LastCommitStdin);
+        var committed = sandbox.LastCommitStdin!;
+        Assert.Contains("CodeyBox-WorkItem: wi-1", committed, StringComparison.Ordinal);
+        Assert.Contains("Co-Authored-By: CodeyBox <noreply@codeybox.invalid>", committed, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task FinalizeConflictResolutionAsync_WrapsLsFilesInspectorFailure()
     {
         const string path = "src/CodeyBox.Api/CodeyBoxOptionsValidator.cs";
@@ -1642,6 +1690,7 @@ public sealed class AgenticConflictResolverTests
         public int GrepCallCount { get; private set; }
         public int LsFilesCallCount { get; private set; }
         public int KillActiveExecsCallCount { get; private set; }
+        public string? LastCommitStdin { get; private set; }
         public bool FailCredentialCleanupWrites { get; init; }
 
         public void AddConflictedFile(string relativePath, string content)
@@ -1758,6 +1807,16 @@ public sealed class AgenticConflictResolverTests
                 AddCallCount++;
                 for (var i = 5; i < argv.Count; i++)
                     GitAdd(argv[i]);
+                return Task.FromResult(new SandboxExecResult(0, "", ""));
+            }
+
+            if (argv.Count >= 5
+                && argv[0] == "git" && argv[1] == "-C" && argv[3] == "commit")
+            {
+                LastCommitStdin = exec.Stdin;
+                var key2 = string.Join('\0', argv);
+                if (_commands.TryGetValue(key2, out var cannedCommit))
+                    return Task.FromResult(cannedCommit);
                 return Task.FromResult(new SandboxExecResult(0, "", ""));
             }
 
