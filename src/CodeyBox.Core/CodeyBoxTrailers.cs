@@ -10,20 +10,24 @@ namespace CodeyBox.Core;
 /// commit message separated from the subject/body by a blank line.
 ///
 /// <para>
-/// Agent work commit schema:
+/// Agent work commit schema (unless disabled by the attribution flags —
+/// <see cref="Compose"/> / <see cref="ComposeMechanical"/> omit the gated lines;
+/// both flags off yields an empty string):
 ///   <list type="bullet">
-///     <item><description><c>CodeyBox-WorkItem: &lt;id&gt;</c> — the full work-item id (always present).</description></item>
-///     <item><description><c>CodeyBox-Agent: &lt;agent&gt;[/&lt;model&gt;]</c> — the final agent/model that produced the work (always present).</description></item>
-///     <item><description><c>CodeyBox-Prompt-Revision: &lt;N&gt;</c> — the prompt revision that was active when the iteration was dispatched. Present when the orchestrator dispatched the iteration with a known revision.</description></item>
-///     <item><description><c>CodeyBox-Fallbacks: from→to (×N reason); …</c> — emitted only when fallback events occurred this run.</description></item>
-///     <item><description><c>Co-Authored-By: CodeyBox &lt;noreply@codeybox.invalid&gt;</c> — terminal co-author trailer (always present).</description></item>
+///     <item><description><c>CodeyBox-WorkItem: &lt;id&gt;</c> — the full work-item id (present unless <c>CodeyBoxTrailers</c> attribution is disabled).</description></item>
+///     <item><description><c>CodeyBox-Agent: &lt;agent&gt;[/&lt;model&gt;]</c> — the final agent/model that produced the work (present unless <c>CodeyBoxTrailers</c> attribution is disabled).</description></item>
+///     <item><description><c>CodeyBox-Prompt-Revision: &lt;N&gt;</c> — the prompt revision that was active when the iteration was dispatched. Present when the orchestrator dispatched the iteration with a known revision, unless <c>CodeyBoxTrailers</c> attribution is disabled.</description></item>
+///     <item><description><c>CodeyBox-Fallbacks: from→to (×N reason); …</c> — emitted only when fallback events occurred this run and unless <c>CodeyBoxTrailers</c> attribution is disabled.</description></item>
+///     <item><description><c>Co-Authored-By: CodeyBox &lt;noreply@codeybox.invalid&gt;</c> — terminal co-author trailer (present unless <c>CoAuthoredBy</c> attribution is disabled).</description></item>
 ///   </list>
 /// </para>
 ///
 /// <para>
 /// Mechanical fixer commit schema uses <c>CodeyBox-Mechanical-Fixer</c>
 /// instead of <c>CodeyBox-Agent</c> so deterministic normalizer commits are
-/// not attributed as agent/model work.
+/// not attributed as agent/model work. Both schemas are gated by the
+/// attribution flags (Compose/ComposeMechanical omit the disabled lines;
+/// both flags off yields empty).
 /// </para>
 /// </summary>
 public static class CodeyBoxTrailers
@@ -39,7 +43,9 @@ public static class CodeyBoxTrailers
     /// Env-var name passed into the agent's sandbox carrying the prompt revision
     /// that was active when the current iteration was dispatched. The agent
     /// echoes this value back as the <see cref="PromptRevisionTrailerKey"/>
-    /// trailer on every commit; <c>process:prompt-revision-trailer</c> verifies
+    /// trailer on every commit unless <c>CodeyBoxTrailers</c> attribution is
+    /// disabled (Compose/ComposeMechanical omit it; both flags off yields empty);
+    /// <c>process:prompt-revision-trailer</c> verifies
     /// the trailer matches. Single shared constant so the orchestrator (writer),
     /// the audit module (verifier), and the rework-prompt template (reader)
     /// reference the same symbol — a future rename touches one place.

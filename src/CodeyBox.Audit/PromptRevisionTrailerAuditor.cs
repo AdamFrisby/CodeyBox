@@ -7,7 +7,11 @@ namespace CodeyBox.Audit;
 /// Deterministic auditor that verifies the agent's most recent commit carries
 /// a <c>CodeyBox-Prompt-Revision: N</c> trailer matching the revision the
 /// orchestrator snapshotted at iteration-dispatch time. A missing or
-/// mismatched trailer is a blocking finding — it means the agent finished
+/// mismatched trailer is a blocking finding unless <c>CodeyBoxTrailers</c>
+/// attribution is disabled (Compose/ComposeMechanical omit the trailers;
+/// both flags off yields empty) — in that case the auditor returns skipped
+/// ('skipped: trailers disabled by config') and stale-prompt detection falls
+/// back to the DB dispatch ledger. Otherwise it means the agent finished
 /// against a stale prompt (the operator updated the prompt mid-iteration via
 /// PUT /workitems/{id}/prompt) or did not emit the required trailer at all.
 ///
