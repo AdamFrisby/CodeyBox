@@ -10,11 +10,14 @@ Xcode workers.
 
 ## Containment posture — read this first
 
-CodeyBox ships Linux-only precisely because the egress guarantee depends
-on nftables, which macOS cannot provide. This provider therefore has
-**no host-enforced egress filtering**, and the host classifies every
-plugin kind `NotEnforced` — this plugin cannot promote itself, and nothing
-below changes that classification. Do not claim enforced egress.
+Tart VMs give **VM isolation**: each work item gets a fresh VM with its own
+guest kernel via Apple's Virtualization.framework
+(`SandboxIsolationLevel.DedicatedKernel` — the primary boundary), torn down
+on disposal, with no shared filesystem with the orchestrator host or other
+VMs. Egress enforcement is a further, separate layer: this provider has
+**no statically enforced egress**, and the host classifies every plugin kind
+`NotEnforced` — this plugin cannot promote itself, and nothing below changes
+that classification. Do not claim enforced egress.
 
 What isolation this provider **does** give:
 
@@ -141,34 +144,82 @@ operation. Operational values are config knobs, never literals in source.
 ## Softnet egress filtering (`Network:Mode=softnet`, default off)
 
 Tart supports [Softnet](https://github.com/cirruslabs/softnet): a userspace
-packet filter that runs on the Mac host, outside the guest, giving each VM
-its own vmnet network with a private `/30` subnet. In Softnet mode every
-`tart run` is launched as an argv array with `--net-softnet`,
-`--net-softnet-block=0.0.0.0/0`, and
+packet filter that runs **on the Mac host, outside the guest**, giving each VM
+its own vmnet network with a private `/30` subnet and applying an IPv4 policy
+of allow/block CIDR lists (set at launch through
+`--net-softnet --net-softnet-block=<cidrs> --net-softnet-allow=<cidrs>`,
+updatable at runtime over the JSON-RPC control socket). Softnet documents
+IPv4 only.
+
+In Softnet mode every `tart run` is launched as an argv array with
+`--net-softnet`, `--net-softnet-block=0.0.0.0/0`, and
 `--net-softnet-allow=<gateway>,<resolved /32s>`, where the allowlist is the
 acquisition's `AllowedHosts` resolved to IPv4 at create time (bounded per-host
 DNS timeout; unresolvable hosts are logged and skipped while block-all holds
 for them) plus the vmnet gateway (DHCP/DNS). An empty allowlist means no
-egress beyond DNS. The effective policy (mode + exact CIDRs) is recorded on
-the sandbox (`ITartSoftnetPolicyReport`, readable via `SandboxCapability`)
-and in the create log, so the host verifier and operators see exactly what
-each VM may reach.
+egress beyond the gateway. The effective policy (mode + exact CIDRs) is
+recorded on the sandbox (`ITartSoftnetPolicyReport`, readable via
+`SandboxCapability`) and in the create log, so the host verifier and operators
+see exactly what each VM may reach.
+
+### Installation: Softnet needs privilege (Mac host only)
+
+Softnet needs privilege to attach to vmnet: install it with its **setuid bit**
+or a **passwordless-sudoers entry** (it drops privileges after
+initialisation), per the
+[Softnet README](https://github.com/cirruslabs/softnet). Point
+`Network:SoftnetBinaryPath` at the helper (absolute path recommended) and
+override `Network:GatewayCidr` to match this Mac's Softnet vmnet subnet
+(never `@host` or the LAN).
+
+### Config
+
+```json
+{
+  "CodeyBox": {
+    "Plugins:codeybox.tart-sandbox": {
+      "Enabled": true,
+      "Network": {
+        "Mode": "softnet",
+        "GatewayCidr": "192.168.64.1/32",
+        "MaxAllowCidrs": 64,
+        "DnsTimeoutSeconds": 5,
+        "SoftnetBinaryPath": "/usr/local/bin/softnet"
+      }
+    }
+  }
+}
+```
+
+### What's enforced and what isn't
+
+- **Enforced per VM (IPv4):** block `0.0.0.0/0`, allow the vmnet gateway plus
+  the create-time-resolved allowlist (`/32`s, capped by `MaxAllowCidrs` —
+  overflows fail the create). Resume reinstalls the stored create-time
+  allowlist; a VM whose policy is unknown (provider restarted) refuses resume
+  fail-closed: delete it and let the pipeline provision a fresh sandbox.
+- **Not enforced:** anything outside that IPv4 policy. DNS still resolves
+  through the gateway — as on Linux, where DNS resolves but TCP to a
+  non-allowlisted IP does not establish — and IPv6 plus host-LAN
+  reachability are proven only by the canary and the operator procedure
+  below, never assumed. Softnet's own documentation covers IPv4 only.
+- **Static classification unchanged:** Softnet mode alone never changes the
+  host's `NotEnforced` classification. Profiled work reaches `tart` only
+  through the host-owned per-sandbox canary below — dispose, demote, alert,
+  and re-place on failure. The verified grant is deliberately never stronger
+  than orchestrator-host nftables enforcement.
 
 Rules the provider enforces: preflight (macOS only) probes the Softnet binary
 before any clone and refuses the create with a typed
 `TartSoftnetUnavailableException` naming the setup step when Softnet is
-missing or unprivileged — never a silent NAT fallback. Resume reinstalls the
-stored create-time allowlist; a VM whose policy is unknown (provider
-restarted) refuses resume fail-closed: delete it and let the pipeline
-provision a fresh sandbox.
+missing or unprivileged — never a silent NAT fallback.
 
-Prerequisites (Mac host only): Softnet installed with its setuid bit or a
-passwordless-sudoers entry (it drops privileges after initialisation).
+### Operator verification (unverified on real hardware)
 
-### Operator verification (needs a real Mac — not verified in CI)
-
-No CI or dev machine here is a Mac, so run this scripted check on the target
-Mac after enabling Softnet mode:
+No CI or dev machine here is a Mac, so the two properties below cannot be
+proven in CI — until an operator runs the scripted procedure on real hardware
+and records the results here, this path stays **unverified on real hardware**.
+Run on the target Mac after enabling Softnet mode:
 
 ```bash
 # 1. Probe the helper the provider preflights.
@@ -181,7 +232,18 @@ tart run --help | grep -A2 softnet
 #    DNS resolves (gateway DNS) while TCP to a non-allowlisted IP hangs.
 # 5. Negative: point Network:SoftnetBinaryPath at a missing binary and confirm
 #    creates fail with TartSoftnetUnavailableException (no NAT fallback).
+# 6. Fail-closed + IPv6 (the CI-unprovable properties):
+TART_VERIFY_VM=codeybox-verify-1 \
+TART_VERIFY_SSH="ssh admin@<guest-ip>" \
+TART_VERIFY_ALLOWED="<allowlisted-host>:443" \
+scripts/verify-tart-softnet.sh
+#    The script kills the Softnet process for the VM and requires the guest
+#    to lose ALL network (no NAT fallback), and requires the guest to reach
+#    no IPv6 destination. Record its output plus the macOS/Tart/Softnet
+#    versions and date below.
 ```
+
+Results: *unverified on real hardware — no operator run recorded yet.*
 
 ### Serving profiled work: per-sandbox canary verification (opt-in)
 

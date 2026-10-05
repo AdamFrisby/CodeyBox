@@ -103,6 +103,33 @@ inside the VM affects nothing. See [`../operating/host-firewall.md`](../operatin
 for the threat model and setup. The Process and Bubblewrap providers do
 **not** enforce egress (they are dev-only / shared-kernel).
 
+### 3a. Verified provider-host enforcement (per sandbox, never static)
+
+One concession exists for a packet filter that runs outside the guest but
+outside the orchestrator host's kernel: Tart Softnet on the Mac host. The VM
+(own kernel via Virtualization.framework) remains the primary boundary;
+Softnet egress is a further, weaker layer — never ranked above host
+enforcement.
+
+- The static classification never changes: the `tart` kind is always
+  `NotEnforced` (`HostPlatformSupport.GetEgressEnforcement`), and a plugin can
+  never promote itself. Enforcement status is decided by host-owned code.
+- Per-sandbox enforcement (`EnforcedOnProviderHostVerified`) requires all
+  three: Softnet mode on, the kind opted in through host-owned config
+  (`CodeyBox:EgressVerification:Kinds`), and the host's canary passing for
+  that sandbox (allowlisted TCP succeeds; canary, IPv6, and host-LAN connects
+  fail within the bound).
+- On canary failure the sandbox is disposed, an alert fires, the kind is
+  demoted for the cool-down, and the item is re-placed on an enforced
+  provider — never run unverified. Long-lived sandboxes can re-verify on a
+  cadence, and a dead filter process fails the sandbox closed.
+- Limits: Softnet documents IPv4 only — DNS still resolves through the
+  gateway (as on Linux) while TCP is filtered, and the IPv6 and fail-closed
+  properties hold only where the Mac-only operator procedure
+  (`scripts/verify-tart-softnet.sh`) has proven them on real hardware. Until
+  then they are documented as unverified. No CI or dev machine here is a Mac;
+  in-tree tests cover the host logic against fakes only.
+
 ### 4. Ephemeral credential mounts
 
 Agent secrets are written to a tmpfs mount (`/run/codeybox/creds`) that

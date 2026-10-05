@@ -1,8 +1,12 @@
 # Host platform support
 
-CodeyBox 0.7 ships **Linux only** for local VM sandboxes. The orchestrator
+CodeyBox 0.7 ships **Linux only** for host-enforced local VM sandboxes. The
+orchestrator
 also runs on macOS and Windows, but only in the **remote-executor topology**:
 VMs execute on a Linux executor host while the orchestrator runs locally.
+One Mac-native exception: the Tart plugin gives local VMs on Apple Silicon
+with VM isolation, whose egress is verified per sandbox (below) rather than
+enforced on the orchestrator host.
 This page records why, and what is supported where.
 
 ## The egress question
@@ -17,19 +21,26 @@ That mechanism is Linux-only, and the assessed alternatives do not reach
 equivalence — with one host-owned exception below the table: a
 provider-host packet filter (today: Tart Softnet on the Mac host) can serve
 profiled work after a per-sandbox canary, but it is never ranked above
-orchestrator-host enforcement.
+orchestrator-host enforcement. VM isolation (own guest kernel) and egress
+enforcement are separate claims: macOS + Tart gives the first
+(`DedicatedKernel` via Virtualization.framework) while the second stays
+`NotEnforced` until Softnet mode, operator opt-in, and a passing canary
+promote one sandbox at a time.
 
 | Candidate | Verdict | Reason |
 |---|---|---|
-| macOS `pf` anchor per VM | Rejected | Multipass on macOS uses Apple's hypervisor framework with its own NAT network; there is no per-VM bridge attachment point in the host kernel where an unbypassable per-profile drop path can be installed. `pf` rules also require disabling SIP-protected defaults or installer-owned anchors that OS upgrades can reset. |
+| macOS `pf` anchor per VM (for Multipass) | Rejected | Multipass on macOS uses Apple's hypervisor framework with its own NAT network; there is no per-VM bridge attachment point in the host kernel where an unbypassable per-profile drop path can be installed. `pf` rules also require disabling SIP-protected defaults or installer-owned anchors that OS upgrades can reset. |
+| Tart Softnet per-VM filter (for `tart`) | **Verified per sandbox** | Softnet runs on the Mac host, outside the guest, with a per-VM vmnet network and an IPv4 block-all default plus the resolved allowlist. Static classification stays `NotEnforced`; profiled work is served only after the host-owned per-sandbox canary passes (opt-in + Softnet mode + canary), ranked strictly below orchestrator-host enforcement. See below. |
 | Windows Filtering Platform (WFP) callout per VM | Rejected | Multipass on Windows runs on Hyper-V with a virtual switch owned by the provider. Per-VM allowlist enforcement would need a custom WFP callout driver plus signed-driver install — an unsigned script cannot install an unbypassable host-kernel drop path, and Hyper-V NAT networks give no stable per-VM L2 hook. |
 | In-guest filtering (iptables/nftables inside the VM) | Rejected | The threat model assumes a root agent. Anything enforced inside the guest is flushable from inside the guest (`iptables -F`). Enforcement must live outside the attacker-controlled kernel. |
 | Per-provider user-space proxy on the host | Rejected | A proxy only constrains traffic that goes through the proxy. A root agent in a bridged/NAT VM can route around it. It is allowlist-shaped logging, not isolation. |
 | Remote-executor topology (orchestrator on macOS/Windows, VMs on a Linux executor) | **Supported** | Enforcement stays exactly where it is today: nftables on Linux bridges on the executor host. No new mechanism is needed and no isolation claim is weakened. |
 
 "Only the remote-executor topology is supported on non-Linux hosts" is the
-staged answer: it reuses the proven enforcement instead of inventing a weaker
-one per platform.
+staged answer for host-enforced egress: it reuses the proven enforcement
+instead of inventing a weaker one per platform. Tart on macOS is the one
+local-VM exception, and only through the per-sandbox verified path below —
+never as static enforcement.
 
 ## Verified provider-host filters (per-sandbox, never static)
 
@@ -66,11 +77,11 @@ tests cover the host logic against fakes only.
 
 ## Supported matrix
 
-| Orchestrator host | `incus` | `multipass` (local) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (dev-only) |
-|---|---|---|---|---|---|---|
-| Linux | ✅ enforced on host | ✅ enforced on host | ✅ enforced on executor | ✅ enforced on executor | ⚠️ shared kernel, no egress | ⚠️ no isolation, dev only |
-| macOS | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
-| Windows | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
+| Orchestrator host | `incus` | `multipass` (local) | `tart` (plugin, macOS only) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (dev-only) |
+|---|---|---|---|---|---|---|---|
+| Linux | ✅ enforced on host | ✅ enforced on host | ❌ macOS only | ✅ enforced on executor | ✅ enforced on executor | ⚠️ shared kernel, no egress | ⚠️ no isolation, dev only |
+| macOS | ❌ | ❌ | ✅ VM isolation (`DedicatedKernel`); egress `NotEnforced` by default, `EnforcedOnProviderHostVerified` per sandbox when Softnet mode is on, the kind is opted in, and the canary passes | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
+| Windows | ❌ | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
 
 Legend: ✅ = supported with network isolation; ⚠️ = runs but must never be
 described as isolated (see `concepts/security.md` sharp edges); ❌ =
@@ -134,6 +145,14 @@ not the config file alone.
 **macOS/Windows orchestrator:** run the same procedure on the Linux executor
 host. No isolation is claimed for anything enforced (or unenforced) on the
 macOS/Windows machine itself.
+
+**macOS orchestrator with Tart Softnet:** the per-sandbox verified path has
+its own Mac-only operator procedure —
+`scripts/verify-tart-softnet.sh` plus
+[`docs/extending/tart-sandbox-plugin.md`](../extending/tart-sandbox-plugin.md#operator-verification-unverified-on-real-hardware).
+It establishes the two properties CI cannot prove (fail-closed when the
+Softnet process dies; no IPv6 egress). Until an operator has run it on real
+hardware, the verified path is documented as unverified.
 
 ## Build packaging note: the ACP bridge
 
