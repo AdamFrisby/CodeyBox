@@ -20,7 +20,9 @@ namespace CodeyBox.Api;
 /// fail closed. Egress classification is deliberately absent here — it stays in
 /// <see cref="HostPlatformSupport.GetEgressEnforcement"/>, where every plugin kind
 /// classifies <see cref="EgressEnforcementLocation.NotEnforced"/> unless promoted by
-/// an in-tree change.</para>
+/// an in-tree change. The per-sandbox verified path (operator opt-in through
+/// <c>CodeyBox:EgressVerification:Kinds</c> plus a passing host canary) is decided
+/// by host-owned placement code, never by anything in this catalog.</para>
 /// </summary>
 public sealed class PluginSandboxProviderCatalog
 {

@@ -88,6 +88,11 @@ public sealed class SandboxPlacementAcquirer
     private readonly ISandboxProviderRegistry _registry;
     private readonly ISandboxProvider? _fallback;
     private readonly Func<ExecutorPhaseDispatchOptions> _optionsAccessor;
+    private readonly Func<EgressVerificationOptions> _verificationOptionsAccessor;
+    private readonly EgressVerificationGate _verificationGate;
+    private readonly EgressCanaryVerifier _canaryVerifier;
+    private readonly IEgressVerificationEventSink _verificationSink;
+    private readonly TimeProvider _clock;
     private readonly ILogger<SandboxPlacementAcquirer> _log;
     private readonly object _gatesSync = new();
     private readonly Dictionary<string, ResizableConcurrencyGate> _gatesByMember = new(StringComparer.Ordinal);
@@ -98,7 +103,12 @@ public sealed class SandboxPlacementAcquirer
         ISandboxProvider? fallbackProvider = null,
         Func<ExecutorPhaseDispatchOptions>? optionsAccessor = null,
         ILogger<SandboxPlacementAcquirer>? log = null,
-        int? maxConcurrentWorkers = null)
+        int? maxConcurrentWorkers = null,
+        Func<EgressVerificationOptions>? verificationOptionsAccessor = null,
+        EgressVerificationGate? verificationGate = null,
+        EgressCanaryVerifier? canaryVerifier = null,
+        IEgressVerificationEventSink? verificationSink = null,
+        TimeProvider? clock = null)
     {
         ArgumentNullException.ThrowIfNull(classes);
         ArgumentNullException.ThrowIfNull(registry);
@@ -106,6 +116,11 @@ public sealed class SandboxPlacementAcquirer
         _registry = registry;
         _fallback = fallbackProvider;
         _optionsAccessor = optionsAccessor ?? (() => new ExecutorPhaseDispatchOptions());
+        _verificationOptionsAccessor = verificationOptionsAccessor ?? (() => new EgressVerificationOptions());
+        _clock = clock ?? TimeProvider.System;
+        _verificationGate = verificationGate ?? new EgressVerificationGate(_verificationOptionsAccessor, _clock);
+        _canaryVerifier = canaryVerifier ?? new EgressCanaryVerifier(_clock);
+        _verificationSink = verificationSink ?? NullEgressVerificationEventSink.Instance;
         _log = log ?? NullLogger<SandboxPlacementAcquirer>.Instance;
         SyncMemberCapacities(_classes.Current, maxConcurrentWorkers);
     }
@@ -258,7 +273,11 @@ public sealed class SandboxPlacementAcquirer
     /// egress (see <see cref="SandboxEgressPolicy"/>): members on
     /// <see cref="EgressEnforcementLocation.NotEnforced"/> providers are
     /// excluded before the decider runs, and the acquisition is unplaceable —
-    /// naming the refused kinds — when none remain.
+    /// naming the refused kinds — when none remain. A <c>NotEnforced</c> kind
+    /// the operator opted into canary verification may still serve the
+    /// profile, but the sandbox is handed over only after its own canary
+    /// passes; on failure the sandbox is disposed, the kind is demoted for
+    /// the cool-down, and placement retries on an enforced provider.
     /// </summary>
     public async Task<ISandbox> AcquireAsync(
         SandboxPlacementAcquisition acquisition,
@@ -285,6 +304,8 @@ public sealed class SandboxPlacementAcquirer
 
         var options = _optionsAccessor();
         options.Validate();
+        var verificationOptions = _verificationOptionsAccessor();
+        verificationOptions.Validate();
 
         // The shared assembler — the same normalisation and bounds executor
         // phase dispatch uses, so the two placement paths cannot drift apart.
@@ -303,77 +324,108 @@ public sealed class SandboxPlacementAcquirer
             candidates.Add((member, provider, SandboxProviderCapabilityGate.ApplyProviderCapabilities(member, provider)));
         }
 
-        // Enforced-egress gate: a member whose provider kind is classified
-        // NotEnforced (every plugin-contributed kind, plus bubblewrap/process)
-        // must not serve work requiring a named network profile, whose
-        // allowlist only exists as host-side nftables rules the provider never
-        // attaches to. Refusal is explicit and names the kinds; enforced
-        // members keep placing for the same profile.
-        var selectable = ApplyEnforcedEgressRequirement(acquisition, candidates);
-
-        var loads = SnapshotLoads();
-        var decision = ExecutorPlacement.Decide(
-            selectable.Select(static c => c.Placement).ToList(),
-            requirements,
-            loads,
-            runtimeUnhealthy: null);
-
-        var ranked = RankEligible(EligibleCandidates(selectable, decision), loads);
-        if (ranked.Count != 0)
+        // A failed canary demotes its kind and placement retries without it,
+        // so every round makes progress: rounds are bounded by the candidate
+        // count plus one and exhaustion is unreachable in practice.
+        var maxRounds = candidates.Count + 1;
+        for (var round = 0; ; round++)
         {
-            // Fast path: atomically take the first ranked member with headroom.
-            // Bursts spill across members through the atomic take instead of
-            // piling onto one member behind a shared stale load snapshot.
-            foreach (var candidate in ranked)
-            {
-                var gate = GateFor(candidate.Member.MemberId, acquisition, options);
-                if (gate.TryEnter())
-                {
-                    LogPlacement(acquisition, decision, candidate);
-                    return await CreateOnMemberAsync(candidate.Provider, gate, acquisition.Spec, ct).ConfigureAwait(false);
-                }
-            }
+            if (round >= maxRounds)
+                throw new SandboxPlacementUnplaceableException(
+                    "enforced-egress",
+                    $"work item '{acquisition.WorkItemId}' phase '{acquisition.Phase}': " +
+                    $"every verification-eligible provider kind failed its canary and no enforced provider could serve the acquisition.");
 
-            // Every eligible take lost a creation race. Re-decide on fresh
-            // loads: a still-eligible winner is waited on through a true async
-            // wait (never a poll loop); a now-empty set falls through to the
-            // refusal analysis below.
-            loads = SnapshotLoads();
-            decision = ExecutorPlacement.Decide(
+            // Enforced-egress gate: a member whose provider kind is classified
+            // NotEnforced (every plugin-contributed kind, plus bubblewrap/process)
+            // must not serve work requiring a named network profile, whose
+            // allowlist only exists as host-side nftables rules the provider never
+            // attaches to — unless the kind is verification-eligible, in which
+            // case the per-sandbox canary below decides before handoff.
+            // Refusal is explicit and names the kinds; enforced members keep
+            // placing for the same profile.
+            var selectable = ApplyEnforcedEgressRequirement(acquisition, candidates, verificationOptions);
+
+            var loads = SnapshotLoads();
+            var decision = ExecutorPlacement.Decide(
                 selectable.Select(static c => c.Placement).ToList(),
                 requirements,
                 loads,
                 runtimeUnhealthy: null);
-            ranked = RankEligible(EligibleCandidates(selectable, decision), loads);
+
+            var rankVerifiedLast = SandboxEgressPolicy.RequiresEnforcedEgress(acquisition.RequiredNetworkProfile);
+            var ranked = RankEligible(EligibleCandidates(selectable, decision), loads, rankVerifiedLast);
             if (ranked.Count != 0)
             {
-                var winner = ranked[0];
-                var gate = GateFor(winner.Member.MemberId, acquisition, options);
-                LogPlacement(acquisition, decision, winner);
-                await gate.WaitAsync(ct).ConfigureAwait(false);
-                return await CreateOnMemberAsync(winner.Provider, gate, acquisition.Spec, ct).ConfigureAwait(false);
+                // Fast path: atomically take the first ranked member with headroom.
+                // Bursts spill across members through the atomic take instead of
+                // piling onto one member behind a shared stale load snapshot.
+                var retried = false;
+                foreach (var candidate in ranked)
+                {
+                    var gate = GateFor(candidate.Member.MemberId, acquisition, options);
+                    if (!gate.TryEnter())
+                        continue;
+                    LogPlacement(acquisition, decision, candidate);
+                    var sandbox = await CreateAndVerifyOnMemberAsync(
+                        candidate, gate, acquisition, verificationOptions, ct).ConfigureAwait(false);
+                    if (sandbox is not null)
+                        return sandbox;
+                    retried = true;
+                    break;
+                }
+                if (retried)
+                    continue;
+
+                // Every eligible take lost a creation race. Re-decide on fresh
+                // loads: a still-eligible winner is waited on through a true async
+                // wait (never a poll loop); a now-empty set falls through to the
+                // refusal analysis below.
+                loads = SnapshotLoads();
+                decision = ExecutorPlacement.Decide(
+                    selectable.Select(static c => c.Placement).ToList(),
+                    requirements,
+                    loads,
+                    runtimeUnhealthy: null);
+                ranked = RankEligible(EligibleCandidates(selectable, decision), loads, rankVerifiedLast);
+                if (ranked.Count != 0)
+                {
+                    var winner = ranked[0];
+                    var gate = GateFor(winner.Member.MemberId, acquisition, options);
+                    LogPlacement(acquisition, decision, winner);
+                    await gate.WaitAsync(ct).ConfigureAwait(false);
+                    var sandbox = await CreateAndVerifyOnMemberAsync(
+                        winner, gate, acquisition, verificationOptions, ct).ConfigureAwait(false);
+                    if (sandbox is not null)
+                        return sandbox;
+                    continue;
+                }
             }
-        }
 
-        // No eligible member right now. A permanent refusal fails
-        // operator-visible; a capacity-only refusal waits for member headroom
-        // (with one member this is the former process-wide gate); anything
-        // else defers with the placement backoff for the requeue path.
-        if (decision.UnmetCapability is not null)
+            // No eligible member right now. A permanent refusal fails
+            // operator-visible; a capacity-only refusal waits for member headroom
+            // (with one member this is the former process-wide gate); anything
+            // else defers with the placement backoff for the requeue path.
+            if (decision.UnmetCapability is not null)
+                throw BuildRefusal(acquisition, decision, options);
+
+            var blocked = CapacityBlockedCandidates(selectable, requirements, decision);
+            if (blocked.Count != 0)
+            {
+                var waitLoads = SnapshotLoads();
+                var target = RankEligible(blocked, waitLoads, rankVerifiedLast)[0];
+                var gate = GateFor(target.Member.MemberId, acquisition, options);
+                LogPlacement(acquisition, decision, target);
+                await gate.WaitAsync(ct).ConfigureAwait(false);
+                var sandbox = await CreateAndVerifyOnMemberAsync(
+                    target, gate, acquisition, verificationOptions, ct).ConfigureAwait(false);
+                if (sandbox is not null)
+                    return sandbox;
+                continue;
+            }
+
             throw BuildRefusal(acquisition, decision, options);
-
-        var blocked = CapacityBlockedCandidates(selectable, requirements, decision);
-        if (blocked.Count != 0)
-        {
-            var waitLoads = SnapshotLoads();
-            var target = RankEligible(blocked, waitLoads)[0];
-            var gate = GateFor(target.Member.MemberId, acquisition, options);
-            LogPlacement(acquisition, decision, target);
-            await gate.WaitAsync(ct).ConfigureAwait(false);
-            return await CreateOnMemberAsync(target.Provider, gate, acquisition.Spec, ct).ConfigureAwait(false);
         }
-
-        throw BuildRefusal(acquisition, decision, options);
     }
 
     private void LogPlacement(
@@ -394,15 +446,19 @@ public sealed class SandboxPlacementAcquirer
     /// <summary>
     /// Applies the enforced-egress requirement for one acquisition: when the
     /// acquisition names a network profile, only members whose provider kind the
-    /// host classifies as enforced may serve it. A <c>NotEnforced</c> member is
-    /// dropped before the decider runs (never quietly used where enforcement was
-    /// required); when no member can serve the profile the acquisition fails
+    /// host classifies as enforced may serve it — plus members on kinds that
+    /// are verification-eligible right now (operator-opted-in, not demoted,
+    /// canary endpoints configured), whose sandbox still needs its own passing
+    /// canary before handoff. A <c>NotEnforced</c> member that is not eligible
+    /// is dropped before the decider runs (never quietly used where enforcement
+    /// was required); when no member can serve the profile the acquisition fails
     /// operator-visible with a reason naming every refused kind. Acquisitions with
     /// no profile pass through untouched.
     /// </summary>
     private List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> ApplyEnforcedEgressRequirement(
         SandboxPlacementAcquisition acquisition,
-        List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> candidates)
+        List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> candidates,
+        EgressVerificationOptions verificationOptions)
     {
         if (!SandboxEgressPolicy.RequiresEnforcedEgress(acquisition.RequiredNetworkProfile))
             return candidates;
@@ -410,12 +466,19 @@ public sealed class SandboxPlacementAcquirer
         var selectable = new List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)>(candidates.Count);
         var refusedKinds = new List<string>();
         var refusedMembers = new List<string>();
+        var verifiedMembers = new List<string>();
         foreach (var candidate in candidates)
         {
             var kind = candidate.Member.ProviderKind.Trim().ToLowerInvariant();
             if (SandboxEgressPolicy.IsEnforced(candidate.Member.ProviderKind))
             {
                 selectable.Add(candidate);
+                continue;
+            }
+            if (IsVerificationSelectable(candidate.Member.ProviderKind, verificationOptions))
+            {
+                selectable.Add(candidate);
+                verifiedMembers.Add($"'{candidate.Member.MemberId}' (kind '{kind}')");
                 continue;
             }
             if (!refusedKinds.Contains(kind, StringComparer.Ordinal))
@@ -433,6 +496,17 @@ public sealed class SandboxPlacementAcquirer
                 refusedMembers.Count,
                 string.Join(", ", refusedMembers));
         }
+        if (verifiedMembers.Count > 0)
+        {
+            _log.LogInformation(
+                "Sandbox placement for work item {WorkItemId} phase {Phase}: network profile '{Profile}' may use {Count} member(s) on verification-eligible providers " +
+                "(canary required before handoff): {Members}.",
+                acquisition.WorkItemId,
+                acquisition.Phase,
+                profile,
+                verifiedMembers.Count,
+                string.Join(", ", verifiedMembers));
+        }
         if (selectable.Count == 0)
         {
             throw new SandboxPlacementUnplaceableException(
@@ -441,9 +515,40 @@ public sealed class SandboxPlacementAcquirer
                 $"which needs enforced egress, but every available member is backed by a NotEnforced provider " +
                 $"({string.Join(", ", refusedMembers)}). A NotEnforced provider (every plugin-contributed kind, " +
                 $"plus bubblewrap/process) may only serve sandboxes with no named network profile. " +
-                $"Add a member on an enforced provider (incus, multipass, multipass-remote, sprites) or drop the profile requirement.");
+                $"Add a member on an enforced provider (incus, multipass, multipass-remote, sprites), " +
+                $"opt a provider-host-filter kind in through CodeyBox:EgressVerification:Kinds, or drop the profile requirement.");
         }
         return selectable;
+    }
+
+    /// <summary>
+    /// True when <paramref name="providerKind"/> may be selected for profiled
+    /// work subject to a per-sandbox canary: operator-opted-in, not demoted,
+    /// and the canary endpoints are configured (an unconfigured canary could
+    /// never pass, so the kind is treated as <c>NotEnforced</c> now instead
+    /// of churning through doomed creates and demotions).
+    /// </summary>
+    private bool IsVerificationSelectable(string providerKind, EgressVerificationOptions verificationOptions)
+    {
+        ArgumentNullException.ThrowIfNull(verificationOptions);
+        return SandboxEgressPolicy.IsVerificationEligible(providerKind, _verificationGate)
+            && verificationOptions.AreCanaryEndpointsConfigured();
+    }
+
+    /// <summary>
+    /// True when a sandbox created for <paramref name="acquisition"/> on
+    /// <paramref name="providerKind"/> needs its canary before handoff:
+    /// profiled work on a kind that is not statically enforced but is
+    /// verification-selectable right now.
+    /// </summary>
+    private bool RequiresCanary(
+        string providerKind,
+        SandboxPlacementAcquisition acquisition,
+        EgressVerificationOptions verificationOptions)
+    {
+        return SandboxEgressPolicy.RequiresEnforcedEgress(acquisition.RequiredNetworkProfile)
+            && !SandboxEgressPolicy.IsEnforced(providerKind)
+            && IsVerificationSelectable(providerKind, verificationOptions);
     }
 
     private static List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> EligibleCandidates(        List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> candidates,
@@ -460,15 +565,38 @@ public sealed class SandboxPlacementAcquirer
         return eligible;
     }
 
-    private static List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> RankEligible(
+    /// <summary>
+    /// Ranks eligible candidates for admission. When <paramref name="verifiedLast"/>
+    /// (profiled work), statically-enforced members sort ahead of
+    /// verification-eligible ones at equal preference: a verified
+    /// provider-host filter is never preferred over orchestrator-host
+    /// enforcement. Within a tier the existing preference/load order is
+    /// unchanged. Unprofiled work keeps the exact historical order.
+    /// </summary>
+    private List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> RankEligible(
         List<(SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement)> eligible,
-        IReadOnlyDictionary<string, int> loads) =>
-        eligible
-            .OrderByDescending(static c => c.Member.PreferenceScore)
+        IReadOnlyDictionary<string, int> loads,
+        bool verifiedLast)
+    {
+        if (!verifiedLast)
+        {
+            return eligible
+                .OrderByDescending(static c => c.Member.PreferenceScore)
+                .ThenBy(c => LoadRatio(c.Placement, loads))
+                .ThenBy(c => Load(c.Placement, loads))
+                .ThenBy(static c => c.Member.MemberId, StringComparer.Ordinal)
+                .ToList();
+        }
+        return eligible
+            .OrderBy(c =>
+                SandboxEgressPolicy.EnforcementRank(
+                    SandboxEgressPolicy.EffectiveEnforcement(c.Member.ProviderKind, _verificationGate)))
+            .ThenByDescending(static c => c.Member.PreferenceScore)
             .ThenBy(c => LoadRatio(c.Placement, loads))
             .ThenBy(c => Load(c.Placement, loads))
             .ThenBy(static c => c.Member.MemberId, StringComparer.Ordinal)
             .ToList();
+    }
 
     /// <summary>
     /// Members the decider excludes only because of load: eligible under zero
@@ -527,6 +655,120 @@ public sealed class SandboxPlacementAcquirer
             throw;
         }
     }
+
+    /// <summary>
+    /// Creates the sandbox on the winning member and, for profiled work on a
+    /// verification-eligible kind, runs the host's canary before handoff.
+    /// Returns the sandbox on success, or null when the canary failed: the
+    /// sandbox is already disposed (releasing its gate permit), the kind is
+    /// demoted for the cool-down, a loud alert event is recorded, and the
+    /// caller re-places the acquisition on an enforced provider. Create
+    /// failures still release the permit and rethrow, exactly like
+    /// <see cref="CreateOnMemberAsync"/>.
+    /// </summary>
+    private async Task<ISandbox?> CreateAndVerifyOnMemberAsync(
+        (SandboxMember Member, ISandboxProvider Provider, SandboxPlacementMember Placement) candidate,
+        ResizableConcurrencyGate gate,
+        SandboxPlacementAcquisition acquisition,
+        EgressVerificationOptions verificationOptions,
+        CancellationToken ct)
+    {
+        var kind = candidate.Member.ProviderKind.Trim().ToLowerInvariant();
+        if (!RequiresCanary(candidate.Member.ProviderKind, acquisition, verificationOptions))
+        {
+            return await CreateOnMemberAsync(candidate.Provider, gate, acquisition.Spec, ct).ConfigureAwait(false);
+        }
+        var spec = TranslateProfileForVerifiedKind(acquisition, candidate.Member.ProviderKind);
+        ISandbox sandbox;
+        try
+        {
+            sandbox = await candidate.Provider.CreateAsync(spec, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            gate.Release();
+            throw;
+        }
+        var result = await _canaryVerifier.VerifyAsync(sandbox, kind, verificationOptions, ct).ConfigureAwait(false);
+        if (result.Passed)
+        {
+            _verificationGate.RecordSuccess(kind);
+            await _verificationSink.RecordAsync(ToVerificationEvent(acquisition, result, alert: false), ct).ConfigureAwait(false);
+            _log.LogInformation(
+                "Sandbox placement for work item {WorkItemId} phase {Phase}: egress canary passed for sandbox {SandboxId} on verification-eligible provider kind '{Kind}'.",
+                acquisition.WorkItemId, acquisition.Phase, sandbox.Id, kind);
+            return new VerifiedEgressSandbox(
+                new MemberGateSandbox(sandbox, gate),
+                kind,
+                _canaryVerifier,
+                _verificationOptionsAccessor,
+                _verificationGate,
+                _verificationSink,
+                _clock,
+                acquisition.WorkItemId.ToString(),
+                acquisition.Phase);
+        }
+        var demotedUntil = _verificationGate.RecordFailure(kind);
+        await _verificationSink.RecordAsync(ToVerificationEvent(acquisition, result, alert: true), ct).ConfigureAwait(false);
+        _log.LogCritical(
+            "Sandbox placement for work item {WorkItemId} phase {Phase}: egress canary FAILED for sandbox {SandboxId} on provider kind '{Kind}' ({Reason}); " +
+            "the sandbox was disposed and the kind is demoted to NotEnforced until {DemotedUntil:O}. Re-placing on an enforced provider.",
+            acquisition.WorkItemId, acquisition.Phase, sandbox.Id, kind,
+            result.FailureReason, demotedUntil);
+        try
+        {
+            await sandbox.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Translates the acquisition spec for a verified-kind create: the named
+    /// profile requests a host nftables bridge the provider-host filter never
+    /// attaches to, so the host clears <c>ProfileName</c> and the provider's
+    /// filter consumes <c>AllowedHosts</c> instead (for Tart, the Softnet
+    /// allowlist). Enforcement for this sandbox comes from the filter plus
+    /// the canary — never from the cleared bridge name. Host-owned, per
+    /// sandbox; the caller's original spec is untouched for re-placement.
+    /// </summary>
+    private SandboxSpec TranslateProfileForVerifiedKind(
+        SandboxPlacementAcquisition acquisition,
+        string providerKind)
+    {
+        var kind = providerKind.Trim().ToLowerInvariant();
+        var spec = acquisition.Spec with
+        {
+            Network = acquisition.Spec.Network with { ProfileName = null },
+        };
+        _log.LogInformation(
+            "Sandbox placement for work item {WorkItemId} phase {Phase}: translating network profile '{Profile}' for verification-eligible provider kind '{Kind}': " +
+            "clearing ProfileName so the provider-host filter enforces AllowedHosts ({HostCount} host(s)) instead of a host bridge.",
+            acquisition.WorkItemId, acquisition.Phase,
+            acquisition.RequiredNetworkProfile!.Trim(), kind,
+            acquisition.Spec.Network.AllowedHosts.Count);
+        return spec;
+    }
+
+    private static EgressVerificationEvent ToVerificationEvent(
+        SandboxPlacementAcquisition acquisition,
+        EgressCanaryResult result,
+        bool alert) =>
+        new(
+            acquisition.WorkItemId.ToString(),
+            acquisition.Phase,
+            result.ProviderKind,
+            result.SandboxId,
+            result.Passed,
+            result.FailureReason,
+            result.Checks.Select(static c =>
+                new EgressVerificationCheckEvent(c.Name, c.Passed, c.ExitCode, c.Elapsed.TotalMilliseconds)).ToArray(),
+            result.StartedAt,
+            result.FinishedAt,
+            alert);
 
     private Dictionary<string, int> SnapshotLoads()
     {

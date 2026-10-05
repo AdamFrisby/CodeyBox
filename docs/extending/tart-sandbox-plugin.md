@@ -17,8 +17,8 @@ every member naming the kind.
 CodeyBox ships Linux-only precisely because the egress guarantee depends
 on nftables, which macOS cannot provide. This item states plainly what
 containment is and is not available on macOS rather than assuming parity:
-**there is no enforced egress on this provider**, and there cannot be
-without an in-tree host mechanism that does not exist.
+**there is no statically enforced egress on this provider**, and there
+cannot be without an in-tree host mechanism that does not exist.
 
 The host therefore classifies this kind `NotEnforced`, unconditionally. The
 plugin cannot promote itself; no option, label, or return value changes the
@@ -26,8 +26,12 @@ classification. Consequences, enforced by placement:
 
 - Any acquisition that names a **network profile** requires enforced egress and
   is refused for this kind (unplaceable, naming `tart` and the missing
-  `baseline`/`network-egress-enforcement` capability). The provider
-  additionally refuses a `ProfileName` that ever reaches it.
+  `baseline`/`network-egress-enforcement` capability) — unless the operator
+  opts `tart` into host-owned per-sandbox canary verification
+  (`CodeyBox:EgressVerification`), in which case each sandbox is handed over
+  only after its own canary passes, and the verified grant is never stronger
+  than orchestrator-host enforcement. The provider
+  additionally refuses a `ProfileName` that ever reaches it directly.
 - Guest egress follows the Mac host's network (NAT/shared with the host).
   An operator choosing this provider for unprofiled work is accepting
   host-default egress, not a CodeyBox allowlist. Do not claim enforced
@@ -99,10 +103,13 @@ every `tart run` (block `0.0.0.0/0`, allow the vmnet gateway for DHCP/DNS
 plus the acquisition's `AllowedHosts` resolved to IPv4 `/32`s). Preflight
 refuses creates with a typed error when Softnet is missing or unprivileged
 — never a silent NAT fallback — and each sandbox reports its effective
-policy for the host verifier. This does **not** change the host's egress
-classification: the kind stays `NotEnforced`, and profiled work still
-refuses. See the plugin README for knobs and the scripted Mac-only
-operator verification procedure.
+policy for the host verifier. This does **not** change the host's static egress
+classification: the kind stays `NotEnforced`, and profiled work reaches it
+only through the host-owned per-sandbox canary
+(`CodeyBox:EgressVerification`, operator opt-in plus a passing canary per
+sandbox — dispose, demote, alert, and re-place on failure). See the plugin
+README for knobs, the canary reference, and the scripted Mac-only operator
+verification procedure.
 
 ## Failure handling
 

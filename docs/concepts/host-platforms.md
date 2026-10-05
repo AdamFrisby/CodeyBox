@@ -14,7 +14,10 @@ allowlist. The drops happen in the host kernel, on bridges the guest cannot
 see — an agent with sudo inside the VM cannot switch them off.
 
 That mechanism is Linux-only, and the assessed alternatives do not reach
-equivalence:
+equivalence — with one host-owned exception below the table: a
+provider-host packet filter (today: Tart Softnet on the Mac host) can serve
+profiled work after a per-sandbox canary, but it is never ranked above
+orchestrator-host enforcement.
 
 | Candidate | Verdict | Reason |
 |---|---|---|
@@ -27,6 +30,39 @@ equivalence:
 "Only the remote-executor topology is supported on non-Linux hosts" is the
 staged answer: it reuses the proven enforcement instead of inventing a weaker
 one per platform.
+
+## Verified provider-host filters (per-sandbox, never static)
+
+One host-owned concession exists for filters that run outside the guest on
+the provider host but outside the orchestrator host's kernel — today, Tart
+Softnet on the Mac host. The static classification never changes for these
+kinds (`HostPlatformSupport.GetEgressEnforcement` still reports
+`NotEnforced`; a plugin can never promote itself). Instead, placement may
+hand a profiled sandbox to an opted-in kind only after the host's own
+canary passes for that sandbox:
+
+- Opt-in is host config, `CodeyBox:EgressVerification:Kinds` (for example
+  `["tart"]`). A plugin cannot set it.
+- The canary runs through the normal sandbox exec path right after create
+  and before any work phase: a TCP connect to an allowlisted destination
+  must succeed; connects to a configured canary destination, to a global
+  IPv6 address, and to the Mac host's LAN address must all fail within the
+  per-check bound. The result and timings are recorded as an event.
+- On failure the sandbox is disposed, a loud alert is emitted, the kind is
+  demoted to `NotEnforced` for the configured cool-down, and the item is
+  re-placed on an enforced provider — never run unverified.
+- Long-lived sandboxes can re-verify on a cadence (`ReverifyInterval`), and
+  a provider filter-process signal (`IEgressFilterHealth`) fails the
+  sandbox closed when the filter dies.
+- Workload-trust routing ranks the verified value strictly below
+  orchestrator-host enforcement: it is a concession for where static
+  enforcement cannot exist, never an upgrade.
+
+The Mac-only operator procedure (Softnet install, canary endpoints, scripted
+checks) lives with the provider: `plugins/sandbox/CodeyBox.TartSandboxPlugin/README.md`.
+Anything needing a real Mac is written there as an explicit procedure, not
+claimed as verified — no CI or dev machine here is a Mac, and the in-tree
+tests cover the host logic against fakes only.
 
 ## Supported matrix
 

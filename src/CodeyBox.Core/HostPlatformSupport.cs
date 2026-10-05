@@ -4,6 +4,10 @@ namespace CodeyBox.Core;
 /// Where sandbox network-egress enforcement happens for a provider.
 /// Only <see cref="EnforcedOnOrchestratorHost"/> claims host-side isolation,
 /// and that mechanism is Linux-only (nftables on per-profile bridges).
+/// <see cref="EnforcedOnProviderHostVerified"/> is never stronger than
+/// <see cref="EnforcedOnOrchestratorHost"/>: it is a per-sandbox, canary-gated
+/// concession for provider-host filters (for example Tart Softnet), granted
+/// only after host-owned verification passes for the sandbox in question.
 /// </summary>
 public enum EgressEnforcementLocation
 {
@@ -18,6 +22,19 @@ public enum EgressEnforcementLocation
     /// The orchestrator host needs no packet filter; the executor does.
     /// </summary>
     EnforcedOnRemoteExecutorHost,
+
+    /// <summary>
+    /// Enforced by a packet filter outside the guest on the provider host
+    /// (for example Tart Softnet on the Mac host), where the orchestrator
+    /// host itself runs no filter. This value is granted only per sandbox,
+    /// and only when BOTH hold: the operator opted the kind in through
+    /// host-owned config (<c>CodeyBox:EgressVerification:Kinds</c> — a plugin
+    /// cannot set this) AND the host's canary verification passed for that
+    /// sandbox. The static <see cref="HostPlatformSupport.GetEgressEnforcement"/>
+    /// switch never returns this value; it is resolved per sandbox through
+    /// <see cref="SandboxEgressPolicy.EffectiveEnforcement"/>.
+    /// </summary>
+    EnforcedOnProviderHostVerified,
 
     /// <summary>No egress enforcement. Must never be described as isolation.</summary>
     NotEnforced,
@@ -117,6 +134,12 @@ public static class HostPlatformSupport
     /// an enforced classification is an in-tree change subject to review, never a plugin
     /// capability. See <see cref="SandboxEgressPolicy"/> for where <c>NotEnforced</c>
     /// providers may and may not be used.
+    /// This switch never returns
+    /// <see cref="EgressEnforcementLocation.EnforcedOnProviderHostVerified"/>: that value is
+    /// per-sandbox, granted only when the operator opted the kind in through
+    /// <c>CodeyBox:EgressVerification:Kinds</c> AND the host's canary verification passed
+    /// for the sandbox in question. Resolve it per sandbox through
+    /// <see cref="SandboxEgressPolicy.EffectiveEnforcement"/>.
     /// </remarks>
     public static EgressEnforcementLocation GetEgressEnforcement(string providerId)
     {
@@ -133,6 +156,10 @@ public static class HostPlatformSupport
     /// True only where the enforcement mechanism has actually been exercised:
     /// local providers on a Linux host (nftables bridges), or remote providers
     /// whose executor host is Linux with setup-host-networks.sh applied.
+    /// A provider-host filter verified per sandbox (see
+    /// <see cref="EgressEnforcementLocation.EnforcedOnProviderHostVerified"/>)
+    /// never flips this static claim: verification is per sandbox, so a kind
+    /// is never statically "isolated" by opting in.
     /// </summary>
     public static bool ClaimsNetworkIsolation(string providerId, HostOperatingSystem host, bool remoteExecutorIsLinuxEnforced = true)
     {

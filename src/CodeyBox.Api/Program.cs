@@ -810,6 +810,8 @@ static ISandboxProvider BuildRegistrySandboxProvider(IServiceProvider sp, string
 /// kind, so an operator can see which of their providers actually contain network
 /// egress and which do not. <c>NotEnforced</c> (every plugin kind, plus bubblewrap
 /// and process) is logged as a warning stating where such a provider may be used.
+/// A kind opted into <c>CodeyBox:EgressVerification</c> stays <c>NotEnforced</c>
+/// here — verification is granted per sandbox by placement, never statically.
 /// </summary>
 static void LogSandboxEgressClassification(
     string kind,
@@ -834,6 +836,19 @@ static void LogSandboxEgressClassification(
             "(Linux nftables bridges; see scripts/setup-host-networks.sh).",
             kind,
             hostPlatform.Name);
+        return;
+    }
+    if (enforcement == CodeyBox.Core.EgressEnforcementLocation.EnforcedOnProviderHostVerified)
+    {
+        // Defensive: the static switch never returns the verified value (it is
+        // per-sandbox, via SandboxEgressPolicy.EffectiveEnforcement). Logged
+        // without the NotEnforced warning so a future static source of this
+        // value stays explicit — and still never above orchestrator-host
+        // enforcement.
+        startupLog.LogInformation(
+            "Sandbox egress enforcement for provider '{Provider}': {Classification}.",
+            kind,
+            CodeyBox.Core.SandboxEgressPolicy.DescribeEgressEnforcement(kind));
         return;
     }
     startupLog.LogWarning(
@@ -2171,13 +2186,25 @@ builder.Services.AddSingleton<SandboxClassesSnapshot>(sp =>
 // embeddings); production always synthesizes the default single-member class
 // above. The dispatch knobs resolve through the live IOptionsMonitor so a
 // PlacementRecheckIn edit lands on the next deferred placement without
-// restart.
+// restart. Egress-verification reads the same way: opt-in, canary endpoints
+// and cool-down land on the next acquisition, while the shared gate keeps
+// per-kind demotions process-wide across acquisitions.
+builder.Services.AddSingleton<CodeyBox.Core.EgressVerificationGate>(sp => new CodeyBox.Core.EgressVerificationGate(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.EgressVerification,
+    sp.GetRequiredService<TimeProvider>()));
+builder.Services.AddSingleton<CodeyBox.Core.IEgressVerificationEventSink>(sp =>
+    new CodeyBox.Core.LoggerEgressVerificationEventSink(
+        sp.GetRequiredService<ILoggerFactory>().CreateLogger("CodeyBox.EgressVerification")));
 builder.Services.AddSingleton<SandboxPlacementAcquirer>(sp => new SandboxPlacementAcquirer(
     sp.GetRequiredService<SandboxClassesSnapshot>(),
     sp.GetRequiredService<ISandboxProviderRegistry>(),
     fallbackProvider: sp.GetRequiredService<ISandboxProvider>(),
     optionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.ExecutorPhaseDispatch,
-    log: sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxPlacementAcquirer>()));
+    log: sp.GetRequiredService<ILoggerFactory>().CreateLogger<SandboxPlacementAcquirer>(),
+    verificationOptionsAccessor: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.EgressVerification,
+    verificationGate: sp.GetRequiredService<CodeyBox.Core.EgressVerificationGate>(),
+    verificationSink: sp.GetRequiredService<CodeyBox.Core.IEgressVerificationEventSink>(),
+    clock: sp.GetRequiredService<TimeProvider>()));
 
 // --- Per-agent concurrency / rate-aware dispatch -----------------------------
 builder.Services.AddSingleton<AgentConcurrencyOptions>(sp =>
@@ -6661,6 +6688,17 @@ namespace CodeyBox.Api
         /// Hot-reloadable.
         /// </summary>
         public CodeyBox.Orchestrator.ExecutorPhaseDispatchOptions ExecutorPhaseDispatch { get; set; } = new();
+
+        /// <summary>
+        /// Per-sandbox egress-verification opt-in (see
+        /// <see cref="CodeyBox.Core.EgressVerificationOptions"/>): the
+        /// provider kinds whose provider-host filters (for example Tart
+        /// Softnet) may serve profiled work after the host's canary passes
+        /// for the sandbox, plus the canary endpoints and bounds.
+        /// Hot-reloadable. Empty by default: nothing is verifiable and every
+        /// plugin kind stays <c>NotEnforced</c>.
+        /// </summary>
+        public CodeyBox.Core.EgressVerificationOptions EgressVerification { get; set; } = new();
 
         /// <summary>
         /// Optional reusable agent instances. AgentClass members can reference
