@@ -44,8 +44,9 @@ GitHub Copilot, Cursor, Devin, Gemini, opencode, Aider, Goose and more — and
 routes each task to whichever one is best and available, falling back
 automatically when a provider hits a rate limit. No coding agent ever runs on
 your host: every model call that touches a repository happens through an agent
-CLI inside a sandbox, boxed in a real VM behind a host-enforced firewall —
-see [Security: defense in depth](#security-defense-in-depth).
+CLI inside a sandbox, boxed in a real VM with its own kernel (and, on Linux,
+behind a host-enforced firewall) — see
+[Security: defense in depth](#security-defense-in-depth).
 
 > Built in C#/.NET 10. Managed repos can be any stack — Python, Node, Go, Rust,
 > C#, or your own — through config-driven auditors.
@@ -136,8 +137,9 @@ the other.
   works items in parallel, runs the same audit gate a human reviewer would, and
   only bothers you when it genuinely needs a decision.
 - **You don't trust an LLM agent with `sudo` on your machine.** Every agent runs
-  in a real VM with kernel isolation and a host-enforced firewall — a
-  compromised agent can't reach your host or exfiltrate past its allowlist.
+  in a real VM with its own kernel, so a compromised agent can't reach your
+  host — and on Linux hosts a host-enforced firewall stops it exfiltrating past
+  its allowlist.
 - **You pay for several coding subscriptions.** CodeyBox pools them: one task
   queue, automatic routing across agents, quota-aware fallback, and per-agent
   cost tracking so you can see where the money goes.
@@ -165,13 +167,17 @@ Most agent orchestrators run the model in a container or straight on the host.
 CodeyBox stacks several independent layers between an agent and your machine, so
 a prompt-injected or actively malicious agent has to defeat all of them:
 
-- **Real VMs, not containers.** Each agent runs in a KVM-backed microVM. A
-  container shares the host kernel — one Linux privilege-escalation bug and the
-  agent is on your host. A guest-kernel exploit inside a VM isn't.
-- **Host-enforced egress.** The firewall is nftables rules on the *host*, not
-  inside the guest. An agent that gains `sudo` in its sandbox still can't reach
-  your LAN, cloud-metadata endpoints, or anything off its allowlist — it can't
-  flush a firewall it can't see.
+- **Real VMs, not containers — the primary boundary.** Each agent runs in its
+  own VM with its own kernel: KVM on Linux, Apple's Virtualization.framework on
+  a Mac with Tart. A container shares the host kernel — one privilege-escalation
+  bug and the agent is on your host. A guest-kernel exploit inside a VM isn't.
+  Everything below is a further layer on top of this one.
+- **Host-enforced egress.** On Linux providers the network allowlist is nftables
+  rules on the *host*, not inside the guest. An agent that gains `sudo` in its
+  sandbox still can't reach your LAN, cloud-metadata endpoints, or anything off
+  its allowlist — it can't flush a firewall it can't see. Providers that can't
+  enforce this are labelled *egress not enforced*, and work that requires an
+  enforced network profile is never placed on them.
 - **Least-privilege credentials.** Audit-tool sandboxes get no agent secrets at
   all. Your upstream/GitHub credentials never leave the orchestrator process. An
   injected agent has nothing to exfiltrate beyond its own scoped token.
@@ -473,22 +479,29 @@ sandbox install command, and its known quirks.
 
 ## Host platform support
 
-| Orchestrator host | `incus` | `multipass` (local) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (dev-only) |
-|---|---|---|---|---|---|---|
-| Linux | ✅ enforced on host | ✅ enforced on host | ✅ enforced on executor | ✅ enforced on executor | ⚠️ shared kernel, no egress | ⚠️ no isolation, dev only |
-| macOS | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
-| Windows | ❌ | ❌ | ✅ enforced on executor | ✅ enforced on executor | ❌ | ❌ |
+| Orchestrator host | `incus` | `multipass` (local) | `tart` (plugin) | `multipass-remote` | `sprites` | `bubblewrap` | `process` (dev-only) |
+|---|---|---|---|---|---|---|---|
+| Linux | ✅ VM, egress enforced on host | ✅ VM, egress enforced on host | ❌ macOS only | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ⚠️ shared kernel, no egress | ⚠️ no isolation, dev only |
+| macOS | ❌ | ❌ | ✅ VM (macOS or Linux guests), ⚠️ egress not enforced | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ❌ | ❌ |
+| Windows | ❌ | ❌ | ❌ | ✅ VM, egress enforced on executor | ✅ VM, egress enforced on executor | ❌ | ❌ |
 
-Local VM sandboxes are Linux-only because egress isolation is enforced on the
-host by nftables on per-profile Linux bridges — there is no equivalent host-side
-mechanism on macOS or Windows (assessed in
-[`docs/concepts/host-platforms.md`](docs/concepts/host-platforms.md)). On macOS
-and Windows only the remote-executor topology is supported: the orchestrator
-runs locally (`./build.sh` on macOS, `./build.ps1` on Windows) while VMs execute
-on a Linux executor host where the allowlist holds. Guests are always Linux VMs;
-running the orchestrator on a platform does not imply guest sandboxes for it.
-An unenforced allowlist is never described as isolation. Unsupported provider +
-host combinations fail fast at startup with a message pointing at the matrix.
+**On a Mac**, run the orchestrator locally (`./build.sh`) and give agents
+local VMs with the [Tart](docs/extending/tart-sandbox-plugin.md) plugin — a
+fresh VM with its own kernel per work item, with macOS guests as well as Linux
+ones, so Apple-platform work can run too. What a Mac host doesn't yet give you
+is the host-enforced egress allowlist: a Tart guest's network follows the
+Mac's, so treat it as able to reach anything your Mac can. Use Tart for the
+work you would trust with that, and a Linux host or a remote Linux executor for
+the rest — work that requires an enforced network profile is placed there
+automatically. Enforced egress for Tart through its Softnet packet filter is in
+progress.
+
+**On Windows**, run the orchestrator locally (`./build.ps1`) with VMs on a
+remote Linux executor host, where the allowlist holds.
+
+An unenforced allowlist is never described as isolation, and unsupported
+provider + host combinations fail fast at startup with a message pointing at
+the matrix ([`docs/concepts/host-platforms.md`](docs/concepts/host-platforms.md)).
 
 ## Sandbox providers
 
