@@ -137,6 +137,13 @@ public sealed partial class PipelineRunner
                 var stored = await _store.GetAsync(item.Id, ct);
                 if (request.ExistingPullRequestNumber is null && stored?.MergedPrNumber is not null)
                     request = request with { ExistingPullRequestNumber = stored.MergedPrNumber };
+                // Lease base for an owned-branch rewrite: the tip CodeyBox
+                // last pushed. A retry proves a diverged remote tip is its own
+                // previous push by matching this sha before rewriting under
+                // --force-with-lease; without it a diverged remote parks for
+                // the operator instead of being rewritten blind.
+                if (request.ExpectedRemoteHeadSha is null && !string.IsNullOrWhiteSpace(stored?.LastPushedWorkBranchSha))
+                    request = request with { ExpectedRemoteHeadSha = stored.LastPushedWorkBranchSha };
             }
 
             // Pre-merge CI gate. The forge's textual `mergeable` flag does not
@@ -401,6 +408,7 @@ public sealed partial class PipelineRunner
                             {
                                 MergedPrNumber = outcome.PullRequestNumber ?? racedPersist.MergedPrNumber,
                                 MergedPrUrl = outcome.PullRequestUrl ?? racedPersist.MergedPrUrl,
+                                LastPushedWorkBranchSha = outcome.PushedWorkBranchSha ?? racedPersist.LastPushedWorkBranchSha,
                             }, ct);
                         }
                         continue;
@@ -425,6 +433,26 @@ public sealed partial class PipelineRunner
                     && ex is not AgentAuthRequiredException
                     && ex is not AgentInfrastructureFailureException)
                 {
+                    // Owned-branch lease guard: a third party moved the work
+                    // branch (lease mismatch), or the remote diverged from an
+                    // unrecorded prior push. Both are terminal classifications,
+                    // NOT merge conflicts: never retry in this loop (a retry
+                    // re-hits the same remote ref) and never route into
+                    // conflict-rework. Park for the operator, who re-drives
+                    // the upstream step after inspecting the branch.
+                    if (UpstreamLeaseMismatchException.TryFindIn(ex, out var leaseMismatch))
+                    {
+                        _log.LogWarning("Upstream push refused by lease guard: {Error}", leaseMismatch.Message);
+                        await TransitionFailed(item, leaseMismatch.Message, ct, project, failureKind: WorkItemFailureKinds.UpstreamBlocked);
+                        break;
+                    }
+                    if (UpstreamOwnedBranchDivergedException.TryFindIn(ex, out var divergedHistory))
+                    {
+                        _log.LogWarning("Upstream push diverged from unrecorded history: {Error}", divergedHistory.Message);
+                        await TransitionFailed(item, divergedHistory.Message, ct, project, failureKind: WorkItemFailureKinds.UpstreamBlocked);
+                        break;
+                    }
+
                     if (UpstreamPushReconcileConflictException.TryFindIn(ex, out var conflict))
                     {
                         _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
@@ -513,7 +541,8 @@ public sealed partial class PipelineRunner
                 // local-only sha lives on LocalSquashSha.
                 if (completed.MergedSha is not null ||
                     completed.PullRequestNumber is not null ||
-                    completed.PullRequestUrl is not null)
+                    completed.PullRequestUrl is not null ||
+                    completed.PushedWorkBranchSha is not null)
                 {
                     var preMergePersist = await _store.GetAsync(item.Id, ct) ?? item;
                     await _store.UpdateAsync(preMergePersist with
@@ -521,6 +550,7 @@ public sealed partial class PipelineRunner
                         MergeSha = completed.MergedSha ?? preMergePersist.MergeSha,
                         MergedPrNumber = completed.PullRequestNumber ?? preMergePersist.MergedPrNumber,
                         MergedPrUrl = completed.PullRequestUrl ?? preMergePersist.MergedPrUrl,
+                        LastPushedWorkBranchSha = completed.PushedWorkBranchSha ?? preMergePersist.LastPushedWorkBranchSha,
                     }, ct);
                 }
 

@@ -41,6 +41,8 @@ internal static class WorkItemEndpoints
         group.MapPost("/{id}/uncancel", UncancelAsync);
         group.MapPost("/{id}/resume", ResumeAsync);
         group.MapPost("/{id}/recover", RecoverAsync);
+        group.MapGet("/upstream-redrive-candidates", ListUpstreamRedriveCandidatesAsync);
+        group.MapPost("/{id}/redrive-upstream", RedriveUpstreamAsync);
 
         var projects = app.MapGroup("/projects");
         projects.MapGet("/", ListProjectsAsync);
@@ -426,6 +428,77 @@ internal static class WorkItemEndpoints
 
         var outcome = await commands.RetryAsync(item!, body?.From, body?.WorkTimeoutMinutes, ct);
         return outcome.ToHttpResult();
+    }
+
+    /// <summary>
+    /// Lists work items stranded by a stale upstream branch ref that are
+    /// eligible for an operator-authorized upstream re-drive: settled in
+    /// Failed / MergeConflictResolutionFailed / Merged with an open PR on
+    /// their own <c>codeybox/*</c> branch. Read-only.
+    /// </summary>
+    private static async Task<IResult> ListUpstreamRedriveCandidatesAsync(
+        UpstreamRedriveService redrive,
+        CancellationToken ct)
+    {
+        var candidates = await redrive.ListCandidatesAsync(ct);
+        return Results.Ok(new
+        {
+            candidates = candidates.Select(c => new
+            {
+                projectId = c.ProjectId,
+                workItemId = c.WorkItemId,
+                title = c.Title,
+                state = c.State.ToString(),
+                workBranch = c.WorkBranch,
+                pullRequestNumber = c.PullRequestNumber,
+                pullRequestUrl = c.PullRequestUrl,
+                pullRequestHeadSha = c.PullRequestHeadSha,
+                lastPushedWorkBranchSha = c.LastPushedWorkBranchSha,
+                reason = c.Reason,
+            }).ToArray(),
+        });
+    }
+
+    /// <summary>
+    /// Operator-authorized re-drive of the upstream step for one stranded
+    /// item: records the open PR's currently observed head sha as the lease
+    /// base (invoking this asserts no third party pushed to the branch) and
+    /// retries from the upstream phase under the normal lease rules. A third
+    /// party push landing between the observation and the guarded push still
+    /// fails the lease and parks — authorization covers the observed tip,
+    /// never a blind overwrite.
+    ///
+    /// Returns 202 when the re-drive is armed, 404 when the item does not
+    /// exist, 409 when the state/branch/PR preconditions do not hold or the
+    /// retry is refused.
+    /// </summary>
+    private static async Task<IResult> RedriveUpstreamAsync(
+        string id,
+        IWorkItemStore store,
+        UpstreamRedriveService redrive,
+        CancellationToken ct)
+    {
+        var (item, err) = await ResolveWorkItemAsync(id, store, ct);
+        if (err is not null) return err;
+
+        var result = await redrive.RedriveAsync(item!.Id, ct);
+        if (!result.Success)
+        {
+            var notFound = result.Error?.Contains("not found", StringComparison.OrdinalIgnoreCase) == true;
+            return notFound
+                ? Results.NotFound(new { error = result.Error })
+                : Results.Conflict(new { error = result.Error });
+        }
+
+        return Results.Accepted($"/workitems/{id}", new
+        {
+            id,
+            from = "upstream",
+            actualFrom = result.ActualFrom,
+            state = result.ResumeState,
+            pullRequestNumber = result.PullRequestNumber,
+            leaseBaseSha = result.LeaseBaseSha,
+        });
     }
 
 

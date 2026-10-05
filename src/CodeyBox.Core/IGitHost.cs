@@ -290,6 +290,47 @@ public interface IGitHost
         CancellationToken ct = default)
         => throw new NotSupportedException("This git host does not support host-side branch updates.");
 
+    /// <summary>
+    /// Reads the current tip sha of <paramref name="branch"/> on the upstream
+    /// without modifying any local ref. Returns <c>null</c> when the upstream
+    /// does not advertise the branch. Throws on transport / auth errors.
+    ///
+    /// Default returns <c>null</c> for hosts that do not model an upstream
+    /// (so test fakes that don't implement the call behave as "branch not
+    /// found" rather than crashing). Callers treat <c>null</c> as absent and
+    /// use a plain push; a non-null sha feeds the owned-branch lease decision.
+    /// </summary>
+    Task<string?> GetUpstreamBranchShaAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Rewrites a CodeyBox-owned work branch on the upstream with
+    /// <c>git push --force-with-lease</c>, guarded so a third party's commits
+    /// are never clobbered blind: the push succeeds only when the remote ref
+    /// still points at <paramref name="expectedOldSha"/>. Refuses branches
+    /// outside the <c>codeybox/</c> prefix (see
+    /// <see cref="CodeyBoxBranchPolicy"/>) and throws
+    /// <see cref="UpstreamLeaseMismatchException"/> when the lease fails
+    /// because the remote moved. Never retries internally — the caller
+    /// decides whether the mismatch is park-worthy.
+    ///
+    /// Default throws — only hosts that expose a real bare repo need to
+    /// implement this.
+    /// </summary>
+    Task PushBranchWithLeaseAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        string expectedOldSha,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support lease-guarded branch rewrites.");
+
     /// <summary>Discards the host-side state for a finished work item.</summary>
     Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default);
 
