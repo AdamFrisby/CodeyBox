@@ -425,7 +425,7 @@ public sealed partial class PipelineRunner
                     && ex is not AgentAuthRequiredException
                     && ex is not AgentInfrastructureFailureException)
                 {
-                    if (TryGetUpstreamReconcileConflict(ex, out var conflict))
+                    if (UpstreamPushReconcileConflictException.TryFindIn(ex, out var conflict))
                     {
                         _log.LogWarning("Upstream complete failed with unrecoverable reconcile conflict: {Error}", conflict.Message);
                         // A non-fast-forward push whose automatic single-shot
