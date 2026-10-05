@@ -131,19 +131,25 @@ public sealed partial class StrykerMutationRunner
     private static List<string> BuildStrykerArgv(
         StrykerMutationRunnerOptions opts, StrykerProjectGroup group, string outputDir)
     {
+        // Sink-side guard (defense in depth alongside StrykerPaths): every
+        // repo-derived value is validated AT the argv sink so a future
+        // caller can never pass a dash-leading value that Stryker would
+        // parse as a flag. Stryker's "--" end-of-options handling is
+        // version-dependent, so fail-closed rejection is the version-proof
+        // guard; legitimate repo names never start with '-'.
         var argv = new List<string>(opts.ToolCommand)
         {
-            "-p", group.ProjectFileName,
+            "-p", EnsureSafeCliValue(group.ProjectFileName, "project file name"),
         };
         foreach (var test in group.TestProjects)
         {
             argv.Add("-tp");
-            argv.Add(RelativeSegments(group.ProjectDirectory, test));
+            argv.Add(EnsureSafeCliValue(RelativeSegments(group.ProjectDirectory, test), "test project path"));
         }
         foreach (var pattern in group.MutatePatterns)
         {
             argv.Add("-m");
-            argv.Add(pattern);
+            argv.Add(EnsureSafeCliValue(pattern, "mutate pattern"));
         }
         argv.Add("-r");
         argv.Add("Json");
@@ -163,6 +169,41 @@ public sealed partial class StrykerMutationRunner
         }
         return argv;
     }
+
+    private static string EnsureSafeCliValue(string value, string what)
+    {
+        // Repo-controlled values reach Stryker option positions (-p/-tp/-m)
+        // where a leading '-' would desynchronize flag parsing (scope
+        // manipulation or gate distortion). Reject fail-closed: empty,
+        // dash-leading, or control/NUL-carrying values never reach argv.
+        // Segment-internal dashes (e.g. "my-dir/file.cs") are harmless and
+        // remain allowed; only a leading dash (or a segment starting with
+        // '-' after a '/' in patterns/relative paths) is dangerous.
+        if (string.IsNullOrEmpty(value)
+            || value[0] == '-'
+            || value[0] == '\0'
+            || value.Contains('\0'))
+            throw StrykerOptionInjection(value, what);
+        foreach (var c in value)
+        {
+            if (char.IsControl(c))
+                throw StrykerOptionInjection(value, what);
+        }
+        foreach (var segment in value.Replace('\\', '/').Split('/'))
+        {
+            if (segment.Length > 0 && segment[0] == '-' && segment is not (".." or "."))
+                throw StrykerOptionInjection(value, what);
+        }
+        return value;
+    }
+
+    private static StrykerRunFailedException StrykerOptionInjection(string value, string what) =>
+        new($"Stryker {what} '{StrykerPaths.SanitizeForLog(value)}' starts with '-' or carries " +
+            "control characters and could parse as a CLI flag; refusing to run. Rename the path " +
+            "so it does not begin with '-' (or a path segment beginning with '-').")
+        {
+            Kind = StrykerFailureKind.Tool,
+        };
 
     private static string CanonicalLevel(string level) =>
         level.Trim().ToLowerInvariant() switch

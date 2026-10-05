@@ -119,6 +119,10 @@ public sealed class StrykerOptionsAndSelectionTests
     [InlineData("", null)]
     [InlineData("   ", null)]
     [InlineData("-", null)]
+    [InlineData("--", null)]
+    [InlineData("-evil.cs", null)]
+    [InlineData("src/-evil.cs", null)]
+    [InlineData("src/--flag/File.cs", null)]
     public void RepoPaths_NormalizedOrRejected(string? input, string? expected)
     {
         Assert.Equal(expected, StrykerPaths.NormalizeRepoPath(input));

@@ -44,6 +44,13 @@ public static class StrykerPaths
                 return null;
             if (segment is "-" or "--")
                 return null;
+            // Any segment starting with '-' (e.g. "-evil.cs") would parse
+            // as a CLI flag where the path later reaches a process argv
+            // sink (Stryker -p/-tp/-m values). Stryker's end-of-options
+            // handling is version-dependent, so reject such names
+            // fail-closed here instead of relying on a "--" separator.
+            if (segment[0] == '-')
+                return null;
             segments.Add(segment);
         }
         if (segments.Count == 0)

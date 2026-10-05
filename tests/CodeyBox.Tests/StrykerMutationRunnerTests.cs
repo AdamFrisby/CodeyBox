@@ -444,6 +444,8 @@ public sealed class StrykerMutationRunnerTests
     [InlineData("/abs/evil.cs")]
     [InlineData("src/SampleCalc/../../evil.cs")]
     [InlineData("src/SampleCalc/\0evil.cs")]
+    [InlineData("src/SampleCalc/-evil.cs")]
+    [InlineData("src/-evil/Calc.cs")]
     public async Task HostileChangedPaths_Rejected_BeforeAnyRun(string hostile)
     {
         var (sandbox, _) = CreateSandbox();
@@ -454,6 +456,29 @@ public sealed class StrykerMutationRunnerTests
 
         Assert.Empty(StrykerRuns(sandbox));
         Assert.DoesNotContain(sandbox.Calls, c => c.Argv.Contains("-m"));
+    }
+
+    [Theory]
+    [InlineData("-evil.csproj")]
+    [InlineData("-evil.cs")]
+    [InlineData("--flag")]
+    public void ArgvSink_RejectsDashLeadingRepoValues(string hostile)
+    {
+        // The argv sink carries its own guard: even if a dash-leading value
+        // somehow bypassed path normalization, it must never reach Stryker
+        // where it would parse as a flag.
+        var method = typeof(StrykerMutationRunner).GetMethod(
+            "BuildStrykerArgv",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var opts = new StrykerMutationRunnerOptions();
+        StrykerProjectGroup group = new(
+            "src/A/A.csproj", "src/A", hostile, [], ["A.cs"], ["A.cs"]);
+
+        var ex = Assert.Throws<System.Reflection.TargetInvocationException>(
+            () => method.Invoke(null, [opts, group, "/tmp/codeybox-stryker-test"]));
+        Assert.IsType<StrykerRunFailedException>(ex.InnerException);
     }
 
     [Fact]
