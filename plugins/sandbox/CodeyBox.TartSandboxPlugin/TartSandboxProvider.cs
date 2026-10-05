@@ -49,9 +49,12 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
     internal const string CredentialMountPath = "/run/codeybox/creds";
 
     private readonly ConcurrentDictionary<string, ActiveSandboxEntry> _activeSandboxes = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, IReadOnlyList<string>> _softnetAllowLists = new(StringComparer.Ordinal);
     private readonly ITartProcessRunner _runner;
     private readonly Func<bool> _isMacOS;
     private readonly TimeProvider _timeProvider;
+    private readonly ITartDnsResolver _dnsResolver;
+    private readonly Func<TartSandboxOptions, CancellationToken, Task>? _softnetPreflightOverride;
 
     private Func<TartSandboxOptions> _readOptions;
     private ILogger _log;
@@ -67,6 +70,8 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         var section = configuration.GetSection($"CodeyBox:Plugins:{TartSandboxOptions.PluginId}");
         _readOptions = () => TartSandboxOptions.FromConfiguration(section);
         _runner = new SystemTartProcessRunner();
+        _dnsResolver = SystemTartDnsResolver.Instance;
+        _softnetPreflightOverride = null;
     }
 
     /// <summary>Test constructor with full control over options, transport, platform, and clock.</summary>
@@ -75,13 +80,17 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         ITartProcessRunner runner,
         Func<bool>? isMacOS,
         TimeProvider timeProvider,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        ITartDnsResolver? dnsResolver = null,
+        Func<TartSandboxOptions, CancellationToken, Task>? softnetPreflight = null)
     {
         _readOptions = readOptions ?? throw new ArgumentNullException(nameof(readOptions));
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         _isMacOS = isMacOS ?? throw new ArgumentNullException(nameof(isMacOS));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _log = logger ?? NullLogger.Instance;
+        _dnsResolver = dnsResolver ?? SystemTartDnsResolver.Instance;
+        _softnetPreflightOverride = softnetPreflight;
     }
 
     /// <summary>Provider kind. Normalised (trimmed, lowercase) and matched by exact ordinal equality.</summary>
@@ -159,6 +168,11 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         var vmName = BuildVmName(opts.NamePrefix);
         var transport = new TartSshGuestTransport(_runner, _readOptions, () => ResolvePassword(opts));
 
+        // Softnet preflight and allowlist resolution happen before cloning:
+        // a misconfigured filter or an over-budget allowlist refuses the
+        // create fail-closed instead of provisioning a NAT VM.
+        var softnetAllowCidrs = await PrepareSoftnetPolicyAsync(opts, spec, ct).ConfigureAwait(false);
+
         try
         {
             await CloneAsync(opts, image, vmName, ct).ConfigureAwait(false);
@@ -168,14 +182,21 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
             throw TartFailureClassification.ToDeferred(ex, "clone-vm", Recheck(opts));
         }
 
-        var sandbox = new TartSandbox(vmName, "0.0.0.0", _runner, transport, _readOptions, spec, _timeProvider, _log, id => _activeSandboxes.TryRemove(id, out _));
+        var sandbox = new TartSandbox(vmName, "0.0.0.0", _runner, transport, _readOptions, spec, _timeProvider, _log, id =>
+        {
+            _activeSandboxes.TryRemove(id, out _);
+            _softnetAllowLists.TryRemove(id, out _);
+        });
+        sandbox.SetNetworkPolicy(opts.Network.Mode, softnetAllowCidrs ?? []);
         var entry = new ActiveSandboxEntry(spec.TimingWorkItemId, sandbox);
         _activeSandboxes[vmName] = entry;
+        if (softnetAllowCidrs is not null)
+            _softnetAllowLists[vmName] = softnetAllowCidrs;
 
         try
         {
             await SizeVmAsync(opts, vmName, spec, ct).ConfigureAwait(false);
-            var runProcess = StartVm(opts, vmName);
+            var runProcess = StartVm(opts, vmName, softnetAllowCidrs);
             sandbox.AttachVmProcess(runProcess);
             var ip = await transport.WaitForSshAsync(vmName, ct).ConfigureAwait(false);
             sandbox.RefreshIp(ip);
@@ -183,12 +204,14 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
             var writableMounts = await StageMountsAsync(opts, transport, ip, spec, ct).ConfigureAwait(false);
             sandbox.SetWritableMounts(writableMounts);
             await EnsureWorkDirAsync(opts, transport, ip, spec, ct).ConfigureAwait(false);
+            LogSoftnetPolicy(vmName, opts.Network.Mode, softnetAllowCidrs);
             return sandbox;
         }
         catch (Exception ex)
         {
             await TeardownBestEffortAsync(opts, sandbox).ConfigureAwait(false);
             _activeSandboxes.TryRemove(vmName, out _);
+            _softnetAllowLists.TryRemove(vmName, out _);
             if (ex is TartCliException cliEx)
                 throw TartFailureClassification.ToDeferred(cliEx, "create-vm", Recheck(opts));
             throw;
@@ -278,10 +301,25 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         var transport = new TartSshGuestTransport(_runner, _readOptions, () => ResolvePassword(opts));
         try
         {
+            // Resume re-launches `tart run`, so Softnet mode must reinstall
+            // the same filter: reuse the stored create-time allowlist and
+            // never silently resume as NAT. A VM whose policy is unknown
+            // (provider restart dropped the map) refuses fail-closed.
+            IReadOnlyList<string>? softnetAllowCidrs = null;
+            if (opts.Network.Mode == TartNetworkMode.Softnet)
+            {
+                await EnsureSoftnetReadyAsync(opts, ct).ConfigureAwait(false);
+                if (!_softnetAllowLists.TryGetValue(name, out softnetAllowCidrs))
+                    throw new TartSoftnetUnavailableException(
+                        "softnet-policy-unknown",
+                        $"Delete the stopped VM '{name}' (tart delete {name}) and let the pipeline provision a fresh Softnet sandbox.",
+                        $"No stored Softnet allowlist for '{name}': the provider restarted after the VM was created.");
+            }
+
             // The detached `tart run` handle is released without killing:
             // the VM must keep running after resume. Later teardown goes
             // through the CLI, never this handle.
-            StartVm(opts, name).Dispose();
+            StartVm(opts, name, softnetAllowCidrs).Dispose();
             await transport.WaitForSshAsync(name, ct).ConfigureAwait(false);
         }
         catch (TartCliException ex)
@@ -315,6 +353,23 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         // Fail closed on a known_hosts path that would disable server
         // authentication; the SSH sink re-validates at use time.
         _ = TartSshGuestTransport.ResolveKnownHostsPath(opts);
+        ValidateNetworkOptions(opts.Network);
+    }
+
+    internal static void ValidateNetworkOptions(TartSandboxNetworkOptions network)
+    {
+        ArgumentNullException.ThrowIfNull(network);
+        var prefix = $"CodeyBox:Plugins:{TartSandboxOptions.PluginId}:Network";
+        if (!Enum.IsDefined(network.Mode))
+            throw new InvalidOperationException($"{prefix}:Mode has an unknown value.");
+        if (string.IsNullOrWhiteSpace(network.SoftnetBinaryPath))
+            throw new InvalidOperationException($"{prefix}:SoftnetBinaryPath must be non-empty.");
+        if (string.IsNullOrWhiteSpace(network.GatewayCidr) || !TartSandboxNetworkOptions.IsIPv4Cidr(network.GatewayCidr.Trim()))
+            throw new InvalidOperationException($"{prefix}:GatewayCidr must be an IPv4 CIDR.");
+        if (network.MaxAllowCidrs < 1 || network.MaxAllowCidrs > 4096)
+            throw new InvalidOperationException($"{prefix}:MaxAllowCidrs must be 1-4096.");
+        if (network.DnsTimeoutSeconds < 1 || network.DnsTimeoutSeconds > 30)
+            throw new InvalidOperationException($"{prefix}:DnsTimeoutSeconds must be 1-30.");
     }
 
     internal void EnsureEnabled(TartSandboxOptions opts)
@@ -432,7 +487,7 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
             throw TartFailureClassification.ForExit(opts.TartBinaryPath, ["set", vmName], result.ExitCode, result.Stderr);
     }
 
-    internal ITartDetachedProcess StartVm(TartSandboxOptions opts, string vmName)
+    internal ITartDetachedProcess StartVm(TartSandboxOptions opts, string vmName, IReadOnlyList<string>? softnetAllowCidrs = null)
     {
         ArgumentNullException.ThrowIfNull(opts);
         ArgumentException.ThrowIfNullOrWhiteSpace(vmName);
@@ -441,9 +496,151 @@ public sealed class TartSandboxProvider : ISandboxProvider, ISuspendingSandboxPr
         if (!IsValidVmName(vmName))
             throw new ArgumentException($"Sandbox name '{vmName}' contains invalid characters (only [a-z0-9-] allowed).", nameof(vmName));
         var argv = new List<string> { "run" };
+        if (opts.Network.Mode == TartNetworkMode.Softnet)
+        {
+            // Fail closed: Softnet mode always installs the filter. A null or
+            // empty allowlist here means the policy build was skipped — never
+            // launch the VM as NAT instead.
+            if (softnetAllowCidrs is null || softnetAllowCidrs.Count == 0)
+                throw new TartSoftnetUnavailableException(
+                    "softnet-policy-unknown",
+                    $"Fix CodeyBox:Plugins:{TartSandboxOptions.PluginId}:Network so the allowlist resolves, then retry the create.",
+                    "Softnet mode requires a resolved allowlist (at least the vmnet gateway CIDR).");
+            argv.AddRange(TartSoftnetPolicy.BuildRunFlags(softnetAllowCidrs));
+        }
         argv.AddRange(opts.ExtraRunArgs.Where(static arg => !string.IsNullOrWhiteSpace(arg)));
         argv.Add(vmName);
         return _runner.StartDetached(new TartProcessSpec(opts.TartBinaryPath, argv, Stdin: null, Timeout: Timeout.InfiniteTimeSpan));
+    }
+
+    /// <summary>
+    /// Builds the Softnet allowlist for one create, or null in NAT mode.
+    /// Preflight (macOS only) refuses unusable Softnet before any clone, and
+    /// the acquisition's <c>AllowedHosts</c> resolve to IPv4 <c>/32</c>s with
+    /// a bounded per-host DNS timeout; unresolvable hosts are logged and
+    /// skipped while the block-all default holds for them.
+    /// </summary>
+    internal async Task<IReadOnlyList<string>?> PrepareSoftnetPolicyAsync(
+        TartSandboxOptions opts, SandboxSpec spec, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        ArgumentNullException.ThrowIfNull(spec);
+        if (opts.Network.Mode != TartNetworkMode.Softnet)
+            return null;
+        await EnsureSoftnetReadyAsync(opts, ct).ConfigureAwait(false);
+        return await ResolveSoftnetAllowCidrsAsync(opts, spec.Network.AllowedHosts, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Softnet preflight, macOS only: proves the helper binary is installed
+    /// and can run (setuid or sudoers) via a bounded version probe. Anything
+    /// else throws the typed fail-closed error — never a NAT fallback. On
+    /// non-macOS hosts the Tart host gate already refused, so there is
+    /// nothing Softnet-specific to probe.
+    /// </summary>
+    internal async Task EnsureSoftnetReadyAsync(TartSandboxOptions opts, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        if (opts.Network.Mode != TartNetworkMode.Softnet)
+            return;
+        if (!_isMacOS())
+            return;
+        if (_softnetPreflightOverride is not null)
+        {
+            await _softnetPreflightOverride(opts, ct).ConfigureAwait(false);
+            return;
+        }
+        var probe = new TartProcessSpec(
+            opts.Network.SoftnetBinaryPath, ["--version"], Stdin: null,
+            TimeSpan.FromSeconds(Math.Clamp(opts.CliTimeoutSeconds, 5, 600)));
+        TartProcessResult result;
+        try
+        {
+            result = await _runner.RunAsync(probe, stdoutChunk: null, stderrChunk: null, maxOutputBytes: 4096, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new TartSoftnetUnavailableException(
+                "softnet-missing",
+                $"Install Softnet on the Mac host with the setuid bit or a passwordless-sudoers entry, then retry " +
+                $"(CodeyBox:Plugins:{TartSandboxOptions.PluginId}:Network:SoftnetBinaryPath='{opts.Network.SoftnetBinaryPath}').",
+                $"Softnet probe failed to run: {LastLine(ex.Message)}");
+        }
+        if (result.ExitCode != 0)
+            throw new TartSoftnetUnavailableException(
+                result.ExitCode == 126 || result.ExitCode == 127 ? "softnet-missing" : "softnet-denied",
+                result.ExitCode == 126 || result.ExitCode == 127
+                    ? $"Install Softnet on the Mac host with the setuid bit or a passwordless-sudoers entry, then retry " +
+                      $"(CodeyBox:Plugins:{TartSandboxOptions.PluginId}:Network:SoftnetBinaryPath='{opts.Network.SoftnetBinaryPath}')."
+                    : "Grant Softnet privilege via its setuid bit or a passwordless-sudoers entry, then retry.",
+                $"Softnet probe '{opts.Network.SoftnetBinaryPath} --version' exited {result.ExitCode}: {LastLine(result.Stderr)}");
+    }
+
+    /// <summary>
+    /// Resolves acquisition hosts to the Softnet allowlist: gateway first,
+    /// then sorted deduped IPv4 <c>/32</c>s, bounded by
+    /// <c>Network:MaxAllowCidrs</c>. Host entries are normalised
+    /// (trimmed, blank-skipped, case-insensitive dedupe, sorted) so the argv
+    /// is deterministic; each lookup carries the configured DNS timeout.
+    /// </summary>
+    internal async Task<IReadOnlyList<string>> ResolveSoftnetAllowCidrsAsync(
+        TartSandboxOptions opts, IReadOnlyList<string> allowedHosts, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        ArgumentNullException.ThrowIfNull(allowedHosts);
+        var hosts = allowedHosts
+            .Where(static h => !string.IsNullOrWhiteSpace(h))
+            .Select(static h => h.Trim().TrimEnd('.'))
+            .Where(static h => h.Length > 0 && h.Length <= 253)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static h => h, StringComparer.Ordinal)
+            .ToArray();
+        // The host count itself is bounded by the CIDR budget: more distinct
+        // hosts than the allowlist can hold fails closed here (naming the
+        // bound) instead of silently dropping acquisition hosts.
+        if (hosts.Length > Math.Max(opts.Network.MaxAllowCidrs, 1))
+            throw new InvalidOperationException(
+                $"Softnet allowlist needs {hosts.Length} host lookups, over the {opts.Network.MaxAllowCidrs}-CIDR bound " +
+                $"(CodeyBox:Plugins:{TartSandboxOptions.PluginId}:Network:MaxAllowCidrs). " +
+                $"Reduce the acquisition's AllowedHosts or raise the bound.");
+        var resolved = new List<System.Net.IPAddress>(hosts.Length * 2);
+        foreach (var host in hosts)
+        {
+            ct.ThrowIfCancellationRequested();
+            IReadOnlyList<System.Net.IPAddress> addresses;
+            try
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(opts.Network.DnsTimeoutSeconds, 1, 30)));
+                addresses = await _dnsResolver.ResolveIPv4Async(host, timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                TartSoftnetPolicy.LogSkippedHost(_log, host, $"DNS lookup exceeded the {opts.Network.DnsTimeoutSeconds}s bound");
+                continue;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                TartSoftnetPolicy.LogSkippedHost(_log, host, LastLine(ex.Message));
+                continue;
+            }
+            var ipv4 = addresses
+                .Where(static ip => ip is not null && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                .ToArray();
+            if (ipv4.Length == 0)
+                TartSoftnetPolicy.LogSkippedHost(_log, host, "no IPv4 address resolved (Softnet policy is IPv4-only)");
+            resolved.AddRange(ipv4);
+        }
+        return TartSoftnetPolicy.BuildAllowCidrs(resolved, opts.Network.GatewayCidr.Trim(), opts.Network.MaxAllowCidrs);
+    }
+
+    private void LogSoftnetPolicy(string vmName, TartNetworkMode mode, IReadOnlyList<string>? allowCidrs)
+    {
+        if (mode != TartNetworkMode.Softnet || allowCidrs is null)
+            return;
+        _log.LogInformation(
+            "Tart VM '{Vm}': Softnet egress policy installed (block {BlockAll}, allow [{Allow}]), host classification unchanged (NotEnforced).",
+            vmName, TartSoftnetPolicy.BlockAllCidr, string.Join(",", allowCidrs));
     }
 
     internal async Task<IReadOnlyList<TartVmListEntry>> ListVmsAsync(TartSandboxOptions opts, CancellationToken ct)

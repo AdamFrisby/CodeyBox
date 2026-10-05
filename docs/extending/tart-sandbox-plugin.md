@@ -92,6 +92,18 @@ pipeline replays from its checkpoint) and `teardown`
 baseline bake, cache seeding, disk guard, or port publishing: placement
 refuses work requiring them rather than failing deep inside a phase.
 
+## Softnet egress filtering (opt-in, default off)
+
+`Network:Mode=softnet` attaches Tart's Softnet userspace packet filter to
+every `tart run` (block `0.0.0.0/0`, allow the vmnet gateway for DHCP/DNS
+plus the acquisition's `AllowedHosts` resolved to IPv4 `/32`s). Preflight
+refuses creates with a typed error when Softnet is missing or unprivileged
+— never a silent NAT fallback — and each sandbox reports its effective
+policy for the host verifier. This does **not** change the host's egress
+classification: the kind stays `NotEnforced`, and profiled work still
+refuses. See the plugin README for knobs and the scripted Mac-only
+operator verification procedure.
+
 ## Failure handling
 
 Every host-side failure — missing `tart` binary, non-macOS host,

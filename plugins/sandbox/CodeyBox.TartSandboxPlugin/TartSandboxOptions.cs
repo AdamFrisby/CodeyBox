@@ -112,6 +112,14 @@ public sealed record TartSandboxOptions
     /// </summary>
     public IReadOnlyList<string> SetupCommands { get; init; } = [];
 
+    /// <summary>
+    /// Guest-network backend knobs (<c>CodeyBox:Plugins:codeybox.tart-sandbox:Network</c>).
+    /// Default NAT preserves today's behaviour; <c>Mode=softnet</c> attaches
+    /// the Softnet packet filter with a block-all default plus the
+    /// acquisition allowlist. Never changes the host's egress classification.
+    /// </summary>
+    public TartSandboxNetworkOptions Network { get; init; } = new();
+
     // No network-profile map on purpose: a named SandboxNetworkPolicy.ProfileName
     // implies host-side nftables enforcement, which cannot exist on macOS —
     // placement refuses those specs for this (NotEnforced) kind, and the
@@ -241,6 +249,7 @@ public sealed record TartSandboxOptions
             AllowPersistentTmpfsDowngrade = PluginConfigReaders.ReadBool(section, "AllowPersistentTmpfsDowngrade", defaults.AllowPersistentTmpfsDowngrade),
             ProvisioningRecheckSeconds = Math.Clamp(
                 PluginConfigReaders.ReadInt(section, "ProvisioningRecheckSeconds", defaults.ProvisioningRecheckSeconds), 5, 3600),
+            Network = TartSandboxNetworkOptions.FromConfiguration(section.GetSection("Network")),
         };
     }
 
