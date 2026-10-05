@@ -473,7 +473,7 @@ sandbox baseline, and two smoke probes.
 
 Agents are interchangeable. A class lists members with quality scores; the router
 prefers the highest-scoring one that's within quota and under its concurrency
-cap. Every fallback is recorded in the commit trailer. See
+cap. See
 [`docs/concepts/agents.md`](docs/concepts/agents.md) for each agent's auth, its
 sandbox install command, and its known quirks.
 
@@ -558,25 +558,6 @@ both Incus and Multipass. Turn it on **per project** with
 Credentials are tiered: tool-only audit sandboxes hold **no** agent secrets, and
 upstream remote credentials (e.g. a GitHub PAT) live **only** in the orchestrator
 process and never cross into a sandbox.
-
-## Provenance
-
-Every commit CodeyBox produces carries a trailer block, so attribution survives
-even a full database wipe — `git log` is the source of truth:
-
-```
-codeybox: <subject>
-
-CodeyBox-WorkItem: <id>
-CodeyBox-Agent: <agent>[/<model>]
-CodeyBox-Prompt-Revision: <n>                        # when the revision is known
-CodeyBox-Fallbacks: claude→codex (×2 quota); …       # only if fallbacks happened
-Co-Authored-By: CodeyBox <noreply@codeybox.invalid>
-```
-
-Mechanical-fixer commits carry `CodeyBox-Mechanical-Fixer` instead of
-`CodeyBox-Agent`, so deterministic normalisations are never attributed to a
-model.
 
 ## Documentation
 
