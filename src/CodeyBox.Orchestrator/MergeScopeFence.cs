@@ -19,7 +19,7 @@ public sealed class ScopeFenceViolation : Exception
     }
 }
 
-public sealed class MergeConflictResolutionFailedException : Exception
+public class MergeConflictResolutionFailedException : Exception
 {
     public string? FailureKind { get; }
     public AgentKind? Agent { get; }
@@ -37,6 +37,27 @@ public sealed class MergeConflictResolutionFailedException : Exception
         FailureKind = failureKind ?? prior?.FailureKind;
         Agent = agent ?? prior?.Agent;
         Phase = phase ?? prior?.Phase;
+    }
+}
+
+/// <summary>
+/// A clean textual merge whose combined tree fails the required build: each
+/// side built on its own base, but the combination does not compile (a
+/// semantic conflict). Unlike a resolver-guard trip this carries no
+/// wrongdoing — the item must be reworked against the refreshed base with
+/// the build errors in the brief, never landed, and never terminally
+/// failed on this signal alone. The conflict-rework path recognises this
+/// subtype (a clean rebase is the expected state, not a recovery) and
+/// briefs the agent with <see cref="BuildOutput"/>.
+/// </summary>
+public sealed class MergeResultBuildFailedException : MergeConflictResolutionFailedException
+{
+    public string BuildOutput { get; }
+
+    public MergeResultBuildFailedException(string message, string buildOutput, Exception? innerException = null)
+        : base(message, innerException)
+    {
+        BuildOutput = buildOutput;
     }
 }
 

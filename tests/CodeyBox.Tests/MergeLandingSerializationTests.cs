@@ -125,7 +125,9 @@ public sealed class MergeLandingSerializationTests : IDisposable
     /// fails, and the forge never observes overlapping merge calls.
     /// The test holds the shared gate while both items run so they are
     /// guaranteed to contend (no timing luck), then releases and asserts
-    /// ordered, non-overlapping landings.
+    /// ordered, non-overlapping landings. The merge-result verification
+    /// observes the same queue, so contention now surfaces at the merge
+    /// phase (before any forge call) rather than only at upstream push.
     /// </summary>
     [Fact]
     public async Task ConcurrentLandings_OnSameBase_LandSerializedWithoutTerminalFailure()
@@ -169,10 +171,12 @@ public sealed class MergeLandingSerializationTests : IDisposable
             // coincide; both items still contend on the held landing gate.
             await Task.Delay(500);
             run2 = Task.Run(() => tp.Pipeline.RunAsync(item2, CancellationToken.None));
-            await WaitForAsync(tp.Store, item1.Id, i => i.State == WorkItemState.UpstreamPushing, TimeSpan.FromMinutes(2), "item1 upstream push");
-            await WaitForAsync(tp.Store, item2.Id, i => i.State == WorkItemState.UpstreamPushing, TimeSpan.FromMinutes(2), "item2 upstream push");
+            await WaitForAsync(tp.Store, item1.Id, i => i.State == WorkItemState.Merging, TimeSpan.FromMinutes(2), "item1 merge");
+            await WaitForAsync(tp.Store, item2.Id, i => i.State == WorkItemState.Merging, TimeSpan.FromMinutes(2), "item2 merge");
 
-            // Both items are parked at the landing gate: no forge call yet.
+            // Both items are parked at the shared landing queue (merge-result
+            // verification observes it before upstream push does): no forge
+            // call yet.
             Assert.Equal(0, remote.CompleteCalls);
             ReleaseHold();
 

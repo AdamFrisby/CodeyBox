@@ -1626,6 +1626,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.AutoMergeRaceRecoveryMaxAttempts,
                 opts.MergeLandingMaxAttempts,
                 opts.MergeGuardReworkMaxAttempts,
+                opts.MergeResultBuildVerificationEnabled,
+                MergeResultBuildVerificationTimeoutSeconds = opts.MergeResultBuildVerificationTimeout.TotalSeconds,
                 opts.EnableSandboxReuse,
                 opts.MaxSandboxReuses,
                 MaxSandboxLifetimeSeconds = opts.MaxSandboxLifetime.TotalSeconds,

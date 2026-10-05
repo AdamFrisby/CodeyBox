@@ -100,16 +100,17 @@ public sealed partial class PipelineRunner
             item = bumped ?? item;
         }
 
-        // Capture the file-set the work agent's prior commits modified. `git
-        // rebase` re-creates commits with new SHAs so an ancestor-SHA check
-        // doesn't survive a clean rebase; the *changed-file set* does. A
-        // destructive `git reset --hard origin/<base>` produces an empty new
-        // diff while the prior diff is non-empty, which is the anti-
-        // abandonment signal.
+        // The work agent's own contribution: files changed between the
+        // fork point and the prior work tip. Diffing the work tip against
+        // the CURRENT base tip instead would also list sibling-side
+        // additions (present on base, absent on work) as work deletions, so
+        // a rework that correctly preserves them (they arrive via the
+        // rebase) would trip the anti-abandonment guard below for files the
+        // work agent never touched.
         IReadOnlyList<string> priorChangedFiles;
         try
         {
-            priorChangedFiles = await ListChangedFilesAsync(repoId, baseTip, priorWorkTip, ct);
+            priorChangedFiles = await ListWorkContributionFilesAsync(repoId, baseTip, priorWorkTip, ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -234,8 +235,9 @@ public sealed partial class PipelineRunner
         }
 
         // Anti-abandonment guard: the file-set the work agent touched
-        // (relative to `baseTip`) must remain reflected in the rework's diff
-        // against the same base. A clean rebase preserves these — the SHAs
+        // (relative to the fork point — the merge-base, or baseTip on
+        // fallback) must remain reflected in the rework's diff against the
+        // refreshed base tip. A clean rebase preserves these — the SHAs
         // change but the files do not. A destructive `git reset --hard
         // origin/<base>` produces an empty diff and trips this check.
         if (priorChangedFiles.Count > 0)
@@ -395,7 +397,13 @@ public sealed partial class PipelineRunner
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", $"origin/{baseBranch}"],
             }, ct);
-            if (rebaseStart.Success)
+            // A clean rebase is the EXPECTED state for a merge-result build
+            // failure (the textual merge was clean too) — not a recovery.
+            // Brief the agent with the build errors so it repairs the work
+            // branch against the refreshed base instead of no-op pushing a
+            // tree the merge queue has already proven does not compile.
+            var semanticBuildFailure = originalFailure as MergeResultBuildFailedException;
+            if (rebaseStart.Success && semanticBuildFailure is null)
             {
                 // The host saw conflicts, but the sandbox rebase came back
                 // clean. Most likely: upstream advanced after the merge phase
@@ -406,54 +414,64 @@ public sealed partial class PipelineRunner
                 return await PushAndStatConflictReworkAsync(sandbox, isolatedRepoPath, repoId, workBranch, priorWorkTip, baseBranch, ct);
             }
 
-            // Verify the rebase is actually paused — guard against transient
-            // git errors that aren't conflict-related.
-            var statusBefore = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
-            }, ct);
-            if (!statusBefore.Success || string.IsNullOrWhiteSpace(statusBefore.Stdout))
-            {
-                return new ConflictReworkAgentOutcome(
-                    AgentSucceeded: false,
-                    NewTip: null,
-                    FailureReason: $"rebase failed but status came back clean: {rebaseStart.Stderr.Trim()}",
-                    SemanticIncompatibleReason: null,
-                    FilesChanged: null, Insertions: null, Deletions: null);
-            }
-
-            // Collect the actual sandbox-side conflict file list from git's
-            // unmerged index entries. Do not fall back to the merge-phase error
-            // string: that text is telemetry, not a safe path source.
             IReadOnlyList<string> sandboxConflictFiles;
-            try
+            if (rebaseStart.Success)
             {
-                sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, ct);
+                sandboxConflictFiles = Array.Empty<string>();
             }
-            catch (MergeConflictResolutionFailedException ex)
+            else
             {
-                return new ConflictReworkAgentOutcome(
-                    AgentSucceeded: false,
-                    NewTip: null,
-                    FailureReason: $"could not inspect sandbox conflict files: {ex.Message}",
-                    SemanticIncompatibleReason: null,
-                    FilesChanged: null, Insertions: null, Deletions: null);
-            }
+                // Verify the rebase is actually paused — guard against transient
+                // git errors that aren't conflict-related.
+                var statusBefore = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+                }, ct);
+                if (!statusBefore.Success || string.IsNullOrWhiteSpace(statusBefore.Stdout))
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: $"rebase failed but status came back clean: {rebaseStart.Stderr.Trim()}",
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null);
+                }
 
-            if (sandboxConflictFiles.Count == 0)
-            {
-                return new ConflictReworkAgentOutcome(
-                    AgentSucceeded: false,
-                    NewTip: null,
-                    FailureReason: "rebase failed but git ls-files reported no unmerged paths",
-                    SemanticIncompatibleReason: null,
-                    FilesChanged: null, Insertions: null, Deletions: null);
+                // Collect the actual sandbox-side conflict file list from git's
+                // unmerged index entries. Do not fall back to the merge-phase error
+                // string: that text is telemetry, not a safe path source.
+                try
+                {
+                    sandboxConflictFiles = await ListSandboxConflictFilesAsync(sandbox, ct);
+                }
+                catch (MergeConflictResolutionFailedException ex)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: $"could not inspect sandbox conflict files: {ex.Message}",
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null);
+                }
+
+                if (sandboxConflictFiles.Count == 0)
+                {
+                    return new ConflictReworkAgentOutcome(
+                        AgentSucceeded: false,
+                        NewTip: null,
+                        FailureReason: "rebase failed but git ls-files reported no unmerged paths",
+                        SemanticIncompatibleReason: null,
+                        FilesChanged: null, Insertions: null, Deletions: null);
+                }
             }
 
             await publishStartedAsync(sandboxConflictFiles);
 
-            var prompt = _promptComposer.BuildConflictReworkPrompt(
-                item.Prompt, baseBranch, workBranch, sandboxConflictFiles, originalFailure.Message);
+            var prompt = semanticBuildFailure is null
+                ? _promptComposer.BuildConflictReworkPrompt(
+                    item.Prompt, baseBranch, workBranch, sandboxConflictFiles, originalFailure.Message)
+                : _promptComposer.BuildSemanticConflictReworkPrompt(
+                    item.Prompt, baseBranch, workBranch, semanticBuildFailure.BuildOutput);
             prompt = await ProcessAgentPromptAsync(
                 item.Id,
                 runner.Kind,
@@ -945,6 +963,37 @@ public sealed partial class PipelineRunner
         return stdout
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToArray();
+    }
+
+    /// <summary>
+    /// Returns the file paths the work branch changed relative to its fork
+    /// point with the base branch — the work agent's own contribution (new
+    /// files, modifications, and deletions it made). Falls back to diffing
+    /// against <paramref name="baseTip"/> when the merge-base cannot be
+    /// resolved, preserving the pre-existing guard behaviour instead of
+    /// weakening it on infrastructure hiccups.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ListWorkContributionFilesAsync(
+        string repoId, string baseTip, string workTip, CancellationToken ct)
+    {
+        var fromTip = baseTip;
+        try
+        {
+            var (mergeBase, _) = await RunHostGitCaptureAsync(_gitHost.GetRepoPath(repoId), ct,
+                "merge-base", baseTip, workTip);
+            var fork = mergeBase
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault();
+            if (!string.IsNullOrEmpty(fork))
+                fromTip = fork;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Conflict rework: could not resolve merge-base; diffing work contribution against the base tip");
+        }
+
+        return await ListChangedFilesAsync(repoId, fromTip, workTip, ct);
     }
 
     private async Task PublishConflictReworkFinishedAsync(

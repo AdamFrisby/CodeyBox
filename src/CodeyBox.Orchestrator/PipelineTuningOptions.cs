@@ -125,6 +125,27 @@ public sealed class PipelineTuningOptions
     public int MergeLandingMaxAttempts { get; set; } = 3;
 
     /// <summary>
+    /// Whether the merge phase builds the exact merge-result tree with the
+    /// project's required build (the same command as the required-build
+    /// gate) in a sandbox before advancing the base branch. A clean
+    /// textual merge of two branches that each built on their own base can
+    /// still fail to compile when combined (e.g. duplicate symbols); the
+    /// gate refuses to land such a tree. Default true. Hot-reloaded with
+    /// the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public bool MergeResultBuildVerificationEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Upper bound for a single merge-result build verification, measured
+    /// from sandbox acquisition through build completion. Exceeding it
+    /// fails the verification (the item re-queues through rework and
+    /// re-verifies) — an unverified tree is never landed. Must be
+    /// positive. Default 15 minutes. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan MergeResultBuildVerificationTimeout { get; set; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>
     /// Maximum conflict-rework turns the merge phase runs after a resolver
     /// safety guard fires (edits outside the permitted conflict hunks, or a
     /// rework that discarded prior commits). Each turn re-engages the work
@@ -505,6 +526,12 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(MergeGuardReworkMaxAttempts),
                 "MergeGuardReworkMaxAttempts must be >= 1");
+        }
+        if (MergeResultBuildVerificationTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MergeResultBuildVerificationTimeout),
+                "MergeResultBuildVerificationTimeout must be positive");
         }
         if (EarlyEndedTurnMaxNudges < 0)
         {
