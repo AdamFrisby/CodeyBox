@@ -51,7 +51,7 @@
   <!-- Release identity. Declared once here so assembly metadata, the admin UI's
        reported version and scripts/package.sh's tarball name cannot disagree. -->
   <PropertyGroup>
-    <VersionPrefix>0.7.0</VersionPrefix>
+    <VersionPrefix>0.8.0</VersionPrefix>
     <Product>CodeyBox</Product>
     <Company>Adam Frisby</Company>
     <Authors>Adam Frisby</Authors>
