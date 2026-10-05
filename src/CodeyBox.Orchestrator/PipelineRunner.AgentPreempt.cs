@@ -187,9 +187,10 @@ public sealed partial class PipelineRunner
             // resumed work tree, so an unredacted glog here leaks just like the PR.
             await StripAgentLogScratchFromIndexAsync(sandbox, ct);
             await StripReservedScratchpadPathsFromIndexAsync(sandbox, ct);
-            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, agentKind, observedModelId, ct);
+            var preemptProject = await TryResolveProjectAsync(item.ProjectId, ct);
+            var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, agentKind, observedModelId, ct, attribution: ResolveAttribution(preemptProject));
             await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "--allow-empty", "-m",
-                $"codeybox: preempt checkpoint {item.Title}\n\n{trailerBlock}");
+                ComposeCommitMessage($"codeybox: preempt checkpoint {item.Title}", trailerBlock, preemptProject));
             await EnsureReservedScratchpadPathsAbsentFromTreeAsync(sandbox, ct);
             var sourceCommitSha = await ReadSandboxHeadShaAsync(sandbox, ct);
             var typedCheckpointRef = scratchpadArchive is null

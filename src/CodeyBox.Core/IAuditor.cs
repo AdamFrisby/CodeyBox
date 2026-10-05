@@ -236,6 +236,23 @@ public sealed record AuditContext(
     /// </summary>
     int? PromptRevisionAtDispatch = null,
     /// <summary>
+    /// When false, <c>CodeyBox-*</c> trailers are disabled by operator config
+    /// (<c>CodeyBox:CommitAttribution:CodeyBoxTrailers=false</c> or the
+    /// per-project override). The <c>process:prompt-revision-trailer</c>
+    /// auditor skips the trailer read and reports an explicit skipped finding
+    /// instead; stale-prompt detection falls back to comparing
+    /// <see cref="PromptRevisionAtDispatch"/> against
+    /// <see cref="PromptRevisionCurrent"/> from the DB. Default true.
+    /// </summary>
+    bool CodeyBoxTrailersEnabled = true,
+    /// <summary>
+    /// The work item's current prompt revision from the DB at audit time.
+    /// Used only when <see cref="CodeyBoxTrailersEnabled"/> is false to keep
+    /// stale-prompt detection working without the trailer. Null = unknown
+    /// (skip the DB staleness check).
+    /// </summary>
+    int? PromptRevisionCurrent = null,
+    /// <summary>
     /// Project-level policy for <c>process:build-script</c>. When false, a
     /// missing repo-root <c>build.sh</c> makes that auditor skip. When true,
     /// a missing script is a blocking audit finding.

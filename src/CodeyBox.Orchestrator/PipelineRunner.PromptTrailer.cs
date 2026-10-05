@@ -46,12 +46,29 @@ public sealed partial class PipelineRunner
     /// block is still emitted, just without the optional fallbacks line, so a
     /// SQLite hiccup never blocks a commit.
     /// </summary>
+    internal CommitAttribution ResolveAttribution(Project? project)
+        => _attribution.Resolve(project);
+
+    internal async Task<Project?> TryResolveProjectAsync(ProjectId projectId, CancellationToken ct)
+    {
+        try
+        {
+            return await _projects.GetAsync(projectId, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "project lookup failed during attribution resolution (project {ProjectId})", projectId);
+            return null;
+        }
+    }
+
     internal async Task<string> ComposeCommitTrailerBlockAsync(
         WorkItemId workItemId,
         AgentKind finalAgent,
         string? finalModel,
         CancellationToken ct,
-        int? promptRevisionAtDispatch = null)
+        int? promptRevisionAtDispatch = null,
+        CommitAttribution? attribution = null)
     {
         IReadOnlyList<AgentFallbackRecord>? history = null;
         if (_fallbackHistory is not null)
@@ -65,8 +82,38 @@ public sealed partial class PipelineRunner
                 _log.LogDebug(ex, "fallback history fetch failed for commit-trailer composition (work item {WorkItemId})", workItemId);
             }
         }
-        return CodeyBoxTrailers.Compose(workItemId, finalAgent, finalModel, history, promptRevisionAtDispatch);
+        attribution ??= _attribution.CurrentDefault;
+        return CodeyBoxTrailers.Compose(workItemId, finalAgent, finalModel, history, promptRevisionAtDispatch,
+            attribution.IncludeCoAuthoredBy, attribution.IncludeCodeyBoxTrailers);
     }
+
+    internal async Task<string> ComposeCommitTrailerBlockAsync(
+        WorkItem item,
+        Project project,
+        AgentKind finalAgent,
+        string? finalModel,
+        CancellationToken ct,
+        int? promptRevisionAtDispatch = null)
+        => await ComposeCommitTrailerBlockAsync(item.Id, finalAgent, finalModel, ct, promptRevisionAtDispatch, ResolveAttribution(project));
+
+    /// <summary>
+    /// Join a subject with a trailer block under the attribution policy and
+    /// strip any disabled trailer lines defence-in-depth (an agent may have
+    /// embedded them in free text). Empty trailer blocks yield the subject
+    /// alone with no dangling blank line.
+    /// </summary>
+    internal string ComposeCommitMessage(string subject, string trailerBlock, Project? project)
+    {
+        var attribution = ResolveAttribution(project);
+        return _attribution.ComposeMessage(subject, trailerBlock, attribution);
+    }
+
+    /// <summary>
+    /// Strip disabled trailer lines from a fully-composed message the host is
+    /// about to commit (defence in depth for agent-embedded trailers).
+    /// </summary>
+    internal string StripDisabledTrailers(string message, Project? project)
+        => _attribution.StripDisabledTrailers(message, ResolveAttribution(project));
 
     /// <summary>
     /// Verifies the sandbox's HEAD commit carries a
@@ -93,8 +140,17 @@ public sealed partial class PipelineRunner
         string? finalModel,
         int promptRevisionAtDispatch,
         string agentPhase,
-        CancellationToken ct)
+        CancellationToken ct,
+        Project? project = null,
+        CommitAttribution? attribution = null)
     {
+        attribution ??= ResolveAttribution(project);
+        if (!attribution.IncludeCodeyBoxTrailers)
+        {
+            await StripDisabledTrailersFromHeadAsync(sandbox, item, agentPhase, attribution, ct);
+            return;
+        }
+
         var trailers = await sandbox.ExecAsync(new SandboxExec
         {
             Argv =
@@ -155,8 +211,11 @@ public sealed partial class PipelineRunner
         }
 
         var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, finalAgent, finalModel, ct,
-            promptRevisionAtDispatch: promptRevisionAtDispatch);
-        var commitMessage = $"codeybox: stamp prompt-revision trailer\n\n{trailerBlock}";
+            promptRevisionAtDispatch: promptRevisionAtDispatch, attribution: attribution);
+        var commitMessage = string.IsNullOrWhiteSpace(trailerBlock)
+            ? "codeybox: stamp prompt-revision trailer"
+            : $"codeybox: stamp prompt-revision trailer\n\n{trailerBlock}";
+        commitMessage = _attribution.StripDisabledTrailers(commitMessage, attribution);
 
         await using (var stampScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit.stamp_trailer",
             activitySource: CodeyBoxActivities.Sandbox, log: _log))
@@ -167,6 +226,32 @@ public sealed partial class PipelineRunner
         _log.LogInformation(
             "Work item {Id}: stamped CodeyBox-Prompt-Revision={Revision} on HEAD ({Phase}); agent did not emit the trailer",
             item.Id, promptRevisionAtDispatch, agentPhase);
+    }
+
+    internal async Task StripDisabledTrailersFromHeadAsync(
+        ISandbox sandbox,
+        WorkItem item,
+        string agentPhase,
+        CommitAttribution attribution,
+        CancellationToken ct)
+    {
+        if (attribution.IncludeCoAuthoredBy && attribution.IncludeCodeyBoxTrailers)
+            return;
+        var read = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "log", "-1", "--pretty=format:%B"],
+        }, ct);
+        if (!read.Success)
+        {
+            _log.LogDebug("Failed to read HEAD message for trailer strip in work item {Id} (git exit {Exit})", item.Id, read.ExitCode);
+            return;
+        }
+        var stripped = _attribution.StripDisabledTrailers(read.Stdout ?? string.Empty, attribution);
+        if (!string.Equals(stripped, read.Stdout ?? string.Empty, StringComparison.Ordinal))
+        {
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "--amend", "--allow-empty", "-m", stripped);
+            _log.LogInformation("Work item {Id}: stripped disabled trailers from HEAD ({Phase})", item.Id, agentPhase);
+        }
     }
 
     private TimeSpan ResolvePhaseAbsoluteTimeout(TimeSpan perAttemptTimeout) =>

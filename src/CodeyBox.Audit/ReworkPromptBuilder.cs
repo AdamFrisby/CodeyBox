@@ -16,7 +16,8 @@ public static class ReworkPromptBuilder
         int iteration,
         int maxIterations,
         IReadOnlyList<WorkItemQuestion>? answeredQuestions = null,
-        bool allowAgentQuestions = false)
+        bool allowAgentQuestions = false,
+        CodeyBox.Core.CommitAttribution? attribution = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine("## Rework requested");
@@ -32,13 +33,7 @@ public static class ReworkPromptBuilder
         sb.AppendLine();
         sb.AppendLine("Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.");
         sb.AppendLine();
-        sb.AppendLine("Every commit message MUST end with the following trailers, separated from the subject by a blank line:");
-        sb.AppendLine();
-        sb.AppendLine("    " + CodeyBoxTrailers.PromptRevisionTrailerKey + ": $" + CodeyBoxTrailers.PromptRevisionEnvVar);
-        sb.AppendLine("    " + CodeyBoxTrailers.CoAuthoredBy);
-        sb.AppendLine();
-        sb.AppendLine("The `" + CodeyBoxTrailers.PromptRevisionTrailerKey + "` value MUST be the literal integer from the `" + CodeyBoxTrailers.PromptRevisionEnvVar + "` environment variable. The orchestrator audits this trailer to detect agents that finished against a stale prompt; missing or mismatched values are a blocking finding.");
-        sb.AppendLine();
+        AppendTrailerInstructions(sb, attribution ?? CodeyBox.Core.CommitAttribution.Default);
 
         if (allowAgentQuestions)
         {
@@ -104,5 +99,23 @@ public static class ReworkPromptBuilder
         sb.AppendLine();
         sb.AppendLine(originalPrompt);
         return sb.ToString();
+    }
+
+    private static void AppendTrailerInstructions(System.Text.StringBuilder sb, CodeyBox.Core.CommitAttribution attribution)
+    {
+        if (!attribution.IncludeCodeyBoxTrailers && !attribution.IncludeCoAuthoredBy)
+            return;
+        sb.AppendLine("Every commit message MUST end with the following trailers, separated from the subject by a blank line:");
+        sb.AppendLine();
+        if (attribution.IncludeCodeyBoxTrailers)
+            sb.AppendLine("    " + CodeyBoxTrailers.PromptRevisionTrailerKey + ": $" + CodeyBoxTrailers.PromptRevisionEnvVar);
+        if (attribution.IncludeCoAuthoredBy)
+            sb.AppendLine("    " + CodeyBoxTrailers.CoAuthoredBy);
+        sb.AppendLine();
+        if (attribution.IncludeCodeyBoxTrailers)
+        {
+            sb.AppendLine("The `" + CodeyBoxTrailers.PromptRevisionTrailerKey + "` value MUST be the literal integer from the `" + CodeyBoxTrailers.PromptRevisionEnvVar + "` environment variable. The orchestrator audits this trailer to detect agents that finished against a stale prompt; missing or mismatched values are a blocking finding.");
+            sb.AppendLine();
+        }
     }
 }

@@ -118,6 +118,30 @@ disable the timeout. Hot-reloadable through the normal project-config
 reload. See [work-items.md](work-items.md#work-phase-timeout-budget) for the
 full precedence chain.
 
+### `CommitAttribution` (per-project override)
+
+Set `CommitAttribution` to opt a project out of CodeyBox attribution. Any set
+flag wins over the host default (`CodeyBox:CommitAttribution`); unset flags
+inherit the host value at use time, so host hot-reloads still apply. `Defaults`
+may carry the same block as a fleet-wide baseline that individual projects can
+narrow further.
+
+```json
+"CommitAttribution": {
+  "CoAuthoredBy": false,
+  "CodeyBoxTrailers": false,
+  "PullRequestFooter": false
+}
+```
+
+`CoAuthoredBy: false` drops the co-author trailer from commits and squash
+messages; `CodeyBoxTrailers: false` drops every `CodeyBox-*` trailer and skips
+the `process:prompt-revision-trailer` auditor with an explicit
+`skipped: trailers disabled by config` result (stale-prompt tracking continues
+via the DB); `PullRequestFooter: false` drops the Generated-by footer from PR
+bodies. New commits only — already-landed history is never rewritten. See
+`docs/reference/configuration.md` for the host defaults.
+
 ### Inheritance from `Defaults`
 
 Anything a project omits comes from `Defaults` (shallow merge):
@@ -126,6 +150,7 @@ Anything a project omits comes from `Defaults` (shallow merge):
 * `BaseBranch` — default integration branch
 * `WorkTimeoutMinutes` — default work-phase budget in minutes
 * `Audit.*` — every field in `ProjectAudit` falls through individually
+* `CommitAttribution.*` — every flag falls through individually (project wins over `Defaults`, which wins over the host default)
 
 `Languages` is list-typed and not append-merged: if a project sets it, it
 replaces the defaults entirely. `AuditTypes` supports the existing list form,

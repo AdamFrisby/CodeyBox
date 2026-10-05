@@ -83,8 +83,8 @@ public sealed partial class PipelineRunner
             {
                 var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
                 var cleanTrailerBlock = await ComposeCommitTrailerBlockAsync(
-                    item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct);
-                var cleanMessage = $"codeybox: merge {workBranch}\n\n{cleanTrailerBlock}\n";
+                    item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct, attribution: ResolveAttribution(project));
+                var cleanMessage = ComposeCommitMessage($"codeybox: merge {workBranch}", cleanTrailerBlock, project) + "\n";
                 cleanMergeSha = await _gitHost.CreateMergeCommitAsync(
                     repoId, hostMerge.TreeSha, preMergeSha, workTipSha, cleanMessage,
                     cleanGitName, cleanGitEmail, ct);
@@ -430,7 +430,7 @@ public sealed partial class PipelineRunner
             {
                 try
                 {
-                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, chosenMergeRunner.Kind, observedModelId, ct);
+                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, chosenMergeRunner.Kind, observedModelId, ct, attribution: ResolveAttribution(project));
                     await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
                     mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
                     await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
@@ -992,7 +992,9 @@ public sealed partial class PipelineRunner
         }, ct);
         if (mergeHead.Success)
         {
-            var msg = $"codeybox: merge {workBranch}\n\n{trailerBlock}\n";
+            var msg = string.IsNullOrWhiteSpace(trailerBlock)
+                ? $"codeybox: merge {workBranch}\n"
+                : $"codeybox: merge {workBranch}\n\n{trailerBlock.Trim()}\n";
             var commit = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "commit", "-F", "-"],

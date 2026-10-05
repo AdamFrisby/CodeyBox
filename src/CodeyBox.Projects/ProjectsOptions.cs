@@ -34,6 +34,13 @@ public sealed class ProjectDefaultsConfig
     public bool? GraphicalSandbox { get; set; }
 
     /// <summary>
+    /// Default attribution overrides applied to every project unless the
+    /// project carries its own override for the same flag. Null flags inherit
+    /// the host default (<c>CodeyBox:CommitAttribution</c>) at use time.
+    /// </summary>
+    public CommitAttributionOverride? CommitAttribution { get; set; }
+
+    /// <summary>
     /// Default knob values applied to every project unless the project carries
     /// its own override for the same key. Keys must match a registered
     /// <c>IKnob.Key</c>; unknown keys or values rejected by the knob descriptor
@@ -67,6 +74,13 @@ public sealed class ProjectConfig
     public ProjectBudgetConfig? Budget { get; set; }
     public ProjectReleaseConfigOptions? Release { get; set; }
     public bool? SkipCredentialSmokeTest { get; set; }
+
+    /// <summary>
+    /// Per-project attribution override. Each set flag wins over the host
+    /// default (<c>CodeyBox:CommitAttribution</c>); null flags inherit.
+    /// Maps to <see cref="CodeyBox.Core.Project.CommitAttribution"/>.
+    /// </summary>
+    public CommitAttributionOverride? CommitAttribution { get; set; }
 
     /// <summary>
     /// Optional per-project cap on the priority accepted by the API. Maps to

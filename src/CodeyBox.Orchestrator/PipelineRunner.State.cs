@@ -95,6 +95,7 @@ public sealed partial class PipelineRunner
     // Hot-reloadable quota-fallback and merge-staging retry knobs. Defaulted to
     // a private snapshot (unchanging defaults) when DI does not supply one.
     private readonly PipelineTuningSnapshot _pipelineTuning;
+    private readonly CommitAttributionPolicy _attribution;
     // Optional stale-base remediation router. When wired AND enabled, a
     // stale-base conflict discovered at upstream-push time re-dispatches the
     // item into conflict-rework instead of parking. Null preserves the
@@ -613,7 +614,8 @@ public sealed partial class PipelineRunner
         // per-SHA verdict cache; the tracker owns the durable project
         // condition, the fix-item dedupe, and the dispatcher hold.
         BaseBuildVerifier? baseBuildVerifier = null,
-        BaseBrokenConditionTracker? baseBrokenConditions = null)
+        BaseBrokenConditionTracker? baseBrokenConditions = null,
+        CommitAttributionPolicy? attributionPolicy = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -737,6 +739,7 @@ public sealed partial class PipelineRunner
         _checkCompletionRunner = checkCompletionRunner;
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
+        _attribution = attributionPolicy ?? new CommitAttributionPolicy(new CommitAttributionSnapshot(new CommitAttributionOptions()));
         _staleBaseReworkRouter = staleBaseReworkRouter;
         _flakeEscalation = flakeEscalation;
         _flakeEscalationOptions = flakeEscalationOptions;

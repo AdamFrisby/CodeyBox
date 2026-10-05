@@ -342,6 +342,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             SkipCredentialSmokeTest = pc.SkipCredentialSmokeTest ?? false,
             MaxPriority = pc.MaxPriority,
             GraphicalSandbox = pc.GraphicalSandbox ?? defaults.GraphicalSandbox ?? false,
+            CommitAttribution = ResolveCommitAttribution(pc.CommitAttribution, defaults.CommitAttribution),
             ClaudeSession = new ProjectClaudeSessionConfig
             {
                 Enabled = pc.ClaudeSession?.Enabled ?? false,
@@ -1254,6 +1255,23 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         return filtered;
     }
 
+    private static CommitAttributionOverride? ResolveCommitAttribution(
+        CommitAttributionOverride? project,
+        CommitAttributionOverride? defaults)
+    {
+        if (project is null && defaults is null)
+            return null;
+        var merged = new CommitAttributionOverride
+        {
+            CoAuthoredBy = project?.CoAuthoredBy ?? defaults?.CoAuthoredBy,
+            CodeyBoxTrailers = project?.CodeyBoxTrailers ?? defaults?.CodeyBoxTrailers,
+            PullRequestFooter = project?.PullRequestFooter ?? defaults?.PullRequestFooter,
+        };
+        return merged.CoAuthoredBy is null && merged.CodeyBoxTrailers is null && merged.PullRequestFooter is null
+            ? null
+            : merged;
+    }
+
     private static ProjectBudget ResolveBudget(ProjectBudgetConfig? c)
     {
         if (c is null) return new();
@@ -1272,8 +1290,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         };
     }
 
-    private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)
-    {
+    private static ProjectReleaseConfig ResolveReleaseConfig(ProjectReleaseConfigOptions? c)    {
         if (c is null) return new();
         var defaults = new ProjectReleaseConfig();
         TimeSpan? syncInterval = c.AutoSyncMainIntervalMinutes.HasValue

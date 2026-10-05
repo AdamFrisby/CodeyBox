@@ -49,10 +49,14 @@ internal sealed class PromptComposer
         bool allowAgentQuestions = false,
         IReadOnlyList<IAuditor>? auditors = null,
         bool selfReviewChecklistEnabled = false,
-        string? approvedPlan = null)
+        string? approvedPlan = null,
+        CommitAttribution? attribution = null)
     {
+        attribution ??= CommitAttribution.Default;
         var sb = new System.Text.StringBuilder();
-        sb.Append($"Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.\n\nEvery commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n    {CodeyBoxTrailers.PromptRevisionTrailerKey}: ${CodeyBoxTrailers.PromptRevisionEnvVar}\n    {CodeyBoxTrailers.CoAuthoredBy}\n\nThe `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\nIf during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/concepts/agent-feedback.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
+        sb.Append("Work only in the repository and branch already checked out in this workspace. Commit your changes locally, but do not push branches, create pull requests, or use GitHub/GitLab APIs, MCP tools, CLIs, or web interfaces for delivery. The CodeyBox orchestrator owns all upstream publication after audit.\n\n");
+        sb.Append(BuildTrailerInstructions(attribution));
+        sb.Append("If during your work you notice adjacent issues that are out of scope for the current task — bugs you saw, gaps in tests, missing validation, dead code — write them to `.codeybox/suggestions.json` as structured entries (schema in `docs/concepts/agent-feedback.md`). Do **not** fix them in this work item; the operator will triage. If you have nothing to suggest, do not create the file.");
 
         // No-action-required protocol: a CONDITIONAL work item (e.g. "do X only
         // when precondition P holds") whose investigation shows the
@@ -117,6 +121,22 @@ internal sealed class PromptComposer
         }
 
         sb.Append($"\n\n{userPrompt}");
+        return sb.ToString();
+    }
+
+    internal static string BuildTrailerInstructions(CommitAttribution attribution)
+    {
+        if (!attribution.IncludeCodeyBoxTrailers && !attribution.IncludeCoAuthoredBy)
+            return string.Empty;
+        var sb = new System.Text.StringBuilder();
+        sb.Append("Every commit message MUST end with the following trailers, separated from the subject by a blank line:\n\n");
+        if (attribution.IncludeCodeyBoxTrailers)
+            sb.Append($"    {CodeyBoxTrailers.PromptRevisionTrailerKey}: ${CodeyBoxTrailers.PromptRevisionEnvVar}\n");
+        if (attribution.IncludeCoAuthoredBy)
+            sb.Append($"    {CodeyBoxTrailers.CoAuthoredBy}\n");
+        sb.Append("\n");
+        if (attribution.IncludeCodeyBoxTrailers)
+            sb.Append($"The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` value MUST be the literal integer from the `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable — the orchestrator uses it to detect when an agent finished work against an older prompt. Copy the number verbatim; do not include the variable syntax in the commit.\n\n");
         return sb.ToString();
     }
 

@@ -41,6 +41,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly IGitHubTokenProvider _tokenProvider;
     private readonly ITimingStore? _timings;
     private readonly IPullRequestDescriptionGenerator? _descriptionGenerator;
+    private readonly CommitAttribution _attribution;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
@@ -48,7 +49,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         ILogger<GitHubUpstreamRemote> log,
         GitHubUpstreamOptions opts,
         ITimingStore? timings = null,
-        IPullRequestDescriptionGenerator? descriptionGenerator = null)
+        IPullRequestDescriptionGenerator? descriptionGenerator = null,
+        CommitAttribution? attribution = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -60,6 +62,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 : throw new ArgumentException("A GitHub token or token provider must be provided", nameof(opts)));
         _timings = timings;
         _descriptionGenerator = descriptionGenerator;
+        _attribution = attribution ?? CommitAttribution.Default;
         if (!IsValidRemoteName(_opts.Owner))
             throw new ArgumentException($"GitHub Owner contains invalid characters: '{_opts.Owner}'", nameof(opts));
         if (!IsValidRemoteName(_opts.Repository))
@@ -655,15 +658,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     // forge side; the 🤖 line links back to the platform for operators.
     private const string PrFooter = "\n\n---\n*Co-Authored-By: CodeyBox <noreply@codeybox.invalid>*  \n🤖 Generated with [CodeyBox](https://codeybox.invalid)";
 
-    private static string BuildFooter(UpstreamCompletionRequest request)
+    private string BuildFooter(UpstreamCompletionRequest request)
+        => BuildFooter(request, _attribution);
+
+    private static string BuildFooter(UpstreamCompletionRequest request, CommitAttribution attribution)
     {
+        if (!attribution.IncludePullRequestFooter)
+            return string.Empty;
         if (request.Initiator is null)
             return PrFooter;
         var github = request.Initiator.FindProvider("github");
-        var attribution = github is not null && GitHubIdentity.IsValidLogin(github.Login)
+        var initiatedBy = github is not null && GitHubIdentity.IsValidLogin(github.Login)
             ? $"@{github.Login}"
             : EscapeMarkdown(request.Initiator.DisplayName);
-        return $"\n\nInitiated by {attribution}{PrFooter}";
+        return $"\n\nInitiated by {initiatedBy}{PrFooter}";
     }
 
     private static string EscapeMarkdown(string value) =>
@@ -1302,10 +1310,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             : title + expectedSuffix;
     }
 
-    private static string BuildSquashCommitMessage(
+    private string BuildSquashCommitMessage(
         PrDescriptionResult? prDescription,
         IReadOnlyList<string> commitMessages,
         UpstreamCompletionRequest completionRequest)
+        => BuildSquashCommitMessage(prDescription, commitMessages, completionRequest, _attribution);
+
+    private static string BuildSquashCommitMessage(
+        PrDescriptionResult? prDescription,
+        IReadOnlyList<string> commitMessages,
+        UpstreamCompletionRequest completionRequest,
+        CommitAttribution attribution)
     {
         var promptRevision =
             ExtractLastPromptRevision(commitMessages) ??
@@ -1325,7 +1340,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         if (string.IsNullOrWhiteSpace(body))
             body = "Apply the CodeyBox work item changes.";
 
-        return $"{body.Trim()}\n\n{BuildSquashTrailerBlock(promptRevision)}";
+        var trailers = BuildSquashTrailerBlock(promptRevision, attribution);
+        var message = string.IsNullOrWhiteSpace(trailers)
+            ? body.Trim()
+            : $"{body.Trim()}\n\n{trailers}";
+        return CommitAttributionPolicy.StripDisabledTrailers(
+            message, attribution.IncludeCoAuthoredBy, attribution.IncludeCodeyBoxTrailers);
     }
 
     private static string CleanCommitMessagesForFallback(IReadOnlyList<string> commitMessages)
@@ -1619,14 +1639,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return PureReworkOrAuditSubject.IsMatch(lower);
     }
 
-    private static string BuildSquashTrailerBlock(int? promptRevision)
-    {
-        if (promptRevision is null)
-            return CodeyBoxTrailers.CoAuthoredBy;
+    private string BuildSquashTrailerBlock(int? promptRevision)
+        => BuildSquashTrailerBlock(promptRevision, _attribution);
 
-        return string.Create(
-            CultureInfo.InvariantCulture,
-            $"{CodeyBoxTrailers.PromptRevisionTrailerKey}: {promptRevision}\n{CodeyBoxTrailers.CoAuthoredBy}");
+    private static string BuildSquashTrailerBlock(int? promptRevision, CommitAttribution attribution)
+    {
+        var lines = new List<string>();
+        if (promptRevision is { } rev && attribution.IncludeCodeyBoxTrailers)
+            lines.Add(string.Create(CultureInfo.InvariantCulture, $"{CodeyBoxTrailers.PromptRevisionTrailerKey}: {rev}"));
+        if (attribution.IncludeCoAuthoredBy)
+            lines.Add(CodeyBoxTrailers.CoAuthoredBy);
+        return string.Join("\n", lines);
     }
 
     private static string StripCiSkipControlsFromTitle(string title)
@@ -1650,8 +1673,14 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return ExcessBlankLines.Replace(cleaned.ToString().Trim(), "\n\n");
     }
 
-    private static string TruncateCommitMessageForSquashFallback(string message, int maxBytes)
+    private string TruncateCommitMessageForSquashFallback(string message, int maxBytes)
+        => TruncateCommitMessageForSquashFallback(message, maxBytes, _attribution);
+
+    private static string TruncateCommitMessageForSquashFallback(string message, int maxBytes, CommitAttribution? attribution = null)
     {
+        attribution ??= CommitAttribution.Default;
+        if (!attribution.IncludeCodeyBoxTrailers)
+            return RawOutputRedactor.TruncateToBytes(message, maxBytes);
         if (ExtractLastPromptRevision(message) is not { } promptRevision)
             return RawOutputRedactor.TruncateToBytes(message, maxBytes);
 
