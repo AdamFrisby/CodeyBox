@@ -172,6 +172,14 @@ public sealed record Project
     public bool AllowAgentQuestions { get; init; } = false;
 
     /// <summary>
+    /// Per-project attribution override. Null flags inherit the host default
+    /// (<c>CodeyBox:CommitAttribution</c>) at use time via
+    /// <see cref="CommitAttributionPolicy"/> so host hot-reload applies without
+    /// a project reload. Null record = inherit all host defaults.
+    /// </summary>
+    public CommitAttributionOverride? CommitAttribution { get; init; }
+
+    /// <summary>
     /// Ordered list of credential plugin IDs this project prefers. When set,
     /// only the listed plugin IDs are included in the credential chain for this
     /// project, in the order given (between the built-in OAuth-file provider and

@@ -122,14 +122,18 @@ public sealed partial class PipelineRunner
             var fixerNames = changedFixers.Count == 0
                 ? string.Join("+", fixers.Select(f => f.Name))
                 : string.Join("+", changedFixers.Select(f => f.Name));
+            var attribution = ResolveAttribution(project);
+            int? revisionForTrailer = attribution.IncludeCodeyBoxTrailers ? revision : null;
             var trailerBlock = CodeyBoxTrailers.ComposeMechanical(
                 item.Id,
                 fixerNames,
-                promptRevisionAtDispatch: revision);
+                promptRevisionAtDispatch: revisionForTrailer,
+                includeCoAuthoredBy: attribution.IncludeCoAuthoredBy,
+                includeCodeyBoxTrailers: attribution.IncludeCodeyBoxTrailers);
             var subject = commitFixers.Count == 1 && !string.IsNullOrWhiteSpace(commitFixers[0].CommitSubject)
                 ? commitFixers[0].CommitSubject.Trim()
                 : MechanicalFixerCommitSubjects.Default;
-            var commitMessage = $"{subject}\n\n{trailerBlock}";
+            var commitMessage = ComposeCommitMessage(subject, trailerBlock, project);
 
             await using (var commitScope = await TimingScope.BeginAsync(
                 _timings,

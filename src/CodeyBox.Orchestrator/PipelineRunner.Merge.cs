@@ -83,8 +83,8 @@ public sealed partial class PipelineRunner
             {
                 var (cleanGitName, cleanGitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
                 var cleanTrailerBlock = await ComposeCommitTrailerBlockAsync(
-                    item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct);
-                var cleanMessage = $"codeybox: merge {workBranch}\n\n{cleanTrailerBlock}\n";
+                    item.Id, runner.Kind, ResolveObservedModelId(runner, item.ModelId), ct, attribution: ResolveAttribution(project));
+                var cleanMessage = ComposeCommitMessage($"codeybox: merge {workBranch}", cleanTrailerBlock, project) + "\n";
                 cleanMergeSha = await _gitHost.CreateMergeCommitAsync(
                     repoId, hostMerge.TreeSha, preMergeSha, workTipSha, cleanMessage,
                     cleanGitName, cleanGitEmail, ct);
@@ -430,8 +430,9 @@ public sealed partial class PipelineRunner
             {
                 try
                 {
-                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, chosenMergeRunner.Kind, observedModelId, ct);
-                    await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct);
+                    var mergeAttribution = ResolveAttribution(project);
+                    var mergeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, chosenMergeRunner.Kind, observedModelId, ct, attribution: mergeAttribution);
+                    await FinalizeConflictResolutionAsync(sandbox, conflictHunks, workBranch, mergeTrailerBlock, ct, mergeAttribution);
                     mergeSha = await VerifyMergeStateAsync(sandbox, baseBranch, workBranch, preMergeSha, ct);
                     await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{verificationRef}");
                     await sandbox.SyncStateToHostAsync(ct);
@@ -932,7 +933,8 @@ public sealed partial class PipelineRunner
         IReadOnlyList<ConflictHunk> conflictHunks,
         string workBranch,
         string trailerBlock,
-        CancellationToken ct)
+        CancellationToken ct,
+        CommitAttribution? attribution = null)
     {
         var files = conflictHunks.Select(h => h.Path).Distinct(StringComparer.Ordinal).ToArray();
         foreach (var file in files)
@@ -992,7 +994,8 @@ public sealed partial class PipelineRunner
         }, ct);
         if (mergeHead.Success)
         {
-            var msg = $"codeybox: merge {workBranch}\n\n{trailerBlock}\n";
+            var msg = CommitAttributionPolicy.ComposeMessageStatic(
+                $"codeybox: merge {workBranch}", trailerBlock, attribution ?? CommitAttribution.Default) + "\n";
             var commit = await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["git", "-C", SandboxConventions.WorkDir, "commit", "-F", "-"],

@@ -73,7 +73,7 @@ public sealed partial class PipelineRunner
             return;
         }
 
-        var selfReviewPrompt = BuildPreemptiveSelfReviewPrompt(guidance, promptRevisionAtDispatch);
+        var selfReviewPrompt = BuildPreemptiveSelfReviewPrompt(guidance, promptRevisionAtDispatch, ResolveAttribution(project));
         string shaBefore;
         try
         {
@@ -166,8 +166,8 @@ public sealed partial class PipelineRunner
             {
                 var trailerBlock = await ComposeCommitTrailerBlockAsync(
                     item.Id, runner.Kind, observedModelId, ct,
-                    promptRevisionAtDispatch: promptRevisionAtDispatch);
-                var commitMessage = $"codeybox: pre-emptive self-review fixes\n\n{trailerBlock}";
+                    promptRevisionAtDispatch: promptRevisionAtDispatch, attribution: ResolveAttribution(project));
+                var commitMessage = ComposeCommitMessage("codeybox: pre-emptive self-review fixes", trailerBlock, project);
                 await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", commitMessage);
             }
 
@@ -283,7 +283,8 @@ public sealed partial class PipelineRunner
     /// </summary>
     internal static string BuildPreemptiveSelfReviewPrompt(
         string guidance,
-        int promptRevisionAtDispatch)
+        int promptRevisionAtDispatch,
+        CodeyBox.Core.CommitAttribution? attribution = null)
     {
         var sb = new System.Text.StringBuilder();
         sb.Append(
@@ -297,8 +298,12 @@ public sealed partial class PipelineRunner
         sb.Append("\n\nReview criteria:\n\n");
         sb.Append(guidance);
         sb.Append("\n\n");
-        sb.Append(
-            $"If you make any edits, commit them on top of the current HEAD. The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` trailer value for any commit you create MUST be the literal integer **{promptRevisionAtDispatch.ToString(System.Globalization.CultureInfo.InvariantCulture)}** (the same revision the prior work turn used). Do not run build / test commands; the orchestrator will run the formal audit gates in its own sandbox after this turn.");
+        if ((attribution ?? CodeyBox.Core.CommitAttribution.Default).IncludeCodeyBoxTrailers)
+            sb.Append(
+                $"If you make any edits, commit them on top of the current HEAD. The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` trailer value for any commit you create MUST be the literal integer **{promptRevisionAtDispatch.ToString(System.Globalization.CultureInfo.InvariantCulture)}** (the same revision the prior work turn used). Do not run build / test commands; the orchestrator will run the formal audit gates in its own sandbox after this turn.");
+        else
+            sb.Append(
+                "If you make any edits, commit them on top of the current HEAD. Do not run build / test commands; the orchestrator will run the formal audit gates in its own sandbox after this turn.");
         return sb.ToString();
     }
 
@@ -1756,9 +1761,13 @@ public sealed partial class PipelineRunner
     /// instruction (read an unset env var) and the orchestrator stamp
     /// would be papering over noisy commits.
     /// </summary>
-    internal static string AppendSessionPromptRevisionDirective(string prompt, int revision) =>
-        prompt + "\n\n# Session-mode prompt-revision override\n\n"
+    internal static string AppendSessionPromptRevisionDirective(string prompt, int revision, CodeyBox.Core.CommitAttribution? attribution = null)
+    {
+        if (!(attribution ?? CodeyBox.Core.CommitAttribution.Default).IncludeCodeyBoxTrailers)
+            return prompt;
+        return prompt + "\n\n# Session-mode prompt-revision override\n\n"
             + $"The `{CodeyBoxTrailers.PromptRevisionTrailerKey}` trailer value for this turn MUST be the literal integer **{revision}**. "
             + $"(The `{CodeyBoxTrailers.PromptRevisionEnvVar}` environment variable is not available in the session worker VM — use this literal integer instead.)";
+    }
 
 }

@@ -36,6 +36,7 @@ public sealed class ProjectAuditorComposer
     private readonly TestFailureAttributionOptionsSnapshot? _testFailureAttributionOptions;
     private readonly TestSelectionShadowConfig? _testSelectionShadow;
     private readonly ILogger<ProjectAuditorComposer> _logger;
+    private readonly CodeyBox.Core.CommitAttributionPolicy? _attributionPolicy;
     private readonly IReadOnlySet<string> _requiredAuditors;
 
     /// <summary>
@@ -73,6 +74,7 @@ public sealed class ProjectAuditorComposer
         IPresetCatalog catalog,
         IEnumerable<IAuditor> registeredAuditors,
         ILogger<ProjectAuditorComposer> logger,
+        CodeyBox.Core.CommitAttributionPolicy? attributionPolicy = null,
         PresetCatalogOptions? catalogOptions = null,
         Func<TestRunOptions>? testRunOptions = null,
         Func<PlanAdherenceAuditorOptions>? planAdherenceOptions = null,
@@ -89,6 +91,7 @@ public sealed class ProjectAuditorComposer
         _testFailureAttributionOptions = testFailureAttributionOptions;
         _testSelectionShadow = testSelectionShadow;
         _logger = logger;
+        _attributionPolicy = attributionPolicy;
         _requiredAuditors = new HashSet<string>(
             requiredAuditorPolicy?.Names ?? [], StringComparer.OrdinalIgnoreCase);
 
@@ -175,13 +178,24 @@ public sealed class ProjectAuditorComposer
             IncludeRegisteredAuditor("gui:smoke", auditors, prepend: true);
         }
 
-        // Always include the deterministic prompt-revision trailer auditor.
-        // It is cheap (single git log -1), requires no agent credentials, and
-        // enforces the cross-iteration invariant that the agent's HEAD commit
-        // carries the CodeyBox-Prompt-Revision trailer the orchestrator
-        // snapshotted at dispatch time. A missing or stale trailer means the
-        // agent finished against an old prompt — a blocking finding.
-        if (!auditors.Any(a => a.Name.Equals(
+        // Always include the deterministic prompt-revision trailer auditor,
+        // unless CodeyBox trailers are disabled by config for this project
+        // (host default or per-project override). It is cheap (single git
+        // log -1), requires no agent credentials, and enforces the
+        // cross-iteration invariant that the agent's HEAD commit carries the
+        // CodeyBox-Prompt-Revision trailer the orchestrator snapshotted at
+        // dispatch time. A missing or stale trailer means the agent finished
+        // against an old prompt — a blocking finding. When trailers are off
+        // the auditor is removed from the effective panel and the pipeline
+        // records an explicit 'skipped: trailers disabled by config' result
+        // instead; stale-prompt tracking continues via the dispatch ledger.
+        var trailersEnabled = _attributionPolicy?.Resolve(project).IncludeCodeyBoxTrailers ?? true;
+        if (!trailersEnabled)
+        {
+            auditors.RemoveAll(a => a.Name.Equals(
+                PromptRevisionTrailerAuditor.AuditorName, StringComparison.OrdinalIgnoreCase));
+        }
+        else if (!auditors.Any(a => a.Name.Equals(
                 PromptRevisionTrailerAuditor.AuditorName, StringComparison.OrdinalIgnoreCase)))
         {
             IncludeRegisteredAuditor(PromptRevisionTrailerAuditor.AuditorName, auditors, prepend: false);

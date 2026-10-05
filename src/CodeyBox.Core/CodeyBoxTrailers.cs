@@ -10,20 +10,24 @@ namespace CodeyBox.Core;
 /// commit message separated from the subject/body by a blank line.
 ///
 /// <para>
-/// Agent work commit schema:
+/// Agent work commit schema (unless disabled by the attribution flags —
+/// <see cref="Compose"/> / <see cref="ComposeMechanical"/> omit the gated lines;
+/// both flags off yields an empty string):
 ///   <list type="bullet">
-///     <item><description><c>CodeyBox-WorkItem: &lt;id&gt;</c> — the full work-item id (always present).</description></item>
-///     <item><description><c>CodeyBox-Agent: &lt;agent&gt;[/&lt;model&gt;]</c> — the final agent/model that produced the work (always present).</description></item>
-///     <item><description><c>CodeyBox-Prompt-Revision: &lt;N&gt;</c> — the prompt revision that was active when the iteration was dispatched. Present when the orchestrator dispatched the iteration with a known revision.</description></item>
-///     <item><description><c>CodeyBox-Fallbacks: from→to (×N reason); …</c> — emitted only when fallback events occurred this run.</description></item>
-///     <item><description><c>Co-Authored-By: CodeyBox &lt;noreply@codeybox.invalid&gt;</c> — terminal co-author trailer (always present).</description></item>
+///     <item><description><c>CodeyBox-WorkItem: &lt;id&gt;</c> — the full work-item id (present unless <c>CodeyBoxTrailers</c> attribution is disabled).</description></item>
+///     <item><description><c>CodeyBox-Agent: &lt;agent&gt;[/&lt;model&gt;]</c> — the final agent/model that produced the work (present unless <c>CodeyBoxTrailers</c> attribution is disabled).</description></item>
+///     <item><description><c>CodeyBox-Prompt-Revision: &lt;N&gt;</c> — the prompt revision that was active when the iteration was dispatched. Present when the orchestrator dispatched the iteration with a known revision, unless <c>CodeyBoxTrailers</c> attribution is disabled.</description></item>
+///     <item><description><c>CodeyBox-Fallbacks: from→to (×N reason); …</c> — emitted only when fallback events occurred this run and unless <c>CodeyBoxTrailers</c> attribution is disabled.</description></item>
+///     <item><description><c>Co-Authored-By: CodeyBox &lt;noreply@codeybox.invalid&gt;</c> — terminal co-author trailer (present unless <c>CoAuthoredBy</c> attribution is disabled).</description></item>
 ///   </list>
 /// </para>
 ///
 /// <para>
 /// Mechanical fixer commit schema uses <c>CodeyBox-Mechanical-Fixer</c>
 /// instead of <c>CodeyBox-Agent</c> so deterministic normalizer commits are
-/// not attributed as agent/model work.
+/// not attributed as agent/model work. Both schemas are gated by the
+/// attribution flags (Compose/ComposeMechanical omit the disabled lines;
+/// both flags off yields empty).
 /// </para>
 /// </summary>
 public static class CodeyBoxTrailers
@@ -39,7 +43,9 @@ public static class CodeyBoxTrailers
     /// Env-var name passed into the agent's sandbox carrying the prompt revision
     /// that was active when the current iteration was dispatched. The agent
     /// echoes this value back as the <see cref="PromptRevisionTrailerKey"/>
-    /// trailer on every commit; <c>process:prompt-revision-trailer</c> verifies
+    /// trailer on every commit unless <c>CodeyBoxTrailers</c> attribution is
+    /// disabled (Compose/ComposeMechanical omit it; both flags off yields empty);
+    /// <c>process:prompt-revision-trailer</c> verifies
     /// the trailer matches. Single shared constant so the orchestrator (writer),
     /// the audit module (verifier), and the rework-prompt template (reader)
     /// reference the same symbol — a future rename touches one place.
@@ -50,63 +56,97 @@ public static class CodeyBoxTrailers
 
     /// <summary>
     /// Build the trailer block to append to a CodeyBox-emitted commit message.
-    /// Lines are joined with '\n', no leading or trailing newline; the final
-    /// line is always the canonical <see cref="CoAuthoredBy"/> trailer.
+    /// Lines are joined with '\n', no leading or trailing newline; when
+    /// includeCoAuthoredBy is true, the final line is the canonical <see cref="CoAuthoredBy"/> trailer.
     /// <see cref="FallbacksTrailerKey"/> is included only when at least one
-    /// fallback record was provided.
+    /// fallback record was provided. Attribution flags gate the block:
+    /// <paramref name="includeCodeyBoxTrailers"/> omits every
+    /// <c>CodeyBox-*</c> line and <paramref name="includeCoAuthoredBy"/> omits
+    /// the terminal co-author line. Both false yields an empty string.
     /// </summary>
     public static string Compose(
         WorkItemId workItemId,
         AgentKind finalAgent,
         string? finalModel = null,
         IReadOnlyList<AgentFallbackRecord>? fallbackHistory = null,
-        int? promptRevisionAtDispatch = null)
+        int? promptRevisionAtDispatch = null,
+        bool includeCoAuthoredBy = true,
+        bool includeCodeyBoxTrailers = true)
     {
         var sb = new StringBuilder();
-        sb.Append(WorkItemTrailerKey).Append(": ").Append(workItemId).Append('\n');
+        if (includeCodeyBoxTrailers)
+        {
+            sb.Append(WorkItemTrailerKey).Append(": ").Append(workItemId).Append('\n');
 
-        sb.Append(AgentTrailerKey).Append(": ").Append(SanitizeOneLine(finalAgent.Value));
-        var model = SanitizeOneLine(finalModel ?? string.Empty);
-        if (model.Length > 0)
-            sb.Append('/').Append(model);
-        sb.Append('\n');
+            sb.Append(AgentTrailerKey).Append(": ").Append(SanitizeOneLine(finalAgent.Value));
+            var model = SanitizeOneLine(finalModel ?? string.Empty);
+            if (model.Length > 0)
+                sb.Append('/').Append(model);
+            sb.Append('\n');
 
-        if (promptRevisionAtDispatch is { } rev)
-            sb.Append(PromptRevisionTrailerKey).Append(": ").Append(rev).Append('\n');
+            if (promptRevisionAtDispatch is { } rev)
+                sb.Append(PromptRevisionTrailerKey).Append(": ").Append(rev).Append('\n');
 
-        var fallbackLine = ComposeFallbackSummary(fallbackHistory);
-        if (fallbackLine is not null)
-            sb.Append(FallbacksTrailerKey).Append(": ").Append(fallbackLine).Append('\n');
+            var fallbackLine = ComposeFallbackSummary(fallbackHistory);
+            if (fallbackLine is not null)
+                sb.Append(FallbacksTrailerKey).Append(": ").Append(fallbackLine).Append('\n');
+        }
 
-        sb.Append(CoAuthoredBy);
-        return sb.ToString();
+        if (includeCoAuthoredBy)
+            sb.Append(CoAuthoredBy);
+        return sb.ToString().TrimEnd('\n');
     }
+
+    public static string Compose(
+        WorkItemId workItemId,
+        AgentKind finalAgent,
+        CommitAttribution attribution,
+        string? finalModel = null,
+        IReadOnlyList<AgentFallbackRecord>? fallbackHistory = null,
+        int? promptRevisionAtDispatch = null)
+        => Compose(workItemId, finalAgent, finalModel, fallbackHistory, promptRevisionAtDispatch,
+            attribution.IncludeCoAuthoredBy, attribution.IncludeCodeyBoxTrailers);
 
     /// <summary>
     /// Build the trailer block for a deterministic mechanical-fixer commit.
     /// These commits retain work-item and prompt-revision metadata, but
     /// intentionally omit <see cref="AgentTrailerKey"/> so commit-log consumers
     /// do not count normalizer output as agent-produced work.
+    /// Attribution flags behave as in <see cref="Compose"/>.
     /// </summary>
     public static string ComposeMechanical(
         WorkItemId workItemId,
         string? fixerNames,
-        int? promptRevisionAtDispatch = null)
+        int? promptRevisionAtDispatch = null,
+        bool includeCoAuthoredBy = true,
+        bool includeCodeyBoxTrailers = true)
     {
         var sb = new StringBuilder();
-        sb.Append(WorkItemTrailerKey).Append(": ").Append(workItemId).Append('\n');
+        if (includeCodeyBoxTrailers)
+        {
+            sb.Append(WorkItemTrailerKey).Append(": ").Append(workItemId).Append('\n');
 
-        var fixers = SanitizeOneLine(fixerNames ?? string.Empty);
-        sb.Append(MechanicalFixerTrailerKey).Append(": ")
-            .Append(fixers.Length == 0 ? "unknown" : fixers)
-            .Append('\n');
+            var fixers = SanitizeOneLine(fixerNames ?? string.Empty);
+            sb.Append(MechanicalFixerTrailerKey).Append(": ")
+                .Append(fixers.Length == 0 ? "unknown" : fixers)
+                .Append('\n');
 
-        if (promptRevisionAtDispatch is { } rev)
-            sb.Append(PromptRevisionTrailerKey).Append(": ").Append(rev).Append('\n');
+            if (promptRevisionAtDispatch is { } rev)
+                sb.Append(PromptRevisionTrailerKey).Append(": ").Append(rev).Append('\n');
+        }
 
-        sb.Append(CoAuthoredBy);
-        return sb.ToString();
+        if (includeCoAuthoredBy)
+            sb.Append(CoAuthoredBy);
+        return sb.ToString().TrimEnd('\n');
     }
+
+    public static string ComposeMechanical(
+        WorkItemId workItemId,
+        string? fixerNames,
+        CommitAttribution attribution,
+        int? promptRevisionAtDispatch = null)
+        => ComposeMechanical(workItemId, fixerNames, promptRevisionAtDispatch,
+            attribution.IncludeCoAuthoredBy, attribution.IncludeCodeyBoxTrailers);
 
     /// <summary>
     /// Summarise fallback events as a single RFC-5322-safe line, or null if

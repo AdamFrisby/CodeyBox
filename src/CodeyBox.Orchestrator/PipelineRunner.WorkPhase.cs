@@ -427,7 +427,7 @@ public sealed partial class PipelineRunner
             // resolved literal so the session-mode agent writes the right
             // trailer regardless of env-var visibility inside the VM.
             if (useClaudeSession && !resumingPreempt)
-                prompt = AppendSessionPromptRevisionDirective(prompt, promptRevisionAtDispatch);
+                prompt = AppendSessionPromptRevisionDirective(prompt, promptRevisionAtDispatch, ResolveAttribution(project));
 
             var streamCapture = (_agentStreams is not null && _agentStreams.Options.Enabled)
                 ? await BeginAgentStreamCaptureAsync(item.Id, agentPhase, iteration ?? 1, ct)
@@ -1041,10 +1041,10 @@ public sealed partial class PipelineRunner
             if (hasStagedDiff)
             {
                 var trailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
-                    promptRevisionAtDispatch: promptRevisionAtDispatch);
+                    promptRevisionAtDispatch: promptRevisionAtDispatch, attribution: ResolveAttribution(project));
                 var commitMessage = isInitial
-                    ? $"codeybox: {item.Title}\n\n{trailerBlock}"
-                    : $"codeybox rework: address audit findings\n\n{trailerBlock}";
+                    ? ComposeCommitMessage($"codeybox: {item.Title}", trailerBlock, project)
+                    : ComposeCommitMessage("codeybox rework: address audit findings", trailerBlock, project);
                 await using (var commitScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.commit",
                     activitySource: CodeyBoxActivities.Sandbox, log: _log))
                 {
@@ -1311,10 +1311,10 @@ public sealed partial class PipelineRunner
                         if (nudgeStaged.ExitCode != 0)
                         {
                             var nudgeTrailerBlock = await ComposeCommitTrailerBlockAsync(item.Id, runner.Kind, observedModelId, ct,
-                                promptRevisionAtDispatch: promptRevisionAtDispatch);
+                                promptRevisionAtDispatch: promptRevisionAtDispatch, attribution: ResolveAttribution(project));
                             var nudgeCommitMessage = isInitial
-                                ? $"codeybox: {item.Title}\n\n{nudgeTrailerBlock}"
-                                : $"codeybox rework: address audit findings\n\n{nudgeTrailerBlock}";
+                                ? ComposeCommitMessage($"codeybox: {item.Title}", nudgeTrailerBlock, project)
+                                : ComposeCommitMessage("codeybox rework: address audit findings", nudgeTrailerBlock, project);
                             await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "commit", "-m", nudgeCommitMessage);
                         }
                         await EnsureReservedScratchpadPathsAbsentFromTreeAsync(sandbox, ct);

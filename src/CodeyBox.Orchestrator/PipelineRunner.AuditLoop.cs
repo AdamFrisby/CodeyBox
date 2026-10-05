@@ -255,9 +255,13 @@ public sealed partial class PipelineRunner
                         f.Description,
                         f.Location))
                     .ToList();
+                var attributionForAudit = ResolveAttribution(project);
+                var trailersEnabledForAudit = attributionForAudit.IncludeCodeyBoxTrailers;
                 var ctx = new AuditContext(item.Id, workBranch, baseBranch, iteration, item.Prompt,
                     ModelId: item.ModelId, ReasoningMode: item.ReasoningMode,
                     PromptRevisionAtDispatch: revisionForCtx,
+                    CodeyBoxTrailersEnabled: trailersEnabledForAudit,
+                    PromptRevisionCurrent: item.PromptRevision,
                     BuildScriptRequired: project.Audit.BuildScriptRequired,
                     ProjectId: project.Id.Value,
                     Target: AuditTarget.Code,
@@ -267,6 +271,32 @@ public sealed partial class PipelineRunner
                     // "no plan to check" and passes as a no-op.
                     PlanArtifact: item.PlanArtifact,
                     PriorBlockingFindings: priorBlockingFindings);
+                if (!trailersEnabledForAudit)
+                {
+                    // The prompt-revision auditor was removed from the
+                    // effective panel by ProjectAuditorComposer; record the
+                    // explicit skipped result here so the audit report names
+                    // it instead of silently dropping the check. Stale-prompt
+                    // detection continues via the DB dispatch ledger.
+                    if (revisionForCtx is { } dispatchedRev
+                        && item.PromptRevision != dispatchedRev)
+                    {
+                        preCollectedFindings.Add(new AuditFinding(
+                            CodeyBox.Audit.PromptRevisionTrailerAuditor.AuditorName,
+                            AuditSeverity.Error,
+                            $"stale prompt revision (dispatch {dispatchedRev}, current {item.PromptRevision}; trailers disabled by config)",
+                            "The work item's prompt was updated after this iteration was dispatched (DB comparison; commit trailers are disabled). Re-read the latest prompt and produce a new commit."));
+                    }
+                    else
+                    {
+                        preCollectedFindings.Add(new AuditFinding(
+                            CodeyBox.Audit.PromptRevisionTrailerAuditor.AuditorName,
+                            AuditSeverity.Info,
+                            "skipped: trailers disabled by config",
+                            "CodeyBox-CommitAttribution CodeyBoxTrailers is off, so the prompt-revision trailer is not required. Stale-prompt tracking continues via the dispatch ledger (work_item_iterations.PromptRevisionAtDispatch)."));
+                    }
+                    preCompletedAuditors.Add(CodeyBox.Audit.PromptRevisionTrailerAuditor.AuditorName);
+                }
                 var prePassedBuildTestGateEvidence = BuildTestGateEvidence.None;
                 var auditorsForCollection = scheduledAuditors;
                 var preGateAttributions = new List<TestFailureAttributionResult>();
@@ -986,7 +1016,7 @@ public sealed partial class PipelineRunner
             ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
             : (IReadOnlyList<WorkItemQuestion>)[];
         var baseReworkPrompt = ReworkPromptBuilder.Build(
-            freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions);
+            freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions, ResolveAttribution(project));
         using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
         var (reworkTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
         reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(reworkTimeout));

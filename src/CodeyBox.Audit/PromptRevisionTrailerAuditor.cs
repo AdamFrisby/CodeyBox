@@ -7,7 +7,11 @@ namespace CodeyBox.Audit;
 /// Deterministic auditor that verifies the agent's most recent commit carries
 /// a <c>CodeyBox-Prompt-Revision: N</c> trailer matching the revision the
 /// orchestrator snapshotted at iteration-dispatch time. A missing or
-/// mismatched trailer is a blocking finding — it means the agent finished
+/// mismatched trailer is a blocking finding unless <c>CodeyBoxTrailers</c>
+/// attribution is disabled (Compose/ComposeMechanical omit the trailers;
+/// both flags off yields empty) — in that case the auditor returns skipped
+/// ('skipped: trailers disabled by config') and stale-prompt detection falls
+/// back to the DB dispatch ledger. Otherwise it means the agent finished
 /// against a stale prompt (the operator updated the prompt mid-iteration via
 /// PUT /workitems/{id}/prompt) or did not emit the required trailer at all.
 ///
@@ -28,6 +32,35 @@ public sealed class PromptRevisionTrailerAuditor : IAuditor
         AuditContext context,
         CancellationToken ct = default)
     {
+        // Trailers disabled by operator config: skip the git read and report
+        // an explicit skipped finding (never a vacuous pass). Stale-prompt
+        // detection still works from the DB: when the pipeline supplies the
+        // current revision and it differs from the dispatched revision, the
+        // agent worked against a stale prompt — a blocking finding that does
+        // not depend on any trailer.
+        if (!context.CodeyBoxTrailersEnabled)
+        {
+            if (context.PromptRevisionCurrent is { } current
+                && context.PromptRevisionAtDispatch is { } dispatched
+                && current != dispatched)
+            {
+                return new AuditResult(false,
+                [
+                    new AuditFinding(
+                        Name, AuditSeverity.Error,
+                        $"stale prompt revision (dispatch {dispatched}, current {current}; trailers disabled by config)",
+                        "The work item's prompt was updated after this iteration was dispatched (DB comparison; commit trailers are disabled). Re-read the latest prompt and produce a new commit."),
+                ]);
+            }
+            return new AuditResult(true,
+            [
+                new AuditFinding(
+                    Name, AuditSeverity.Info,
+                    "skipped: trailers disabled by config",
+                    "CodeyBox-CommitAttribution CodeyBoxTrailers is off, so the prompt-revision trailer is not required. Stale-prompt tracking continues via the dispatch ledger (work_item_iterations.PromptRevisionAtDispatch)."),
+            ]);
+        }
+
         // Legacy / unknown dispatch revision — no expectation to enforce. Emit
         // a non-blocking Warning so the missing dispatch row is visible (the
         // dispatch ledger is now always populated by the orchestrator before

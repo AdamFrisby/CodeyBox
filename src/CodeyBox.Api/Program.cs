@@ -2729,6 +2729,23 @@ builder.Services.AddSingleton<SmokeOptions>(sp =>
 builder.Services.AddSingleton<SmokeOptionsSnapshot>(sp =>
     new SmokeOptionsSnapshot(sp.GetRequiredService<SmokeOptions>()));
 
+// Commit-attribution policy — single source of truth for Co-Authored-By,
+// CodeyBox-* trailers, and the PR footer. Host defaults bind from
+// CodeyBox:CommitAttribution (all true = today's behaviour); per-project
+// overrides win at Resolve time. The snapshot is refreshed through the same
+// IOptionsMonitor<CodeyBoxOptions>.OnChange path as the session options below
+// so edits take effect on the next commit without a restart.
+builder.Services.AddSingleton<CodeyBox.Core.CommitAttributionSnapshot>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var live = new CodeyBox.Core.CommitAttributionSnapshot(monitor.CurrentValue.CommitAttribution);
+    monitor.OnChange(opts => live.Replace(opts.CommitAttribution));
+    return live;
+});
+builder.Services.AddSingleton<CodeyBox.Core.CommitAttributionPolicy>(sp =>
+    new CodeyBox.Core.CommitAttributionPolicy(
+        sp.GetRequiredService<CodeyBox.Core.CommitAttributionSnapshot>()));
+
 builder.Services.AddSingleton<TransitionHealthOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -4171,7 +4188,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     baselineStager: sp.GetRequiredService<TestSelectionBaselineAuditStager>(),
     providerTransientCorrelation: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
     baseBuildVerifier: sp.GetRequiredService<BaseBuildVerifier>(),
-    baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>()));
+    baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>(),
+    attributionPolicy: sp.GetRequiredService<CodeyBox.Core.CommitAttributionPolicy>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -6690,6 +6708,13 @@ namespace CodeyBox.Api
 
         /// <summary>Credential smoke test tuning knobs.</summary>
         public SmokeConfig Smoke { get; set; } = new();
+
+        /// <summary>
+        /// Commit/PR attribution switches. All default to true (today's
+        /// behaviour). Hot-reloadable: the snapshot takes effect on the next
+        /// commit. Per-project overrides win over these host defaults.
+        /// </summary>
+        public CodeyBox.Core.CommitAttributionOptions CommitAttribution { get; set; } = new();
 
         /// <summary>
         /// Pipeline transition-health metric tuning. Controls the

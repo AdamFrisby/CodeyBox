@@ -38,6 +38,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly GitHubAppStore? _githubApps;
     private readonly ICompletionClient? _completionClient;
     private readonly ILogger<CompletionPullRequestDescriptionGenerator>? _completionLog;
+    private readonly CodeyBox.Core.CommitAttributionPolicy? _attributionPolicy;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -52,7 +53,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         ITimingStore? timings = null,
         GitHubAppStore? githubApps = null,
         ICompletionClient? completionClient = null,
-        ILogger<CompletionPullRequestDescriptionGenerator>? completionLog = null)
+        ILogger<CompletionPullRequestDescriptionGenerator>? completionLog = null,
+        CodeyBox.Core.CommitAttributionPolicy? attributionPolicy = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -66,6 +68,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _githubApps = githubApps;
         _completionClient = completionClient;
         _completionLog = completionLog;
+        _attributionPolicy = attributionPolicy;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])
@@ -111,7 +114,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                     AutoMerge = u.AutoMerge,
                     PullRequestTitleTemplate = u.PullRequestTitleTemplate,
                     PrDescription = MapPrDescriptionOptions(u.PrDescription),
-                }, _timings, BuildDescriptionGenerator(u.PrDescription));
+                }, _timings, BuildDescriptionGenerator(u.PrDescription),
+                    _attributionPolicy?.Resolve(project));
 
             case "git-generic":
                 return new GitGenericUpstreamRemote(_gitHost, new GitGenericUpstreamOptions

@@ -14,7 +14,8 @@ new value on the next read.
 
 Hot-reloadable today:
 
-- `Projects` — adding a new project takes effect on the next pickup. Removing
+- `Projects` — adding a new project takes effect on the next pickup.
+- `CommitAttribution` — attribution switches take effect on the next commit (hot-reloaded through the shared policy snapshot; per-project overrides win). Removing
   a project that still has non-terminal work items is **rejected** by an
   `IValidateOptions<ProjectsOptions>` and the prior project list is retained;
   the repository keeps its own last-good snapshot because rejected options do
@@ -597,6 +598,26 @@ cannot execute the commands needed to publish that Git/private-state
 checkpoint. A retained lease is provider-bound internal metadata, not an
 additional retry attempt. Cancellation or any lifecycle transition that clears
 the lease makes the VM eligible for the normal sandbox leak reaper.
+
+## `CommitAttribution`
+
+Controls whether CodeyBox stamps its name into commits and pull requests. All three default to `true` (today's behaviour). Hot-reloadable: edits take effect on the next commit. Already-landed history is never rewritten.
+
+```json
+"CommitAttribution": {
+  "CoAuthoredBy": true,
+  "CodeyBoxTrailers": true,
+  "PullRequestFooter": true
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `CoAuthoredBy` | `true` | The `Co-Authored-By: CodeyBox <noreply@codeybox.invalid>` trailer on orchestrator-composed commits (work, rework, mechanical-fixer, conflict-resolution, merge) and in GitHub squash-merge messages. When `false`, agent prompts stop asking for it and the host strips it defence-in-depth. |
+| `CodeyBoxTrailers` | `true` | All `CodeyBox-*` trailers (`WorkItem`, `Agent`, `Fallbacks`, `Prompt-Revision`, `Mechanical-Fixer`). When `false`, orchestrator commits, mechanical-fixer commits and squash messages omit them; agent prompts stop asking for them; the host strips agent-added ones by exact key; and the `process:prompt-revision-trailer` auditor is removed from the effective panel with an explicit `skipped: trailers disabled by config` result. Stale-prompt tracking continues via the DB dispatch ledger (`work_item_iterations.PromptRevisionAtDispatch`). |
+| `PullRequestFooter` | `true` | The `*Co-Authored-By: CodeyBox ...* 🤖 Generated ...` footer in GitHub PR bodies. When `false`, PR bodies carry no CodeyBox footer. |
+
+Per-project override: set `CommitAttribution` on a project (or under `Defaults`) — any set flag wins over the host default; unset flags inherit. See `docs/concepts/projects.md`.
 
 ## `WorkerPoolHealthWatchdog`
 
