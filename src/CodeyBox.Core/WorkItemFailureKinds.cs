@@ -40,6 +40,17 @@ public static class WorkItemFailureKinds
     /// </summary>
     public const string OutputBound = "output-bound";
 
+    /// <summary>
+    /// Upstream push blocked by the owned-branch lease guard: either a third
+    /// party pushed to the CodeyBox-owned work branch (lease mismatch) or the
+    /// remote diverged from an unrecorded prior push. Retrying the same input
+    /// cannot succeed — the remote ref must be inspected (and the upstream
+    /// step re-driven) by an operator — so downstream classifiers treat this
+    /// as non-retryable and park the item instead of spending recovery budget.
+    /// Never routed into conflict-rework: this is not a merge conflict.
+    /// </summary>
+    public const string UpstreamBlocked = "upstream_blocked";
+
     private static readonly string[] InfraShaped =
     [
         Infrastructure,

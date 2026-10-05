@@ -582,6 +582,72 @@ public sealed class LocalGitHost : IGitHost
                 $"git update-ref to set '{branch}' to {sha} failed: {update.Stderr}");
     }
 
+    public async Task<string?> GetUpstreamBranchShaAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+    {
+        Validation.ValidateRepositoryUrl(upstreamUrl, nameof(upstreamUrl));
+        Validation.ValidateBranchName(branch, nameof(branch));
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        // ls-remote observes the upstream ref without touching any local ref,
+        // so a concurrent third-party push can only move the remote forward —
+        // the lease push below still guards the actual rewrite.
+        // git ls-remote [<repository> [<refs>...]] — like push, it takes no
+        // `--` before <repository>, so URL validation above is the guard.
+        var ls = await RunGitAsync(
+            workdir: path,
+            ct,
+            extraEnv: upstreamEnv,
+            "ls-remote", upstreamUrl, $"refs/heads/{branch}");
+        if (ls.ExitCode != 0)
+            throw new InvalidOperationException($"git ls-remote upstream branch '{branch}' failed: {ls.Stderr}");
+        foreach (var line in ls.Stdout.Split('\n'))
+        {
+            var tab = line.IndexOf('\t');
+            if (tab <= 0)
+                continue;
+            var sha = line[..tab].Trim();
+            if (sha.Length is >= 40 and <= 64 && sha.All(Uri.IsHexDigit))
+                return sha.ToLowerInvariant();
+        }
+        return null;
+    }
+
+    public async Task PushBranchWithLeaseAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        string expectedOldSha,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+    {
+        CodeyBoxBranchPolicy.RequireOwnedWorkBranch(branch);
+        Validation.ValidateRepositoryUrl(upstreamUrl, nameof(upstreamUrl));
+        Validation.ValidateCommitSha(expectedOldSha, nameof(expectedOldSha));
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        // Single guarded attempt, never retried here: a failed lease means the
+        // remote moved under us and only the caller (which owns the expected
+        // sha) can decide whether that is park-worthy.
+        var rc = await RunGitAsync(
+            workdir: path,
+            ct,
+            extraEnv: upstreamEnv,
+            "push", "--force-with-lease=refs/heads/" + branch + ":" + expectedOldSha,
+            upstreamUrl, $"{branch}:{branch}");
+        if (rc.ExitCode == 0)
+            return;
+        var output = rc.Stdout + "\n" + rc.Stderr;
+        if (output.Contains("stale info", StringComparison.OrdinalIgnoreCase)
+            || IsNonFastForwardRejection(rc.Stdout, rc.Stderr))
+            throw new UpstreamLeaseMismatchException(branch, expectedOldSha, actualSha: null);
+        throw new InvalidOperationException($"git lease-guarded push of '{branch}' to upstream failed: {rc.Stderr}");
+    }
+
     public async Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
     {
         var path = GetRepoPath(repositoryId);

@@ -167,6 +167,17 @@ Returns `412 Precondition Failed` when the bare repo or the work-branch ref is n
 
 Distinct from `/uncancel` (operator cancels are refused there by design — the operator chose to stop, so undoing that needs its own verb) and from `/retry` (which is scoped to terminal-failed and `NoActionRequired` states, not Cancelled).
 
+### Re-driving a stranded upstream push
+
+CodeyBox owns `codeybox/*` branches. When a retried item's new head shares no history with the remote tip (the previous attempt's head), the push is rewritten only under `--force-with-lease` against the recorded last-pushed SHA — a moved remote parks the item with `failureKind=upstream_blocked` instead of being clobbered or retried. A diverged remote with no recorded push parks distinctly too: it is not a merge conflict and never enters conflict-rework.
+
+```
+GET /workitems/upstream-redrive-candidates
+POST /workitems/{id}/redrive-upstream
+```
+
+`GET` lists settled items (`Failed`, `MergeConflictResolutionFailed`, `Merged`) that still have an open PR on their own branch, with the PR head and the last-pushed SHA for comparison. `POST` records the open PR's currently observed head as the operator-authorized lease base (invoking it asserts no third party pushed to the branch) and resumes the upstream phase under the normal lease rules — a concurrent third-party push still fails the lease and parks. Returns `202` when armed, `404` when the item is gone, `409` when the state/branch/PR preconditions do not hold or the retry is refused. A startup scan logs the same candidates once at boot; nothing is pushed without the explicit `POST`.
+
 ### AbandonedAfterRecoveryAttempts
 
 When the recovery loop has retried an item more than `CodeyBox:DeadWorker:MaxRecoveryAttempts` times (default 10) without it ever completing the recovered phase, the item is transitioned to `AbandonedAfterRecoveryAttempts` with a descriptive `lastError`. Use `POST /workitems/{id}/retry` to resume manually after investigating the root cause.

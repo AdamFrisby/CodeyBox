@@ -724,6 +724,18 @@ public sealed record WorkItem
     public string? MergedPrUrl { get; init; }
 
     /// <summary>
+    /// Tip sha of the work branch CodeyBox last pushed to the upstream,
+    /// recorded after every successful work-branch push (plain or
+    /// lease-guarded). A later retry proves a diverged remote tip is its own
+    /// previous push by matching this sha before rewriting the owned branch
+    /// under <c>--force-with-lease</c>; a mismatch parks for the operator
+    /// instead of clobbering a third party's commits. Survives retries and
+    /// restarts; null when no push has been recorded yet (first attempt or
+    /// legacy rows predating this tracking).
+    /// </summary>
+    public string? LastPushedWorkBranchSha { get; init; }
+
+    /// <summary>
     /// The release this work item belongs to. When set, the orchestrator targets the
     /// release branch instead of the project's default base branch, and the release state
     /// machine tracks this item's terminal state for the closed→in_review auto-transition.

@@ -694,6 +694,18 @@ public sealed record UpstreamCompletionRequest
     /// merge against the still-open PR).
     /// </summary>
     public int? ExistingPullRequestNumber { get; init; }
+
+    /// <summary>
+    /// Sha CodeyBox last pushed to the work branch (tracked on the work item
+    /// as <c>LastPushedWorkBranchSha</c>), or an operator-authorized sha
+    /// observed on the remote during a re-drive. When the remote tip has
+    /// diverged from the new head, the implementation rewrites the owned
+    /// branch only under a <c>--force-with-lease</c> bound to this sha; a
+    /// mismatch means a third party pushed and the rewrite is refused.
+    /// Null when CodeyBox has no record (first push, or legacy rows): a
+    /// diverged remote is then reported distinctly rather than rewritten.
+    /// </summary>
+    public string? ExpectedRemoteHeadSha { get; init; }
 }
 
 /// <summary>Result of <see cref="IUpstreamRemote.CompleteAsync"/>.</summary>
@@ -718,4 +730,13 @@ public sealed record UpstreamCompletionOutcome
     /// motion: re-fetch base, re-run the merge phase, and retry the merge.
     /// </summary>
     public bool AutoMergeRaced { get; init; }
+
+    /// <summary>
+    /// Tip sha of the work branch the implementation actually pushed (plain
+    /// or lease-guarded). The orchestrator persists it as the work item's
+    /// last-pushed sha so a later retry can prove a stale remote tip is its
+    /// own history before rewriting it under lease. Null when no push
+    /// happened in this call (e.g. noop upstreams).
+    /// </summary>
+    public string? PushedWorkBranchSha { get; init; }
 }

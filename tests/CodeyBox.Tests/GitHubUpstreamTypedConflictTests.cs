@@ -106,11 +106,14 @@ internal sealed class GitHubTypedConflictTestFactory : IUpstreamRemoteFactory
 }
 
 /// <summary>
-/// Adapter-level regression: genuine diverged work-branch conflicts through
+/// Adapter-level regression: diverged <c>codeybox/*</c> work branches through
 /// the real <see cref="LocalGitHost"/> and the real
-/// <see cref="GitHubUpstreamRemote"/> must surface the shared typed contract
-/// (branch + strategy) without credential leakage — not a flattened
-/// message-only <see cref="InvalidOperationException"/>.
+/// <see cref="GitHubUpstreamRemote"/> surface the owned-branch typed
+/// contracts without credential leakage — never a flattened message-only
+/// <see cref="InvalidOperationException"/>, and never a reconcile-conflict
+/// routed into conflict-rework (a diverged owned branch is not a merge
+/// conflict). A recorded prior push rewrites the stale tip under
+/// <c>--force-with-lease</c> instead of resurrecting it.
 /// </summary>
 public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
 {
@@ -196,27 +199,33 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
     }
 
     [Fact]
-    public async Task RebaseConflict_PreservesTypedBranchAndStrategyWithoutInnerOrToken()
+    public async Task RebaseDivergenceWithoutLeaseRecord_ParksDistinctFromConflict()
     {
+        // Owned-branch rule: a diverged remote with no recorded CodeyBox push
+        // is NOT a merge conflict — it parks distinctly instead of rebasing
+        // the new head onto the stale tip. Typed, branch-identifying, and
+        // free of credential material.
         var workBranch = NewBranch();
-        var (host, repoId, _, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "local\n", "remote\n");
+        var (host, repoId, upstreamBare, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "local\n", "remote\n");
         using (shim)
         {
             var (owner, repo) = SplitGithubUrl(githubUrl);
             var remote = BuildRemote(host, handler, owner, repo, token, "rebase");
-            var ex = await Assert.ThrowsAsync<UpstreamPushReconcileConflictException>(() =>
+            var ex = await Assert.ThrowsAsync<UpstreamOwnedBranchDivergedException>(() =>
                 remote.CompleteAsync(SampleRequest(repoId, workBranch, "rebase"), CancellationToken.None));
             Assert.Equal(workBranch, ex.Branch);
-            Assert.Equal("rebase", ex.Strategy);
-            Assert.Null(ex.InnerException);
+            Assert.False(UpstreamPushReconcileConflictException.TryFindIn(ex, out _));
             Assert.DoesNotContain(token, ex.Message);
             Assert.DoesNotContain(token, ex.Branch);
             Assert.Empty(handler.Requests);
+            // The stale remote tip is untouched.
+            var (_, content, _) = await TestSupport.RunGit(upstreamBare, "show", $"{workBranch}:conflict.txt");
+            Assert.Equal("remote\n", content);
         }
     }
 
     [Fact]
-    public async Task MergeConflict_PreservesTypedMergeIdentity()
+    public async Task MergeDivergenceWithoutLeaseRecord_ParksDistinctFromConflict()
     {
         var workBranch = NewBranch();
         var (host, repoId, _, shim, githubUrl, token, handler) = await SetupDivergedAsync(workBranch, "local\n", "remote\n");
@@ -224,18 +233,20 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
         {
             var (owner, repo) = SplitGithubUrl(githubUrl);
             var remote = BuildRemote(host, handler, owner, repo, token, "merge");
-            var ex = await Assert.ThrowsAsync<UpstreamPushReconcileConflictException>(() =>
+            var ex = await Assert.ThrowsAsync<UpstreamOwnedBranchDivergedException>(() =>
                 remote.CompleteAsync(SampleRequest(repoId, workBranch, "merge"), CancellationToken.None));
             Assert.Equal(workBranch, ex.Branch);
-            Assert.Equal("merge", ex.Strategy);
-            Assert.Null(ex.InnerException);
+            Assert.False(UpstreamPushReconcileConflictException.TryFindIn(ex, out _));
             Assert.DoesNotContain(token, ex.Message);
         }
     }
 
     [Fact]
-    public async Task NonConflictingDivergence_ReconcilesAndPushesBothHistories()
+    public async Task RecordedDivergence_LeasePushRewritesWithoutResurrecting()
     {
+        // With a recorded prior push (the lease base), a diverged owned
+        // branch is rewritten under --force-with-lease: the stale tip is
+        // replaced, never merged — superseded commits stay superseded.
         var workBranch = NewBranch();
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
         var upstreamBare = Path.Combine(_workspace, "upstream-" + Guid.NewGuid().ToString("N")[..8] + ".git");
@@ -253,25 +264,30 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
         await CommitBranchFileAsync(upstreamBare, workBranch, "remote.txt", "remote\n", "remote upstream change");
 
         var tipBefore = (await TestSupport.RunGit(host.GetRepoPath(repoId), "rev-parse", workBranch)).stdout.Trim();
+        var (_, remoteTip, _) = await TestSupport.RunGit(upstreamBare, "rev-parse", workBranch);
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(new HttpResponseMessage(HttpStatusCode.Created)
         {
             Content = new StringContent(JsonSerializer.Serialize(new { number = 11, html_url = $"https://github.com/{owner}/{repo}/pull/11" }), Encoding.UTF8, "application/json"),
         });
         var remote = BuildRemote(host, handler, owner, repo, token, "rebase");
-        var outcome = await remote.CompleteAsync(SampleRequest(repoId, workBranch, "rebase"), CancellationToken.None);
+        var request = SampleRequest(repoId, workBranch, "rebase") with
+        {
+            ExpectedRemoteHeadSha = remoteTip.Trim(),
+        };
+        var outcome = await remote.CompleteAsync(request, CancellationToken.None);
 
         Assert.True(outcome.BranchPushed);
         Assert.Equal(11, outcome.PullRequestNumber);
-        var tipAfter = (await TestSupport.RunGit(host.GetRepoPath(repoId), "rev-parse", workBranch)).stdout.Trim();
-        Assert.NotEqual(tipBefore, tipAfter);
-        var (_, agentFile, _) = await TestSupport.RunGit(upstreamBare, "show", $"{workBranch}:agent.txt");
-        var (_, remoteFile, _) = await TestSupport.RunGit(upstreamBare, "show", $"{workBranch}:remote.txt");
-        Assert.Equal("agent\n", agentFile);
-        Assert.Equal("remote\n", remoteFile);
+        Assert.Equal(tipBefore, outcome.PushedWorkBranchSha);
+        var (_, tipAfter, _) = await TestSupport.RunGit(upstreamBare, "rev-parse", workBranch);
+        Assert.Equal(tipBefore, tipAfter.Trim());
+        // Rewritten, not reconciled: the stale remote-only file is gone and
+        // no merge of the two histories happened.
+        var (showCode, _, _) = await TestSupport.RunGitNoThrow(upstreamBare, "show", $"{workBranch}:remote.txt");
+        Assert.NotEqual(0, showCode);
         var (_, subjects, _) = await TestSupport.RunGit(upstreamBare, "log", "--format=%s", "--max-count=3", workBranch);
-        Assert.Contains("local agent change", subjects);
-        Assert.Contains("remote upstream change", subjects);
+        Assert.DoesNotContain("remote upstream change", subjects);
     }
 
     [Fact]

@@ -119,6 +119,16 @@ public sealed class DefaultTerminalFailureClassifier : ITerminalFailureClassifie
                 TerminalFailureClass.Deterministic,
                 "failureKind=configuration: pipeline rejected the work-item's config");
 
+        // Owned-branch lease guard blocked the upstream push (third-party
+        // branch motion, or diverged-from-unrecorded-history). Retrying the
+        // same input re-hits the same remote ref; only an operator re-drive
+        // (after inspecting the branch) can proceed. Never auto-retry and
+        // never confuse with a merge conflict.
+        if (string.Equals(item.FailureKind, WorkItemFailureKinds.UpstreamBlocked, StringComparison.OrdinalIgnoreCase))
+            return new TerminalFailureClassification(
+                TerminalFailureClass.Deterministic,
+                "failureKind=upstream_blocked: lease guard refused the rewrite; operator re-drive required");
+
         // Audit non-convergence (state AuditFailed) is deterministic: the
         // audit loop produced its last verdict and an unchanged retry would
         // re-run the same audit on the same diff. Operator must intervene.

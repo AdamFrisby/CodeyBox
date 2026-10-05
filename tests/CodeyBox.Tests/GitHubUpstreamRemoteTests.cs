@@ -916,7 +916,7 @@ public sealed class GitHubUpstreamRemoteTests
     [Fact]
     public async Task CompleteAsync_ExistingPrNumberWithSquash_UsesExistingPrBodyForCommitMessage()
     {
-        var gitHost = new FakeGitHost();
+        var gitHost = GitHostWithTip();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(PullRequestResponse(
             42,
@@ -977,7 +977,7 @@ public sealed class GitHubUpstreamRemoteTests
     [Fact]
     public async Task CompleteAsync_ExistingPrNumberWithSquash_StaticPrBodyUsesCommitFallback()
     {
-        var gitHost = new FakeGitHost();
+        var gitHost = GitHostWithTip();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(PullRequestResponse(
             43,
@@ -1032,7 +1032,7 @@ public sealed class GitHubUpstreamRemoteTests
     [Fact]
     public async Task CompleteAsync_ExistingPrNumberWithSquash_PrDescriptionDisabledUsesCommitFallback()
     {
-        var gitHost = new FakeGitHost();
+        var gitHost = GitHostWithTip();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(PullRequestResponse(
             44,
@@ -1081,7 +1081,7 @@ public sealed class GitHubUpstreamRemoteTests
     [Fact]
     public async Task CompleteAsync_ExistingPrNumberWithSquash_PrFetchNonSuccessUsesLocalFallback()
     {
-        var gitHost = new FakeGitHost();
+        var gitHost = GitHostWithTip();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(JsonResponse(HttpStatusCode.InternalServerError, """{"message":"backend unavailable"}"""));
         handler.Enqueue(PullRequestCommitsResponse("[]"));
@@ -1124,7 +1124,7 @@ public sealed class GitHubUpstreamRemoteTests
     [Fact]
     public async Task CompleteAsync_ExistingPrNumberWithSquash_PrFetchExceptionUsesLocalFallback()
     {
-        var gitHost = new FakeGitHost();
+        var gitHost = GitHostWithTip();
         var handler = new FakeHttpMessageHandler();
         handler.EnqueueException(new HttpRequestException("connection reset"));
         handler.Enqueue(PullRequestCommitsResponse("[]"));
@@ -1598,22 +1598,34 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
-    public async Task CompleteAsync_422WithClosedUnmergedPr_ThrowsNotDelivered()
+    public async Task CompleteAsync_422WithClosedUnmergedPr_OpensFreshPrAndLinksStale()
     {
+        // A closed-unmerged PR for the exact pushed revision no longer fails
+        // the item: the remote supersedes it — fresh PR, link comment on the
+        // stale one, best-effort close — and delivery proceeds on the new PR.
         var gitHost = GitHostWithTip();
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(AlreadyExists422Response());
         handler.Enqueue(PrListResponse());
         handler.Enqueue(PrListResponse(13));
         handler.Enqueue(PrDetailResponse(13, "closed", merged: false, null, SampleRequest.WorkBranch, PushedTipSha, "myorg", "main"));
+        handler.Enqueue(JsonResponse(HttpStatusCode.Created,
+            """{"number":14,"html_url":"https://github.com/myorg/myrepo/pull/14"}"""));
+        handler.Enqueue(JsonResponse(HttpStatusCode.Created, """{"id":1}"""));
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, """{"number":13,"state":"closed"}"""));
+        handler.Enqueue(PullRequestCommitsResponse("[]"));
+        handler.Enqueue(MergeOkResponse("merged-after-recovery"));
 
-        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true });
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            remote.CompleteAsync(SampleRequest, CancellationToken.None));
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "squash" });
+        var outcome = await remote.CompleteAsync(SampleRequest, CancellationToken.None);
 
-        Assert.Contains("closed without merge", ex.Message);
-        Assert.Contains("not delivered", ex.Message);
-        Assert.DoesNotContain(handler.Requests, IsMergePut);
+        Assert.True(outcome.BranchPushed);
+        Assert.Equal(14, outcome.PullRequestNumber);
+        Assert.Equal("https://github.com/myorg/myrepo/pull/14", outcome.PullRequestUrl);
+        Assert.Equal("merged-after-recovery", outcome.MergedSha);
+        var comment = Assert.Single(handler.Requests, r =>
+            r.Method == HttpMethod.Post && r.RequestUri!.PathAndQuery.EndsWith("/issues/13/comments", StringComparison.Ordinal));
+        Assert.Contains("#14", handler.RequestBodies[handler.Requests.IndexOf(comment)]);
     }
 
     [Fact]
@@ -1930,6 +1942,12 @@ internal sealed class ThrowingFakeGitHost : IGitHost
         IReadOnlyDictionary<string, string> upstreamEnv,
         UpstreamPushReconcileStrategy reconcileStrategy = UpstreamPushReconcileStrategy.Rebase,
         CancellationToken ct = default)
+        => throw _ex;
+
+    // The owned-branch push path resolves the local tip before pushing, so a
+    // host that fails every git call must fail here too — preserving each
+    // test's scripted error on the first git operation.
+    public Task<string> ResolveCommitAsync(string repositoryId, string commitish, CancellationToken ct = default)
         => throw _ex;
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)

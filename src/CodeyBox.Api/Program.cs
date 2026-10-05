@@ -4776,6 +4776,19 @@ builder.Services.AddHostedService(sp =>
 });
 
 // --- Plugin foundation -------------------------------------------------------
+// One-off startup reconciliation for stranded upstream pushes (owned-branch
+// lease-guard parks and other settled items with an open PR on their own
+// branch). Detection only — the operator re-drive endpoint carries the
+// authorization the lease guard requires.
+builder.Services.AddSingleton<UpstreamRedriveService>(sp => new UpstreamRedriveService(
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IUpstreamRemoteFactory>(),
+    sp.GetRequiredService<WorkItemRetrier>(),
+    sp.GetRequiredService<ILogger<UpstreamRedriveService>>()));
+builder.Services.AddHostedService(sp => new StaleUpstreamRedriveDetector(
+    sp.GetRequiredService<UpstreamRedriveService>(),
+    sp.GetRequiredService<ILogger<StaleUpstreamRedriveDetector>>()));
 // Discovers assemblies from CodeyBox:Plugins, registers plugin types under
 // their Core interfaces before the container is frozen, then runs
 // IPluginInitializer.InitializeAsync at startup via PluginInitializationService.
