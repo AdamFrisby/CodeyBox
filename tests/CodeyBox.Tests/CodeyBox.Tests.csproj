@@ -76,6 +76,7 @@
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.CfnlintAuditorPlugin\CodeyBox.CfnlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.CheckovAuditorPlugin\CodeyBox.CheckovAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.ConftestAuditorPlugin\CodeyBox.ConftestAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.PlutoAuditorPlugin\CodeyBox.PlutoAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-infrastructure\CodeyBox.ZizmorAuditorPlugin\CodeyBox.ZizmorAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-licensing\CodeyBox.ReuseAuditorPlugin\CodeyBox.ReuseAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-licensing\CodeyBox.ScancodeAuditorPlugin\CodeyBox.ScancodeAuditorPlugin.csproj" />
