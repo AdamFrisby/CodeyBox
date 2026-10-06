@@ -1,0 +1,17 @@
+{
+  "_type": "WorkPackage",
+  "id": 101,
+  "lockVersion": 7,
+  "subject": "Login redirect is broken",
+  "description": { "format": "markdown", "raw": "Fix the login redirect." },
+  "createdAt": "2024-11-20T10:00:00.000Z",
+  "updatedAt": "2024-11-27T10:00:00.000Z",
+  "_links": {
+    "self": { "href": "/api/v3/work_packages/101", "title": "Login redirect is broken" },
+    "status": { "href": "/api/v3/statuses/1", "title": "New" },
+    "assignee": { "href": "/api/v3/users/42", "title": "CodeyBox Bot" },
+    "author": { "href": "/api/v3/users/7", "title": "Operator" },
+    "project": { "href": "/api/v3/projects/5", "title": "Product" },
+    "activities": { "href": "/api/v3/work_packages/101/activities" }
+  }
+}

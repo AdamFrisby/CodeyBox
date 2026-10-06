@@ -1,6 +1,7 @@
 # External work sync (`IWorkSource` / `IWorkTracker`)
 
-CodeyBox tracks work in its own work items; Linear, Jira, YouTrack and
+CodeyBox tracks work in its own work items; Linear, Jira, YouTrack,
+OpenProject and
 friends track it in theirs. Two contracts bridge the gap, with the machinery
 between them:
 

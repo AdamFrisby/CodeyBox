@@ -1,0 +1,31 @@
+{
+  "_type": "Collection",
+  "total": 2,
+  "count": 2,
+  "pageSize": 50,
+  "offset": 1,
+  "_embedded": {
+    "elements": [
+      {
+        "_type": "Activity",
+        "id": 9001,
+        "comment": { "format": "markdown", "raw": "Status set to In progress" },
+        "_links": {
+          "self": { "href": "/api/v3/activities/9001" },
+          "workPackage": { "href": "/api/v3/work_packages/101", "title": "Login redirect is broken" },
+          "user": { "href": "/api/v3/users/42" }
+        }
+      },
+      {
+        "_type": "Activity",
+        "id": 9000,
+        "comment": { "format": "markdown", "raw": "" },
+        "_links": {
+          "self": { "href": "/api/v3/activities/9000" },
+          "workPackage": { "href": "/api/v3/work_packages/101", "title": "Login redirect is broken" },
+          "user": { "href": "/api/v3/users/7" }
+        }
+      }
+    ]
+  }
+}
