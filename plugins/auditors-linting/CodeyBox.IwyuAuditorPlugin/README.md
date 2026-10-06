@@ -87,8 +87,9 @@ trees) are counted and logged per run, never analysed.
 - **A unit that produces no verdict at all.** iwyu_tool aggregates child
   exits via `max()`, so a signal-killed (e.g. OOM-killed) unit's negative
   returncode folds into exit 0. The auditor reconciles the report against
-  the database: fewer verdict records than selected in-worktree units is an
-  infrastructure failure, never a silent partial pass.
+  the database by file identity: a selected in-worktree unit whose file
+  carries no verdict record is an infrastructure failure, never a silent
+  partial pass — extra records for associated headers cannot mask it.
 - **Pre-0.17 exit codes.** IWYU 0.16 and older returned `2 + edits`; those
   releases fail the version pin.
 - **Out-of-worktree report paths.** A reported path that stays absolute (or
@@ -122,7 +123,7 @@ iwyu_tool's exit is the worst child exit (verified against IWYU 0.21 —
 |---|---|---|
 | `0` | Every selected translation unit analysed (clean, or violations reported) | Verdict — pass or advisory findings |
 | `0` with empty/unrecognised output | No verdict records — nothing actually ran | Infrastructure (`AuditUnavailableException`) |
-| `0` with fewer verdict records than selected units | A unit exited without a verdict (e.g. signal-killed — `max()` folds negative returncodes into 0) | Infrastructure — coverage is unverifiable |
+| `0` with a selected unit's file carrying no verdict record | A unit exited without a verdict (e.g. signal-killed — `max()` folds negative returncodes into 0) | Infrastructure — coverage is unverifiable |
 | `1` | A translation unit hit an unrecoverable error, or the driver failed (bad database, bad flags) | Infrastructure — partial coverage is never a pass |
 | `126` / `127` | `iwyu_tool` not executable or not found | Infrastructure |
 | anything else | Unknown convention | Infrastructure (fails loud, never a pass) |
@@ -147,6 +148,13 @@ environments — iwyu_tool honors the first as the engine path, which would
 bypass this pin, and the engine honors the second as a verbosity override:
 `IWYU_VERBOSE=0` suppresses the "should add"/"should remove" sections of
 every verdict, which would pass a run while reporting nothing.
+
+Keep the two binaries **collocated**: iwyu_tool resolves
+`include-what-you-use` next to its own script before falling back to PATH,
+while the pin probes the PATH-resolved binary — a baseline that places a
+different engine beside iwyu_tool than the one `command -v` finds would
+verify one binary and exec another. The apt `iwyu` package collocates both
+in `/usr/bin`; an exotic layout must preserve that.
 
 The tool requirements declare **`AptPackage = "iwyu"`** for both binaries,
 so baseline provisioning installs them via apt **only when this plugin is

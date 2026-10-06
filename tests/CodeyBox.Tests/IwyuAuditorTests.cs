@@ -22,8 +22,8 @@ namespace CodeyBox.Tests;
 /// - Add/remove blocks map to advisory iwyu-add/iwyu-remove findings with
 ///   normalized locations; a per-run iwyu-coverage info finding counts the
 ///   files that received verdicts; exit-0 output without verdict records
-///   fails closed, and exit-0 output with fewer verdicts than the
-///   selected in-worktree units is reconciled as infrastructure too
+///   fails closed, and exit-0 output where a selected in-worktree unit's
+///   file carries no verdict record is reconciled as infrastructure too
 ///   (iwyu_tool folds a signal-killed unit into exit 0).
 /// - IWYU_BINARY and IWYU_VERBOSE are stripped from the tool environment so
 ///   the pinned engine cannot be swapped under the driver and verdict
@@ -52,6 +52,8 @@ public sealed class IwyuAuditorTests
         ---
 
         (/work/src/util.h has correct #includes/fwd-decls)
+
+        (/work/src/lib.cpp has correct #includes/fwd-decls)
         """;
 
     private const string OutputClean = """
@@ -60,30 +62,32 @@ public sealed class IwyuAuditorTests
         (/work/src/lib.cpp has correct #includes/fwd-decls)
         """;
 
-    // Two translation units each emitting a remove suggestion under their
-    // own path — the findings stay per-file distinct.
+    // The two in-scope DefaultDatabase units each emitting a remove
+    // suggestion under their own path — the findings stay per-file
+    // distinct.
     private const string OutputDuplicatedAcrossTus = """
-        /work/src/a.cpp should add these lines:
+        /work/src/app.cpp should add these lines:
 
-        /work/src/a.cpp should remove these lines:
+        /work/src/app.cpp should remove these lines:
         - #include "shared.h"  // lines 4-4
 
-        The full include-list for /work/src/a.cpp:
+        The full include-list for /work/src/app.cpp:
         ---
 
-        /work/src/b.cpp should add these lines:
+        /work/src/lib.cpp should add these lines:
 
-        /work/src/b.cpp should remove these lines:
+        /work/src/lib.cpp should remove these lines:
         - #include "shared.h"  // lines 7-7
 
-        The full include-list for /work/src/b.cpp:
+        The full include-list for /work/src/lib.cpp:
         ---
         """;
 
-    // The fixtures pair the finding-bearing block with a clean verdict for
-    // the second in-scope unit in DefaultDatabase — verdict records are
-    // reconciled against the selected unit count, so a single-file report
-    // would fail as incomplete coverage before findings are read.
+    // The fixtures pair the finding-bearing block with clean verdicts for
+    // every other in-scope unit in DefaultDatabase — verdict records are
+    // reconciled against the selected files by identity, so a report
+    // lacking any selected unit's verdict fails as incomplete coverage
+    // before findings are read.
     private const string OutputVendored = """
         /work/vendor/lib.cpp should add these lines:
         #include <map>             // for map
@@ -95,6 +99,8 @@ public sealed class IwyuAuditorTests
         ---
 
         (/work/src/app.cpp has correct #includes/fwd-decls)
+
+        (/work/src/lib.cpp has correct #includes/fwd-decls)
         """;
 
     private const string OutputAbsoluteOutsidePath = """
@@ -108,6 +114,8 @@ public sealed class IwyuAuditorTests
         ---
 
         (/work/src/app.cpp has correct #includes/fwd-decls)
+
+        (/work/src/lib.cpp has correct #includes/fwd-decls)
         """;
 
     private const string DefaultDatabase = """
@@ -169,11 +177,14 @@ public sealed class IwyuAuditorTests
                 ? new SandboxExecResult(0, "/work/build\n/work\ndir-no-db\n", "")
                 : Ok(exec)));
 
-        var auditor = await InitializedAuditor();
+        // "build" is the configured value so the unrecognised-shape fallback
+        // cannot echo the asserted clause — only the dir-no-db branch
+        // produces it.
+        var auditor = await InitializedAuditor("build");
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
-        Assert.Contains("compile_commands.json", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("is a directory with no compile_commands.json", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -432,8 +443,12 @@ public sealed class IwyuAuditorTests
         var scanExecs = 0;
         var sandbox = new FakeSandbox((exec, _) =>
         {
+            // Only the driver's presence probe fails — the engine stays
+            // installed, so the driver check's absence cannot be masked by
+            // the engine presence check failing instead.
             if (IsPresenceProbe(exec))
-                return Task.FromResult(new SandboxExecResult(1, "", ""));
+                return Task.FromResult(new SandboxExecResult(
+                    exec.Argv.Contains("iwyu_tool", StringComparer.Ordinal) ? 1 : 0, "", ""));
             if (exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1)
                 scanExecs++;
             return Task.FromResult(Ok(exec));
@@ -443,7 +458,7 @@ public sealed class IwyuAuditorTests
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
-        Assert.Contains("iwyu_tool", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("'iwyu_tool' is not installed", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -465,7 +480,7 @@ public sealed class IwyuAuditorTests
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
-        Assert.Contains("include-what-you-use", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("'include-what-you-use' is not installed", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, scanExecs);
     }
 
@@ -497,6 +512,9 @@ public sealed class IwyuAuditorTests
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
+        // Only the unreadable-version branch produces this clause — the
+        // downstream mismatch guard's message would name a version.
+        Assert.Contains("could not be determined", ex.Message, StringComparison.Ordinal);
         Assert.Contains("include-what-you-use", ex.Message, StringComparison.Ordinal);
     }
 
@@ -520,6 +538,9 @@ public sealed class IwyuAuditorTests
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
+        // Only the unparseable-config rejection produces this clause — the
+        // downstream mismatch guard's message also embeds the key name.
+        Assert.Contains("unparseable", ex.Message, StringComparison.Ordinal);
         Assert.Contains("ExpectedVersion", ex.Message, StringComparison.Ordinal);
         Assert.True(ex.IsDeterministic);
     }
@@ -545,7 +566,7 @@ public sealed class IwyuAuditorTests
 
         var coverage = Assert.Single(result.Findings, f => f.Title.Contains("iwyu-coverage", StringComparison.Ordinal));
         Assert.Equal(AuditSeverity.Info, coverage.Severity);
-        Assert.Contains("2 file(s)", coverage.Title, StringComparison.Ordinal);
+        Assert.Contains("3 file(s)", coverage.Title, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -589,11 +610,16 @@ public sealed class IwyuAuditorTests
         // iwyu_tool's exit aggregation folds a signal-killed unit's negative
         // returncode into exit 0, so the exit code alone cannot prove the
         // selected units ran: the report carries one verdict while the
-        // database selected two in-worktree units.
+        // database selected two in-worktree units — reconciliation is by
+        // file identity, so an extra verdict for an associated header (like
+        // src/util.h here) cannot mask the missing unit.
         var sandbox = new FakeSandbox((exec, _) =>
             Task.FromResult(exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1
                 ? new SandboxExecResult(
-                    0, "(/work/src/app.cpp has correct #includes/fwd-decls)\n", "")
+                    0,
+                    "(/work/src/app.cpp has correct #includes/fwd-decls)\n"
+                        + "(/work/src/util.h has correct #includes/fwd-decls)\n",
+                    "")
                 : Ok(exec)));
 
         var auditor = await InitializedAuditor();
@@ -601,6 +627,7 @@ public sealed class IwyuAuditorTests
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("fewer", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("src/lib.cpp", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -655,8 +682,8 @@ public sealed class IwyuAuditorTests
 
         var removals = result.Findings.Where(f => f.Title.Contains("iwyu-remove", StringComparison.Ordinal)).ToList();
         Assert.Equal(2, removals.Count); // one per TU — the suggestion lives in different files
-        Assert.Contains(removals, f => f.Location == "src/a.cpp:4");
-        Assert.Contains(removals, f => f.Location == "src/b.cpp:7");
+        Assert.Contains(removals, f => f.Location == "src/app.cpp:4");
+        Assert.Contains(removals, f => f.Location == "src/lib.cpp:7");
     }
 
     [Fact]

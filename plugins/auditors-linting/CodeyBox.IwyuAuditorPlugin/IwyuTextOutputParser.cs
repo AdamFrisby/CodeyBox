@@ -31,11 +31,13 @@ namespace CodeyBox.IwyuAuditorPlugin;
 /// that matched nothing, or output corruption) — the parser throws
 /// <see cref="ExternalToolParseException"/>, which the base reports as
 /// infrastructure rather than letting a vacuous run read as a pass. When
-/// the input carries <see cref="ExternalToolParseInput.ExpectedVerdictCount"/>,
-/// fewer verdict records than selected translation units fail the same way:
-/// iwyu_tool's <c>max()</c> exit aggregation cannot raise a signal-killed
-/// child's negative returncode above 0, so the count is the only evidence a
-/// missing unit leaves.
+/// the input carries <see cref="ExternalToolParseInput.ExpectedVerdictFiles"/>,
+/// every selected unit's file must carry a verdict record: iwyu_tool's
+/// <c>max()</c> exit aggregation cannot raise a signal-killed child's
+/// negative returncode above 0, so the record is the only evidence a
+/// missing unit leaves — and reconciliation is by file identity, not
+/// record count, because a surviving unit's associated-header verdicts
+/// emit extra records that would mask the missing one in a count.
 /// Compiler diagnostics, iwyu's own notes, and any other unrecognised line
 /// in the general state are not include findings and are ignored — they stay
 /// visible in the raw output.</para>
@@ -83,6 +85,12 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
     private const int MaxReportedPathChars = 1024;
     private const int MaxReportedLineChars = 2048;
 
+    // Per-path cap when naming uncovered units in the reconciliation
+    // failure, and the number of missing paths listed — the message is
+    // bounded even though the paths are auditor-computed, not raw output.
+    private const int MaxMissingPathChars = 160;
+    private const int MaxMissingPathsListed = 3;
+
     // Unit separator for the duplicate-suppression key (the same header
     // diagnostic is re-emitted once per translation unit that includes it).
     private const string IdentityFieldSeparator = "\u001f";
@@ -118,7 +126,8 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
         var findings = new List<ExternalToolFinding>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var dropped = 0;
-        var verdictFiles = 0;
+        var verdictRecords = 0;
+        var coveredFiles = new HashSet<string>(StringComparer.Ordinal);
         var state = Section.General;
         string? sectionPath = null;
 
@@ -147,7 +156,8 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
             {
                 state = Section.List;
                 sectionPath = listHeader.Groups["path"].Value;
-                verdictFiles++;
+                verdictRecords++;
+                RecordCoveredFile(coveredFiles, sectionPath, input);
                 continue;
             }
 
@@ -163,7 +173,8 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
             {
                 state = Section.General;
                 sectionPath = null;
-                verdictFiles++;
+                verdictRecords++;
+                RecordCoveredFile(coveredFiles, correct.Groups["path"].Value, input);
                 continue;
             }
 
@@ -218,7 +229,7 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
             }
         }
 
-        if (verdictFiles == 0)
+        if (verdictRecords == 0)
         {
             throw new ExternalToolParseException(
                 $"Tool '{input.ToolName}' produced output (exit {input.ExitCode}) containing no "
@@ -227,23 +238,27 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
                 + "#includes/fwd-decls' block, so no translation unit's verdict can be trusted.");
         }
 
-        if (input.ExpectedVerdictCount is { } expected && verdictFiles < expected)
+        if (input.ExpectedVerdictFiles is { } expected)
         {
-            throw new ExternalToolParseException(
-                $"Tool '{input.ToolName}' produced verdict records for {verdictFiles} file(s), fewer "
-                + $"than the {expected} translation units selected from the compilation database — a "
-                + "unit that exited without a verdict (iwyu_tool's exit aggregation folds a "
-                + "signal-killed child into exit 0) leaves coverage unverifiable, so this is "
-                + "infrastructure, not a pass.");
+            var missing = expected.Where(file => !coveredFiles.Contains(file)).ToList();
+            if (missing.Count > 0)
+                throw new ExternalToolParseException(
+                    $"Tool '{input.ToolName}' produced no verdict record for {missing.Count} of the "
+                    + $"{expected.Count} translation units selected from the compilation database "
+                    + $"(no verdict covers {FormatMissing(missing)}) — fewer verdicts than selected "
+                    + "units means a unit exited without producing one (iwyu_tool's exit aggregation "
+                    + "folds a signal-killed child into exit 0), and extra records for associated "
+                    + "headers cannot stand in for it, so coverage is unverifiable: this is "
+                    + "infrastructure, not a pass.");
         }
 
-        // Coverage record: exactly how many file verdicts the run produced.
-        // Emitted at note level so it never gates and can be filtered via
-        // MinimumSeverity or ExcludedRules.
+        // Coverage record: how many distinct files the run produced a
+        // verdict for. Emitted at note level so it never gates and can be
+        // filtered via MinimumSeverity or ExcludedRules.
         findings.Add(new ExternalToolFinding(
             SeverityLevel: CoverageLevel,
             RuleId: CoverageRuleId,
-            Message: $"include-what-you-use produced include verdicts for {verdictFiles} file(s)."));
+            Message: $"include-what-you-use produced include verdicts for {coveredFiles.Count} file(s)."));
 
         // The parser-side cap drops suggestions the base's truncation marker
         // cannot see — surface the drop as its own note record so a capped
@@ -257,6 +272,24 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
 
         return findings;
     }
+
+    // A verdict record's path joins the covered set under the same
+    // normalization findings use — anchors first, then the shared
+    // relativize-or-file:// policy — so reconciliation compares each
+    // expected unit against the location a finding would carry.
+    private static void RecordCoveredFile(
+        HashSet<string> coveredFiles,
+        string? rawPath,
+        ExternalToolParseInput input)
+    {
+        if (NormalizeReportedPath(rawPath, input) is { } path)
+            coveredFiles.Add(path);
+    }
+
+    private static string FormatMissing(IReadOnlyList<string> missing)
+        => string.Join(", ", missing.Take(MaxMissingPathsListed).Select(
+                static m => $"'{ExternalToolJsonHelpers.Truncate(m, MaxMissingPathChars)}'"))
+            + (missing.Count > MaxMissingPathsListed ? ", …" : string.Empty);
 
     private static void AddFinding(
         List<ExternalToolFinding> findings,

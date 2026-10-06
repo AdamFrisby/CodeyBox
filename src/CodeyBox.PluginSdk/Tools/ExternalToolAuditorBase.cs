@@ -47,6 +47,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
     // already frozen.
     private readonly AsyncLocal<string?> _perRunTempDirectoryPath = new();
 
+    // Per-run mutable cell minted by RunAsync next to the scratch directory,
+    // carrying the plugin's PerRunState. The CELL travels by AsyncLocal —
+    // downward into every hook RunAsync calls — while the plugin mutates the
+    // shared cell's contents: an AsyncLocal assignment inside an async hook
+    // would stay on that hook's execution-context copy and never reach the
+    // later hooks (the reason the base, not a hook, owns the assignment).
+    private readonly AsyncLocal<RunStateCell?> _perRunStateCell = new();
+
+    private sealed class RunStateCell
+    {
+        internal object? State;
+    }
+
     // Each candidate is probed with -e (exists) and -L (symlink — catches a
     // dangling symlink that -e would miss) and echoed when present; the
     // script always exits 0 once it completes, so the exit code carries only
@@ -291,6 +304,33 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 + "available while a run is in progress.")
             { IsDeterministic = true };
 
+    /// <summary>
+    /// A per-run state slot for hooks that must hand data computed in one
+    /// hook to a later hook of the SAME run — e.g.
+    /// <see cref="ResolveContextArgumentsAsync"/> analysis consumed by
+    /// <see cref="ResolveParserInputAsync"/>. <see cref="RunAsync"/> mints the
+    /// cell before any hook runs and clears it when the run finishes, so the
+    /// value never crosses runs and concurrent audits on this (singleton)
+    /// auditor cannot cross-contaminate. The cell travels to hooks through
+    /// AsyncLocal's downward flow; hooks must only read/write this property —
+    /// assigning their own AsyncLocal inside a hook would stay invisible to
+    /// the run. The slot is <see cref="object"/> so each plugin owns its own
+    /// state type; read with a pattern check. Throws a deterministic
+    /// <see cref="AuditUnavailableException"/> when read or written outside
+    /// a run.
+    /// </summary>
+    protected object? PerRunState
+    {
+        get => PerRunStateCell().State;
+        set => PerRunStateCell().State = value;
+    }
+
+    private RunStateCell PerRunStateCell()
+        => _perRunStateCell.Value ?? throw new AuditUnavailableException(
+            $"could-not-verify: audit tool '{ToolName}' per-run state is only available while a run "
+            + "is in progress.")
+        { IsDeterministic = true };
+
     private static string MintPerRunTempDirectoryPath(string tool)
         => Path.Combine(Path.GetTempPath(), "codeybox-" + tool + "-" + Guid.NewGuid().ToString("N"));
 
@@ -307,6 +347,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var tool = ExternalToolNames.Validate(ToolName, nameof(ToolName));
         var options = OptionsAccessor() ?? new ExternalToolAuditorOptions();
         _perRunTempDirectoryPath.Value = MintPerRunTempDirectoryPath(tool);
+        _perRunStateCell.Value = new RunStateCell();
         try
         {
             var contextArguments = await ResolveContextArgumentsAsync(
@@ -345,6 +386,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         finally
         {
             _perRunTempDirectoryPath.Value = null;
+            _perRunStateCell.Value = null;
         }
     }
 

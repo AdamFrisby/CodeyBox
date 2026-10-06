@@ -1,4 +1,3 @@
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
@@ -48,9 +47,10 @@ namespace CodeyBox.IwyuAuditorPlugin;
 /// analysed". <c>iwyu_tool</c> aggregates the worst child exit code via
 /// <c>max()</c> — a signal-killed unit's negative returncode cannot raise
 /// the aggregate above <c>0</c>, so the exit code alone cannot prove full
-/// coverage. The report is therefore reconciled against the parsed
-/// database: <c>0</c> with fewer verdict records than selected in-worktree
-/// units (a unit that produced no verdict at all) fails closed as
+/// coverage. The report is therefore reconciled against the coverage plan
+/// the parsed database yielded: <c>0</c> where a selected in-worktree
+/// unit's file carries no verdict record (a unit that produced no verdict
+/// at all) fails closed as
 /// infrastructure, and any other exit means at least one unit failed or
 /// the driver itself failed — infrastructure, never a partial pass.
 /// <c>126</c>/<c>127</c> = cannot execute / not found. A literal
@@ -83,7 +83,8 @@ namespace CodeyBox.IwyuAuditorPlugin;
 /// the coverage accounting explicit: zero in-worktree entries is a
 /// deterministic infrastructure failure (never a vacuous pass), the
 /// out-of-tree entry count is logged per run, and the parsed report's
-/// verdict count is reconciled against the in-scope unit count so a unit
+/// verdict records are reconciled against the selected in-worktree files
+/// by path identity, so a unit
 /// that exited without producing a verdict (e.g. signal-killed — iwyu_tool's
 /// <c>max()</c> aggregation folds that into exit <c>0</c>) is an
 /// infrastructure failure, not a silent partial pass.</para>
@@ -177,46 +178,8 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
     // arbitrarily many entries, and per-entry work must stay bounded.
     private const int MaxCompilationDatabaseEntriesCeiling = 65_536;
 
-    // Per-field bound on untrusted database strings (file/directory): enough
-    // for the deepest real path, small enough that a hostile entry cannot
-    // bloat argv or failure text.
-    private const int MaxDatabaseFieldChars = 1024;
-
-    // Bounds on an entry's compile invocation: a single 'command' string or
-    // each 'arguments' element, and the element count. Compile command lines
-    // are legitimately long; these bound per-entry work without excluding
-    // real-world databases.
-    private const int MaxCompileCommandChars = 8192;
-    private const int MaxCompileArguments = 512;
-
     /// <summary>The analysis engine iwyu_tool execs per translation unit.</summary>
     private const string EngineBinary = "include-what-you-use";
-
-    // Canonicalization + file-type probe for the configured database path.
-    // Two realpath lines first (the configured path resolved in the
-    // sandbox's own path space — providers may translate the exec working
-    // directory — and the canonical worktree root), then for a directory
-    // holding a compile_commands.json a third realpath line resolving the
-    // LEAF — [ -f ] follows symlinks, so without it a repo-controlled
-    // compile_commands.json symlink would pass the directory containment
-    // check yet redirect the bounded read (and the -p operand) outside the
-    // worktree — then a marker line: dir (leaf emitted), dir-no-db, file, or
-    // missing. Structured argv: the configured path travels as "$1", never
-    // inside the script text.
-    private const string DatabasePathProbeScript =
-        "realpath -m -- \"$1\" . || exit 1\n"
-        + "if [ -d \"$1\" ]; then\n"
-        + "  if [ -f \"$1/compile_commands.json\" ]; then\n"
-        + "    realpath -m -- \"$1/compile_commands.json\" || exit 1\n"
-        + "    echo dir\n"
-        + "  else\n"
-        + "    echo dir-no-db\n"
-        + "  fi\n"
-        + "elif [ -f \"$1\" ]; then\n"
-        + "  echo file\n"
-        + "else\n"
-        + "  echo missing\n"
-        + "fi";
 
     // IWYU's version banner: "include-what-you-use 0.21 based on Ubuntu
     // clang version 18.1.3". The IWYU token — never the clang token — is the
@@ -251,6 +214,14 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
     private Func<string?> _compilationDatabase = static () => null;
     private Func<int> _maxDatabaseEntries = static () => DefaultMaxCompilationDatabaseEntries;
     private ILogger _logger = NullLogger.Instance;
+
+    // The run's coverage plan rides the base's PerRunState slot from
+    // ResolveContextArgumentsAsync to ResolveParserInputAsync. The pre-scan
+    // analysis is the faithful plan: entry compile flags reach the clang
+    // driver verbatim and can rewrite the database file mid-run, so a
+    // post-scan re-read could describe a different database than the one
+    // iwyu_tool selected from.
+    private sealed record PerRunPlan(string DatabaseFile, CompilationDatabasePlan Analysis);
 
     /// <inheritdoc />
     public override string Name => "codeybox:iwyu";
@@ -337,8 +308,10 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
             sandbox, workingDirectory, configured.Trim(), options, ct).ConfigureAwait(false);
         var databaseJson = await ReadDatabaseAsync(sandbox, workingDirectory, databaseFile, options, ct)
             .ConfigureAwait(false);
-        var analysis = AnalyzeCompilationDatabase(databaseJson, worktreeRoot);
-        ReportCoverage((analysis.InScope, analysis.OutOfScope));
+        var analysis = IwyuCompilationDatabase.Analyze(
+            databaseJson, worktreeRoot, _maxDatabaseEntries(), ToolName);
+        ReportCoverage(analysis);
+        PerRunState = new PerRunPlan(databaseFile, analysis);
 
         // Selecting the worktree root asks iwyu_tool for exactly the
         // canonicalized-in-tree entries — the source-containment boundary.
@@ -427,7 +400,7 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
             "compilation-database resolution",
             new SandboxExec
             {
-                Argv = ["sh", "-c", DatabasePathProbeScript, "sh", candidate],
+                Argv = ["sh", "-c", IwyuCompilationDatabase.PathProbeScript, "sh", candidate],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
@@ -547,265 +520,23 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
         return read.Stdout ?? string.Empty;
     }
 
-    /// <summary>
-    /// Counts database entries whose canonicalized <c>file</c> resolves
-    /// inside the audited worktree — a lexical approximation of the set
-    /// <c>iwyu_tool … .</c> selects (see
-    /// <see cref="CanonicalizeEntryFile"/>) — and collects the
-    /// relative-path anchors the parser uses to resolve path spellings
-    /// reported against each entry's <c>directory</c>. The JSON is
-    /// repository content: a malformed document, a malformed entry, more
-    /// than the configured entry bound, or zero in-worktree translation
-    /// units are all deterministic infrastructure failures — a vacuous or
-    /// unaccountable-coverage run is never a pass.
-    /// </summary>
-    private (int InScope, int OutOfScope, IReadOnlyDictionary<string, string> RelativePathAnchors)
-        AnalyzeCompilationDatabase(string json, string worktreeRoot)
+    private void ReportCoverage(CompilationDatabasePlan analysis)
     {
-        var maxEntries = _maxDatabaseEntries();
-        JsonDocument document;
-        try
-        {
-            document = JsonDocument.Parse(json);
-        }
-        catch (JsonException ex)
-        {
-            throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{ToolName}' read a compilation database that is not "
-                + $"valid JSON: {SingleLine(ex.Message)}",
-                ex)
-            { IsDeterministic = true };
-        }
-
-        using (document)
-        {
-            if (document.RootElement.ValueKind != JsonValueKind.Array)
-                throw MalformedDatabase("the root is not a JSON array");
-
-            var inScope = 0;
-            var outOfScope = 0;
-            var anchors = new Dictionary<string, string>(StringComparer.Ordinal);
-            var ambiguousAnchors = new HashSet<string>(StringComparer.Ordinal);
-            var entryIndex = 0;
-            foreach (var entry in document.RootElement.EnumerateArray())
-            {
-                if (++entryIndex > maxEntries)
-                    throw new AuditUnavailableException(
-                        $"could-not-verify: audit tool '{ToolName}' compilation database holds more "
-                        + $"than {maxEntries} entries — the per-run bound keeps "
-                        + "coverage accounting finite. Narrow the build or raise "
-                        + $"CodeyBox:Plugins:{PluginId}:{MaxCompilationDatabaseEntriesKey}.")
-                    { IsDeterministic = true };
-
-                if (entry.ValueKind != JsonValueKind.Object)
-                    throw MalformedDatabase($"entry #{entryIndex} is not an object");
-
-                var file = ExternalToolJsonHelpers.GetString(entry, "file"u8);
-                if (file is null || file.Length == 0)
-                    throw MalformedDatabase($"entry #{entryIndex} has no usable 'file' path");
-                if (file.Length > MaxDatabaseFieldChars || file.Any(char.IsControl))
-                    throw MalformedDatabase($"entry #{entryIndex} has an overlong or control-carrying 'file' path");
-
-                var directory = ExternalToolJsonHelpers.GetString(entry, "directory"u8);
-                if (directory is null)
-                    // iwyu_tool reads entry['directory'] unconditionally —
-                    // a missing field crashes the driver at run time, so it
-                    // fails deterministically here instead.
-                    throw MalformedDatabase($"entry #{entryIndex} has no usable 'directory' path");
-                if (directory.Length == 0 || directory.Length > MaxDatabaseFieldChars
-                    || directory.Any(char.IsControl))
-                    throw MalformedDatabase(
-                        $"entry #{entryIndex} has an overlong or control-carrying 'directory' path");
-
-                if (!HasUsableInvocation(entry))
-                    throw MalformedDatabase(
-                        $"entry #{entryIndex} has no usable 'command' string or 'arguments' string "
-                        + "array — iwyu_tool raises on entries it cannot exec, which would crash "
-                        + "the driver mid-run");
-
-                var canonical = CanonicalizeEntryFile(file, directory, worktreeRoot);
-                if (HostPathPolicy.IsStrictlyWithinDirectory(canonical, worktreeRoot))
-                {
-                    inScope++;
-                    AddEntryAnchors(anchors, ambiguousAnchors, file, directory, canonical, worktreeRoot);
-                }
-                else
-                {
-                    outOfScope++;
-                }
-            }
-
-            if (inScope == 0)
-                throw new AuditUnavailableException(
-                    $"could-not-verify: audit tool '{ToolName}' compilation database lists no "
-                    + "translation units inside the audited worktree — nothing can be analysed, so "
-                    + "this is infrastructure, not a pass. Check that the database was generated "
-                    + "against this tree.")
-                { IsDeterministic = true };
-
-            return (inScope, outOfScope, anchors);
-        }
-    }
-
-    // An entry is runnable when it carries a non-empty 'command' string or a
-    // non-empty 'arguments' string array — the two shapes iwyu_tool's
-    // Invocation.from_compile_command accepts; anything else raises mid-run.
-    // Both are bounded here so a hostile entry cannot bloat argv.
-    private static bool HasUsableInvocation(JsonElement entry)
-    {
-        if (ExternalToolJsonHelpers.GetString(entry, "command"u8) is { Length: > 0 } command
-            && command.Length <= MaxCompileCommandChars)
-            return true;
-        if (!entry.TryGetProperty("arguments"u8, out var arguments)
-            || arguments.ValueKind != JsonValueKind.Array)
-            return false;
-        var count = 0;
-        foreach (var argument in arguments.EnumerateArray())
-        {
-            if (++count > MaxCompileArguments
-                || argument.ValueKind != JsonValueKind.String
-                || argument.GetString() is not { Length: > 0 } value
-                || value.Length > MaxCompileCommandChars)
-                return false;
-        }
-        return count > 0;
-    }
-
-    /// <summary>
-    /// Resolves a database entry's <c>file</c> to its would-be canonical
-    /// path — relative <c>file</c> joins <c>directory</c> (which iwyu_tool
-    /// requires on every entry), and a relative <c>directory</c> joins the
-    /// worktree root the driver runs in. This is a LEXICAL approximation of
-    /// iwyu_tool's <c>os.path.realpath</c> fixup
-    /// (<c>fixup_compilation_db</c> + <c>is_subpath_of</c>): it collapses dot
-    /// segments but cannot resolve symlink components, so a <c>file</c>
-    /// traversing an in-tree symlink to outside the worktree counts as
-    /// in-scope here while iwyu_tool skips it. The divergence cannot widen
-    /// analysis — the tool's own realpath selection is the boundary — and
-    /// the report's verdict count is reconciled against the in-scope count
-    /// so a skipped entry surfaces as an infrastructure failure rather than
-    /// silent partial coverage.
-    /// </summary>
-    private static string CanonicalizeEntryFile(string file, string directory, string worktreeRoot)
-    {
-        string combined;
-        if (file.StartsWith("/", StringComparison.Ordinal))
-        {
-            combined = file;
-        }
-        else if (!directory.StartsWith("/", StringComparison.Ordinal))
-        {
-            // A relative directory resolves against the driver's cwd — the
-            // worktree.
-            combined = worktreeRoot + "/" + directory + "/" + file;
-        }
-        else
-        {
-            combined = directory + "/" + file;
-        }
-
-        return ExternalToolJsonHelpers.CollapseDotSegments(
-            ExternalToolJsonHelpers.NormalizePath(combined));
-    }
-
-    // Registers the relative spellings under which IWYU can report this
-    // entry's file — the 'file' field itself when relative, and the
-    // canonical file spelled relative to the entry's 'directory' (the cwd
-    // iwyu_tool runs the compile command in, e.g. "-c ../src/a.cc") — each
-    // mapped to the file's repository-relative path. A key claimed by two
-    // different resolutions is ambiguous and dropped: the parser falls back
-    // to the shared reported-path policy for it.
-    private static void AddEntryAnchors(
-        Dictionary<string, string> anchors,
-        HashSet<string> ambiguousAnchors,
-        string file,
-        string directory,
-        string canonicalFile,
-        string worktreeRoot)
-    {
-        var prefix = worktreeRoot == "/" ? "/" : worktreeRoot + "/";
-        if (!canonicalFile.StartsWith(prefix, StringComparison.Ordinal))
-            return;
-        var repositoryRelative = canonicalFile[prefix.Length..];
-
-        var canonicalDirectory = directory.StartsWith("/", StringComparison.Ordinal)
-            ? ExternalToolJsonHelpers.CollapseDotSegments(
-                ExternalToolJsonHelpers.NormalizePath(directory))
-            : ExternalToolJsonHelpers.CollapseDotSegments(
-                ExternalToolJsonHelpers.NormalizePath(worktreeRoot + "/" + directory));
-
-        if (!file.StartsWith("/", StringComparison.Ordinal))
-            AddAnchor(anchors, ambiguousAnchors, file, repositoryRelative);
-        AddAnchor(
-            anchors, ambiguousAnchors,
-            RelativeSpelling(canonicalDirectory, canonicalFile), repositoryRelative);
-    }
-
-    private static void AddAnchor(
-        Dictionary<string, string> anchors,
-        HashSet<string> ambiguousAnchors,
-        string spelling,
-        string repositoryRelative)
-    {
-        var key = ExternalToolJsonHelpers.CollapseDotSegments(
-            ExternalToolJsonHelpers.NormalizePath(spelling));
-        if (key.Length == 0 || key.StartsWith("/", StringComparison.Ordinal)
-            || ambiguousAnchors.Contains(key))
-            return;
-        if (anchors.TryGetValue(key, out var existing)
-            && !string.Equals(existing, repositoryRelative, StringComparison.Ordinal))
-        {
-            anchors.Remove(key);
-            ambiguousAnchors.Add(key);
-            return;
-        }
-        anchors[key] = repositoryRelative;
-    }
-
-    // The canonical absolute path `toPath` spelled relative to the canonical
-    // absolute directory `fromDir` — the form a compile command's source
-    // operand takes when the build spells sources relative to the build
-    // directory ("../src/a.cc" from /work/build to /work/src/a.cc).
-    private static string RelativeSpelling(string fromDir, string toPath)
-    {
-        var from = fromDir.Split('/');
-        var to = toPath.Split('/');
-        var common = 0;
-        while (common < from.Length && common < to.Length && from[common] == to[common])
-            common++;
-        var builder = new System.Text.StringBuilder();
-        for (var i = common; i < from.Length; i++)
-        {
-            if (from[i].Length > 0)
-                builder.Append("../");
-        }
-        builder.Append(string.Join('/', to.Skip(common)));
-        return builder.ToString();
-    }
-
-    private void ReportCoverage((int InScope, int OutOfScope) coverage)
-    {
-        if (coverage.OutOfScope > 0)
+        if (analysis.OutOfScopeCount > 0)
         {
             _logger.LogWarning(
                 "IwyuAuditor: {OutOfScope} compilation-database entries resolve outside the audited "
                     + "worktree and were not analysed (in-scope: {InScope}).",
-                coverage.OutOfScope,
-                coverage.InScope);
+                analysis.OutOfScopeCount,
+                analysis.InScopeFiles.Count);
         }
         else
         {
             _logger.LogInformation(
                 "IwyuAuditor: {InScope} in-worktree translation units selected for analysis.",
-                coverage.InScope);
+                analysis.InScopeFiles.Count);
         }
     }
-
-    private AuditUnavailableException MalformedDatabase(string detail)
-        => new(
-            $"could-not-verify: audit tool '{ToolName}' read a malformed compilation database "
-            + $"({detail}). Regenerate it with a conforming build tool.")
-        { IsDeterministic = true };
 
     /// <summary>
     /// Resolves the canonical directory the aggregated scan runs in.
@@ -857,17 +588,22 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <summary>
-    /// Re-derives the coverage plan from the database the scan actually ran
-    /// against — the resolved <c>-p</c> operand on the argv, not a re-read
-    /// of scoped config that a hot reload could have flipped since the
-    /// arguments were built — and stamps it onto the parse input: the
-    /// in-scope translation-unit count the parser reconciles verdict
-    /// records against (iwyu_tool's <c>max()</c> exit aggregation can hide
-    /// a unit that produced no verdict), and the relative-path anchors
-    /// resolving spellings reported against an entry's <c>directory</c>.
-    /// The re-read is the same bounded read the run already performed.
+    /// Stamps the run's coverage plan — recorded by
+    /// <see cref="ResolveContextArgumentsAsync"/> from the database the scan
+    /// ran against — onto the parse input: the repository-relative files the
+    /// selection covers (each must carry a verdict record; iwyu_tool's
+    /// <c>max()</c> exit aggregation can hide a unit that produced none) and
+    /// the relative-path anchors resolving spellings reported against an
+    /// entry's <c>directory</c>. The plan rides the <see cref="PerRunState"/>
+    /// slot rather than being re-derived post-scan: the scan's own compile
+    /// flags can
+    /// rewrite the database file mid-run, so a re-read could describe a
+    /// different database than the one iwyu_tool parsed. A run that reaches
+    /// here with no recorded plan, or whose argv lost the
+    /// <c>-p &lt;database&gt;</c> operand that names the analysed file, is a
+    /// defect — reconciliation fails closed instead of silently disabling.
     /// </summary>
-    protected override async Task<ExternalToolParseInput> ResolveParserInputAsync(
+    protected override Task<ExternalToolParseInput> ResolveParserInputAsync(
         ISandbox sandbox,
         string workingDirectory,
         string tool,
@@ -877,20 +613,34 @@ public sealed class IwyuAuditor : ExternalToolAuditorBase, IPluginInitializer
         string? scanRoot,
         CancellationToken ct)
     {
-        (int InScope, IReadOnlyDictionary<string, string> Anchors)? plan = null;
-        if (argv.Count > 2 && argv[1] == "-p" && scanRoot is not null)
-        {
-            var databaseJson = await ReadDatabaseAsync(
-                sandbox, workingDirectory, argv[2], options, ct).ConfigureAwait(false);
-            var analysis = AnalyzeCompilationDatabase(databaseJson, scanRoot);
-            plan = (analysis.InScope, analysis.RelativePathAnchors);
-        }
+        var perRun = PerRunState as PerRunPlan;
+        PerRunState = null;
+        if (perRun is null || !ArgvCarriesDatabaseOperand(argv, perRun.DatabaseFile))
+            throw new AuditUnavailableException(
+                $"could-not-verify: audit tool '{ToolName}' produced a report whose coverage cannot "
+                + "be reconciled — the run's compilation-database plan is missing, or the scan argv "
+                + "lost its '-p <database>' operand — so this is infrastructure, not a pass.")
+            { IsDeterministic = true };
 
-        return new ExternalToolParseInput(
+        return Task.FromResult(new ExternalToolParseInput(
             tool, result.Stdout, result.Stderr, result.ExitCode,
             ScanRoot: scanRoot, WorkingDirectory: workingDirectory,
-            ExpectedVerdictCount: plan?.InScope,
-            RelativePathAnchors: plan?.Anchors);
+            ExpectedVerdictFiles: perRun.Analysis.InScopeFiles,
+            RelativePathAnchors: perRun.Analysis.RelativePathAnchors));
+    }
+
+    // The scan argv must name the database the plan analysed: "-p" followed
+    // by the resolved file. Structural search rather than a fixed index —
+    // author-built and operator arguments can precede or follow the context
+    // arguments, so position alone is not the contract.
+    private static bool ArgvCarriesDatabaseOperand(IReadOnlyList<string> argv, string databaseFile)
+    {
+        for (var i = 1; i + 1 < argv.Count; i++)
+        {
+            if (argv[i] == "-p" && argv[i + 1] == databaseFile)
+                return true;
+        }
+        return false;
     }
 
     // The pin's expected side: the configured spelling normalized to the
