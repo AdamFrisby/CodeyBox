@@ -14,7 +14,7 @@ namespace CodeyBox.IwyuAuditorPlugin;
 /// <para>The per-file grammar (verified against IWYU 0.21's
 /// <c>iwyu_output.cc</c> — <c>CalculateAndReportIwyuViolations</c>):</para>
 /// <list type="bullet">
-/// <item><c>(PATH) has correct #includes/fwd-decls)</c> — a file needing no
+/// <item><c>(PATH has correct #includes/fwd-decls)</c> — a file needing no
 /// edits. Records a verdict, produces no finding.</item>
 /// <item><c>PATH should add these lines:</c> followed by the desired
 /// include/fwd-declare lines (<c>#include &lt;vector&gt;  // for std::vector</c>,
@@ -30,7 +30,12 @@ namespace CodeyBox.IwyuAuditorPlugin;
 /// means iwyu_tool ran no translation unit (an empty database, a selection
 /// that matched nothing, or output corruption) — the parser throws
 /// <see cref="ExternalToolParseException"/>, which the base reports as
-/// infrastructure rather than letting a vacuous run read as a pass.
+/// infrastructure rather than letting a vacuous run read as a pass. When
+/// the input carries <see cref="ExternalToolParseInput.ExpectedVerdictCount"/>,
+/// fewer verdict records than selected translation units fail the same way:
+/// iwyu_tool's <c>max()</c> exit aggregation cannot raise a signal-killed
+/// child's negative returncode above 0, so the count is the only evidence a
+/// missing unit leaves.
 /// Compiler diagnostics, iwyu's own notes, and any other unrecognised line
 /// in the general state are not include findings and are ignored — they stay
 /// visible in the raw output.</para>
@@ -40,7 +45,15 @@ namespace CodeyBox.IwyuAuditorPlugin;
 /// absolute paths are relativized against the probed scan root, anything
 /// that stays absolute or still carries a <c>..</c> escape is re-marked with
 /// a <c>file://</c> prefix so it can never read as a repository-relative
-/// location.</para>
+/// location. Relative spellings are first resolved against
+/// <see cref="ExternalToolParseInput.RelativePathAnchors"/> — iwyu_tool runs
+/// each unit with <c>cwd = entry.directory</c> and IWYU prints the source
+/// path as the compile command spelled it, so <c>../src/a.cc</c> from a
+/// build-directory entry resolves to the file it actually names rather than
+/// reading as an out-of-tree escape (and a bare <c>src/a.cc</c> spelled from
+/// a different directory is not mistaken for the repository-relative one).
+/// Unanchored spellings — e.g. associated headers IWYU resolved through
+/// include search paths — keep the shared policy.</para>
 /// </summary>
 internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
 {
@@ -52,6 +65,13 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
 
     /// <summary>Rule id attached to the single per-run coverage finding.</summary>
     internal const string CoverageRuleId = "iwyu-coverage";
+
+    /// <summary>
+    /// Rule id attached to the parser-cap record emitted when the report
+    /// carried more suggestions than <see cref="MaxResults"/> — the drop is
+    /// otherwise invisible to the base's finding-level truncation marker.
+    /// </summary>
+    internal const string TruncatedRuleId = "iwyu-truncated";
 
     /// <summary>Severity reported for include findings — advisory by design.</summary>
     internal const string ViolationLevel = "warning";
@@ -97,6 +117,7 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
 
         var findings = new List<ExternalToolFinding>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var dropped = 0;
         var verdictFiles = 0;
         var state = Section.General;
         string? sectionPath = null;
@@ -163,11 +184,18 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
                         SeverityLevel: ViolationLevel,
                         RuleId: AddRuleId,
                         Message: $"add missing include or forward declaration: '{suggestion}'",
-                        Path: path));
+                        Path: path),
+                    ref dropped);
             }
             else if (state == Section.Remove)
             {
-                var removal = RemovalPattern.Match(line);
+                // Removal entries carry "// lines N-M"; the cheap substring
+                // gate plus the length bound keep the regex's lazy match off
+                // pathological whitespace-dense lines.
+                var removal = line.Length <= MaxReportedLineChars
+                    && line.Contains("// lines ", StringComparison.Ordinal)
+                        ? RemovalPattern.Match(line)
+                        : Match.Empty;
                 var suggestion = removal.Success
                     ? removal.Groups["line"].Value.Trim()
                     : line.Trim().TrimStart('-').Trim();
@@ -185,7 +213,8 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
                         RuleId: RemoveRuleId,
                         Message: $"remove unneeded include or forward declaration: '{suggestion}'",
                         Path: path,
-                        Line: lineNumber));
+                        Line: lineNumber),
+                    ref dropped);
             }
         }
 
@@ -198,6 +227,16 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
                 + "#includes/fwd-decls' block, so no translation unit's verdict can be trusted.");
         }
 
+        if (input.ExpectedVerdictCount is { } expected && verdictFiles < expected)
+        {
+            throw new ExternalToolParseException(
+                $"Tool '{input.ToolName}' produced verdict records for {verdictFiles} file(s), fewer "
+                + $"than the {expected} translation units selected from the compilation database — a "
+                + "unit that exited without a verdict (iwyu_tool's exit aggregation folds a "
+                + "signal-killed child into exit 0) leaves coverage unverifiable, so this is "
+                + "infrastructure, not a pass.");
+        }
+
         // Coverage record: exactly how many file verdicts the run produced.
         // Emitted at note level so it never gates and can be filtered via
         // MinimumSeverity or ExcludedRules.
@@ -206,16 +245,30 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
             RuleId: CoverageRuleId,
             Message: $"include-what-you-use produced include verdicts for {verdictFiles} file(s)."));
 
+        // The parser-side cap drops suggestions the base's truncation marker
+        // cannot see — surface the drop as its own note record so a capped
+        // report is never mistaken for the complete one.
+        if (dropped > 0)
+            findings.Add(new ExternalToolFinding(
+                SeverityLevel: CoverageLevel,
+                RuleId: TruncatedRuleId,
+                Message: $"the report carried {dropped} further suggestion(s) beyond the "
+                    + $"{MaxResults}-result parser bound — they were dropped."));
+
         return findings;
     }
 
     private static void AddFinding(
         List<ExternalToolFinding> findings,
         HashSet<string> seen,
-        ExternalToolFinding finding)
+        ExternalToolFinding finding,
+        ref int dropped)
     {
         if (findings.Count >= MaxResults)
+        {
+            dropped++;
             return;
+        }
         if (seen.Add(string.Concat(
                 finding.RuleId ?? string.Empty, IdentityFieldSeparator,
                 finding.Path ?? string.Empty, IdentityFieldSeparator,
@@ -229,6 +282,23 @@ internal sealed class IwyuTextOutputParser : IExternalToolOutputParser
     {
         if (string.IsNullOrWhiteSpace(rawPath) || rawPath.Length > MaxReportedPathChars)
             return null;
+
+        // A relative spelling is anchored at the directory iwyu_tool ran the
+        // unit in (entry.directory), not the scan root — resolve it through
+        // the per-entry anchors the auditor computed from the database
+        // before the shared policy can read it as worktree-relative. The
+        // file:// strip mirrors the shared policy so a prefixed spelling
+        // resolves identically.
+        var normalized = ExternalToolJsonHelpers.NormalizePath(rawPath);
+        if (normalized.StartsWith(
+                ExternalToolJsonHelpers.FileSchemePrefix, StringComparison.OrdinalIgnoreCase))
+            normalized = normalized[ExternalToolJsonHelpers.FileSchemePrefix.Length..];
+        var collapsed = ExternalToolJsonHelpers.CollapseDotSegments(normalized);
+        if (collapsed.Length > 0 && !collapsed.StartsWith("/", StringComparison.Ordinal)
+            && input.RelativePathAnchors is { } anchors
+            && anchors.TryGetValue(collapsed, out var anchored))
+            return anchored;
+
         return ExternalToolJsonHelpers.NormalizeReportedPath(
             rawPath.Trim(), input.ScanRoot, input.WorkingDirectory);
     }

@@ -152,7 +152,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
     /// <summary>
     /// Optional pinned-version declaration. Non-null makes
-    /// <see cref="RunAsync"/> probe the tool with the pin's
+    /// <see cref="RunAsync"/> probe the pin's binary — the tool itself, or
+    /// <see cref="ToolVersionPin.ProbedBinary"/> when the version-pinned
+    /// component is a separate binary the driver execs — with the pin's
     /// <see cref="ToolVersionPin.VersionProbeArguments"/> before every scan —
     /// after the presence check, before <see cref="VerifyToolAsync"/> — and
     /// fail closed on a missing binary, an unrecognised version string, or a
@@ -591,6 +593,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
         if (VersionPin is not { } pin)
             return;
 
+        // The pin's subject is normally the tool itself, but a driver/engine
+        // split (iwyu_tool → include-what-you-use) pins the binary the driver
+        // execs. A different probed binary gets the same presence check the
+        // tool received — a missing engine is "not installed", not merely an
+        // unparseable banner.
+        var probedBinary = pin.ProbedBinary is { Length: > 0 } probed
+            ? ExternalToolNames.Validate(probed, nameof(pin.ProbedBinary))
+            : tool;
+        if (!string.Equals(probedBinary, tool, StringComparison.Ordinal))
+            await ThrowIfBinaryMissingAsync(
+                sandbox, workingDirectory, probedBinary, options, ct,
+                $"audit tool '{tool}' execs it during the scan").ConfigureAwait(false);
+
         var configured = pin.ConfiguredExpectedVersion();
         var expected = ExtractToolVersion(
             string.IsNullOrWhiteSpace(configured) ? pin.DefaultExpectedVersion : configured.Trim());
@@ -598,7 +613,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has an unparseable {ToolVersionPin.ExpectedVersionKey} "
                 + $"('{TruncateForMessage(configured)}'); set CodeyBox:Plugins:{pin.PluginId}:{ToolVersionPin.ExpectedVersionKey} "
-                + $"to a {tool} release such as '{pin.DefaultExpectedVersion}'.")
+                + $"to a {probedBinary} release such as '{pin.DefaultExpectedVersion}'.")
             { IsDeterministic = true };
 
         var probeArguments = pin.VersionProbeArguments.Count > 0
@@ -610,7 +625,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             "version check",
             new SandboxExec
             {
-                Argv = [tool, .. probeArguments],
+                Argv = [probedBinary, .. probeArguments],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
@@ -628,15 +643,15 @@ public abstract class ExternalToolAuditorBase : IAuditor
         if (result.ExitCode != 0
             || reported is null)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
+                $"could-not-verify: audit tool '{probedBinary}' version could not be determined "
                 + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
+                + $"a missing or foreign '{probedBinary}' is infrastructure, not a verdict on the diff.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
         if (!string.Equals(reported, expected, StringComparison.Ordinal))
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
+                $"could-not-verify: audit tool '{probedBinary}' is version {reported}, but this auditor is "
                 + $"pinned to {expected}. A different release changes the tool's checks and its "
                 + $"findings; provision the pinned release or set {ToolVersionPin.ExpectedVersionKey} "
                 + "to the version you provisioned.")

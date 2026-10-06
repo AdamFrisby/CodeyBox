@@ -22,9 +22,12 @@ namespace CodeyBox.Tests;
 /// - Add/remove blocks map to advisory iwyu-add/iwyu-remove findings with
 ///   normalized locations; a per-run iwyu-coverage info finding counts the
 ///   files that received verdicts; exit-0 output without verdict records
-///   fails closed.
-/// - IWYU_BINARY is stripped from the tool environment so the pinned engine
-///   cannot be swapped under the driver.
+///   fails closed, and exit-0 output with fewer verdicts than the
+///   selected in-worktree units is reconciled as infrastructure too
+///   (iwyu_tool folds a signal-killed unit into exit 0).
+/// - IWYU_BINARY and IWYU_VERBOSE are stripped from the tool environment so
+///   the pinned engine cannot be swapped under the driver and verdict
+///   sections cannot be silenced.
 /// - Operator -p and post-"--" --error/--error_always flags are rejected
 ///   deterministically (they would bypass database validation or renumber
 ///   the exit convention).
@@ -77,6 +80,10 @@ public sealed class IwyuAuditorTests
         ---
         """;
 
+    // The fixtures pair the finding-bearing block with a clean verdict for
+    // the second in-scope unit in DefaultDatabase — verdict records are
+    // reconciled against the selected unit count, so a single-file report
+    // would fail as incomplete coverage before findings are read.
     private const string OutputVendored = """
         /work/vendor/lib.cpp should add these lines:
         #include <map>             // for map
@@ -86,6 +93,8 @@ public sealed class IwyuAuditorTests
         The full include-list for /work/vendor/lib.cpp:
         #include <map>             // for map
         ---
+
+        (/work/src/app.cpp has correct #includes/fwd-decls)
         """;
 
     private const string OutputAbsoluteOutsidePath = """
@@ -97,6 +106,8 @@ public sealed class IwyuAuditorTests
         The full include-list for /usr/include/thing.h:
         #include <stdint.h>        // for uint32_t
         ---
+
+        (/work/src/app.cpp has correct #includes/fwd-decls)
         """;
 
     private const string DefaultDatabase = """
@@ -213,7 +224,8 @@ public sealed class IwyuAuditorTests
         var sandbox = new FakeSandbox((exec, _) =>
         {
             if (IsDatabasePathProbe(exec))
-                return Task.FromResult(new SandboxExecResult(0, "/work/build\n/work\ndir\n", ""));
+                return Task.FromResult(new SandboxExecResult(
+                    0, "/work/build\n/work\n/work/build/compile_commands.json\ndir\n", ""));
             if (exec.Argv[0] == "cat")
             {
                 read = exec;
@@ -230,6 +242,25 @@ public sealed class IwyuAuditorTests
         Assert.True(result.Passed);
         Assert.NotNull(read);
         Assert.Equal("/work/build/compile_commands.json", read!.Argv[2]);
+    }
+
+    [Fact]
+    public async Task DatabaseDirectoryForm_LeafSymlinkEscapingWorktree_IsInfrastructureFailure()
+    {
+        // The directory canonicalizes in-tree, but the compile_commands.json
+        // leaf is a repo-controlled symlink resolving outside — containment
+        // must judge the resolved leaf, not the directory holding it.
+        var sandbox = new FakeSandbox((exec, _) =>
+            Task.FromResult(IsDatabasePathProbe(exec)
+                ? new SandboxExecResult(0, "/work/build\n/work\n/outside/compile_commands.json\ndir\n", "")
+                : Ok(exec)));
+
+        var auditor = await InitializedAuditor("build");
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("outside the audited worktree", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.IsDeterministic);
     }
 
     [Fact]
@@ -279,6 +310,78 @@ public sealed class IwyuAuditorTests
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
 
         Assert.Contains("directory", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DatabaseEntryWithoutCommandOrArguments_IsInfrastructureFailure()
+    {
+        // iwyu_tool raises on an entry with neither 'command' nor
+        // 'arguments' — the auditor fails deterministically instead of
+        // letting the driver crash mid-run.
+        var sandbox = new FakeSandbox((exec, _) =>
+            Task.FromResult(exec.Argv[0] == "cat"
+                ? new SandboxExecResult(
+                    0,
+                    "[{ \"directory\": \"/work\", \"file\": \"/work/src/app.cpp\" }]",
+                    "")
+                : Ok(exec)));
+
+        var auditor = await InitializedAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("arguments", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.IsDeterministic);
+    }
+
+    [Fact]
+    public async Task RelativeReportedPaths_ResolveAgainstEntryDirectory()
+    {
+        // iwyu_tool runs each unit with cwd = entry.directory and IWYU
+        // reports the source as spelled in the compile command: a bare
+        // relative spelling anchors at the entry's directory, and a ".."
+        // spelling resolves to the in-tree file it actually names rather
+        // than reading as an escape.
+        var database = """
+            [
+              { "directory": "/work/bdir",
+                "file": "src/gen.cpp",
+                "arguments": ["clang++", "-c", "src/gen.cpp"] },
+              { "directory": "/work/bdir",
+                "file": "/work/src/a.cc",
+                "arguments": ["clang++", "-c", "../src/a.cc"] }
+            ]
+            """;
+        const string output = """
+            src/gen.cpp should add these lines:
+            #include <vector>          // for std::vector
+
+            The full include-list for src/gen.cpp:
+            ---
+
+            ../src/a.cc should add these lines:
+            #include <cstdint>         // for uint32_t
+
+            The full include-list for ../src/a.cc:
+            ---
+            """;
+        var sandbox = new FakeSandbox((exec, _) =>
+            Task.FromResult(exec.Argv[0] == "cat"
+                ? new SandboxExecResult(0, database, "")
+                : exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1
+                    ? new SandboxExecResult(0, output, "")
+                    : Ok(exec)));
+
+        var auditor = await InitializedAuditor();
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        var adds = result.Findings
+            .Where(f => f.Title.Contains("iwyu-add", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, adds.Count);
+        Assert.Contains(adds, f => f.Location == "bdir/src/gen.cpp");
+        Assert.Contains(adds, f => f.Location == "src/a.cc");
+        Assert.DoesNotContain(adds, f => f.Location!.StartsWith("file://", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -465,14 +568,39 @@ public sealed class IwyuAuditorTests
     [Fact]
     public async Task Exit0_WithNoVerdictRecords_IsInfrastructureFailure_NeverVacuousPass()
     {
+        // Non-empty output so the verdict-records check — not the whitespace
+        // guard — is the statement producing the failure: a stream that ran
+        // but recorded no unit's verdict is never a clean result.
         var sandbox = new FakeSandbox((exec, _) =>
             Task.FromResult(exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1
-                ? new SandboxExecResult(0, string.Empty, "")
+                ? new SandboxExecResult(0, "iwyu_tool: noise with no verdict blocks\n", "")
                 : Ok(exec)));
 
         var auditor = await InitializedAuditor();
-        await Assert.ThrowsAsync<AuditUnavailableException>(
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("verdict records", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Exit0_FewerVerdictsThanSelectedUnits_IsInfrastructureFailure()
+    {
+        // iwyu_tool's exit aggregation folds a signal-killed unit's negative
+        // returncode into exit 0, so the exit code alone cannot prove the
+        // selected units ran: the report carries one verdict while the
+        // database selected two in-worktree units.
+        var sandbox = new FakeSandbox((exec, _) =>
+            Task.FromResult(exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1
+                ? new SandboxExecResult(
+                    0, "(/work/src/app.cpp has correct #includes/fwd-decls)\n", "")
+                : Ok(exec)));
+
+        var auditor = await InitializedAuditor();
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("fewer", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -499,14 +627,19 @@ public sealed class IwyuAuditorTests
     [Fact]
     public async Task Exit2_UsageError_IsInfrastructureFailure()
     {
+        // Verdict-bearing stdout: only the exit-code classification can
+        // produce the asserted failure — a parse-side failure would hide an
+        // exit-convention regression.
         var sandbox = new FakeSandbox((exec, _) =>
             Task.FromResult(exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1
-                ? new SandboxExecResult(2, "", "usage: iwyu_tool [-h] ...")
+                ? new SandboxExecResult(2, OutputClean, "usage: iwyu_tool [-h] ...")
                 : Ok(exec)));
 
         var auditor = await InitializedAuditor();
-        await Assert.ThrowsAsync<AuditUnavailableException>(
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("exit 2", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -573,7 +706,7 @@ public sealed class IwyuAuditorTests
     }
 
     [Fact]
-    public async Task ScanExec_StripsIwyuBinaryOverride()
+    public async Task ScanExec_StripsIwyuEnvironmentOverrides()
     {
         SandboxExec? scan = null;
         var sandbox = new FakeSandbox((exec, _) =>
@@ -590,7 +723,10 @@ public sealed class IwyuAuditorTests
         await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
 
         Assert.NotNull(scan);
+        // IWYU_BINARY would swap the pinned engine binary under the driver;
+        // IWYU_VERBOSE=0 would silence every verdict's add/remove sections.
         Assert.Contains("IWYU_BINARY", scan!.EnvironmentVariablesToUnset);
+        Assert.Contains("IWYU_VERBOSE", scan.EnvironmentVariablesToUnset);
     }
 
     [Fact]
@@ -610,6 +746,44 @@ public sealed class IwyuAuditorTests
         Assert.Contains("ExtraArguments", ex.Message, StringComparison.Ordinal);
         Assert.True(ex.IsDeterministic);
         Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task OperatorClusteredDatabaseFlag_IsDeterministicInfrastructure()
+    {
+        // argparse splits "-vp /path" into -v plus -p /path: the cluster
+        // smuggles the database flag past the exact-token check and would
+        // override the validated database.
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            return Task.FromResult(Ok(exec));
+        });
+
+        var auditor = await InitializedAuditor(extraArguments: "-vp,/other");
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.Contains("'-p'", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex.IsDeterministic);
+        Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task OperatorJoinedJobsFlag_IsNotConfusedForDatabaseFlag()
+    {
+        // "-j4" is iwyu_tool's parallelism flag — the cluster rejection must
+        // not swallow legitimate single-dash value options.
+        var sandbox = new FakeSandbox((exec, _) =>
+            Task.FromResult(exec.Argv[0] == "iwyu_tool" && exec.Argv.Count > 1
+                ? new SandboxExecResult(0, OutputClean, "")
+                : Ok(exec)));
+
+        var auditor = await InitializedAuditor(extraArguments: "-j,4");
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
     }
 
     [Fact]
@@ -795,8 +969,9 @@ public sealed class IwyuAuditorTests
     // Default happy-path responses per probe: db path canonicalizes in-tree
     // to build/compile_commands.json, the read returns a three-entry DB (one
     // out-of-tree), presence checks pass, the engine reports the pinned
-    // version, the scan root is /work, and the scan yields the findings
-    // fixture. Individual tests override whichever probe they exercise.
+    // version, the canonical scan root is /work, and the scan yields the
+    // findings fixture. Individual tests override whichever probe they
+    // exercise.
     private static SandboxExecResult Ok(SandboxExec exec)
     {
         if (IsDatabasePathProbe(exec))
@@ -830,10 +1005,10 @@ public sealed class IwyuAuditorTests
             && exec.Argv[1] == "--version";
 
     private static bool IsScanRootProbe(SandboxExec exec)
-        => exec.Argv.Count >= 3
-            && exec.Argv[0] == "sh"
-            && exec.Argv[1] == "-c"
-            && exec.Argv[2] == "pwd";
+        => exec.Argv.Count == 4
+            && exec.Argv[0] == "realpath"
+            && exec.Argv[1] == "-m"
+            && exec.Argv[2] == "--";
 
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");

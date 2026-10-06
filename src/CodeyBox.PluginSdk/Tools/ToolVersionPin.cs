@@ -25,9 +25,10 @@ namespace CodeyBox.PluginSdk.Tools;
 /// Release used when the operator does not configure one.
 /// </param>
 /// <param name="VersionProbeArguments">
-/// Arguments appended after the tool name for the probe — typically
-/// <c>["--version"]</c>, or <c>["version"]</c> for subcommand-style CLIs.
-/// Empty falls back to <c>--version</c>.
+/// Arguments appended after the probed binary (<paramref name="ProbedBinary"/>
+/// or the tool name) for the probe — typically <c>["--version"]</c>, or
+/// <c>["version"]</c> for subcommand-style CLIs. Empty falls back to
+/// <c>--version</c>.
 /// </param>
 /// <param name="VersionExtractor">
 /// Optional extraction of the reported version from the probe's stdout;
@@ -38,12 +39,24 @@ namespace CodeyBox.PluginSdk.Tools;
 /// version before <c>govulncheck@v…</c>, so the first token is the wrong
 /// component to pin).
 /// </param>
+/// <param name="ProbedBinary">
+/// Binary the version probe execs; null (the default) probes the audited
+/// tool itself. Set it when the version-pinned component is not the driver
+/// named by <see cref="ExternalToolAuditorBase.ToolName"/> — e.g.
+/// <c>iwyu_tool</c> is a launcher script whose analysis engine is the
+/// separate <c>include-what-you-use</c> binary. When it differs from the
+/// tool name, the pin first presence-checks this binary the same way the
+/// tool itself is checked, then probes it with
+/// <paramref name="VersionProbeArguments"/>; failure messages name the
+/// probed binary.
+/// </param>
 public sealed record ToolVersionPin(
     string PluginId,
     Func<string?> ConfiguredExpectedVersion,
     string DefaultExpectedVersion,
     IReadOnlyList<string> VersionProbeArguments,
-    Func<string, string?>? VersionExtractor = null)
+    Func<string, string?>? VersionExtractor = null,
+    string? ProbedBinary = null)
 {
     /// <summary>
     /// Scoped-config key every external-tool auditor honors for overriding

@@ -39,13 +39,36 @@ public sealed record ExternalToolFinding(
 /// finding locations and <see cref="ExternalToolAuditorOptions.ExcludePaths"/>
 /// behave like every other auditor's. Null when the caller did not supply one.
 /// </param>
+/// <param name="ExpectedVerdictCount">
+/// Optional lower bound on the number of per-file verdict records the report
+/// must contain — for per-translation-unit tools, the count of units the
+/// auditor selected for analysis. Drivers whose exit aggregation can hide a
+/// unit that produced no verdict at all (e.g. iwyu_tool folds a
+/// signal-killed child's negative returncode into exit 0) need this
+/// reconciliation: fewer verdicts than selected units means coverage is
+/// unverifiable, and the parser fails closed rather than reporting a silent
+/// partial pass. Null — the default — means no reconciliation.
+/// </param>
+/// <param name="RelativePathAnchors">
+/// Optional map resolving a relative path spelling in the report to its
+/// repository-relative location — for tools that run each unit with a
+/// different working directory and report paths as spelled in that unit's
+/// invocation (iwyu_tool runs each compile command with
+/// <c>cwd = entry.directory</c>). The key is the dot-segment-collapsed
+/// relative spelling (e.g. <c>../src/a.cc</c>), the value the
+/// repository-relative path it resolves to. Parsers consult it only for
+/// reported paths that are relative; absolute paths and unmapped spellings
+/// keep the standard relativize-then-<c>file://</c> policy.
+/// </param>
 public sealed record ExternalToolParseInput(
     string ToolName,
     string Stdout,
     string Stderr,
     int ExitCode,
     string? ScanRoot = null,
-    string? WorkingDirectory = null);
+    string? WorkingDirectory = null,
+    int? ExpectedVerdictCount = null,
+    IReadOnlyDictionary<string, string>? RelativePathAnchors = null);
 
 /// <summary>
 /// Parses a finished tool invocation into findings. The tool does not need to

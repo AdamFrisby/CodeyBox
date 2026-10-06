@@ -84,6 +84,11 @@ trees) are counted and logged per run, never analysed.
   unrecoverable frontend error, iwyu_tool propagates the worst child exit,
   and the run is infrastructure — partial coverage is never reported as a
   pass. The failing unit's clang diagnostics appear in the captured output.
+- **A unit that produces no verdict at all.** iwyu_tool aggregates child
+  exits via `max()`, so a signal-killed (e.g. OOM-killed) unit's negative
+  returncode folds into exit 0. The auditor reconciles the report against
+  the database: fewer verdict records than selected in-worktree units is an
+  infrastructure failure, never a silent partial pass.
 - **Pre-0.17 exit codes.** IWYU 0.16 and older returned `2 + edits`; those
   releases fail the version pin.
 - **Out-of-worktree report paths.** A reported path that stays absolute (or
@@ -97,7 +102,15 @@ trees) are counted and logged per run, never analysed.
   (`*.imp`) referenced by compile flags shape suggestions the same way.
   Both are visible in the audited diff.
 - **More than `MaxFindings` findings.** Excess is dropped and the
-  truncation is reported in the raw output.
+  truncation is reported in the raw output; when the parser's own result
+  cap drops suggestions first, an `iwyu-truncated` note records the drop.
+- **Relative report spellings.** iwyu_tool runs each unit with
+  `cwd = entry.directory` and IWYU prints the source as the compile command
+  spelled it, so a relative report path is resolved against the entry's
+  directory (e.g. `-c ../src/a.cc` under `/work/build` resolves to
+  `src/a.cc`). Spellings that match no entry — associated headers resolved
+  through include search paths — keep the standard relativize-or-`file://`
+  policy.
 
 ## Exit codes and failure classification
 
@@ -109,6 +122,7 @@ iwyu_tool's exit is the worst child exit (verified against IWYU 0.21 —
 |---|---|---|
 | `0` | Every selected translation unit analysed (clean, or violations reported) | Verdict — pass or advisory findings |
 | `0` with empty/unrecognised output | No verdict records — nothing actually ran | Infrastructure (`AuditUnavailableException`) |
+| `0` with fewer verdict records than selected units | A unit exited without a verdict (e.g. signal-killed — `max()` folds negative returncodes into 0) | Infrastructure — coverage is unverifiable |
 | `1` | A translation unit hit an unrecoverable error, or the driver failed (bad database, bad flags) | Infrastructure — partial coverage is never a pass |
 | `126` / `127` | `iwyu_tool` not executable or not found | Infrastructure |
 | anything else | Unknown convention | Infrastructure (fails loud, never a pass) |
@@ -128,8 +142,11 @@ probes `include-what-you-use --version` before every run and reports an
 infrastructure failure on any other version. Each IWYU release builds
 against one LLVM/Clang, so the IWYU pin pins the toolchain pair.
 
-`IWYU_BINARY` is stripped from the scan and probe environments — iwyu_tool
-honors it as the engine path, which would bypass this pin.
+`IWYU_BINARY` and `IWYU_VERBOSE` are stripped from the scan and probe
+environments — iwyu_tool honors the first as the engine path, which would
+bypass this pin, and the engine honors the second as a verbosity override:
+`IWYU_VERBOSE=0` suppresses the "should add"/"should remove" sections of
+every verdict, which would pass a run while reporting nothing.
 
 The tool requirements declare **`AptPackage = "iwyu"`** for both binaries,
 so baseline provisioning installs them via apt **only when this plugin is
@@ -173,17 +190,22 @@ Scoped under `CodeyBox:Plugins:codeybox.iwyu`, resolved per run
 | `ExpectedVersion` | `0.21.0` | Pinned IWYU release (`0.21` and `0.21.0` are equivalent). A different installed version fails closed as infrastructure. |
 | `MaxCompilationDatabaseEntries` | `4096` | Upper bound on database entries; larger databases fail closed deterministically. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
-| `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop (`iwyu-add`, `iwyu-remove`, `iwyu-coverage`). |
+| `IncludedRules` / `ExcludedRules` | — | Exact rule ids to keep/drop (`iwyu-add`, `iwyu-remove`, `iwyu-coverage`, `iwyu-truncated`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/`, `dist/`, `build/`, `out/`, `coverage/`, `.venv/`, `venv/`, `__pycache__/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings only; it does not change which translation units run. Setting it replaces the default list. |
-| `ExtraArguments` | — | Extra `iwyu_tool` options appended after the built argv (e.g. `-j,4` for parallel units, `-e,<path>` to exclude a subtree, `--verbose`, or `--` followed by `-Xiwyu` options). A `-p` flag here is rejected — use `CompilationDatabase`. `-Xiwyu --error`/`--error_always` after `--` is rejected: it renumbers the exit convention the classification depends on. Changing `-o/--output-format` or other report-affecting flags surfaces as an infrastructure failure when the parser can no longer find verdicts. |
+| `ExtraArguments` | — | Extra `iwyu_tool` options appended after the built argv (e.g. `-j,4` for parallel units, `--verbose`, or `--` followed by `-Xiwyu` options). A `-p` flag here is rejected — including an argparse cluster like `-vp` that re-reads as `-p` — use `CompilationDatabase`; narrowing the scan is done by the database's own selection or `ExcludePaths`. `-Xiwyu --error`/`--error_always` after `--` is rejected: it renumbers the exit convention the classification depends on. Changing `-o/--output-format` or other report-affecting flags surfaces as an infrastructure failure when the parser can no longer find verdicts. |
 | `TimeoutSeconds` | `300` | Per-run bound (the database probes share it under a 30 s cap). IWYU runs a full clang front-end per translation unit — raise it for large trees. Exceeding it is infrastructure, not a pass. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. The stream cap also bounds the compilation-database read. |
 
 **Repository trust posture.** The audited repository writes the compilation
-database (its compile flags reach the clang front-end verbatim — the same
-contract as clang-tidy's `-p`), and in-source pragmas (`// IWYU pragma:
-keep` etc.) are honored with no off switch — a subject can shape
-suggestions for its own file, which is the project's own build contract.
+database, and each entry's `command`/`arguments` reaches the clang
+front-end verbatim — enabling this auditor lets the audited repository
+supply arbitrary clang driver flags (including plugin-loading and
+file-inclusion surfaces) inside the audit sandbox. This is a stronger
+trust surface than auditors that do not consume a repository compilation
+database; execution is nonetheless contained to the sandbox. In-source
+pragmas (`// IWYU pragma: keep` etc.) are honored with no off switch — a
+subject can shape suggestions for its own file, which is the project's own
+build contract.
 The auditor controls the boundary that matters: only in-worktree sources
 are analysed, violations are advisory, and an unanalysable unit fails
 loudly. The auditor runs under `AuditCapabilities.None` (no agent
