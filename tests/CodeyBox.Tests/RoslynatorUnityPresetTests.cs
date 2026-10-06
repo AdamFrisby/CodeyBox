@@ -496,18 +496,40 @@ public sealed class RoslynatorUnityPresetTests
 
         try
         {
-            var csproj = await File.ReadAllTextAsync(Path.Combine(fixtureDir, "UnityGame.csproj"));
-            var player = await File.ReadAllTextAsync(Path.Combine(fixtureDir, "Assets", "Scripts", "Player.cs"));
+            SandboxExec? scanExec = null;
+            var sandbox = new FakeSandbox((exec, _) =>
+            {
+                if (IsPresenceProbe(exec) || IsVersionProbe(exec))
+                    return Task.FromResult(Ok(exec));
+                if (IsRepoFileProbe(exec))
+                    return Task.FromResult(EchoPresentOnDisk(fixtureDir, exec));
+                scanExec = exec;
+                return Task.FromResult(new SandboxExecResult(1, UnitySarifUntWarning, ""));
+            });
 
-            // Pinned analyzer package reference the auditor verifies against
-            // via AnalyzerAssemblies (PackageReference Version is the
-            // operator-owned pin; the audit never restores it).
-            Assert.Contains("Microsoft.Unity.Analyzers", csproj, StringComparison.Ordinal);
-            Assert.Contains("1.28.0", csproj, StringComparison.Ordinal);
-            // The UNT0001 pattern the SARIF fixture reports: an empty Unity
-            // message on a MonoBehaviour.
-            Assert.Contains("MonoBehaviour", player, StringComparison.Ordinal);
-            Assert.Contains("void Update()", player, StringComparison.Ordinal);
+            var auditor = new RoslynatorAuditor();
+            await auditor.InitializeAsync(
+                BuildPluginContext(new Dictionary<string, string?>
+                {
+                    ["Scoped:ProjectPath"] = "UnityGame.csproj",
+                    ["Scoped:AnalyzerAssemblies"] = "tools/analyzers/Microsoft.Unity.Analyzers.dll",
+                }),
+                CancellationToken.None);
+
+            // The seeded fixture supplies the probed files: if the csproj
+            // or analyzer DLL were absent, the preset would fail closed as
+            // coverage-unavailable instead of reaching the scan.
+            var result = await ((IAuditor)auditor).RunAsync(sandbox, fixtureDir, FakeContext(), CancellationToken.None);
+
+            Assert.True(result.Passed);
+            var finding = Assert.Single(result.Findings);
+            Assert.Contains("UNT0001", finding.Title, StringComparison.Ordinal);
+            Assert.Equal(AuditSeverity.Warning, finding.Severity);
+            Assert.Equal("Assets/Scripts/Player.cs:12", finding.Location);
+            Assert.NotNull(scanExec);
+            Assert.Contains("--analyzer-assemblies", scanExec!.Argv);
+            Assert.Contains("./tools/analyzers/Microsoft.Unity.Analyzers.dll", scanExec.Argv);
+            Assert.Equal("./UnityGame.csproj", scanExec.Argv[^1]);
         }
         finally
         {
@@ -540,6 +562,13 @@ public sealed class RoslynatorUnityPresetTests
         await File.WriteAllTextAsync(
             Path.Combine(dir, "Assets", "Scripts", "Player.cs"),
             "using UnityEngine;\npublic class Player : MonoBehaviour\n{\n    private void Update()\n    {\n    }\n}\n");
+
+        // Pinned analyzer assembly the preset presence-probes in the
+        // audited tree: content is irrelevant to the probe, presence is
+        // what the auditor verifies before emitting argv.
+        Directory.CreateDirectory(Path.Combine(dir, "tools", "analyzers"));
+        await File.WriteAllTextAsync(
+            Path.Combine(dir, "tools", "analyzers", "Microsoft.Unity.Analyzers.dll"), string.Empty);
 
         return dir;
     }
@@ -581,6 +610,23 @@ public sealed class RoslynatorUnityPresetTests
     // path present: the probe echoes each present path one per line.
     private static SandboxExecResult EchoRequestedPaths(SandboxExec exec)
         => new(0, string.Join("\n", exec.Argv.Skip(4)) + "\n", "");
+
+    // Filesystem-backed variant of the presence probe for the synthetic
+    // fixture: only requested paths that exist under fixtureDir are
+    // echoed, so a missing seeded file fails the preset closed instead
+    // of reaching the scan.
+    private static SandboxExecResult EchoPresentOnDisk(string fixtureDir, SandboxExec exec)
+    {
+        var present = new List<string>();
+        foreach (var requested in exec.Argv.Skip(4))
+        {
+            var stripped = requested.StartsWith("./", StringComparison.Ordinal) ? requested[2..] : requested;
+            var local = stripped.Replace('/', Path.DirectorySeparatorChar);
+            if (File.Exists(Path.Combine(fixtureDir, local)))
+                present.Add(requested);
+        }
+        return new SandboxExecResult(0, string.Join("\n", present) + "\n", "");
+    }
 
     private static void TryDeleteDirectory(string path)
     {
