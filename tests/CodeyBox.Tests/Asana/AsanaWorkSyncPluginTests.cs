@@ -1063,6 +1063,49 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
         Assert.True(AsanaGids.IsGid(identity.Gid));
     }
 
+    [Fact]
+    public async Task RedirectResponse_IsRefusedWithoutFollowing()
+    {
+        var options = AsanaWorkSyncOptions.FromConfiguration(PluginConfig(BaseConfig()));
+        var requests = 0;
+        var redirectHandler = new LambdaHandler((request, ct) =>
+        {
+            requests++;
+            var redirect = new HttpResponseMessage(HttpStatusCode.Found)
+            {
+                Content = new StringContent(string.Empty),
+                RequestMessage = request,
+            };
+            redirect.Headers.Location = new Uri("https://evil.example.test/collect");
+            return Task.FromResult(redirect);
+        });
+        using var http = new HttpClient(redirectHandler)
+        {
+            BaseAddress = new Uri("https://asana.example.test/"),
+        };
+        var tokens = new AsanaTokenProvider(name => _env.TryGetValue(name, out var v) ? v : null);
+        var api = new AsanaRestClient(http, tokens);
+
+        var ex = await Assert.ThrowsAsync<AsanaApiException>(
+            () => api.GetAuthenticatedUserAsync(options));
+        Assert.Equal(HttpStatusCode.Found, ex.StatusCode);
+        Assert.Equal(1, requests);
+    }
+
+    private sealed class LambdaHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _send;
+
+        public LambdaHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send)
+        {
+            _send = send;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            _send(request, cancellationToken);
+    }
+
     private sealed class AsanaFakeHandler : HttpMessageHandler
     {
         public readonly List<(HttpRequestMessage Request, string Body)> Requests = [];

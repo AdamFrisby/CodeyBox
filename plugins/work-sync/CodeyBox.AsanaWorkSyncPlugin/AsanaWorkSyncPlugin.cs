@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using CodeyBox.Core;
 using CodeyBox.PluginSdk;
+using CodeyBox.PluginSdk.Credentials;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -40,7 +41,6 @@ namespace CodeyBox.AsanaWorkSyncPlugin;
 public sealed class AsanaWorkSyncPlugin
     : IWorkSource, IWorkTracker, IPluginInitializer, IDisposable
 {
-    private readonly IHttpClientFactory? _httpFactory;
     private readonly TimeProvider _clock;
     private readonly Func<string, string?> _env;
     private readonly IConfigurationSection? _testConfig;
@@ -54,10 +54,27 @@ public sealed class AsanaWorkSyncPlugin
     private readonly object _clientLock = new();
     private bool _disposed;
 
-    /// <summary>Production constructor (DI provides the HTTP factory).</summary>
+    /// <summary>
+    /// Construction-time timeout for the owned no-redirect client. Never
+    /// enforced: <see cref="EnsureClients"/> immediately overrides it with
+    /// <see cref="Timeout.InfiniteTimeSpan"/> because per-attempt timeouts
+    /// come from the live <c>TimeoutSeconds</c> option. Exists only because
+    /// <see cref="CredentialHttp.CreateNoRedirectClient(TimeSpan)"/>
+    /// requires a finite value.
+    /// </summary>
+    private static readonly TimeSpan OwnedClientConstructionTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Production constructor. The factory parameter is accepted for host DI
+    /// compatibility (the host resolves plugins with an <see
+    /// cref="IHttpClientFactory"/> available) but credential-bearing Asana
+    /// traffic never uses the factory's default redirect-following handler:
+    /// <see cref="EnsureClients"/> builds a dedicated no-redirect client via
+    /// <see cref="CredentialHttp.CreateNoRedirectClient(TimeSpan)"/>.
+    /// </summary>
     public AsanaWorkSyncPlugin(IHttpClientFactory httpFactory, TimeProvider? clock = null)
     {
-        _httpFactory = httpFactory ?? throw new ArgumentNullException(nameof(httpFactory));
+        ArgumentNullException.ThrowIfNull(httpFactory);
         _clock = clock ?? TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
         _ownsHttpClient = true;
@@ -394,11 +411,16 @@ public sealed class AsanaWorkSyncPlugin
                 return _api;
             if (_http is null)
             {
-                _http = _httpFactory!.CreateClient("asana-worksync");
-                // Request timeouts are enforced per attempt from the live
-                // TimeoutSeconds option (a linked CTS in SendWithRetryAsync),
-                // so edits hot-reload; disable the client-level timeout on
-                // this owned client. An injected client is never mutated.
+                // Credential-bearing traffic never follows redirects: the
+                // factory's default handler follows up to 50 cross-origin
+                // hops and would re-send the bearer token to the redirect
+                // target, so this plugin owns a dedicated no-redirect
+                // client. Request timeouts are enforced per attempt from
+                // the live TimeoutSeconds option (a linked CTS in
+                // SendWithRetryAsync), so edits hot-reload; disable the
+                // client-level timeout on this owned client. An injected
+                // client is never mutated.
+                _http = CredentialHttp.CreateNoRedirectClient(OwnedClientConstructionTimeout);
                 _http.Timeout = Timeout.InfiniteTimeSpan;
             }
             _tokens = new AsanaTokenProvider(_env);

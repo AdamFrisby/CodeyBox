@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using CodeyBox.PluginSdk.Credentials;
 
 namespace CodeyBox.AsanaWorkSyncPlugin;
 
@@ -384,6 +385,18 @@ public sealed class AsanaRestClient
 
             using (response)
             {
+                // Credential-bearing traffic never follows redirects: the
+                // owned client disables auto-redirect, and this explicit
+                // refusal covers any injected client whose handler follows
+                // them. A 3xx is untrusted upstream output — following it
+                // would re-send the bearer token to the redirect target —
+                // so it fails the request instead of being retried.
+                if (CredentialHttp.IsRedirect(response.StatusCode))
+                    throw new AsanaApiException(
+                        $"Asana API returned redirect {(int)response.StatusCode} {response.ReasonPhrase} " +
+                        $"for {request.Method} {request.RequestUri?.AbsolutePath}: redirects are refused " +
+                        "and never followed with credentials.",
+                        response.StatusCode);
                 if (!IsRetryable(response.StatusCode) || attempt >= maxAttempts)
                     return await ReadSuccessAsync(options, request, response, requestCt).ConfigureAwait(false);
 
