@@ -105,6 +105,7 @@
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.DetectSecretsAuditorPlugin\CodeyBox.DetectSecretsAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.BetterleaksAuditorPlugin\CodeyBox.BetterleaksAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-secrets\CodeyBox.TrufflehogAuditorPlugin\CodeyBox.TrufflehogAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.CueAuditorPlugin\CodeyBox.CueAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SpectralAuditorPlugin\CodeyBox.SpectralAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SqlfluffAuditorPlugin\CodeyBox.SqlfluffAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-schema\CodeyBox.SquawkAuditorPlugin\CodeyBox.SquawkAuditorPlugin.csproj" />
