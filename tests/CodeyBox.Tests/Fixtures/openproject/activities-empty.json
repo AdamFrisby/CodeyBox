@@ -1,0 +1,8 @@
+{
+  "_type": "Collection",
+  "total": 0,
+  "count": 0,
+  "pageSize": 50,
+  "offset": 1,
+  "_embedded": { "elements": [] }
+}

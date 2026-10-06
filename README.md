@@ -361,7 +361,7 @@ Recovery procedures are in
 - **Pluggable everything, with a catalogue to start from.** Beyond the auditors:
   forges (GitLab, Bitbucket, Gitea, Forgejo, Azure DevOps — GitHub is built
   in), work sources that sync issues in and status back (Jira, Linear, Plane,
-  Shortcut, YouTrack), notifications (Slack, Teams, Discord, ntfy, Gotify),
+  Shortcut, YouTrack, OpenProject), notifications (Slack, Teams, Discord, ntfy, Gotify),
   credential backends (1Password, Bitwarden, Doppler, Infisical, OpenBao), and
   sandbox backends (below). All plugins, all off by default — or ship your own
   as a NuGet package, no fork.

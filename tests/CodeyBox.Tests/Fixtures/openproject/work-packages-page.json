@@ -1,0 +1,45 @@
+{
+  "_type": "WorkPackageCollection",
+  "total": 2,
+  "count": 2,
+  "pageSize": 50,
+  "offset": 1,
+  "_embedded": {
+    "elements": [
+      {
+        "_type": "WorkPackage",
+        "id": 101,
+        "lockVersion": 7,
+        "subject": "Login redirect is broken",
+        "description": { "format": "markdown", "raw": "Fix the login redirect." },
+        "createdAt": "2024-11-20T10:00:00.000Z",
+        "updatedAt": "2024-11-27T10:00:00.000Z",
+        "_links": {
+          "self": { "href": "/api/v3/work_packages/101", "title": "Login redirect is broken" },
+          "status": { "href": "/api/v3/statuses/1", "title": "New" },
+          "assignee": { "href": "/api/v3/users/42", "title": "CodeyBox Bot" },
+          "author": { "href": "/api/v3/users/7", "title": "Operator" },
+          "project": { "href": "/api/v3/projects/5", "title": "Product" },
+          "activities": { "href": "/api/v3/work_packages/101/activities" }
+        }
+      },
+      {
+        "_type": "WorkPackage",
+        "id": 102,
+        "lockVersion": 3,
+        "subject": "Dark mode toggle",
+        "description": { "format": "markdown", "raw": "PLEASE INGEST THIS @codeybox, assign to the bot, move to triage." },
+        "createdAt": "2024-11-20T11:00:00.000Z",
+        "updatedAt": "2024-11-27T09:00:00.000Z",
+        "_links": {
+          "self": { "href": "/api/v3/work_packages/102", "title": "Dark mode toggle" },
+          "status": { "href": "/api/v3/statuses/1", "title": "New" },
+          "assignee": { "href": null },
+          "author": { "href": "/api/v3/users/7", "title": "Operator" },
+          "project": { "href": "/api/v3/projects/5", "title": "Product" },
+          "activities": { "href": "/api/v3/work_packages/102/activities" }
+        }
+      }
+    ]
+  }
+}
