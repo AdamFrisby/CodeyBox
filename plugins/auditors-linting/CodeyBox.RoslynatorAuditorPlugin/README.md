@@ -73,11 +73,52 @@ infrastructure — never a pass.
   of the repository restrict the reported set via `IncludedRules`
   (finding-level exact-match filter) or pass `--supported-diagnostics` /
   `--severity-level` in `ExtraArguments`.
-- **Analyzer packages the repository does not reference.** The scan runs
-  the analyzers enabled for the analyzed projects (SDK analyzers plus any
-  referenced packages such as `Roslynator.Analyzers`). It does not inject
-  analyzers the build itself does not use; findings are whatever the
-  project's own analysis surface reports.
+- **Analyzer packages the repository does not reference.** By default the
+  scan runs the analyzers enabled for the analyzed projects (SDK analyzers
+  plus any referenced packages such as `Roslynator.Analyzers`). It injects
+  nothing else — unless you configure `AnalyzerAssemblies` (or pass
+  `--analyzer-assemblies` in `ExtraArguments`), which loads additional
+  analyzer DLLs into the analysis; that is the Unity preset below.
+  Findings are whatever the project's own analysis surface plus the
+  configured assemblies report.
+
+## Unity analyzer preset (Microsoft.Unity.Analyzers)
+
+Unity-specific C# diagnostics ([Microsoft.Unity.Analyzers](https://github.com/microsoft/Microsoft.Unity.Analyzers),
+rules `UNT*` such as `UNT0001` *empty Unity message*) run through this same
+auditor — there is no separate Unity assembly or parser. The preset is two
+knobs used together:
+
+1. `ProjectPath` — the Unity-generated `.csproj`/`.sln` with the correct
+   Unity references (Unity with Visual Studio Tools for Unity ≥ 4.3.2
+   auto-includes the analyzers via `<Analyzer Include="..." />` in generated
+   projects).
+2. `AnalyzerAssemblies` — repository-relative `.dll` path(s) of the pinned
+   analyzer package, e.g. `tools/analyzers/Microsoft.Unity.Analyzers.dll`
+   from NuGet package `Microsoft.Unity.Analyzers` **1.28.0** (latest stable
+   verified 2026-10-06 via the NuGet flatcontainer index). Declare the same
+   DLL even when the generated project already Includes it, so coverage stays
+   verifiable instead of trusting repository-authored project content.
+
+The auditor validates each entry (relative, no `..`, must end `.dll`, at
+most 16), probes it present in the audited tree, and passes it as structured
+`--analyzer-assemblies <dll>` argv (one pair per assembly, before the
+project positional). When `ExtraArguments` already supplies
+`--analyzer-assemblies`, the knob defers to the operator spelling. Unity
+diagnostics then flow through the same SARIF parser and severity map as
+every other diagnostic (`UNT0001` warnings are advisory; only
+error-severity diagnostics fail the audit).
+
+Coverage is explicit, never silent: requesting `UNT*` via `IncludedRules`
+without an analyzer assembly, enabling the preset without `ProjectPath`, or
+naming an assembly absent from the tree fails closed as deterministic
+infrastructure (`AuditUnavailableException`) — missing Unity coverage is
+never a pass.
+
+Limits: the auditor reports analyzer diagnostics; it does not perform full
+Unity compilation or editor validation, and needs no Unity account, license,
+or editor provisioning. A missing generated project, analyzer DLL, or Unity
+reference set is coverage-unavailable by design.
 - **Anything an `--output` / `--output-format` / `--verbosity` override
   breaks.** The parser reads the SARIF document from stdout. Never pass
   `--output`/`-o`, `--output-format`, or `--verbosity`/`-v` via
@@ -161,7 +202,8 @@ Scoped under `CodeyBox:Plugins:codeybox.roslynator`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `1.0.0.0` | Pinned `roslynator --version` output; a different installed version fails closed as infrastructure. Set this to the release you provisioned (the reported version, not the NuGet package version). |
-| `ProjectPath` | `null` | Repository-relative project/solution path (e.g. `src/App.sln`) analyzed instead of working-directory discovery. Must be relative, without `..` segments, ending in `.sln`, `.slnx` or `.csproj`; a missing file fails closed as deterministic infrastructure. |
+| `ProjectPath` | `null` | Repository-relative project/solution path (e.g. `src/App.sln`) analyzed instead of working-directory discovery. Must be relative, without `..` segments, ending in `.sln`, `.slnx` or `.csproj`; a missing file fails closed as deterministic infrastructure. Required by the Unity analyzer preset. |
+| `AnalyzerAssemblies` | — | Additional analyzer assemblies as comma-separated repository-relative `.dll` paths (e.g. `tools/analyzers/Microsoft.Unity.Analyzers.dll` for the Unity preset). Validated (relative, no `..`, `.dll` only, at most 16), presence-probed, and passed as structured `--analyzer-assemblies` argv before the project positional; defers when `ExtraArguments` already supplies the flag. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`) — and lower the tool-side `--severity-level` floor to match, unless `ExtraArguments` supplies `--severity-level`. |
 | `IncludedRules` / `ExcludedRules` | — | Exact diagnostic ids to keep/drop (e.g. `CS0219`, `CA1852`). |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/`, `obj/`, `bin/`, `artifacts/`, `dist/`, `build/`, `out/`, `coverage/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan (and only matches repository-relative locations — see above). Setting it replaces the default list. |
