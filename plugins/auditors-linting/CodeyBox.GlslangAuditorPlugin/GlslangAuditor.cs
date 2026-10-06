@@ -55,7 +55,9 @@ namespace CodeyBox.GlslangAuditorPlugin;
 /// points, mismatched stage interfaces) surface as infrastructure with
 /// guidance, never as findings against the diff and never as a pass.
 /// Validation only: no SPIR-V is emitted (<c>-V</c>/<c>-o</c> are never
-/// passed) and nothing in the repository is modified. An empty target list
+/// passed) and nothing in the repository is modified. Validating emitted
+/// SPIR-V binaries is the <see cref="SpirvValAuditor"/> in this same
+/// assembly, sharing the family seam. An empty target list
 /// or an empty target file is infrastructure, not a pass.</para>
 /// </summary>
 [CodeyBoxPlugin(
