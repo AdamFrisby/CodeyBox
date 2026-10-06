@@ -154,6 +154,7 @@
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.TeamsPlugin\CodeyBox.TeamsPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.DiscordPlugin\CodeyBox.DiscordPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\notifications\CodeyBox.MatrixPlugin\CodeyBox.MatrixPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\notifications\CodeyBox.MattermostPlugin\CodeyBox.MattermostPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.DaytonaSandboxPlugin\CodeyBox.DaytonaSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.OpenStackSandboxPlugin\CodeyBox.OpenStackSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.GceSandboxPlugin\CodeyBox.GceSandboxPlugin.csproj" />
