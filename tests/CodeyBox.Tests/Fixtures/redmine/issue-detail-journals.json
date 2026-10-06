@@ -1,0 +1,35 @@
+{
+  "issue": {
+    "id": 1,
+    "project": { "id": 10, "identifier": "my-app", "name": "My App" },
+    "status": { "id": 2, "name": "In Progress" },
+    "subject": "Login redirect is broken",
+    "description": "Fix the login redirect.",
+    "journals": [
+      {
+        "id": 101,
+        "user": { "id": 9, "name": "CodeyBox Bot" },
+        "notes": "CodeyBox update: 'Login redirect is broken' is now Working.\n\n<!-- codeybox-work-item:WORK-ITEM-ID -->",
+        "created_on": "2026-09-21T11:00:00Z"
+      },
+      {
+        "id": 102,
+        "user": { "id": 7, "name": "Operator" },
+        "notes": "q-001: use forward-only migrations",
+        "created_on": "2026-09-21T12:00:00Z"
+      },
+      {
+        "id": 103,
+        "user": { "id": 7, "name": "Operator" },
+        "notes": "Looks good, please continue.",
+        "created_on": "2026-09-21T13:00:00Z"
+      },
+      {
+        "id": 104,
+        "user": { "id": 7, "name": "Operator" },
+        "notes": "",
+        "created_on": "2026-09-21T14:00:00Z"
+      }
+    ]
+  }
+}
