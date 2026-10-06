@@ -1,0 +1,9 @@
+{
+  "issue_statuses": [
+    { "id": 1, "name": "New" },
+    { "id": 2, "name": "In Progress" },
+    { "id": 3, "name": "Resolved" },
+    { "id": 4, "name": "Feedback" },
+    { "id": 5, "name": "Ready for CodeyBox" }
+  ]
+}
