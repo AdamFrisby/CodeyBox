@@ -112,6 +112,7 @@
     <Project Path="plugins/auditors-linting/CodeyBox.DetektAuditorPlugin/CodeyBox.DetektAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PmdAuditorPlugin/CodeyBox.PmdAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.RoslynatorAuditorPlugin/CodeyBox.RoslynatorAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.ILVerifyAuditorPlugin/CodeyBox.ILVerifyAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.RegalAuditorPlugin/CodeyBox.RegalAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.GitleaksAuditorPlugin/CodeyBox.GitleaksAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-secrets/CodeyBox.DetectSecretsAuditorPlugin/CodeyBox.DetectSecretsAuditorPlugin.csproj" />
