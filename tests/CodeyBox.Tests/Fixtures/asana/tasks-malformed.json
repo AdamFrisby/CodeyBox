@@ -1,0 +1,20 @@
+{
+  "data": [
+    "not-an-object",
+    42,
+    { "name": "missing gid entirely" },
+    { "gid": "not-numeric", "name": "non-numeric gid" },
+    { "gid": "", "name": "empty gid" },
+    {
+      "gid": "12020",
+      "name": "Lone parseable task",
+      "notes": "Survives a page of malformed siblings.",
+      "assignee": { "gid": "111", "name": "codeybox-bot" },
+      "tags": [],
+      "completed": false,
+      "projects": [{ "gid": "555" }],
+      "memberships": []
+    }
+  ],
+  "next_page": null
+}
