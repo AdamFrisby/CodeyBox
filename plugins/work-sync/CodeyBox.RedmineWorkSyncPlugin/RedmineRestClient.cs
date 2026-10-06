@@ -60,6 +60,12 @@ public sealed class RedmineRestClient
     /// <summary>Upper bound on the exponential backoff delay (milliseconds).</summary>
     internal const int MaxBackoffMs = 5000;
 
+    /// <summary>Read chunk size (bytes) for bounded response-body streaming.</summary>
+    internal const int ReadChunkBytes = 16 * 1024;
+
+    /// <summary>Upper bound (bytes) on an error body inspected for a detail summary.</summary>
+    internal const int MaxErrorBodyBytes = 64 * 1024;
+
     /// <summary>Product token sent as User-Agent — no version, so it cannot drift.</summary>
     internal const string UserAgentProduct = "CodeyBox-RedmineWorkSync";
 
@@ -314,7 +320,7 @@ public sealed class RedmineRestClient
             TimeSpan hinted = TimeSpan.Zero;
             try
             {
-                using var attemptRequest = Clone(request);
+                using var attemptRequest = CloneGetRequest(request);
                 return await SendOnceAsync(options, attemptRequest, ct).ConfigureAwait(false);
             }
             catch (RedmineApiException ex) when (IsRetryable(ex.StatusCode) && attempt < attempts)
@@ -348,8 +354,17 @@ public sealed class RedmineRestClient
         return total > cap ? cap : total;
     }
 
-    private static HttpRequestMessage Clone(HttpRequestMessage request)
+    /// <summary>
+    /// Clones an idempotent GET request for a retry attempt. Only
+    /// content-free requests flow through the retry path (PUTs are never
+    /// retried — an uncertain note reconciles the journal instead), so a
+    /// body here throws rather than being silently dropped.
+    /// </summary>
+    private static HttpRequestMessage CloneGetRequest(HttpRequestMessage request)
     {
+        if (request.Content is not null)
+            throw new InvalidOperationException(
+                "Only content-free GET requests may be cloned for retry; refusing to drop a body.");
         var clone = new HttpRequestMessage(request.Method, request.RequestUri);
         foreach (var header in request.Headers)
             clone.Headers.TryAddWithoutValidation(header.Key, header.Value);
@@ -387,7 +402,7 @@ public sealed class RedmineRestClient
         }
         using (response)
         {
-            if (IsRedirect(response.StatusCode))
+            if (RedmineHttpClients.IsRedirect(response.StatusCode))
                 throw new RedmineApiException(
                     $"Redmine API redirected {request.Method} {request.RequestUri?.AbsolutePath} " +
                     $"({(int)response.StatusCode}); configure the canonical ApiBaseUrl — " +
@@ -423,11 +438,9 @@ public sealed class RedmineRestClient
         }
     }
 
-    private static bool IsRedirect(HttpStatusCode status) =>
-        status is HttpStatusCode.MovedPermanently or HttpStatusCode.Found
-            or HttpStatusCode.SeeOther or HttpStatusCode.TemporaryRedirect
-            or (HttpStatusCode)308;
-
+    /// <summary>
+    /// Reads the upstream <c>Retry-After</c> hint for bounded retries.
+    /// </summary>
     private static TimeSpan? ReadRetryAfter(HttpResponseMessage response)
     {
         if (!response.Headers.TryGetValues("Retry-After", out var values))
@@ -466,7 +479,7 @@ public sealed class RedmineRestClient
                 $"(declared {content.Headers.ContentLength} bytes).");
         await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var memory = new MemoryStream();
-        var chunk = new byte[16 * 1024];
+        var chunk = new byte[ReadChunkBytes];
         int read;
         while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
         {
@@ -485,7 +498,7 @@ public sealed class RedmineRestClient
     /// </summary>
     private static string? ErrorDetail(string body)
     {
-        if (string.IsNullOrWhiteSpace(body) || body.Length > 64 * 1024)
+        if (string.IsNullOrWhiteSpace(body) || body.Length > MaxErrorBodyBytes)
             return null;
         try
         {

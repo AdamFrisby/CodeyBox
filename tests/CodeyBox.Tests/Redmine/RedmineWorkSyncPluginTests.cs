@@ -4,8 +4,10 @@ using System.Text.Json;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Orchestrator.WorkSync;
+using CodeyBox.PluginSdk;
 using CodeyBox.RedmineWorkSyncPlugin;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using RedminePlugin = CodeyBox.RedmineWorkSyncPlugin.RedmineWorkSyncPlugin;
 
 namespace CodeyBox.Tests;
@@ -673,10 +675,15 @@ public sealed class RedmineWorkSyncPluginTests : IDisposable
         {
             var path = req.RequestUri!.AbsolutePath;
             if (req.Method == HttpMethod.Get && path.EndsWith("/issues.json", StringComparison.Ordinal))
+                // A parseable signalled page behind a spoofed 512MB
+                // Content-Length: the byte-cap guard must reject it before
+                // buffering (poll skips the project), while removing the
+                // guard would parse and ingest issue 1 — so only the guard
+                // yields Empty here.
                 return new HttpResponseMessage(HttpStatusCode.OK)
                 {
                     Content = new StringContent(
-                        """{"issues": []}""",
+                        Fixture("issues-page.json"),
                         Encoding.UTF8,
                         "application/json")
                     {
@@ -689,6 +696,43 @@ public sealed class RedmineWorkSyncPluginTests : IDisposable
         var found = await PollAllAsync(plugin);
 
         Assert.Empty(found);
+    }
+
+    [Fact]
+    public async Task ReadBoundedString_RejectsSpoofedContentLength()
+    {
+        using var content = new StringContent(
+            """{"issues": []}""", Encoding.UTF8, "application/json");
+        content.Headers.ContentLength = 512L * 1024 * 1024;
+
+        var ex = await Assert.ThrowsAsync<RedmineApiException>(() =>
+            RedmineRestClient.ReadBoundedStringAsync(content, 32L * 1024 * 1024, CancellationToken.None));
+
+        Assert.Contains("cap", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ReadBoundedString_RejectsStreamExceedingCap()
+    {
+        // No declared length: the chunked read must still stop the moment
+        // the buffered stream passes the cap.
+        using var content = new StringContent(new string('x', 4096), Encoding.UTF8, "application/json");
+        content.Headers.ContentLength = null;
+
+        await Assert.ThrowsAsync<RedmineApiException>(() =>
+            RedmineRestClient.ReadBoundedStringAsync(content, 1024, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ReadBoundedString_ReturnsBodyWithinCap()
+    {
+        using var content = new StringContent(
+            """{"issues": []}""", Encoding.UTF8, "application/json");
+
+        var body = await RedmineRestClient.ReadBoundedStringAsync(
+            content, 32L * 1024 * 1024, CancellationToken.None);
+
+        Assert.Contains("issues", body, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -783,18 +827,88 @@ public sealed class RedmineWorkSyncPluginTests : IDisposable
         _handler.Responder = (req, body) =>
             req.Method == HttpMethod.Get
             && req.RequestUri!.AbsolutePath.EndsWith("/issues.json", StringComparison.Ordinal)
+                // A signalled page behind the 302: only the redirect
+                // refusal yields a skip here — parsing or following it
+                // would surface issue 1 or hit the evil host.
                 ? new HttpResponseMessage(HttpStatusCode.Found)
                 {
-                    Content = new StringContent(string.Empty),
+                    Content = new StringContent(
+                        Fixture("issues-page.json"), Encoding.UTF8, "application/json"),
                     Headers = { Location = new Uri("https://evil.example.test/issues.json") },
                 }
                 : baseResponder(req, body);
+        var log = new CapturingLogger();
+        await plugin.InitializeAsync(new PluginContext(
+            "1.0", RedmineWorkSyncOptions.PluginId, "Redmine Test",
+            new CapturingHost(PluginConfig(BaseConfig()), log)));
 
         var found = await PollAllAsync(plugin);
 
         Assert.Empty(found);
         Assert.All(_handler.Requests,
             r => Assert.DoesNotContain("evil.example.test", r.Request.RequestUri!.Host, StringComparison.Ordinal));
+        // The skip must come from the redirect-specific refusal — a generic
+        // upstream error here would mean the redirect guard was removed.
+        Assert.Contains("redirect", log.Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Redirect_RefusalNamesRedirect()
+    {
+        var options = RedmineWorkSyncOptions.FromConfiguration(PluginConfig(BaseConfig()));
+        var api = new RedmineRestClient(
+            new HttpClient(_handler),
+            new RedmineTokenProvider(name => _env.TryGetValue(name, out var v) ? v : null));
+        _handler.Responder = (req, _) =>
+            req.Method == HttpMethod.Get
+            && req.RequestUri!.AbsolutePath.EndsWith("/issues.json", StringComparison.Ordinal)
+                ? new HttpResponseMessage(HttpStatusCode.Found)
+                {
+                    Content = new StringContent(
+                        Fixture("issues-page.json"), Encoding.UTF8, "application/json"),
+                    Headers = { Location = new Uri("https://evil.example.test/issues.json") },
+                }
+                : new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+                };
+
+        var ex = await Assert.ThrowsAsync<RedmineApiException>(async () =>
+        {
+            await foreach (var _ in api.SearchIssuesPagedAsync(options, "my-app", CancellationToken.None))
+            {
+            }
+        });
+
+        // The refusal must be the redirect-specific one — a generic
+        // non-success error here would mean the redirect guard was removed.
+        Assert.Contains("redirect", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(_handler.Requests);
+        Assert.All(_handler.Requests,
+            r => Assert.DoesNotContain("evil.example.test", r.Request.RequestUri!.Host, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task OwnedClient_NeverFollowsRedirects()
+    {
+        // Real loopback wiring: the redirector answers 302 to a sink that
+        // records everything it receives. If the owned client ever
+        // followed, the sink would see the credential header and fail this.
+        const string canary = "redmine-live-api-key-canary";
+        using var sink = new RecordingStub(_ => (200, null, "sink"));
+        using var redirector = new RecordingStub(_ => (302, sink.Url + "landing", string.Empty));
+        using var client = RedmineHttpClients.Create();
+        using var request = new HttpRequestMessage(HttpMethod.Get, redirector.Url);
+        request.Headers.TryAddWithoutValidation("X-Redmine-API-Key", canary);
+
+        using var response = await client.SendAsync(request, CancellationToken.None);
+
+        // The 302 surfaces unfollowed — exactly one request, nothing at the
+        // redirect target, and the credential went nowhere else.
+        Assert.Equal(HttpStatusCode.Found, response.StatusCode);
+        Assert.Equal(1, redirector.Hits);
+        Assert.Equal(0, sink.Hits);
+        Assert.False(sink.SawText(canary));
     }
 
     [Fact]
@@ -1034,6 +1148,156 @@ public sealed class RedmineWorkSyncPluginTests : IDisposable
         var login = await api.GetAuthenticatedUserLoginAsync(plugin.CurrentOptions());
 
         Assert.Equal("codeybox-bot", login);
+    }
+
+    /// <summary>
+    /// Minimal loopback HTTP stub: records every request it receives
+    /// (method, path, headers, body) and answers with a programmed status,
+    /// optional redirect Location, and body.
+    /// </summary>
+    private sealed class RecordingStub : IDisposable
+    {
+        private readonly Func<HttpListenerRequest, (int Status, string? Location, string Body)> _respond;
+        private readonly HttpListener _listener = new();
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Task _loop;
+        private int _hits;
+        private readonly List<string> _seen = [];
+        private bool _disposed;
+
+        public string Url { get; }
+
+        public int Hits => Volatile.Read(ref _hits);
+
+        public RecordingStub(
+            Func<HttpListenerRequest, (int Status, string? Location, string Body)> respond)
+        {
+            _respond = respond;
+            Url = $"http://127.0.0.1:{ProbeFreePort()}/";
+            _listener.Prefixes.Add(Url);
+            _listener.Start();
+            _loop = AcceptLoopAsync(_cts.Token);
+        }
+
+        public bool SawText(string text)
+        {
+            lock (_seen)
+                return _seen.Any(s => s.Contains(text, StringComparison.Ordinal));
+        }
+
+        private static int ProbeFreePort()
+        {
+            using var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            probe.Start();
+            var port = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
+            probe.Stop();
+            return port;
+        }
+
+        private async Task AcceptLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                HttpListenerContext context;
+                try
+                {
+                    context = await _listener.GetContextAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    break;
+                }
+                Interlocked.Increment(ref _hits);
+                try
+                {
+                    var request = context.Request;
+                    string body = string.Empty;
+                    if (request.HasEntityBody)
+                    {
+                        using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
+                        body = await reader.ReadToEndAsync(ct).ConfigureAwait(false);
+                    }
+                    lock (_seen)
+                        _seen.Add($"{request.HttpMethod} {request.Url?.AbsolutePath} headers={request.Headers} body={body}");
+                    var (status, location, responseBody) = _respond(request);
+                    context.Response.StatusCode = status;
+                    if (location is not null)
+                        context.Response.RedirectLocation = location;
+                    var bytes = Encoding.UTF8.GetBytes(responseBody);
+                    context.Response.ContentLength64 = bytes.Length;
+                    await context.Response.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort stub: a guest disconnect never fails the test.
+                }
+                finally
+                {
+                    try { context.Response.Close(); } catch { }
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            _cts.Cancel();
+            try { _listener.Stop(); } catch { }
+            try { _loop.GetAwaiter().GetResult(); } catch { }
+            _cts.Dispose();
+            _listener.Close();
+        }
+    }
+
+    private sealed class CapturingLogger : ILogger
+    {
+        private readonly object _gate = new();
+        private readonly StringBuilder _text = new();
+
+        public string Text
+        {
+            get
+            {
+                lock (_gate)
+                    return _text.ToString();
+            }
+        }
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            ArgumentNullException.ThrowIfNull(formatter);
+            lock (_gate)
+            {
+                _text.AppendLine(formatter(state, exception));
+                if (exception is not null)
+                    _text.AppendLine(exception.ToString());
+            }
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+
+    private sealed class CapturingHost(IConfigurationSection config, ILogger logger) : IPluginHost
+    {
+        public ILogger Logger { get; } = logger;
+
+        public IConfigurationSection ScopedConfig { get; } = config;
     }
 
     private sealed class RedmineFakeHandler : HttpMessageHandler

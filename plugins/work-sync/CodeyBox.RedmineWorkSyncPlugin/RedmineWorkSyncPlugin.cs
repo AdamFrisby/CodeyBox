@@ -46,7 +46,6 @@ namespace CodeyBox.RedmineWorkSyncPlugin;
 public sealed class RedmineWorkSyncPlugin
     : IWorkSource, IWorkTracker, IPluginInitializer, IDisposable
 {
-    private readonly IHttpClientFactory? _httpFactory;
     private readonly Func<string, string?> _env;
     private readonly IConfigurationSection? _testConfig;
 
@@ -59,10 +58,14 @@ public sealed class RedmineWorkSyncPlugin
     private readonly object _clientLock = new();
     private bool _disposed;
 
-    /// <summary>Production constructor (DI provides the HTTP factory).</summary>
-    public RedmineWorkSyncPlugin(IHttpClientFactory httpFactory)
+    /// <summary>
+    /// Production constructor. The plugin owns its HTTP client (see <see
+    /// cref="RedmineHttpClients"/>) rather than sharing the host factory: the
+    /// API key rides in a request header, so the client must never follow a
+    /// redirect — which would re-send the credential to a server-chosen host.
+    /// </summary>
+    public RedmineWorkSyncPlugin()
     {
-        _httpFactory = httpFactory ?? throw new ArgumentNullException(nameof(httpFactory));
         _env = Environment.GetEnvironmentVariable;
         _ownsHttpClient = true;
     }
@@ -394,12 +397,11 @@ public sealed class RedmineWorkSyncPlugin
                 return _api;
             if (_http is null)
             {
-                _http = _httpFactory!.CreateClient("redmine-worksync");
-                // Request timeouts are enforced per attempt from the live
-                // TimeoutSeconds option (a linked CTS in SendOnceAsync),
-                // so edits hot-reload; disable the client-level timeout on
-                // this owned client. An injected client is never mutated.
-                _http.Timeout = Timeout.InfiniteTimeSpan;
+                // Owned no-redirect client: request timeouts are enforced per
+                // attempt from the live TimeoutSeconds option (a linked CTS
+                // in SendOnceAsync), so edits hot-reload. An injected client
+                // is never mutated.
+                _http = RedmineHttpClients.Create();
             }
             _tokens = new RedmineTokenProvider(_env);
             _api = new RedmineRestClient(_http, _tokens);
