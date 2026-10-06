@@ -132,7 +132,16 @@ public sealed class DefaultProcessRunnerCancellationTests
         var rootPid = await transcript.RootPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
         var descendantPid = await transcript.ChildPid.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        await Assert.ThrowsAnyAsync<IOException>(() => run.WaitAsync(TimeSpan.FromSeconds(5)));
+        // RunCompletionBudget (not the 5 s default): same reasoning as
+        // OutputLimitAfterRootExits_KillsOrphanedWriterProcess above — under
+        // the full audit suite this real-process test races dozens of other
+        // process-spawning tests for CPU, so killing the orphaned descendant's
+        // process group and draining the 4 MiB stdin pipe can exceed 5 s of
+        // wall-clock on a starved scheduler. This WaitAsync deadline is only a
+        // harness guard against a genuine hang; no assertion checks elapsed
+        // time, so widening it weakens nothing the test proves (the
+        // IOException and the reaped processes are still asserted below).
+        await Assert.ThrowsAnyAsync<IOException>(() => run.WaitAsync(RunCompletionBudget));
 
         await AssertProcessesGoneAsync(rootPid, descendantPid);
     }
