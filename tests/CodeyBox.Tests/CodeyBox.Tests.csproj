@@ -50,6 +50,7 @@
     <ProjectReference Include="..\..\src\CodeyBox.Core\CodeyBox.Core.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\..\src\CodeyBox.PluginSdk\CodeyBox.PluginSdk.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-api-compatibility\CodeyBox.AsyncApiAuditorPlugin\CodeyBox.AsyncApiAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-api-compatibility\CodeyBox.BufAuditorPlugin\CodeyBox.BufAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-api-compatibility\CodeyBox.CargoSemverChecksAuditorPlugin\CodeyBox.CargoSemverChecksAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-api-compatibility\CodeyBox.GraphqlInspectorAuditorPlugin\CodeyBox.GraphqlInspectorAuditorPlugin.csproj" />
