@@ -95,6 +95,7 @@
     <Project Path="plugins/auditors-linting/CodeyBox.ExampleSarifAuditorPlugin/CodeyBox.ExampleSarifAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.EslintAuditorPlugin/CodeyBox.EslintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.InspectCodeAuditorPlugin/CodeyBox.InspectCodeAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.IwyuAuditorPlugin/CodeyBox.IwyuAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.KnipAuditorPlugin/CodeyBox.KnipAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.BiomeAuditorPlugin/CodeyBox.BiomeAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.MypyAuditorPlugin/CodeyBox.MypyAuditorPlugin.csproj" />
