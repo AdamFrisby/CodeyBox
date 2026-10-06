@@ -40,8 +40,9 @@ internal sealed class GlslangValidationBackend : IShaderValidationBackend
         ArgumentNullException.ThrowIfNull(targetEnvironment);
 
         // Validation only: no `-V` codegen and no `-o` output — the auditor
-        // checks the sources and emits no SPIR-V (a SPIR-V backend is a
-        // separate dependent task). The target environment is always passed
+        // checks the sources and emits no SPIR-V (validating emitted
+        // binaries is the SpirvValAuditor in this same assembly, sharing
+        // the family seam). The target environment is always passed
         // explicitly rather than inherited from the tool default, and the
         // stage flag only when every target resolved to one stage (the only
         // shape a single `-S` can express; mixed-stage sets rely on

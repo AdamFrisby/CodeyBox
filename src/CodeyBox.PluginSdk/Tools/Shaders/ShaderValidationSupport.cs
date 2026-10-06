@@ -217,7 +217,7 @@ public static class ShaderValidationSupport
             }
         }
 
-        var path = ValidatedTargetPath(pathText, source);
+        var path = ContainRepoRelativePath(pathText, source);
         var extension = PathExtension(path);
         if (string.Equals(extension, ".conf", StringComparison.OrdinalIgnoreCase))
             throw new AuditUnavailableException(
@@ -255,8 +255,10 @@ public static class ShaderValidationSupport
     // worktree: the argv guard (bounded, no leading parameter dash, no
     // controls) plus containment — a rooted path or a `..` segment would
     // point the tool outside the tree and produce report paths the
-    // repo-relative finding contract cannot express.
-    private static string ValidatedTargetPath(string value, string source)
+    // repo-relative finding contract cannot express. Public so the SPIR-V
+    // module seam (which shares this policy but not the stage/extension
+    // vocabulary) reuses the same guard instead of re-implementing it.
+    public static string ContainRepoRelativePath(string value, string source)
     {
         var trimmed = (value ?? string.Empty).Trim();
         if (trimmed.Length == 0
