@@ -1,3 +1,4 @@
+using CodeyBox.Build.MSBuild;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging;
@@ -30,11 +31,6 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     // treated as a tree we cannot safely inspect (the gate falls back to
     // Unavailable rather than partial-data).
     private const int MaxDotnetMarkerPathsPerBranch = 8192;
-    // POSIX shells conventionally use 127 for "command not found".
-    private const int DotnetCommandNotFoundExitCode = 127;
-    // Internal BuildScript sentinel: marker inspection said this gate applies,
-    // but no buildable .NET target was present after checkout.
-    private const int NoRequiredBuildTargetExitCode = 125;
     // Internal verifier sentinel for branch-controlled clone / checkout / build
     // execution exceeding the required-build budget.
     private const int BuildTimeoutExitCode = 124;
@@ -83,106 +79,13 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
 
     // Exposed to tests so the actual gate script — the exact artifact the
     // sandbox executes via `sh -c` — can be run under a controlled shell.
-    internal static readonly string BuildScript = $$"""
-        set -eu
-        {{NuGetHomeSelfHeal.Preamble}}
-        dotnet_command_not_found_exit={{DotnetCommandNotFoundExitCode}}
-        no_required_build_target_exit={{NoRequiredBuildTargetExitCode}}
-
-        if ! command -v dotnet >/dev/null 2>&1; then
-          echo "dotnet is not available in the sandbox PATH" >&2
-          exit "$dotnet_command_not_found_exit"
-        fi
-
-        tmp_root="${TMPDIR:-/tmp}"
-        targets_file="$tmp_root/codeybox-required-build-targets-$$"
-
-        # The build gate must survive sandbox images whose per-user home is not
-        # writable by the build user. `dotnet build` reads — and, when absent,
-        # creates — the per-user NuGet settings directory ($HOME/.nuget/NuGet)
-        # before honouring any repo-, solution-, or RestoreConfigFile-level
-        # configuration, so an image whose $HOME (or $HOME/.nuget) is owned by
-        # another user (e.g. root) fails every restore with
-        # "Failed to read NuGet.Config ... Permission denied" and produces no
-        # assemblies. Redirect the CLI/NuGet per-user home to a directory this
-        # script owns so the gate no longer depends on $HOME being writable.
-        dotnet_home="$tmp_root/codeybox-dotnet-home-$$"
-        original_home="${HOME:-}"
-
-        cleanup() { rm -rf "$targets_file" "$dotnet_home"; }
-        trap cleanup EXIT INT TERM
-
-        mkdir -p "$dotnet_home"
-        export DOTNET_CLI_HOME="$dotnet_home"
-        export DOTNET_NOLOGO=1
-        export DOTNET_CLI_TELEMETRY_OPTOUT=1
-
-        # Relocating DOTNET_CLI_HOME also relocates the NuGet global-packages
-        # folder ($DOTNET_CLI_HOME/.nuget/packages). Images that pre-bake their
-        # package cache under the original per-user home would then restore
-        # against an empty folder and require network access. Preserve that
-        # cache (read access is sufficient — restore never writes to an
-        # already-extracted package) so offline/pinned images keep working.
-        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$original_home" ] && [ -d "$original_home/.nuget/packages" ]; then
-          export NUGET_PACKAGES="$original_home/.nuget/packages"
-        fi
-
-        # Some NuGet builds resolve their user-config path from HOME even when
-        # DOTNET_CLI_HOME is set. Point both variables at the isolated writable
-        # directory, after preserving the original package-cache path above.
-        export HOME="$dotnet_home"
-
-        find . -maxdepth 1 -type f \( -name '*.slnx' -o -name '*.sln' \) | sort > "$targets_file"
-
-        if [ ! -s "$targets_file" ]; then
-          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f \( -name '*.slnx' -o -name '*.sln' \) -print \) | sort > "$targets_file"
-        fi
-
-        # If we discovered any solution file (root or nested), append test
-        # projects: a nested .sln may not include every test project and the
-        # build gate must still cover the full test surface. When no solution
-        # exists at all, the csproj-only fallback below already picks up test
-        # projects.
-        if [ -s "$targets_file" ]; then
-          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f -name '*.csproj' -print \) | sort |
-          while IFS= read -r project; do
-            lower=$(printf '%s' "$project" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-            case "$lower" in
-              *test*.csproj|*/test*/*.csproj|*/tests/*.csproj) printf '%s\n' "$project" ;;
-            esac
-          done >> "$targets_file"
-        fi
-
-        if [ ! -s "$targets_file" ]; then
-          find . \( -type d \( -name '.git' -o -name 'bin' -o -name 'obj' -o -name 'node_modules' \) -prune \) -o \( -type f -name '*.csproj' -print \) | sort > "$targets_file"
-        fi
-
-        sort -u "$targets_file" -o "$targets_file"
-        if [ ! -s "$targets_file" ]; then
-          echo "No .NET solution or project file was found after marker detection." >&2
-          exit "$no_required_build_target_exit"
-        fi
-
-        # Heal an inherited, non-writable per-user NuGet home before restore so a
-        # COW-inherited root-owned $HOME/.nuget cannot abort the build with
-        # "Failed to read NuGet.Config due to unauthorized access". The recovery
-        # is repository-owned (scripts/nuget-home-heal.sh) and dot-sourced so its
-        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below; it
-        # is a no-op when the home is usable and is skipped when the repository
-        # does not ship it. This adds no capability the gate lacks — it already
-        # runs the branch's arbitrary build logic via `dotnet build`.
-        if [ -f scripts/nuget-home-heal.sh ]; then
-          . ./scripts/nuget-home-heal.sh
-        fi
-
-        while IFS= read -r target; do
-          [ -n "$target" ] || continue
-          echo "CodeyBox required build: dotnet build $target"
-          dotnet build "$target" --disable-build-servers --maxcpucount:1
-        done < "$targets_file"
-        """;
+    // Composed by RequiredBuildScript from the same discovery and isolation
+    // fragments as the opted-in capture variant, so the two paths cannot fork.
+    internal static readonly string BuildScript = RequiredBuildScript.Build(captureBinlogs: false);
 
     private readonly ISandboxProvider _sandboxes;
+    private readonly Func<MSBuildDiagnosticsOptions>? _msBuildDiagnostics;
+    private readonly IBuildDiagnosticsProducer? _buildDiagnosticsProducer;
     private readonly IGitHost _gitHost;
     private readonly PipelineOptions _pipelineOptions;
     private readonly ILogger<SandboxRequiredBuildVerifier>? _logger;
@@ -191,12 +94,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         ISandboxProvider sandboxes,
         IGitHost gitHost,
         PipelineOptions pipelineOptions,
-        ILogger<SandboxRequiredBuildVerifier>? logger = null)
+        ILogger<SandboxRequiredBuildVerifier>? logger = null,
+        Func<MSBuildDiagnosticsOptions>? msBuildDiagnostics = null,
+        IBuildDiagnosticsProducer? buildDiagnosticsProducer = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
         _pipelineOptions = pipelineOptions;
         _logger = logger;
+        _msBuildDiagnostics = msBuildDiagnostics;
+        _buildDiagnosticsProducer = buildDiagnosticsProducer;
     }
 
     public async Task<RequiredBuildProbeResult> ProbeAsync(
@@ -367,7 +274,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 : $"Required .NET build markers exist on base branch '{inspection.BaseBranch}', " +
                   $"but work branch '{request.WorkBranch}' contains no solution or project file. " +
                   "The branch deleted or moved the files required for the non-skippable build gate.";
-            return RequiredBuildVerificationResult.Failed(NoRequiredBuildTargetExitCode, output);
+            return RequiredBuildVerificationResult.Failed(RequiredBuildScript.NoRequiredBuildTargetExitCode, output);
         }
 
         string? isolatedRepoPath = null;
@@ -451,6 +358,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         CancellationToken ct)
     {
         ISandbox? sandbox = null;
+        // Opted-in MSBuild diagnostics capture runs inside this same
+        // sandbox session: the capture script variant adds least-data
+        // `-bl` logging to each `dotnet build`; no second build is
+        // ever executed for diagnostics. When disabled the executed
+        // command is byte-identical to the historical one. Options are
+        // read once here so the script, fetch caps, and evidence binding
+        // agree for the whole verification.
+        var captureOptions = MSBuildDiagnosticsEnrichment.ReadOptions(_msBuildDiagnostics);
+        var captureDiagnostics = captureOptions.Enabled
+            && _buildDiagnosticsProducer is { IsEnabled: true };
         try
         {
             sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -478,10 +395,22 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     request.WorkBranch,
                     $"origin/{request.WorkBranch}");
 
+                // Opted-in MSBuild diagnostics capture runs inside this same
+                // sandbox session (see above): choose the script variant and
+                // configuration here; the command stays byte-identical to the
+                // historical one when disabled.
                 build = await sandbox.ExecAsync(new SandboxExec
                 {
-                    Argv = ["sh", "-c", BuildScript],
+                    Argv = ["sh", "-c", captureDiagnostics
+                        ? MSBuildDiagnosticsEnrichment.BuildScriptWithBinlogCapture
+                        : BuildScript],
                     WorkingDirectory = SandboxConventions.WorkDir,
+                    ExtraEnvironment = captureDiagnostics
+                        ? new Dictionary<string, string>
+                        {
+                            [MSBuildDiagnosticsEnrichment.BinlogConfigVariable] = captureOptions.BuildConfiguration,
+                        }
+                        : null,
                 }, buildCt);
             }
             catch (OperationCanceledException) when (buildTimeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
@@ -516,7 +445,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                 return RequiredBuildVerificationResult.Passed(build.ExitCode, output);
             }
 
-            if (build.ExitCode == DotnetCommandNotFoundExitCode
+            if (build.ExitCode == RequiredBuildScript.DotnetCommandNotFoundExitCode
                 && rawOutput.Contains("dotnet is not available in the sandbox PATH", StringComparison.OrdinalIgnoreCase))
             {
                 return RequiredBuildVerificationResult.Unavailable(
@@ -525,7 +454,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     redactedOutput);
             }
 
-            if (build.ExitCode == NoRequiredBuildTargetExitCode)
+            if (build.ExitCode == RequiredBuildScript.NoRequiredBuildTargetExitCode)
             {
                 return RequiredBuildVerificationResult.Unavailable(
                     "could not verify required build: no .NET solution or project file was found after marker detection",
@@ -533,7 +462,26 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     redactedOutput);
             }
 
-            return RequiredBuildVerificationResult.Failed(build.ExitCode, redactedOutput);
+            // Failure-path enrichment only: the authoritative Failed outcome
+            // is already decided; diagnostics add causal context for the
+            // repair loop or an explicit insufficient-diagnostics note. Uses
+            // the caller's token (not the build budget, which is spent), and
+            // never throws for enrichment problems.
+            BuildDiagnosticsEvidence? diagnostics = null;
+            if (captureDiagnostics)
+            {
+                diagnostics = await MSBuildDiagnosticsEnrichment.EnrichFailedBuildAsync(
+                    sandbox,
+                    request.WorkBranch,
+                    captureOptions,
+                    _buildDiagnosticsProducer,
+                    ct).ConfigureAwait(false);
+            }
+
+            return RequiredBuildVerificationResult.Failed(build.ExitCode, redactedOutput) with
+            {
+                BuildDiagnostics = diagnostics,
+            };
         }
         finally
         {

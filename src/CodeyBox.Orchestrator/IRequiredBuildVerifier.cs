@@ -101,6 +101,17 @@ public sealed record RequiredBuildVerificationResult(
     string? Reason = null,
     IReadOnlyList<TestFailureAttributionResult>? TestFailureAttributions = null)
 {
+    /// <summary>
+    /// Optional structured build-diagnostics evidence attached by an opted-in
+    /// diagnostics producer (e.g. the MSBuild binlog adapter). Additive and
+    /// null by default so pre-existing results and persisted state keep
+    /// loading unchanged. Never alters the authoritative
+    /// <see cref="Status"/>/exit-code outcome: missing or insufficient
+    /// diagnostics is reported explicitly inside the evidence, never as a
+    /// pass.
+    /// </summary>
+    public BuildDiagnosticsEvidence? BuildDiagnostics { get; init; }
+
     public static RequiredBuildVerificationResult Skipped { get; } =
         new(RequiredBuildVerificationStatus.Skipped, 0, string.Empty);
 

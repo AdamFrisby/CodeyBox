@@ -555,7 +555,9 @@ internal sealed class RequiredBuildGate
                     AuditorName: RequiredBuildGateIdentity.AuditorName,
                     Severity: AuditSeverity.Error,
                     Title: $"required build failed: {RequiredBuildGateIdentity.DisplayCommand}",
-                    Description: $"Required build exited with code {result.ExitCode}."),
+                    Description: AppendDiagnostics(
+                        $"Required build exited with code {result.ExitCode}.",
+                        result.BuildDiagnostics)),
             },
             RequiredBuildVerificationStatus.Unavailable => new AuditFinding[]
             {
@@ -584,7 +586,23 @@ internal sealed class RequiredBuildGate
         var detail = string.IsNullOrWhiteSpace(result.Output)
             ? "(no build output captured)"
             : result.Output.Trim();
-        return $"required build failed (exit {result.ExitCode}): {detail}";
+        return AppendDiagnostics(
+            $"required build failed (exit {result.ExitCode}): {detail}",
+            result.BuildDiagnostics);
+    }
+
+    /// <summary>
+    /// Appends redacted structured-diagnostics context (root-cause failures
+    /// plus project/target context, or an explicit insufficient-diagnostics
+    /// note) to repair-loop text. Returns the base text unchanged when no
+    /// diagnostics producer contributed evidence, so non-enriched results
+    /// keep their historical shape byte-identically.
+    /// </summary>
+    private static string AppendDiagnostics(string baseText, BuildDiagnosticsEvidence? evidence)
+    {
+        if (evidence is null) return baseText;
+        var rendered = BuildDiagnosticsFormatter.Describe(evidence);
+        return string.IsNullOrEmpty(rendered) ? baseText : baseText + "\n" + rendered;
     }
 
     /// <summary>
