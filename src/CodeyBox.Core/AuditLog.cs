@@ -154,9 +154,24 @@ public static class AuditLog
                 reason ?? "",
                 nextRetryAt?.ToString("O") ?? "");
 
-    public static void WorkItemPickedUp(int workerId, WorkItemId id) =>
-        Audit("work_item.picked_up")
-            .Information("Worker {WorkerId} picked up work item {WorkItemId}", workerId, id.ToString());
+    /// <summary>
+    /// Emitted when a worker takes a work item off the queue and starts its
+    /// pipeline run. Carries the item's lifecycle <paramref name="state"/> and
+    /// recovery-attempt count at pickup so timeline readers can render the
+    /// pickup honestly (a pickup is not itself a state transition). Both are
+    /// optional so pre-existing log lines without them remain readable; the
+    /// reader treats absent values as unknown rather than inferring
+    /// <c>Working</c> from the fact of pickup.
+    /// </summary>
+    public static void WorkItemPickedUp(int workerId, WorkItemId id, string? state = null, int? attempt = null)
+    {
+        var log = Audit("work_item.picked_up");
+        if (!string.IsNullOrEmpty(state))
+            log = log.ForContext("State", state);
+        if (attempt.HasValue)
+            log = log.ForContext("Attempt", attempt.Value);
+        log.Information("Worker {WorkerId} picked up work item {WorkItemId}", workerId, id.ToString());
+    }
 
     // ── Worker pool lifecycle ────────────────────────────────────────────────
 
