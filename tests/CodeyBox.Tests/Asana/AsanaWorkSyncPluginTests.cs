@@ -359,8 +359,43 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
             var path = req.RequestUri!.AbsolutePath;
             if (req.Method == HttpMethod.Get && path.EndsWith("/tasks", StringComparison.Ordinal))
             {
-                var content = new StringContent("{\"data\":[]}");
+                // A real signalled-task payload under a lying
+                // Content-Length: an unguarded read would parse and emit
+                // candidates, so Assert.Empty stays green only when the
+                // declared-size guard actually fires.
+                var content = new StringContent(Fixture("tasks-page-1.json"));
                 content.Headers.ContentLength = 300L * 1024 * 1024;
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+            }
+            return JsonResponse("{}");
+        };
+
+        var candidates = await PollAllAsync(plugin);
+        Assert.Empty(candidates);
+    }
+
+    [Fact]
+    public async Task OversizedStreamedBody_RejectedMidRead()
+    {
+        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["MaxResponseBytes"] = "1048576",
+        });
+        _handler.Responder = (req, _) =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (req.Method == HttpMethod.Get && path.EndsWith("/tasks", StringComparison.Ordinal))
+            {
+                // Valid task JSON larger than the cap but declaring a
+                // Content-Length under it: only the mid-stream cap can
+                // catch this, and an unguarded read emits a candidate —
+                // flipping Assert.Empty to red.
+                var notes = new string('n', 1200 * 1024);
+                var tasksJson = "{\"data\":[{\"gid\":\"12030\",\"name\":\"huge\",\"notes\":"
+                    + JsonEscape(notes)
+                    + ",\"projects\":[{\"gid\":\"555\"}],\"assignee\":{\"gid\":\"111\"}}]}";
+                var content = new StringContent(tasksJson);
+                content.Headers.ContentLength = 1024;
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
             }
             return JsonResponse("{}");
@@ -769,9 +804,8 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
     public async Task DedupReadFailure_DoesNotBlockTheWrite()
     {
         var plugin = CreatePlugin();
-        var storiesFailed = true;
         UseRest(overrideResponder: (req, _) =>
-            req.Method == HttpMethod.Get && req.RequestUri!.AbsolutePath.EndsWith("/stories", StringComparison.Ordinal) && storiesFailed
+            req.Method == HttpMethod.Get && req.RequestUri!.AbsolutePath.EndsWith("/stories", StringComparison.Ordinal)
                 ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
                 {
                     Content = new StringContent("stories are down"),
@@ -911,6 +945,24 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
     }
 
     [Fact]
+    public async Task ModifiedSinceQuery_UsesInjectedClock()
+    {
+        var clock = new AsanaClock(new DateTimeOffset(2026, 6, 1, 12, 0, 0, TimeSpan.Zero));
+        var plugin = CreatePlugin(new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ModifiedSinceHours"] = "2",
+        }, clock);
+        UseRest();
+
+        await PollAllAsync(plugin);
+
+        var tasksRequest = _handler.Requests.First(
+            r => r.Request.RequestUri!.AbsolutePath.EndsWith("/tasks", StringComparison.Ordinal));
+        var query = Uri.UnescapeDataString(tasksRequest.Request.RequestUri!.Query);
+        Assert.Contains("modified_since=2026-06-01T10:00:00", query, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CancelledPoll_PropagatesCancellation()
     {
         var plugin = CreatePlugin();
@@ -1003,11 +1055,11 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
         Assert.Equal(100, parsed.PageSize);
         Assert.Single(warnings);
 
-        Assert.True(AsanaRestClient.TryParseCustomFieldMapping("2001:2002", out var field, out var option));
+        Assert.True(AsanaWorkSyncOptions.TryParseCustomFieldMapping("2001:2002", out var field, out var option));
         Assert.Equal("2001", field);
         Assert.Equal("2002", option);
-        Assert.False(AsanaRestClient.TryParseCustomFieldMapping("nope", out _, out _));
-        Assert.False(AsanaRestClient.TryParseCustomFieldMapping("abc:2002", out _, out _));
+        Assert.False(AsanaWorkSyncOptions.TryParseCustomFieldMapping("nope", out _, out _));
+        Assert.False(AsanaWorkSyncOptions.TryParseCustomFieldMapping("abc:2002", out _, out _));
         Assert.True(AsanaGids.IsGid("12001"));
         Assert.False(AsanaGids.IsGid("PROJ-1"));
         Assert.False(AsanaGids.IsGid(string.Empty));

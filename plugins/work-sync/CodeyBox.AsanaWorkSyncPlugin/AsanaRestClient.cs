@@ -23,6 +23,12 @@ public sealed class AsanaApiException : Exception
         : base(message, innerException)
     {
     }
+
+    public AsanaApiException(string message, HttpStatusCode? statusCode, Exception innerException)
+        : base(message, innerException)
+    {
+        StatusCode = statusCode;
+    }
 }
 
 /// <summary>What the authenticated identity reports about itself (<c>GET /users/me</c>).</summary>
@@ -37,8 +43,9 @@ public sealed record AsanaUserInfo(string Gid, string Name);
 /// <para>List reads request only the identity/signal fields they use via
 /// <c>opt_fields</c> (<see cref="TaskFields"/>); pagination follows the
 /// opaque <c>next_page.offset</c> token, never a numeric skip. Retries on
-/// 429/5xx are bounded by the live options and honour <c>Retry-After</c>
-/// within its cap.</para>
+/// 429/5xx — idempotent requests only, never a write of uncertain outcome —
+/// are bounded by the live options and honour <c>Retry-After</c> within its
+/// cap.</para>
 /// </summary>
 public sealed class AsanaRestClient
 {
@@ -51,13 +58,16 @@ public sealed class AsanaRestClient
     /// </summary>
     internal const string TaskFields =
         "gid,name,notes,assignee.gid,assignee.name,tags.gid,tags.name," +
-        "completed,modified_at,projects.gid,memberships.section.gid,memberships.section.name";
+        "completed,projects.gid,memberships.section.name";
 
     /// <summary>Story fields requested for duplicate detection.</summary>
-    internal const string StoryFields = "gid,type,text,created_by.gid,created_by.name";
+    internal const string StoryFields = "gid,type,text";
 
     /// <summary>Maximum upstream error text surfaced in exception detail.</summary>
     internal const int MaxErrorChars = 300;
+
+    /// <summary>Largest error body parsed for relayed detail — a bound so a huge failure page is never walked for one message.</summary>
+    internal const int MaxErrorBodyChars = 64 * 1024;
 
     /// <summary>Product token sent as User-Agent — no version, so it cannot drift.</summary>
     internal const string UserAgentProduct = "CodeyBox-AsanaWorkSync";
@@ -88,7 +98,7 @@ public sealed class AsanaRestClient
         ArgumentNullException.ThrowIfNull(options);
         RequireGid(projectGid, "project");
         var maxPages = Math.Max(1, options.MaxPagesPerPoll);
-        var limit = Math.Clamp(options.PageSize, 1, 100);
+        var limit = Math.Clamp(options.PageSize, 1, AsanaWorkSyncOptions.MaxApiPageSize);
         string? offset = null;
         // The page count is bounded independently of MaxItemsPerPoll: an
         // upstream returning perpetually non-terminating pages must not keep
@@ -131,7 +141,7 @@ public sealed class AsanaRestClient
     {
         ArgumentNullException.ThrowIfNull(options);
         RequireGid(taskGid, "task");
-        var limit = Math.Clamp(options.DedupScanLimit, 1, 100);
+        var limit = Math.Clamp(options.DedupScanLimit, 1, AsanaWorkSyncOptions.MaxApiPageSize);
         var url = $"{Base(options)}/tasks/{taskGid}/stories"
             + $"?opt_fields={Uri.EscapeDataString(StoryFields)}"
             + $"&limit={limit}";
@@ -236,30 +246,6 @@ public sealed class AsanaRestClient
                 $"Asana {role} GID '{value}' is not a valid numeric GID.", nameof(value));
     }
 
-    /// <summary>
-    /// Parses an explicit custom-field mapping value in
-    /// <c>fieldGid:enumGid</c> form. Returns false (never throws for shape)
-    /// when the value is not two numeric GIDs.
-    /// </summary>
-    internal static bool TryParseCustomFieldMapping(
-        string mapping, out string fieldGid, out string enumGid)
-    {
-        fieldGid = string.Empty;
-        enumGid = string.Empty;
-        if (string.IsNullOrWhiteSpace(mapping))
-            return false;
-        var parts = mapping.Split(':');
-        if (parts.Length != 2)
-            return false;
-        var field = parts[0].Trim();
-        var option = parts[1].Trim();
-        if (!AsanaGids.IsGid(field) || !AsanaGids.IsGid(option))
-            return false;
-        fieldGid = field;
-        enumGid = option;
-        return true;
-    }
-
     private string ModifiedSinceQuery(AsanaWorkSyncOptions options)
     {
         if (options.ModifiedSinceHours <= 0)
@@ -286,18 +272,22 @@ public sealed class AsanaRestClient
     /// and throws before a request is built — the bearer credential must
     /// never be aimed at a placeholder, a non-HTTP target, or a cleartext
     /// channel. <c>http://</c> requires the explicit dev-only <see
-    /// cref="AsanaWorkSyncOptions.AllowUnsafeHttp"/> opt-in.
+    /// cref="AsanaWorkSyncOptions.AllowUnsafeHttp"/> opt-in AND a loopback
+    /// host, so the opt-in can never route the credential off-box in
+    /// cleartext.
     /// </summary>
     private static string Base(AsanaWorkSyncOptions options)
     {
         var raw = options.ApiBaseUrl.TrimEnd('/');
         if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri)
             || (uri.Scheme != Uri.UriSchemeHttps
-                && !(uri.Scheme == Uri.UriSchemeHttp && options.AllowUnsafeHttp)))
+                && !(uri.Scheme == Uri.UriSchemeHttp
+                    && options.AllowUnsafeHttp
+                    && CredentialOptions.IsLoopbackHost(uri.Host))))
             throw new InvalidOperationException(
                 "Asana ApiBaseUrl is not configured or is not an absolute https URL; " +
                 "set it in the plugin configuration before enabling work sync " +
-                "(plaintext http:// would send credentials unencrypted and requires " +
+                "(plaintext http:// is allowed only for loopback hosts and requires " +
                 "the dev-only AllowUnsafeHttp=true opt-in).");
         return raw;
     }
@@ -319,9 +309,6 @@ public sealed class AsanaRestClient
         }
         return null;
     }
-
-    private static string Clip(string value) =>
-        value.Length <= MaxErrorChars ? value : value[..MaxErrorChars];
 
     private async Task<JsonDocument> GetAsync(
         AsanaWorkSyncOptions options, string url, CancellationToken ct)
@@ -347,7 +334,11 @@ public sealed class AsanaRestClient
     /// (Asana documents 500s as sometimes load-related). <c>Retry-After</c>
     /// is honoured in seconds or HTTP-date form within its cap; otherwise an
     /// exponential backoff from the live option applies. Every bound comes
-    /// from options, never literals, so edits hot-reload.
+    /// from options, never literals, so edits hot-reload. Only idempotent
+    /// requests retry: a write whose outcome is uncertain (a story POST that
+    /// may have landed upstream before the failure) is never blindly
+    /// repeated — the pre-write duplicate scan reconciles it on the next
+    /// post instead.
     /// </summary>
     private async Task<JsonDocument> SendWithRetryAsync(
         AsanaWorkSyncOptions options, Func<HttpRequestMessage> buildRequest, CancellationToken ct)
@@ -397,7 +388,19 @@ public sealed class AsanaRestClient
                         $"for {request.Method} {request.RequestUri?.AbsolutePath}: redirects are refused " +
                         "and never followed with credentials.",
                         response.StatusCode);
-                if (!IsRetryable(response.StatusCode) || attempt >= maxAttempts)
+                // Second-layer guard, matching the shared credential
+                // transport: an injected client whose handler followed a
+                // redirect already re-sent the bearer token off-origin —
+                // refuse that response rather than trusting it.
+                if (response.RequestMessage?.RequestUri is { } finalUri
+                    && request.RequestUri is { } originalUri
+                    && !CredentialHttp.IsSameOrigin(finalUri, originalUri))
+                    throw new AsanaApiException(
+                        $"Asana API {request.Method} {originalUri.AbsolutePath} was redirected " +
+                        "to another origin; refusing the response.",
+                        response.StatusCode);
+                if (!IsRetryable(response.StatusCode) || attempt >= maxAttempts
+                    || !IsIdempotent(request.Method))
                     return await ReadSuccessAsync(options, request, response, requestCt).ConfigureAwait(false);
 
                 var delay = RetryDelay(response, attempt, options);
@@ -413,20 +416,24 @@ public sealed class AsanaRestClient
             or HttpStatusCode.ServiceUnavailable
             or HttpStatusCode.GatewayTimeout;
 
-    private static TimeSpan RetryDelay(HttpResponseMessage response, int attempt, AsanaWorkSyncOptions options)
+    /// <summary>
+    /// True for replay-safe methods. POST (story creation) is excluded: a
+    /// retry after a write that may already have committed would
+    /// double-post the comment.
+    /// </summary>
+    private static bool IsIdempotent(HttpMethod method) =>
+        method == HttpMethod.Get || method == HttpMethod.Put;
+
+    private TimeSpan RetryDelay(HttpResponseMessage response, int attempt, AsanaWorkSyncOptions options)
     {
         var cap = TimeSpan.FromSeconds(Math.Max(1, options.RetryMaxDelaySeconds));
-        if (response.Headers.RetryAfter is { } retryAfter)
-        {
-            if (retryAfter.Delta is { } delta && delta >= TimeSpan.Zero && delta <= cap)
-                return delta;
-            if (retryAfter.Date is { } date)
-            {
-                var until = date - DateTimeOffset.UtcNow;
-                if (until >= TimeSpan.Zero && until <= cap)
-                    return until;
-            }
-        }
+        // Shared Retry-After parsing against the injected clock — seconds
+        // and HTTP-date forms both handled, clamped by the implementation
+        // every backend shares.
+        if (CredentialRetryAfter.Parse(response, _clock) is { } hintedSeconds
+            && TimeSpan.FromSeconds(hintedSeconds) is { } hinted
+            && hinted <= cap)
+            return hinted;
         var baseMs = Math.Max(0, options.RetryBaseDelayMs);
         var backoffMs = (double)baseMs * (1L << Math.Min(attempt, 10));
         var cappedMs = Math.Min(backoffMs, cap.TotalMilliseconds);
@@ -465,10 +472,10 @@ public sealed class AsanaRestClient
     /// <summary>
     /// Reads a response body with a hard byte cap — the upstream is a
     /// less-trusted dependency, so its output is bounded before buffering:
-    /// the declared Content-Length is checked first, then the stream is read
-    /// in chunks and rejected the moment it exceeds <paramref
-    /// name="maxBytes"/>. Throws <see cref="AsanaApiException"/> on
-    /// overflow.
+    /// the declared Content-Length is checked first, then the shared <see
+    /// cref="CredentialBodies.CopyCappedAsync"/> loop rejects the stream the
+    /// moment it exceeds <paramref name="maxBytes"/>. Throws <see
+    /// cref="AsanaApiException"/> on overflow.
     /// </summary>
     internal static async Task<string> ReadBoundedStringAsync(
         HttpContent? content, long maxBytes, CancellationToken ct)
@@ -479,28 +486,29 @@ public sealed class AsanaRestClient
             throw new AsanaApiException(
                 $"Asana response body exceeds the {maxBytes}-byte cap " +
                 $"(declared {content.Headers.ContentLength} bytes).");
+        var cap = (int)Math.Clamp(maxBytes, 1, (long)int.MaxValue - 1);
         await using var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var memory = new MemoryStream();
-        var chunk = new byte[16 * 1024];
-        int read;
-        while ((read = await stream.ReadAsync(chunk, ct).ConfigureAwait(false)) > 0)
-        {
-            memory.Write(chunk, 0, read);
-            if (memory.Length > maxBytes)
-                throw new AsanaApiException(
-                    $"Asana response body exceeds the {maxBytes}-byte cap.");
-        }
-        return System.Text.Encoding.UTF8.GetString(memory.ToArray());
+        // The shared capped copy enforces the bound before buffering, so a
+        // lying content-length can never fill host memory.
+        var (bytes, truncated) = await CredentialBodies.CopyCappedAsync(stream, cap, ct).ConfigureAwait(false);
+        if (truncated)
+            throw new AsanaApiException(
+                $"Asana response body exceeds the {maxBytes}-byte cap.");
+        return System.Text.Encoding.UTF8.GetString(bytes);
     }
 
     /// <summary>
-    /// Extracts a bounded, single-line error summary from an Asana error body
+    /// Extracts a bounded error summary from an Asana error body
     /// (<c>{"errors":[{"message":…}]}</c>). Never throws, never echoes
-    /// credentials — the response body is instance text only.
+    /// credentials — the response body is instance text only. Relayed text
+    /// passes through the shared <see cref="CredentialMessages.Truncate"/>
+    /// policy: every control character flattens (ESC/BEL/NUL cannot smuggle
+    /// terminal escapes into logs) and the cap never splits a surrogate
+    /// pair — one implementation so the policy cannot fork per backend.
     /// </summary>
     private static string? ErrorDetail(string body)
     {
-        if (string.IsNullOrWhiteSpace(body) || body.Length > 64 * 1024)
+        if (string.IsNullOrWhiteSpace(body) || body.Length > MaxErrorBodyChars)
             return null;
         try
         {
@@ -508,8 +516,8 @@ public sealed class AsanaRestClient
             var detail = FirstErrorMessage(doc.RootElement);
             if (string.IsNullOrWhiteSpace(detail))
                 return null;
-            var singleLine = detail.Replace('\n', ' ').Replace('\r', ' ');
-            return Clip(singleLine);
+            return CredentialMessages.Truncate(
+                detail, CredentialMessages.NoReadableDetail, MaxErrorChars);
         }
         catch (JsonException)
         {

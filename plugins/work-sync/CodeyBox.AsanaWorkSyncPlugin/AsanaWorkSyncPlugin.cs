@@ -65,17 +65,14 @@ public sealed class AsanaWorkSyncPlugin
     private static readonly TimeSpan OwnedClientConstructionTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Production constructor. The factory parameter is accepted for host DI
-    /// compatibility (the host resolves plugins with an <see
-    /// cref="IHttpClientFactory"/> available) but credential-bearing Asana
-    /// traffic never uses the factory's default redirect-following handler:
-    /// <see cref="EnsureClients"/> builds a dedicated no-redirect client via
-    /// <see cref="CredentialHttp.CreateNoRedirectClient(TimeSpan)"/>.
+    /// Production constructor. The plugin owns its HTTP client (see <see
+    /// cref="EnsureClients"/>) rather than sharing a host factory:
+    /// credential-bearing Asana traffic must never follow a redirect, which
+    /// would re-send the bearer token to the redirect target.
     /// </summary>
-    public AsanaWorkSyncPlugin(IHttpClientFactory httpFactory, TimeProvider? clock = null)
+    public AsanaWorkSyncPlugin()
     {
-        ArgumentNullException.ThrowIfNull(httpFactory);
-        _clock = clock ?? TimeProvider.System;
+        _clock = TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
         _ownsHttpClient = true;
     }
@@ -146,7 +143,12 @@ public sealed class AsanaWorkSyncPlugin
             else
                 _logger.LogInformation(
                     "Asana work sync enabled against {Base} as {Name} ({Gid})",
-                    options.ApiBaseUrl, identity.Name, identity.Gid);
+                    options.ApiBaseUrl,
+                    // The display name is upstream-editable text: the shared
+                    // sanitiser flattens control characters before logging.
+                    CredentialMessages.Truncate(
+                        identity.Name, "(unnamed)", CredentialMessages.MaxServerDetailChars),
+                    identity.Gid);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested
             && (ex is AsanaApiException or HttpRequestException or TaskCanceledException or InvalidOperationException))
@@ -168,23 +170,14 @@ public sealed class AsanaWorkSyncPlugin
             yield break;
         }
         var api = EnsureClients();
+        var projectMap = ValidatedProjectMap(options);
         var cap = Math.Max(1, options.MaxItemsPerPoll);
         var count = 0;
-        foreach (var (asanaProjectGid, codeyBoxProject) in options.ProjectMap)
+        foreach (var projectGid in projectMap.Keys)
         {
             ct.ThrowIfCancellationRequested();
             if (count >= cap)
                 yield break;
-            if (string.IsNullOrWhiteSpace(asanaProjectGid) || string.IsNullOrWhiteSpace(codeyBoxProject))
-                continue;
-            if (!AsanaGids.IsGid(asanaProjectGid.Trim()))
-            {
-                _logger.LogWarning(
-                    "Asana poll skipped project key '{ProjectKey}': not a numeric GID — map Asana project GIDs, never names",
-                    asanaProjectGid);
-                continue;
-            }
-            var projectGid = asanaProjectGid.Trim();
             await foreach (var page in SkipProjectOnQueryFailure(
                 api.ListTasksPagedAsync(options, projectGid, ct), projectGid, ct).ConfigureAwait(false))
             {
@@ -193,7 +186,7 @@ public sealed class AsanaWorkSyncPlugin
                     ct.ThrowIfCancellationRequested();
                     if (count >= cap)
                         yield break;
-                    var candidate = ToCandidate(task, options);
+                    var candidate = ToCandidate(task, options, projectMap);
                     if (candidate is null)
                         continue;
                     count++;
@@ -202,6 +195,54 @@ public sealed class AsanaWorkSyncPlugin
             }
         }
     }
+
+    /// <summary>
+    /// Filters the configured <see cref="AsanaWorkSyncOptions.ProjectMap"/>
+    /// down to entries that can drive a poll: a non-blank numeric-GID key
+    /// mapped to a non-blank, structurally valid CodeyBox project id. Every
+    /// rejected entry is logged — misconfiguration skips loudly rather than
+    /// silently, and one bad mapping can never abort the whole poll (an
+    /// invalid mapped value throws inside <see cref="ProjectId"/>, which is
+    /// validated here instead of mid-enumeration).
+    /// </summary>
+    private IReadOnlyDictionary<string, ProjectId> ValidatedProjectMap(AsanaWorkSyncOptions options)
+    {
+        var map = new Dictionary<string, ProjectId>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in options.ProjectMap)
+        {
+            if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value))
+            {
+                _logger.LogWarning(
+                    "Asana poll skipped a ProjectMap entry ('{Key}' → '{Value}'): blank Asana project key or blank CodeyBox project value",
+                    ConfigValueForLog(key), ConfigValueForLog(value));
+                continue;
+            }
+            var projectGid = key.Trim();
+            if (!AsanaGids.IsGid(projectGid))
+            {
+                _logger.LogWarning(
+                    "Asana poll skipped project key '{ProjectKey}': not a numeric GID — map Asana project GIDs, never names",
+                    ConfigValueForLog(key));
+                continue;
+            }
+            try
+            {
+                map[projectGid] = new ProjectId(value.Trim());
+            }
+            catch (ArgumentException)
+            {
+                _logger.LogWarning(
+                    "Asana poll skipped project key '{ProjectKey}': '{Value}' is not a valid CodeyBox project id (ASCII alphanumerics, '-' or '_', at most 64 chars)",
+                    ConfigValueForLog(key), ConfigValueForLog(value));
+                continue;
+            }
+        }
+        return map;
+    }
+
+    /// <summary>Flattens control characters out of a config value before it reaches a log line.</summary>
+    private static string ConfigValueForLog(string? value) =>
+        CredentialMessages.Truncate(value, "(blank)", CredentialMessages.MaxServerDetailChars);
 
     /// <summary>
     /// Enumerates one project's pages, converting an upstream failure raised
@@ -244,20 +285,36 @@ public sealed class AsanaWorkSyncPlugin
             "Asana work sync is polling-only (SupportsWebhooks=false): it never creates " +
             "webhooks, so there are no verified bodies to parse. Poll for signalled tasks instead.");
 
+    /// <summary>
+    /// The shared write-path gate every <c>Post*Async</c> method applies
+    /// first: enabled check, namespace/external-id tracking check, and the
+    /// GID-shape refusal. Returns the <see cref="TrackerPostResult"/> to
+    /// report, or null when the caller may proceed to upstream writes —
+    /// one implementation so the guard shape cannot drift between the
+    /// three post paths.
+    /// </summary>
+    private TrackerPostResult? GatePost(
+        string postNamespace, string externalId, AsanaWorkSyncOptions options)
+    {
+        if (!options.Enabled)
+            return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "asana work sync is disabled");
+        var check = this.CheckTracked(postNamespace, externalId);
+        if (check is not null)
+            return check;
+        if (!AsanaGids.IsGid(externalId))
+            return new TrackerPostResult(TrackerPostOutcome.Failed,
+                Detail: $"Asana task GID '{externalId}' is not a valid numeric GID.");
+        return null;
+    }
+
     /// <inheritdoc />
     public async Task<TrackerPostResult> PostProgressAsync(
         TrackerProgressUpdate update, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(update);
         var options = CurrentOptions();
-        if (!options.Enabled)
-            return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "asana work sync is disabled");
-        var check = this.CheckTracked(update.Namespace, update.ExternalId);
-        if (check is not null)
-            return check;
-        if (!AsanaGids.IsGid(update.ExternalId))
-            return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"Asana task GID '{update.ExternalId}' is not a valid numeric GID.");
+        if (GatePost(update.Namespace, update.ExternalId, options) is { } gate)
+            return gate;
 
         // The caller (WorkTrackerService) resolves the declared external
         // status from the operator's state mapping and hands it in via
@@ -298,14 +355,8 @@ public sealed class AsanaWorkSyncPlugin
     {
         ArgumentNullException.ThrowIfNull(post);
         var options = CurrentOptions();
-        if (!options.Enabled)
-            return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "asana work sync is disabled");
-        var check = this.CheckTracked(post.Namespace, post.ExternalId);
-        if (check is not null)
-            return check;
-        if (!AsanaGids.IsGid(post.ExternalId))
-            return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"Asana task GID '{post.ExternalId}' is not a valid numeric GID.");
+        if (GatePost(post.Namespace, post.ExternalId, options) is { } gate)
+            return gate;
 
         var api = EnsureClients();
         var questionTag = WorkSyncQuestions.TagFor(post.QuestionId);
@@ -333,14 +384,8 @@ public sealed class AsanaWorkSyncPlugin
     {
         ArgumentNullException.ThrowIfNull(report);
         var options = CurrentOptions();
-        if (!options.Enabled)
-            return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: "asana work sync is disabled");
-        var check = this.CheckTracked(report.Namespace, report.ExternalId);
-        if (check is not null)
-            return check;
-        if (!AsanaGids.IsGid(report.ExternalId))
-            return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"Asana task GID '{report.ExternalId}' is not a valid numeric GID.");
+        if (GatePost(report.Namespace, report.ExternalId, options) is { } gate)
+            return gate;
 
         // The caller (WorkTrackerService) resolves the declared external status
         // from the operator's state mapping and hands it in via ExternalStatus.
@@ -375,8 +420,14 @@ public sealed class AsanaWorkSyncPlugin
         }
         catch (AsanaApiException ex)
         {
+            // When a status was applied above it already landed: report the
+            // partial application honestly, like PostProgressAsync does,
+            // instead of pretending the whole post failed untouched.
             return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"Asana outcome post for task '{report.ExternalId}' failed: {ex.Message}");
+                Detail: string.IsNullOrEmpty(status)
+                    ? $"Asana outcome post for task '{report.ExternalId}' failed: {ex.Message}"
+                    : $"Asana status '{status}' applied to task '{report.ExternalId}' " +
+                        $"but the outcome story failed: {ex.Message}");
         }
     }
 
@@ -411,8 +462,8 @@ public sealed class AsanaWorkSyncPlugin
                 return _api;
             if (_http is null)
             {
-                // Credential-bearing traffic never follows redirects: the
-                // factory's default handler follows up to 50 cross-origin
+                // Credential-bearing traffic never follows redirects: a
+                // shared default handler follows up to 50 cross-origin
                 // hops and would re-send the bearer token to the redirect
                 // target, so this plugin owns a dedicated no-redirect
                 // client. Request timeouts are enforced per attempt from
@@ -459,7 +510,7 @@ public sealed class AsanaWorkSyncPlugin
             }
             if (options.StatusCustomFieldMap.TryGetValue(status, out var mapping))
             {
-                if (!AsanaRestClient.TryParseCustomFieldMapping(mapping, out var fieldGid, out var enumGid))
+                if (!AsanaWorkSyncOptions.TryParseCustomFieldMapping(mapping, out var fieldGid, out var enumGid))
                     return new TrackerPostResult(TrackerPostOutcome.Failed,
                         Detail: $"Asana custom-field mapping for status '{status}' is not fieldGid:enumGid " +
                             "(both numeric GIDs); fix StatusCustomFieldMap.");
@@ -513,7 +564,7 @@ public sealed class AsanaWorkSyncPlugin
         }
         catch (AsanaApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
-            throw new AsanaApiException($"Asana task '{taskGid}' not found", ex.StatusCode);
+            throw new AsanaApiException($"Asana task '{taskGid}' not found", ex.StatusCode, ex);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested
             && (ex is AsanaApiException or HttpRequestException or InvalidOperationException or TaskCanceledException))
@@ -540,17 +591,20 @@ public sealed class AsanaWorkSyncPlugin
         return false;
     }
 
-    private ExternalWorkItem? ToCandidate(AsanaTask task, AsanaWorkSyncOptions options)
+    private ExternalWorkItem? ToCandidate(
+        AsanaTask task,
+        AsanaWorkSyncOptions options,
+        IReadOnlyDictionary<string, ProjectId> projectMap)
     {
         // A multi-homed task (in several projects) ingests under the first
         // mapped project in the task's own project order — deterministic
         // across polls, so overlapping polls converge on one work item while
-        // the global GID keeps outbound writes unambiguous.
-        string? codeyBoxProject = null;
+        // the global GID keeps outbound writes unambiguous. Only validated
+        // mappings reach this point (see ValidatedProjectMap).
+        ProjectId? codeyBoxProject = null;
         foreach (var projectGid in task.ProjectGids)
         {
-            if (options.ProjectMap.TryGetValue(projectGid, out var mapped)
-                && !string.IsNullOrWhiteSpace(mapped))
+            if (projectMap.TryGetValue(projectGid, out var mapped))
             {
                 codeyBoxProject = mapped;
                 break;
@@ -583,7 +637,7 @@ public sealed class AsanaWorkSyncPlugin
         {
             Namespace = Namespace,
             ExternalId = task.Gid,
-            ProjectId = new ProjectId(codeyBoxProject),
+            ProjectId = codeyBoxProject.GetValueOrDefault(),
             Title = string.IsNullOrWhiteSpace(task.Name) ? task.Gid : task.Name,
             Body = WorkSyncText.Truncate(task.Notes, options.MaxIngestedBodyChars),
             PresentSignals = present,

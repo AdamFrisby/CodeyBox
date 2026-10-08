@@ -34,24 +34,30 @@ public sealed record AsanaWorkSyncOptions
     /// </summary>
     public const string ApiVersion = "1.0";
 
+    /// <summary>Asana's maximum REST page size; bounds <see cref="PageSize"/> and <see cref="DedupScanLimit"/>.</summary>
+    internal const int MaxApiPageSize = 100;
+
     /// <summary>Master switch for this plugin. Default false: off unless an operator enables it.</summary>
     public bool Enabled { get; init; }
 
     /// <summary>
     /// Asana API origin including the version path (default
-    /// <c>https://app.asana.com/api/1.0</c>). Must be https — the bearer
-    /// token rides on these requests, so <c>http://</c> is rejected unless
-    /// <see cref="AllowUnsafeHttp"/> is explicitly set. Required when
-    /// <see cref="Enabled"/> is set — there is deliberately no placeholder
-    /// default beyond the public cloud endpoint, so a custom origin is always
-    /// an explicit operator choice.
+    /// <c>https://app.asana.com/api/1.0</c>, composed from <see
+    /// cref="ApiVersion"/> so the two cannot drift). Must be https — the
+    /// bearer token rides on these requests, so <c>http://</c> is rejected
+    /// unless <see cref="AllowUnsafeHttp"/> is explicitly set AND the host is
+    /// loopback. Required when <see cref="Enabled"/> is set — there is
+    /// deliberately no placeholder default beyond the public cloud endpoint,
+    /// so a custom origin is always an explicit operator choice.
     /// </summary>
-    public string ApiBaseUrl { get; init; } = "https://app.asana.com/api/1.0";
+    public string ApiBaseUrl { get; init; } = "https://app.asana.com/api/" + ApiVersion;
 
     /// <summary>
     /// Dev-only opt-in allowing plaintext <c>http://</c> origins (<see
-    /// cref="ApiBaseUrl"/>). Off by default: without it a cleartext URL fails
-    /// fast because it would send the bearer token unencrypted.
+    /// cref="ApiBaseUrl"/>), and only for loopback hosts — the opt-in can
+    /// never send the bearer token off-box in cleartext. Off by default:
+    /// without it a cleartext URL fails fast because it would send the
+    /// bearer token unencrypted.
     /// </summary>
     public bool AllowUnsafeHttp { get; init; }
 
@@ -74,7 +80,9 @@ public sealed record AsanaWorkSyncOptions
     /// immutable user <c>gid</c>; a display <c>name</c> also matches exactly
     /// but is user-editable. For <c>Label</c> the tag gid (preferred) or tag
     /// name; for <c>Status</c> a section name (e.g. <c>Ready for CodeyBox</c>)
-    /// or <c>completed</c>.
+    /// or <c>completed</c>. A name-valued signal delegates the ingestion
+    /// gate to whoever can rename that upstream user, tag, or section —
+    /// GID values are not spoofable that way and are always preferred.
     /// </summary>
     public string SignalValue { get; init; } = string.Empty;
 
@@ -185,14 +193,38 @@ public sealed record AsanaWorkSyncOptions
             TokenEnvVar = PluginConfigReaders.ReadNonEmpty(section, "TokenEnvVar", defaults.TokenEnvVar),
             MaxResponseBytes = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxResponseBytes", defaults.MaxResponseBytes), 1024 * 1024, 256 * 1024 * 1024),
             MaxItemsPerPoll = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxItemsPerPoll", defaults.MaxItemsPerPoll), 1, 1000),
-            PageSize = Math.Clamp(PluginConfigReaders.ReadInt(section, "PageSize", defaults.PageSize), 1, 100),
+            PageSize = Math.Clamp(PluginConfigReaders.ReadInt(section, "PageSize", defaults.PageSize), 1, MaxApiPageSize),
             MaxPagesPerPoll = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxPagesPerPoll", defaults.MaxPagesPerPoll), 1, 1000),
             ModifiedSinceHours = Math.Clamp(PluginConfigReaders.ReadInt(section, "ModifiedSinceHours", defaults.ModifiedSinceHours), 0, 8760),
             RetryMaxAttempts = Math.Clamp(PluginConfigReaders.ReadInt(section, "RetryMaxAttempts", defaults.RetryMaxAttempts), 0, 10),
             RetryBaseDelayMs = Math.Clamp(PluginConfigReaders.ReadInt(section, "RetryBaseDelayMs", defaults.RetryBaseDelayMs), 0, 30000),
             RetryMaxDelaySeconds = Math.Clamp(PluginConfigReaders.ReadInt(section, "RetryMaxDelaySeconds", defaults.RetryMaxDelaySeconds), 1, 300),
-            DedupScanLimit = Math.Clamp(PluginConfigReaders.ReadInt(section, "DedupScanLimit", defaults.DedupScanLimit), 1, 100),
+            DedupScanLimit = Math.Clamp(PluginConfigReaders.ReadInt(section, "DedupScanLimit", defaults.DedupScanLimit), 1, MaxApiPageSize),
             MaxIngestedBodyChars = Math.Clamp(PluginConfigReaders.ReadInt(section, "MaxIngestedBodyChars", defaults.MaxIngestedBodyChars), 1024, 256 * 1024),
         };
+    }
+
+    /// <summary>
+    /// Parses an explicit <see cref="StatusCustomFieldMap"/> value in
+    /// <c>fieldGid:enumGid</c> form. Returns false (never throws for shape)
+    /// when the value is not two numeric GIDs.
+    /// </summary>
+    internal static bool TryParseCustomFieldMapping(
+        string mapping, out string fieldGid, out string enumGid)
+    {
+        fieldGid = string.Empty;
+        enumGid = string.Empty;
+        if (string.IsNullOrWhiteSpace(mapping))
+            return false;
+        var parts = mapping.Split(':');
+        if (parts.Length != 2)
+            return false;
+        var field = parts[0].Trim();
+        var option = parts[1].Trim();
+        if (!AsanaGids.IsGid(field) || !AsanaGids.IsGid(option))
+            return false;
+        fieldGid = field;
+        enumGid = option;
+        return true;
     }
 }

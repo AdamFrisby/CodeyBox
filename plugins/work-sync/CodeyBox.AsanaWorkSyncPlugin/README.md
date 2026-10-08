@@ -12,7 +12,7 @@ the assembly loads only when allowlisted **and** named in `Plugins:Enabled`,
 and it polls/posts nothing until `Enabled=true` in its own section.
 `ApiBaseUrl` defaults to the public cloud endpoint — a custom origin is always
 an explicit operator choice — and must be `https://` unless the dev-only
-`AllowUnsafeHttp` opt-in is set.
+`AllowUnsafeHttp` opt-in is set for a loopback host.
 
 Asana's distinctive surface is **GIDs plus stories**: every resource carries
 an immutable numeric GID (names are editable and never identity), list reads
@@ -131,9 +131,12 @@ no actor field, and our writes are stories while polls read tasks.
   non-numeric project key or external id is refused, never interpolated.
 - `ApiBaseUrl` must be `https://` — the bearer token would otherwise travel
   in cleartext. Plaintext `http://` is refused unless `AllowUnsafeHttp=true`
-  is set explicitly (dev-only opt-in, e.g. a local mock).
+  is set explicitly (dev-only opt-in, e.g. a local mock) **and** the host is
+  loopback, so the opt-in can never send the token off-box in cleartext.
 - Retries on 429/5xx are bounded (`RetryMaxAttempts`) and honour
-  `Retry-After` within its cap; response bodies are bounded before buffering.
+  `Retry-After` within its cap, on idempotent requests only — a story write
+  whose outcome is uncertain is never retried (the pre-write duplicate scan
+  reconciles it instead); response bodies are bounded before buffering.
 - No secrets in logs or error text — only GIDs, status codes, and env-var names.
 - The plugin performs no process execution, no filesystem access, and no
   webhook/membership administration.
