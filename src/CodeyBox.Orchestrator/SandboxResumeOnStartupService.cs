@@ -658,7 +658,8 @@ public sealed class SandboxResumeOnStartupService : IHostedLifecycleService
             provEx.Operation,
             provEx.ErrorClass,
             updated.State.ToString(),
-            provEx.RecheckIn);
+            provEx.RecheckIn,
+            provEx.Detail);
         AuditLog.SandboxResumedOnStartup(item.Id, vmName, success: false, error: provEx.Message);
         _infrastructureDeferrals?.ScheduleInfrastructureDeferredRequeue(item.Id, provEx.RecheckIn, ct);
         _log.LogWarning(

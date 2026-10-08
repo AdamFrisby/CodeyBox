@@ -110,6 +110,7 @@ public sealed class OrchestratorProvisioningDeferredTests : IDisposable
             Assert.Equal("multipass", (string)detailType.GetProperty("provider")!.GetValue(evt.Details)!);
             Assert.Equal("start", (string)detailType.GetProperty("operation")!.GetValue(evt.Details)!);
             Assert.Equal("multipass-start-argument-not-found", (string)detailType.GetProperty("errorClass")!.GetValue(evt.Details)!);
+            Assert.Equal("multipass start failed after retries", (string)detailType.GetProperty("detail")!.GetValue(evt.Details)!);
             Assert.Equal("Queued", (string)detailType.GetProperty("resumeState")!.GetValue(evt.Details)!);
             var suggestedRetryAt = (DateTimeOffset)detailType.GetProperty("suggestedRetryAt")!.GetValue(evt.Details)!;
             Assert.True(

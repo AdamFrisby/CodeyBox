@@ -1156,6 +1156,7 @@ static ISandboxProvider BuildIncus(
             ResourceUsage = resourceUsageStore,
             ArtifactTrust = () => sp.GetRequiredService<IOptionsMonitor<ArtifactTrustOptions>>().CurrentValue,
             ArtifactAdmission = sp.GetService<ArtifactAdmissionService>(),
+            BaselineBlockedTracker = sp.GetRequiredService<BaselineProvisioningBlockedTracker>(),
         });
 
     if (provider is IDiskGuardedSandboxProvider guarded)
@@ -3304,6 +3305,14 @@ builder.Services.AddSingleton<INotificationProvider>(sp =>
     return new NullNotificationProvider("chat");
 });
 
+// Shared baseline-bake failure tracker: the Incus provider records every
+// bake failure here (and clears on success); /queue/status and the
+// baseline_provisioning_blocked notification condition read it. A singleton
+// (not a provider interface) so admission-control wrappers cannot hide it.
+builder.Services.AddSingleton<BaselineProvisioningBlockedTracker>();
+builder.Services.AddSingleton<IBaselineProvisioningBlockedStatusProvider>(
+    sp => sp.GetRequiredService<BaselineProvisioningBlockedTracker>());
+
 // ICondition registrations — one per supported condition.
 builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
@@ -3319,6 +3328,9 @@ builder.Services.AddSingleton<ICondition>(sp => new OrchestratorStallCondition(
     sp.GetRequiredService<OrchestratorProgressClock>(),
     sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
 builder.Services.AddSingleton<ICondition, SandboxLeakReapedCondition>();
+builder.Services.AddSingleton<ICondition>(sp =>
+    new BaselineProvisioningBlockedCondition(
+        sp.GetService<IBaselineProvisioningBlockedStatusProvider>()));
 
 // INotificationBuilder registrations — one per condition.
 builder.Services.AddSingleton<INotificationBuilder, QueueEmptyNotificationBuilder>();
@@ -3332,6 +3344,9 @@ builder.Services.AddSingleton<INotificationBuilder, WorkItemPermanentlyFailedNot
 builder.Services.AddSingleton<INotificationBuilder>(sp => new OrchestratorStallNotificationBuilder(
     sp.GetRequiredService<IOptionsMonitor<NotificationsOptions>>()));
 builder.Services.AddSingleton<INotificationBuilder, SandboxLeakReapedNotificationBuilder>();
+builder.Services.AddSingleton<INotificationBuilder>(sp =>
+    new BaselineProvisioningBlockedNotificationBuilder(
+        sp.GetService<IBaselineProvisioningBlockedStatusProvider>()));
 
 // Rules engine — BackgroundService that evaluates conditions and dispatches.
 builder.Services.AddSingleton<NotificationRulesEngine>();

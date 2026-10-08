@@ -1430,6 +1430,20 @@ internal static class WorkItemEndpoints
             pausedReason = queueController.PausedReason,
             quotaWaiting,
             baseBroken,
+            provisioningBlocked = context.RequestServices
+                .GetService<IBaselineProvisioningBlockedStatusProvider>()
+                ?.GetProvisioningBlockedStatus() is { } blocked
+                ? new
+                {
+                    provider = blocked.Provider,
+                    baselineName = blocked.BaselineName,
+                    blockedSince = blocked.BlockedSince,
+                    lastFailureAt = blocked.LastFailureAt,
+                    consecutiveFailures = blocked.ConsecutiveFailures,
+                    lastBakeCause = blocked.LastBakeCause,
+                    reason = $"no usable baseline; all provisioning blocked since {blocked.BlockedSince:R}; last bake failure: {blocked.LastBakeCause}",
+                }
+                : null,
             refactorGates = refactorGates.Select(g => new
             {
                 projectId = g.ProjectId.Value,
