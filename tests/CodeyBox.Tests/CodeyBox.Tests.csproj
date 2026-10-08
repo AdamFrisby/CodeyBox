@@ -155,6 +155,7 @@
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.DaytonaSandboxPlugin\CodeyBox.DaytonaSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.OpenStackSandboxPlugin\CodeyBox.OpenStackSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.GceSandboxPlugin\CodeyBox.GceSandboxPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.HetznerSandboxPlugin\CodeyBox.HetznerSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.BoxLiteSandboxPlugin\CodeyBox.BoxLiteSandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.MicrosandboxPlugin\CodeyBox.MicrosandboxPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sandbox\CodeyBox.BlaxelSandboxPlugin\CodeyBox.BlaxelSandboxPlugin.csproj" />
