@@ -47,6 +47,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
     // already frozen.
     private readonly AsyncLocal<string?> _perRunTempDirectoryPath = new();
 
+    // Per-run mutable cell minted by RunAsync next to the scratch directory,
+    // carrying the plugin's PerRunState. The CELL travels by AsyncLocal —
+    // downward into every hook RunAsync calls — while the plugin mutates the
+    // shared cell's contents: an AsyncLocal assignment inside an async hook
+    // would stay on that hook's execution-context copy and never reach the
+    // later hooks (the reason the base, not a hook, owns the assignment).
+    private readonly AsyncLocal<RunStateCell?> _perRunStateCell = new();
+
+    private sealed class RunStateCell
+    {
+        internal object? State;
+    }
+
     // Each candidate is probed with -e (exists) and -L (symlink — catches a
     // dangling symlink that -e would miss) and echoed when present; the
     // script always exits 0 once it completes, so the exit code carries only
@@ -152,7 +165,9 @@ public abstract class ExternalToolAuditorBase : IAuditor
 
     /// <summary>
     /// Optional pinned-version declaration. Non-null makes
-    /// <see cref="RunAsync"/> probe the tool with the pin's
+    /// <see cref="RunAsync"/> probe the pin's binary — the tool itself, or
+    /// <see cref="ToolVersionPin.ProbedBinary"/> when the version-pinned
+    /// component is a separate binary the driver execs — with the pin's
     /// <see cref="ToolVersionPin.VersionProbeArguments"/> before every scan —
     /// after the presence check, before <see cref="VerifyToolAsync"/> — and
     /// fail closed on a missing binary, an unrecognised version string, or a
@@ -289,6 +304,33 @@ public abstract class ExternalToolAuditorBase : IAuditor
                 + "available while a run is in progress.")
             { IsDeterministic = true };
 
+    /// <summary>
+    /// A per-run state slot for hooks that must hand data computed in one
+    /// hook to a later hook of the SAME run — e.g.
+    /// <see cref="ResolveContextArgumentsAsync"/> analysis consumed by
+    /// <see cref="ResolveParserInputAsync"/>. <see cref="RunAsync"/> mints the
+    /// cell before any hook runs and clears it when the run finishes, so the
+    /// value never crosses runs and concurrent audits on this (singleton)
+    /// auditor cannot cross-contaminate. The cell travels to hooks through
+    /// AsyncLocal's downward flow; hooks must only read/write this property —
+    /// assigning their own AsyncLocal inside a hook would stay invisible to
+    /// the run. The slot is <see cref="object"/> so each plugin owns its own
+    /// state type; read with a pattern check. Throws a deterministic
+    /// <see cref="AuditUnavailableException"/> when read or written outside
+    /// a run.
+    /// </summary>
+    protected object? PerRunState
+    {
+        get => PerRunStateCell().State;
+        set => PerRunStateCell().State = value;
+    }
+
+    private RunStateCell PerRunStateCell()
+        => _perRunStateCell.Value ?? throw new AuditUnavailableException(
+            $"could-not-verify: audit tool '{ToolName}' per-run state is only available while a run "
+            + "is in progress.")
+        { IsDeterministic = true };
+
     private static string MintPerRunTempDirectoryPath(string tool)
         => Path.Combine(Path.GetTempPath(), "codeybox-" + tool + "-" + Guid.NewGuid().ToString("N"));
 
@@ -305,6 +347,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         var tool = ExternalToolNames.Validate(ToolName, nameof(ToolName));
         var options = OptionsAccessor() ?? new ExternalToolAuditorOptions();
         _perRunTempDirectoryPath.Value = MintPerRunTempDirectoryPath(tool);
+        _perRunStateCell.Value = new RunStateCell();
         try
         {
             var contextArguments = await ResolveContextArgumentsAsync(
@@ -343,6 +386,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
         finally
         {
             _perRunTempDirectoryPath.Value = null;
+            _perRunStateCell.Value = null;
         }
     }
 
@@ -591,6 +635,19 @@ public abstract class ExternalToolAuditorBase : IAuditor
         if (VersionPin is not { } pin)
             return;
 
+        // The pin's subject is normally the tool itself, but a driver/engine
+        // split (iwyu_tool → include-what-you-use) pins the binary the driver
+        // execs. A different probed binary gets the same presence check the
+        // tool received — a missing engine is "not installed", not merely an
+        // unparseable banner.
+        var probedBinary = pin.ProbedBinary is { Length: > 0 } probed
+            ? ExternalToolNames.Validate(probed, nameof(pin.ProbedBinary))
+            : tool;
+        if (!string.Equals(probedBinary, tool, StringComparison.Ordinal))
+            await ThrowIfBinaryMissingAsync(
+                sandbox, workingDirectory, probedBinary, options, ct,
+                $"audit tool '{tool}' execs it during the scan").ConfigureAwait(false);
+
         var configured = pin.ConfiguredExpectedVersion();
         var expected = ExtractToolVersion(
             string.IsNullOrWhiteSpace(configured) ? pin.DefaultExpectedVersion : configured.Trim());
@@ -598,7 +655,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             throw new AuditUnavailableException(
                 $"could-not-verify: auditor '{Name}' has an unparseable {ToolVersionPin.ExpectedVersionKey} "
                 + $"('{TruncateForMessage(configured)}'); set CodeyBox:Plugins:{pin.PluginId}:{ToolVersionPin.ExpectedVersionKey} "
-                + $"to a {tool} release such as '{pin.DefaultExpectedVersion}'.")
+                + $"to a {probedBinary} release such as '{pin.DefaultExpectedVersion}'.")
             { IsDeterministic = true };
 
         var probeArguments = pin.VersionProbeArguments.Count > 0
@@ -610,7 +667,7 @@ public abstract class ExternalToolAuditorBase : IAuditor
             "version check",
             new SandboxExec
             {
-                Argv = [tool, .. probeArguments],
+                Argv = [probedBinary, .. probeArguments],
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
@@ -628,15 +685,15 @@ public abstract class ExternalToolAuditorBase : IAuditor
         if (result.ExitCode != 0
             || reported is null)
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' version could not be determined "
+                $"could-not-verify: audit tool '{probedBinary}' version could not be determined "
                 + $"(exit {result.ExitCode}). The pinned release is required before the scan can run — "
-                + $"a missing or foreign '{tool}' is infrastructure, not a verdict on the diff.",
+                + $"a missing or foreign '{probedBinary}' is infrastructure, not a verdict on the diff.",
                 result.ExitCode,
                 result.Stdout + "\n" + result.Stderr);
 
         if (!string.Equals(reported, expected, StringComparison.Ordinal))
             throw new AuditUnavailableException(
-                $"could-not-verify: audit tool '{tool}' is version {reported}, but this auditor is "
+                $"could-not-verify: audit tool '{probedBinary}' is version {reported}, but this auditor is "
                 + $"pinned to {expected}. A different release changes the tool's checks and its "
                 + $"findings; provision the pinned release or set {ToolVersionPin.ExpectedVersionKey} "
                 + "to the version you provisioned.")

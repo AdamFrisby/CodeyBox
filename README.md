@@ -380,7 +380,7 @@ The plugin catalogue (each one disabled until you enable it):
 
 | Category | Auditors |
 |---|---|
-| Linting (23) | Biome, clang-tidy, Clippy, Cppcheck, Credo, detekt, ESLint, glslang, golangci-lint, ReSharper InspectCode, Knip, mypy, Oxlint, PHPStan, PMD, Pyright, Roslynator, RuboCop, Ruff, SpotBugs, Staticcheck, SwiftLint, and a SARIF example to build your own |
+| Linting (25) | Biome, clang-tidy, Clippy, Cppcheck, Credo, detekt, ESLint, glslang, golangci-lint, include-what-you-use, ReSharper InspectCode, Knip, mypy, Oxlint, PHPStan, PMD, Pyright, Regal, Roslynator, RuboCop, Ruff, SpotBugs, Staticcheck, SwiftLint, and a SARIF example to build your own |
 | SAST (5) | Bandit, Brakeman, CodeQL, DevSkim, Semgrep |
 | Dependency vulnerabilities (8) | cargo-audit, cargo-deny, OWASP Dependency-Check, govulncheck, Grype, OSV-Scanner, Socket, Trivy |
 | Secrets (4) | Betterleaks, detect-secrets, Gitleaks, TruffleHog (with live credential verification) |
