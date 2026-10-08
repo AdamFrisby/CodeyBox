@@ -19,6 +19,7 @@ operational trade-off matches your deployment.
 | `blaxel`          | Hosted microVM (plugin, `codeybox.blaxel`)   | Blaxel account, workspace and API key; plugin allowlisted and enabled | Working — plugin, off by default |
 | `modal`           | Hosted container (plugin, `codeybox.modal`)  | Modal account and token pair; plugin allowlisted and enabled     | Working — plugin, off by default |
 | `openstack`       | Hosted VM (plugin, `codeybox.openstack-sandbox`) | OpenStack application credential; plugin allowlisted and enabled | Working — plugin, off by default |
+| `hetzner`         | Hosted server (plugin, `codeybox.hetzner-sandbox`) | Hetzner Cloud API token (`HCLOUD_TOKEN`); plugin allowlisted and enabled | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -845,6 +846,35 @@ between them:
   come only from the standard `OS_*` environment variables — never from
   configuration — and every endpoint must be `https`.
 
+## `hetzner` — hosted servers via the `codeybox.hetzner-sandbox` plugin
+
+Sandboxes run as Hetzner Cloud servers, contributed as a sandbox provider
+kind through the plugin trust model — off unless the operator allowlists
+**and** enables `codeybox.hetzner-sandbox`. Full operator reference lives in
+[`docs/extending/hetzner-sandbox-plugin.md`](../extending/hetzner-sandbox-plugin.md):
+what to configure (server type, image, location, firewall), what it costs,
+and what it cannot do.
+
+The posture mirrors `openstack` (hosted guest, staged mounts,
+provider-owned firewall, `NotEnforced`) with differences that matter when
+choosing between them:
+
+- **Explicit placement pins.** The server type, approved image (numeric id or
+  exact name among available, non-deprecated images), and location are all
+  required configuration — the vendor never chooses placement. There is no
+  baseline bake/snapshot capability: every acquisition boots the approved
+  image.
+- **Host-scoped API token, no signup flow.** The token comes only from the
+  `HCLOUD_TOKEN` environment variable (renamable); the provider never
+  creates tokens, accounts, or grants, and the token never enters guest
+  user-data.
+- **A dedicated kernel, not enforced egress.** Each sandbox is a server with
+  its own guest kernel (`DedicatedKernel` for workload-trust routing), and
+  the per-sandbox firewall narrows SSH ingress plus DNS/NTP and resolved
+  `AllowedHosts` egress as best-effort defence in depth. The vendor filter's
+  exact default posture is not relied upon; named network profiles are
+  refused.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -859,6 +889,7 @@ between them:
 | Hosted microVMs with standby suspend/resume, plugin-managed  | `blaxel`            |
 | Hosted containers with custom images/snapshots, high concurrency | `modal`         |
 | Hosted VMs on OpenStack with Incus-parity baselines, plugin-managed | `openstack`     |
+| Hosted Hetzner Cloud servers with approved-image pin, plugin-managed | `hetzner`       |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -943,6 +974,7 @@ varies by provider:**
 | blaxel       | None — plugin kind, classified `NotEnforced`; named network profiles are refused |
 | modal        | None — plugin kind, classified `NotEnforced`; named network profiles are refused (`AllowedHosts` is recorded intent only) |
 | openstack    | None — plugin kind, classified `NotEnforced`; named network profiles are refused (per-sandbox security group is best-effort only) |
+| hetzner      | None — plugin kind, classified `NotEnforced`; named network profiles are refused (per-sandbox firewall is best-effort only) |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
