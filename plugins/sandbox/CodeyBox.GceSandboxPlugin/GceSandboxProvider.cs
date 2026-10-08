@@ -130,8 +130,9 @@ public sealed class GceSandboxProvider :
         {
             return name.StartsWith(ReadOptions().InstanceNamePrefix, StringComparison.Ordinal);
         }
-        catch
+        catch (Exception ex)
         {
+            _log.LogDebug(ex, "MightOwnSandbox: failed to read options for sandbox name check; assuming ownership for reaping.");
             return true;
         }
     }
@@ -992,8 +993,8 @@ public sealed class GceSandboxProvider :
                 continue;
             if (!string.Equals(firewall.Network, network, StringComparison.Ordinal))
                 continue;
-            var target = firewall.TargetTags?.FirstOrDefault();
-            if (target is not null && anyOwnerInstanceNames.Contains(target))
+            var targetTags = firewall.TargetTags;
+            if (targetTags is not null && targetTags.Any(t => t is not null && anyOwnerInstanceNames.Contains(t)))
                 continue;
             if (linkedFirewalls.Contains(firewall.Name))
                 continue;
@@ -1076,11 +1077,7 @@ public sealed class GceSandboxProvider :
     internal static string ManagedFilter() =>
         $"{GceNaming.ManagedLabelKey} = \"true\"";
 
-    internal static string NewRequestId()
-    {
-        var id = Guid.NewGuid();
-        return id == Guid.Empty ? Guid.NewGuid().ToString() : id.ToString();
-    }
+    internal static string NewRequestId() => Guid.NewGuid().ToString();
 
     internal static string RegionForZone(string zone)
     {

@@ -605,6 +605,27 @@ public sealed class GceSandboxProviderTests
     }
 
     [Fact]
+    public async Task OrphanSweep_KeepsMultiTagFirewall_TargetingLiveInstanceInLaterTag()
+    {
+        using var harness = NewHarness();
+        // Multi-tag rule: the first tag names no live instance but a later tag
+        // names a live managed instance. Only an Any-tag veto may keep it.
+        harness.Cloud.SeedForeignInstance("codeybox-foreigner");
+        harness.Cloud.SeedForeignFirewall(
+            "codeybox-foreigner-fw", "projects/test-project/global/networks/test-net", "codeybox-gone");
+        harness.Cloud.Firewalls["codeybox-foreigner-fw"] = (
+            "projects/test-project/global/networks/test-net",
+            ["codeybox-gone", "codeybox-foreigner"],
+            ["198.51.100.0/24"]);
+        harness.Cloud.SeedOwnedInstance("codeybox-sweepme", OwnerId);
+
+        await harness.Provider.DisposeLeakedAsync("codeybox-sweepme", CancellationToken.None);
+
+        Assert.True(harness.Cloud.Instances.ContainsKey("codeybox-foreigner"));
+        Assert.True(harness.Cloud.Firewalls.ContainsKey("codeybox-foreigner-fw"));
+    }
+
+    [Fact]
     public async Task OrphanSweep_KeepsForeignFirewall_TargetingLiveForeignInstance()
     {
         using var harness = NewHarness();
