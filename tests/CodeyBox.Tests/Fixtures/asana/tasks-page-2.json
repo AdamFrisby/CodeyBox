@@ -1,0 +1,16 @@
+{
+  "data": [
+    {
+      "gid": "12003",
+      "name": "Second signalled task",
+      "notes": "Add retry bounds to the sync poller.",
+      "assignee": { "gid": "111", "name": "codeybox-bot" },
+      "tags": [{ "gid": "902", "name": "codeybox" }],
+      "completed": false,
+      "modified_at": "2026-10-02T09:30:00.000Z",
+      "projects": [{ "gid": "555" }],
+      "memberships": [{ "section": { "gid": "778", "name": "Ready for CodeyBox" } }]
+    }
+  ],
+  "next_page": null
+}

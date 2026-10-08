@@ -1,0 +1,16 @@
+{
+  "data": [
+    {
+      "gid": "12010",
+      "name": "Multi-homed task",
+      "notes": "Lives in two mapped projects; ingestion must pick one deterministically.",
+      "assignee": { "gid": "111", "name": "codeybox-bot" },
+      "tags": [],
+      "completed": false,
+      "modified_at": "2026-10-03T08:00:00.000Z",
+      "projects": [{ "gid": "555" }, { "gid": "556" }],
+      "memberships": []
+    }
+  ],
+  "next_page": null
+}

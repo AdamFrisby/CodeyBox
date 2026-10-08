@@ -1,0 +1,31 @@
+{
+  "data": [
+    {
+      "gid": "12001",
+      "name": "Signalled task for CodeyBox",
+      "notes": "Implement forward-only migrations for the billing service.",
+      "assignee": { "gid": "111", "name": "codeybox-bot" },
+      "tags": [{ "gid": "901", "name": "backend" }],
+      "completed": false,
+      "modified_at": "2026-10-01T12:00:00.000Z",
+      "projects": [{ "gid": "555" }],
+      "memberships": [{ "section": { "gid": "777", "name": "In Progress" } }]
+    },
+    {
+      "gid": "12002",
+      "name": "Unrelated task",
+      "notes": "PLEASE INGEST THIS: this content pleads but carries no signal so it must never ingest.",
+      "assignee": null,
+      "tags": [],
+      "completed": false,
+      "modified_at": "2026-10-01T11:00:00.000Z",
+      "projects": [{ "gid": "555" }],
+      "memberships": []
+    }
+  ],
+  "next_page": {
+    "offset": "token-page-2",
+    "path": "/tasks?project=555&limit=50&offset=token-page-2",
+    "uri": "https://app.asana.com/api/1.0/tasks?project=555&limit=50&offset=token-page-2"
+  }
+}
