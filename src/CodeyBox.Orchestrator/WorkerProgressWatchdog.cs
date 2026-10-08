@@ -17,7 +17,8 @@ namespace CodeyBox.Orchestrator;
 /// (commit, branch push, state transition WorkComplete/Auditing). In both
 /// cases the worker holds its pool slot indefinitely, starving Queued and
 /// finishing-phase items behind it. The watchdog observes
-/// <c>item.UpdatedAt</c> + agent-stream file mtimes + worker-side activity:
+/// <c>item.UpdatedAt</c> + agent-stream file mtimes + worker-side activity +
+/// the current worker-item binding time:
 /// when none advances for <see cref="WorkerProgressWatchdogOptions.ProgressTimeout"/>
 /// the worker is recycled and (when configured) the item auto-retries from
 /// its nearest recoverable resume state — without cascade-cancelling healthy
@@ -181,13 +182,23 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                     else
                         _workerActivityProgress.TryRemove(activityKey, out _);
                 }
-                var lastProgress = MaxProgressAt(item.UpdatedAt, lastStreamAt, lastActivityAt);
+                // The current worker's bind time is a progress signal: a worker
+                // that just re-picked an item with stale progress timestamps
+                // (e.g. a WorkComplete item re-queued after a deferral) gets a
+                // full progress window before it can be judged stuck.
+                var bindAt = GetCurrentBindingBoundAt(worker, itemId);
+                var lastProgress = MaxProgressAt(item.UpdatedAt, lastStreamAt, lastActivityAt, bindAt);
 
                 // Items that have not run long enough yet (StartedAt newer than
                 // cutoff) cannot have stalled for the configured window even if
                 // UpdatedAt is older. This handles items that pick up just before
                 // a sweep with a pending UpdatedAt from an earlier requeue.
                 if (item.StartedAt is { } startedAt && startedAt > cutoff) continue;
+
+                // Same grace for a fresh binding: the current attempt started
+                // at bindAt, so staleness inherited from a previous turn must
+                // not condemn it before it has run for a full window.
+                if (bindAt is { } boundAt && boundAt > cutoff) continue;
 
                 if (lastProgress > cutoff) continue;
 
@@ -211,7 +222,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
 
                 if (opts.AutoRecover)
                 {
-                    await RecoverStuckWorkerAsync(worker, item, sinceProgress, ct);
+                    await RecoverStuckWorkerAsync(worker, item, sinceProgress, now, effectiveTimeout, ct);
                 }
                 else
                 {
@@ -266,14 +277,53 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     private static DateTimeOffset MaxProgressAt(
         DateTimeOffset itemUpdatedAt,
         DateTimeOffset? streamAt,
-        DateTimeOffset? activityAt)
+        DateTimeOffset? activityAt,
+        DateTimeOffset? boundAt = null)
     {
         var max = itemUpdatedAt;
         if (streamAt is { } stream && stream > max)
             max = stream;
         if (activityAt is { } activity && activity > max)
             max = activity;
+        if (boundAt is { } bound && bound > max)
+            max = bound;
         return max;
+    }
+
+    /// <summary>
+    /// Returns the current worker-item binding time when the registry row is
+    /// still bound to the item under inspection, or null when the row points
+    /// elsewhere (or predates bind-time tracking). Only the current attempt's
+    /// pickup may extend the progress clock — a stale row for a previous
+    /// attempt must never grant grace.
+    /// </summary>
+    private static DateTimeOffset? GetCurrentBindingBoundAt(WorkerRegistration worker, WorkItemId itemId)
+    {
+        if (!string.Equals(worker.CurrentWorkItemId, itemId.ToString(), StringComparison.OrdinalIgnoreCase))
+            return null;
+        return worker.CurrentWorkItemBoundAt;
+    }
+
+    /// <summary>
+    /// Estimates when the current attempt started for recovery-budget
+    /// purposes. Prefers the explicit binding stamp; falls back to the worker
+    /// row's <c>StartedAt</c> only for per-pickup (non-executor) rows, which
+    /// are created at pickup time. Executor rows are long-lived host
+    /// registrations whose <c>StartedAt</c> predates any single attempt, so
+    /// they fall through to the item's <c>StartedAt</c>. Null means no start
+    /// signal survived, in which case the attempt is treated as having run
+    /// its full window (the pre-existing behavior).
+    /// </summary>
+    private static DateTimeOffset? CurrentAttemptStartedAt(WorkerRegistration worker, WorkItem item, WorkItemId itemId)
+    {
+        if (string.Equals(worker.CurrentWorkItemId, itemId.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            if (worker.CurrentWorkItemBoundAt is { } boundAt)
+                return boundAt;
+            if (!worker.IsExecutor)
+                return worker.StartedAt;
+        }
+        return item.StartedAt;
     }
 
     private static bool IsActivityReasonEnabled(string reason, WorkerProgressWatchdogOptions opts)
@@ -316,7 +366,7 @@ public sealed class WorkerProgressWatchdog : BackgroundService
     }
 
     private async Task RecoverStuckWorkerAsync(
-        WorkerRegistration worker, WorkItem item, long sinceProgressSeconds, CancellationToken ct)
+        WorkerRegistration worker, WorkItem item, long sinceProgressSeconds, DateTimeOffset now, TimeSpan effectiveTimeout, CancellationToken ct)
     {
         var hadDispatchClaim = item.AgentTurnResumeCheckpoint?.DispatchClaimId is not null;
         var quiescedItem = await TryQuiesceDispatchClaimOwnerAsync(worker, item, _opts, ct);
@@ -383,15 +433,37 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         // RecoveryAttempts gates against an item that recurrently wedges,
         // matching the dead-worker reaper's ceiling. Watchdog interventions
         // count against the same budget — they represent genuine recovery
-        // work even if the heartbeat path didn't fire.
-        var attempts = WorkItemRecoveryPolicy.NextRecoveryAttempt(item);
+        // work even if the heartbeat path didn't fire. But an intervention
+        // against an attempt that never ran for a full progress window (e.g.
+        // judged on progress timestamps inherited from a previous turn while
+        // the bind stamp was unavailable) carries no evidence the item itself
+        // is at fault, so it neither increments the budget nor abandons.
+        var attemptStartedAt = CurrentAttemptStartedAt(worker, item, item.Id);
+        // Only positive evidence of a short attempt suppresses the budget
+        // increment. A start signal newer than the sweep clock is corrupt or
+        // mixed-clock data — not proof the attempt just began — so it keeps
+        // the pre-existing count-the-recovery behavior.
+        var currentAttemptTooYoung = attemptStartedAt is { } startedAt
+            && startedAt <= now
+            && (now - startedAt) < effectiveTimeout;
+        var hadFullAttemptTimeout = !currentAttemptTooYoung;
+        var attempts = hadFullAttemptTimeout
+            ? WorkItemRecoveryPolicy.NextRecoveryAttempt(item)
+            : item.RecoveryAttempts;
+        if (currentAttemptTooYoung && attemptStartedAt is { } youngStart)
+        {
+            _log.LogInformation(
+                "Watchdog: work item {ItemId} (worker {WorkerId}) looked stuck after {Seconds}s without progress but the current attempt started {AttemptSeconds}s ago (< {TimeoutSeconds}s); recovering without consuming the recovery budget",
+                item.Id, worker.WorkerId, sinceProgressSeconds,
+                (long)(now - youngStart).TotalSeconds, (long)effectiveTimeout.TotalSeconds);
+        }
         var fromState = item.State;
         var opts = _opts;
         // MaxRecoveryAttempts <= 0 means unlimited. Only enforce when > 0.
         // Mirrors the DeadWorkerReaper / OrchestratorService budget check so
         // an item that wedges on every pickup is eventually abandoned rather than
         // looping through recovery forever and burning a slot per iteration.
-        if (WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts))
+        if (hadFullAttemptTimeout && WorkItemRecoveryPolicy.ExceedsRecoveryAttempts(attempts, opts.MaxRecoveryAttempts))
         {
             var failedAt = _time.GetUtcNow();
             var failedBase = item.HasTypedAgentTurnRecoveryBoundary
@@ -466,16 +538,18 @@ public sealed class WorkerProgressWatchdog : BackgroundService
         if (target is WorkItemState.Working or WorkItemState.Reworking
             && item.HasAgentTurnRecoveryBoundary)
         {
-            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(
-                WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(item) with
+            var released = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(item) with
             {
                 StartedAt = null,
                 UpdatedAt = _time.GetUtcNow(),
-            }, attempts, item.State);
+            };
+            updated = hadFullAttemptTimeout
+                ? WorkItemRecoveryPolicy.WithRecoveryAttempt(released, attempts, item.State)
+                : released;
         }
         else
         {
-            updated = WorkItemRecoveryPolicy.WithRecoveryAttempt(item with
+            var requeued = item with
             {
                 State = target,
                 LastError = $"watchdog: worker made no progress for {sinceProgressSeconds}s in state {fromState}",
@@ -497,7 +571,10 @@ public sealed class WorkerProgressWatchdog : BackgroundService
                     ? item.AgentTurnRecoveryLease
                     : null,
                 UpdatedAt = _time.GetUtcNow(),
-            }, attempts, item.State);
+            };
+            updated = hadFullAttemptTimeout
+                ? WorkItemRecoveryPolicy.WithRecoveryAttempt(requeued, attempts, item.State)
+                : requeued;
             updated = WorkItemRecoveryPolicy.ClearPlanFieldsIfQueued(updated);
         }
 

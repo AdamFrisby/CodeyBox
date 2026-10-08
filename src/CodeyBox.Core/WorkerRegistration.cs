@@ -22,6 +22,16 @@ public sealed record WorkerRegistration
     public string? CurrentWorkItemId { get; init; }
 
     /// <summary>
+    /// UTC timestamp when the current worker-item binding was established —
+    /// i.e. when this worker picked up <see cref="CurrentWorkItemId"/> — or
+    /// null when no item is bound (or the row predates bind-time tracking).
+    /// The progress watchdog treats this as a progress signal so every new
+    /// pickup gets a full progress window even when the item itself carries
+    /// stale progress timestamps from an earlier turn.
+    /// </summary>
+    public DateTimeOffset? CurrentWorkItemBoundAt { get; init; }
+
+    /// <summary>
     /// Stable executor host id when this row was written by a remote executor
     /// host's registration (see <see cref="ExecutorRegistration"/>); null for
     /// in-process worker-slot rows. The worker id of executor rows is

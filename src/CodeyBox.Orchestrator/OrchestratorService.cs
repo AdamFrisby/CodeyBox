@@ -2922,14 +2922,16 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         if (_workerRegistry is not null && _deadWorkerOpts is not null)
         {
             registeredWorkerId = Guid.NewGuid().ToString();
+            var pickupAt = _time.GetUtcNow();
             var reg = new WorkerRegistration
             {
                 WorkerId = registeredWorkerId,
                 HostName = Environment.MachineName,
                 ProcessId = Environment.ProcessId,
-                StartedAt = _time.GetUtcNow(),
-                LastHeartbeatAt = _time.GetUtcNow(),
+                StartedAt = pickupAt,
+                LastHeartbeatAt = pickupAt,
                 CurrentWorkItemId = id.ToString(),
+                CurrentWorkItemBoundAt = pickupAt,
             };
             try
             {

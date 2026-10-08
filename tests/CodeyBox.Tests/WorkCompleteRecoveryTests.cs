@@ -303,6 +303,30 @@ public sealed class WorkCompleteRecoveryTests : IDisposable
                 NullLogger<WorkerProgressWatchdog>.Instance,
                 streams: null, webhooks: null, slotReleaser: svc,
                 cancellationRegistry: cancellations);
+
+            // The orchestrator bound these workers seconds ago (real pickup);
+            // backdate the bindings to the freeze point so the simulation
+            // represents workers wedged at WorkComplete for two hours while
+            // still heartbeating. Without this the fresh bindings correctly
+            // grant each attempt a full progress window and nothing is stuck.
+            foreach (var id in new[] { wedgeA.Id, wedgeB.Id })
+            {
+                WorkerRegistration? row = null;
+                foreach (var candidate in await _registry.ListAsync(CancellationToken.None))
+                {
+                    if (string.Equals(candidate.CurrentWorkItemId, id.ToString(), StringComparison.OrdinalIgnoreCase))
+                        row = candidate;
+                }
+                Assert.NotNull(row);
+                await _registry.DeregisterAsync(row!.WorkerId);
+                await _registry.RegisterAsync(row with
+                {
+                    StartedAt = frozenAt,
+                    LastHeartbeatAt = DateTimeOffset.UtcNow,
+                    CurrentWorkItemBoundAt = frozenAt,
+                });
+            }
+
             await watchdog.RunOnceAsync(CancellationToken.None);
 
             // Both wedged holders were recovered in place: still at

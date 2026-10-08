@@ -134,16 +134,21 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             LastError = lastError,
         };
 
-    private async Task PlantHeartbeatingWorkerAsync(string workerId, WorkItemId itemId)
+    private async Task PlantHeartbeatingWorkerAsync(string workerId, WorkItemId itemId, TimeSpan? workerAge = null)
     {
         // A fresh heartbeat — the watchdog must NOT rely on heartbeat staleness;
         // progress is decided from item.UpdatedAt + stream activity only.
+        // The row itself reads as bound (workerAge ?? 1h) ago so the planted
+        // attempt demonstrably ran past the progress window: the budget guard
+        // only spares attempts with positive evidence of a short runtime.
+        // Callers exercising a longer effective timeout pass an explicit age.
+        var age = workerAge ?? TimeSpan.FromHours(1);
         var reg = new WorkerRegistration
         {
             WorkerId = workerId,
             HostName = "host",
             ProcessId = 1,
-            StartedAt = DateTimeOffset.UtcNow.AddHours(-1),
+            StartedAt = DateTimeOffset.UtcNow - age,
             LastHeartbeatAt = DateTimeOffset.UtcNow,
             CurrentWorkItemId = itemId.ToString(),
         };
@@ -1848,7 +1853,9 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             with
         { Agent = AgentKind.Crock };
         await _store.CreateAsync(crockItem);
-        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+        // The planted attempt is as old as the item staleness (past the 2h
+        // override), so this recovery consumes the budget.
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id, workerAge: TimeSpan.FromHours(3));
 
         await watchdog.RunOnceAsync(CancellationToken.None);
 
@@ -2083,7 +2090,9 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
             with
         { Agent = AgentKind.Crock };
         await _store.CreateAsync(crockItem);
-        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id);
+        // The planted attempt is as old as the item staleness (past the 2h
+        // override), so this recovery consumes the budget.
+        await PlantHeartbeatingWorkerAsync(Guid.NewGuid().ToString(), crockItem.Id, workerAge: TimeSpan.FromHours(3));
 
         // Both CapturedAt and LastActivityAt stale — no fresh heartbeat.
         _streams.StampActivity(
@@ -2225,7 +2234,9 @@ public sealed class WorkerProgressWatchdogTests : IDisposable
         WorkerId = workerId,
         HostName = Environment.MachineName,
         ProcessId = Environment.ProcessId,
-        StartedAt = DateTimeOffset.UtcNow,
+        // Bound an hour ago: sweep tests using this helper model a
+        // long-running attempt, so a stuck recovery consumes the budget.
+        StartedAt = DateTimeOffset.UtcNow.AddHours(-1),
         LastHeartbeatAt = DateTimeOffset.UtcNow,
         CurrentWorkItemId = itemId.ToString(),
     };
