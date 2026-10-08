@@ -58,6 +58,7 @@ public sealed class IncusSandboxProvider :
     IDiskGuardedSandboxProvider,
     IBaselineImageResolver,
     IBaselineImageProvisioner,
+    IBaselineProvisioningBlockedStatusProvider,
     IResourceMetricsCapturingProvider
 {
     public const string ProviderId = "incus";
@@ -122,7 +123,18 @@ public sealed class IncusSandboxProvider :
     private readonly ConcurrentDictionary<string, ActiveOwner> _activeOwners = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, GuestActivityState> _guestActivity = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _guestActivityRefreshLock = new(1, 1);
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _uncertainBaselines = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, UncertainBaselineEntry> _uncertainBaselines = new(StringComparer.Ordinal);
+    private readonly BaselineProvisioningBlockedTracker _blockedTracker;
+    private Func<double> _jitterFactor = static () => Random.Shared.NextDouble();
+
+    /// <summary>Overrides the backoff jitter source (unit tests only).</summary>
+    internal Func<double> JitterFactor
+    {
+        get => _jitterFactor;
+        set => _jitterFactor = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    private sealed record UncertainBaselineEntry(string BakeToken, DateTimeOffset FirstSeen);
     private long _lastPoolFreeBytes = -1;
     private string? _lastPoolName;
 
@@ -134,8 +146,9 @@ public sealed class IncusSandboxProvider :
         ITimingStore? timings = null,
         ISandboxResourceUsageStore? resourceUsageStore = null,
         Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
-        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
-        : this(() => options, log, timings, new IncusCliProcessRunner(() => options), resourceUsageStore, trustAccessor: trustAccessor, admission: admission)
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null,
+        BaselineProvisioningBlockedTracker? blockedTracker = null)
+        : this(() => options, log, timings, new IncusCliProcessRunner(() => options), resourceUsageStore, trustAccessor: trustAccessor, admission: admission, blockedTracker: blockedTracker)
     {
     }
 
@@ -145,8 +158,9 @@ public sealed class IncusSandboxProvider :
         ITimingStore? timings = null,
         ISandboxResourceUsageStore? resourceUsageStore = null,
         Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
-        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
-        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(optionsAccessor), resourceUsageStore, trustAccessor: trustAccessor, admission: admission)
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null,
+        BaselineProvisioningBlockedTracker? blockedTracker = null)
+        : this(optionsAccessor, log, timings, new IncusCliProcessRunner(optionsAccessor), resourceUsageStore, trustAccessor: trustAccessor, admission: admission, blockedTracker: blockedTracker)
     {
     }
 
@@ -162,7 +176,8 @@ public sealed class IncusSandboxProvider :
         Func<string, string?>? environmentVariableReader = null,
         IIncusInstanceStateReader? stateReader = null,
         Func<CodeyBox.Sandbox.ArtifactProvenance.ArtifactTrustOptions>? trustAccessor = null,
-        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null)
+        CodeyBox.Sandbox.ArtifactProvenance.ArtifactAdmissionService? admission = null,
+        BaselineProvisioningBlockedTracker? blockedTracker = null)
     {
         _optionsAccessor = optionsAccessor ?? throw new ArgumentNullException(nameof(optionsAccessor));
         _log = log ?? throw new ArgumentNullException(nameof(log));
@@ -174,6 +189,7 @@ public sealed class IncusSandboxProvider :
         _environmentVariableReader = environmentVariableReader ?? Environment.GetEnvironmentVariable;
         _trustAccessor = trustAccessor;
         _admission = admission;
+        _blockedTracker = blockedTracker ?? new BaselineProvisioningBlockedTracker(_timeProvider);
         _cli = new IncusCliRunner(runner, _timeProvider);
         _stateReader = stateReader ?? new DefaultIncusInstanceStateReader(_cli, _timeProvider);
         var initialOptions = ReadValidatedOptions();
@@ -1205,10 +1221,10 @@ public sealed class IncusSandboxProvider :
                 DiskBytes: null))
             .ToList();
         var known = listed.Select(static baseline => baseline.Name).ToHashSet(StringComparer.Ordinal);
-        foreach (var (name, createdAt) in _uncertainBaselines)
+        foreach (var (name, entry) in _uncertainBaselines)
         {
             if (known.Add(name))
-                listed.Add(new BaselineImageInfo(name, createdAt, DiskBytes: null));
+                listed.Add(new BaselineImageInfo(name, entry.FirstSeen, DiskBytes: null));
         }
         return listed;
     }
@@ -1561,6 +1577,11 @@ public sealed class IncusSandboxProvider :
         string baselineName,
         CancellationToken ct)
     {
+        // Re-check every unconfirmed bake candidate on each attempt (the
+        // deferral requeue lands here after RecheckIn): a candidate the daemon
+        // has since removed clears without a restart, and one that is still
+        // present is deleted again with its bake token. Never requires a restart.
+        await ReconcileUncertainBaselinesAsync(options, ct).ConfigureAwait(false);
         var gate = _baselineLocks.GetOrAdd(baselineName, static _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -1594,7 +1615,10 @@ public sealed class IncusSandboxProvider :
                 if (!string.Equals(existing.Status, "STOPPED", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException($"Published Incus baseline '{baselineName}' is not stopped.");
                 if (await SnapshotExistsAsync(options, baselineName, ReadySnapshot, ct).ConfigureAwait(false))
+                {
+                    ClearBakeFailure(baselineName);
                     return baselineName;
+                }
                 throw new InvalidOperationException($"Published Incus baseline '{baselineName}' has no immutable ready snapshot.");
             }
 
@@ -1681,6 +1705,7 @@ public sealed class IncusSandboxProvider :
                         || !string.Equals(winner.Status, "STOPPED", StringComparison.OrdinalIgnoreCase)
                         || !await SnapshotExistsAsync(options, baselineName, ReadySnapshot, ct).ConfigureAwait(false))
                         throw new InvalidOperationException($"Failed to publish Incus baseline '{baselineName}' and no valid concurrent winner exists.");
+                    ClearBakeFailure(baselineName);
                     return baselineName;
                 }
                 published = true;
@@ -1695,11 +1720,14 @@ public sealed class IncusSandboxProvider :
                     maxStdoutBytes: 4096,
                     maxStderrBytes: 4096).ConfigureAwait(false);
                 _log.LogInformation("Baked Incus baseline {BaselineName} for profile {ProfileName}", baselineName, profileName);
+                ClearBakeFailure(baselineName);
                 return baselineName;
             }
             catch (Exception ex)
             {
                 bakeFailure = ex;
+                LogBakeFailure(baselineName, candidateName, ex);
+                RecordBakeFailure(baselineName, ex);
                 throw;
             }
             finally
@@ -1709,13 +1737,25 @@ public sealed class IncusSandboxProvider :
                     var deleted = await TryDeleteBakeCandidateAsync(options, candidateName, bakeToken).ConfigureAwait(false);
                     if (!deleted && bakeFailure is not null)
                     {
-                        _uncertainBaselines.TryAdd(candidateName, _timeProvider.GetUtcNow());
+                        _uncertainBaselines.TryAdd(
+                            candidateName,
+                            new UncertainBaselineEntry(bakeToken, _timeProvider.GetUtcNow()));
+                        var consecutiveFailures = _blockedTracker.GetConsecutiveFailures(baselineName);
+                        var recheckIn = ComputeBakeRecheckDelay(options, consecutiveFailures, IsTransientBakeFailure(bakeFailure, options));
+                        var cause = BuildBakeCause(bakeFailure);
+                        var operation = ExtractIncusOperation(bakeFailure) ?? "baseline bake";
+                        _log.LogWarning(
+                            "Incus baseline bake for {BaselineName} failed and candidate {CandidateName} cleanup is unconfirmed; deferring recheck in {RecheckSeconds}s. Bake cause: {BakeCause}",
+                            baselineName,
+                            candidateName,
+                            (long)recheckIn.TotalSeconds,
+                            cause);
                         throw new SandboxProvisioningDeferredException(
                             Name,
                             "baseline-cleanup",
                             "incus-baseline-delete-unconfirmed",
-                            $"Baseline bake failed and candidate '{candidateName}' may still appear or require cleanup.",
-                            options.DiskGuard?.RecheckIn ?? TimeSpan.FromMinutes(5),
+                            $"Baseline bake for '{baselineName}' failed at {operation}: {cause} Candidate '{candidateName}' cleanup unconfirmed; rechecking.",
+                            recheckIn,
                             retainedSandboxName: candidateName,
                             innerException: bakeFailure);
                     }
@@ -1727,6 +1767,214 @@ public sealed class IncusSandboxProvider :
             gate.Release();
         }
     }
+
+    public BaselineProvisioningBlockedStatus? GetProvisioningBlockedStatus() =>
+        _blockedTracker.GetProvisioningBlockedStatus();
+
+    internal async Task ReconcileUncertainBaselinesAsync(IncusSandboxOptions options, CancellationToken ct)
+    {
+        if (_uncertainBaselines.IsEmpty)
+            return;
+        foreach (var (name, entry) in _uncertainBaselines.ToArray())
+        {
+            ct.ThrowIfCancellationRequested();
+            IncusInstanceInfo? instance;
+            try
+            {
+                instance = await FindInstanceAsync(options, name, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Incus baseline recheck: unable to list bake candidate {CandidateName}; keeping uncertainty for the next recheck",
+                    name);
+                continue;
+            }
+            if (instance is null)
+            {
+                _uncertainBaselines.TryRemove(name, out _);
+                _log.LogInformation(
+                    "Incus baseline recheck: bake candidate {CandidateName} is confirmed gone; uncertainty cleared",
+                    name);
+                continue;
+            }
+            if (!IsOwned(instance, BaselineKind))
+            {
+                _uncertainBaselines.TryRemove(name, out _);
+                _log.LogWarning(
+                    "Incus baseline recheck: {CandidateName} is no longer owned as a baseline; uncertainty cleared without deleting",
+                    name);
+                continue;
+            }
+            if (!string.Equals(GetConfig(instance.Config, BakeTokenKey), entry.BakeToken, StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    "Incus baseline recheck: bake candidate {CandidateName} ownership token changed; keeping uncertainty without deleting",
+                    name);
+                continue;
+            }
+            bool deleted;
+            try
+            {
+                deleted = await TryDeleteBakeCandidateAsync(options, name, entry.BakeToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    ex,
+                    "Incus baseline recheck: retry delete of bake candidate {CandidateName} failed; keeping uncertainty for the next recheck",
+                    name);
+                continue;
+            }
+            if (deleted)
+            {
+                _log.LogInformation(
+                    "Incus baseline recheck: bake candidate {CandidateName} deleted on retry; uncertainty cleared",
+                    name);
+            }
+        }
+    }
+
+    internal TimeSpan ComputeBakeRecheckDelay(
+        IncusSandboxOptions options,
+        int consecutiveFailures,
+        bool isTransient)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (isTransient)
+            return options.ProvisioningRetryRecheckIn;
+        var baseDelay = options.BaselineBakeRetryBaseDelay <= TimeSpan.Zero
+            ? IncusSandboxOptions.DefaultBaselineBakeRetryBaseDelay
+            : options.BaselineBakeRetryBaseDelay;
+        var maxDelay = options.BaselineBakeRetryMaxDelay < baseDelay
+            ? baseDelay
+            : options.BaselineBakeRetryMaxDelay;
+        var shift = Math.Min(Math.Max(consecutiveFailures - 1, 0), 10);
+        var scaledTicks = (double)baseDelay.Ticks * (1 << shift);
+        var cappedTicks = Math.Min(scaledTicks, (double)maxDelay.Ticks);
+        double jitterSample;
+        try
+        {
+            jitterSample = _jitterFactor();
+        }
+        catch (Exception)
+        {
+            jitterSample = 0.5;
+        }
+        if (!double.IsFinite(jitterSample))
+            jitterSample = 0.5;
+        jitterSample = Math.Min(Math.Max(jitterSample, 0.0), 1.0);
+        var jitteredTicks = cappedTicks * (0.8 + 0.4 * jitterSample);
+        var clampedTicks = Math.Min(Math.Max(jitteredTicks, (double)TimeSpan.FromSeconds(1).Ticks), (double)maxDelay.Ticks);
+        return TimeSpan.FromTicks((long)clampedTicks);
+    }
+
+    internal static bool IsTransientBakeFailure(Exception ex, IncusSandboxOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        ArgumentNullException.ThrowIfNull(options);
+        if (ex is IncusTransientTimeoutException)
+            return true;
+        return IncusTransientInfrastructure.TryClassify(ex, options.TransientInfrastructureSignatures) is not null;
+    }
+
+    internal static string BuildBakeCause(Exception ex)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        var parts = new List<string>(capacity: 3);
+        CollectBakeCauseMessages(ex, parts, depth: 0);
+        var operation = ExtractIncusOperation(ex);
+        var exitCode = TryExtractExitCode(string.Join(" | ", parts));
+        var combined = parts.Count == 0 ? "unknown bake failure" : string.Join(" | ", parts);
+        var prefix = operation is null
+            ? exitCode is null ? "" : $"exit {exitCode}: "
+            : exitCode is null ? $"{operation}: " : $"{operation} exit {exitCode}: ";
+        return SingleLineText(prefix + combined);
+    }
+
+    private static string SingleLineText(string? value)
+    {
+        const int maxChars = 1024;
+        var message = value ?? string.Empty;
+        if (message.Length > maxChars)
+            message = message.Substring(0, maxChars);
+        var builder = new System.Text.StringBuilder(message.Length);
+        foreach (var c in message)
+            builder.Append(char.IsControl(c) ? ' ' : c);
+        return builder.ToString().Trim();
+    }
+
+    private static void CollectBakeCauseMessages(Exception ex, List<string> parts, int depth)
+    {
+        if (depth > 4 || parts.Count >= 3)
+            return;
+        if (!string.IsNullOrWhiteSpace(ex.Message))
+        {
+            var single = SingleLineText(ex.Message);
+            if (!string.IsNullOrWhiteSpace(single) && !parts.Contains(single, StringComparer.Ordinal))
+                parts.Add(single);
+        }
+        if (ex is AggregateException aggregate)
+        {
+            foreach (var inner in aggregate.InnerExceptions)
+            {
+                CollectBakeCauseMessages(inner, parts, depth + 1);
+                if (parts.Count >= 3)
+                    return;
+            }
+            return;
+        }
+        if (ex.InnerException is not null)
+            CollectBakeCauseMessages(ex.InnerException, parts, depth + 1);
+    }
+
+    private static int? TryExtractExitCode(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return null;
+        const string marker = "exit code ";
+        var index = text.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+            return null;
+        var digits = index + marker.Length;
+        var value = 0;
+        var count = 0;
+        while (digits < text.Length && char.IsAsciiDigit(text[digits]) && count < 6)
+        {
+            value = value * 10 + (text[digits] - '0');
+            digits++;
+            count++;
+        }
+        return count == 0 ? null : value;
+    }
+
+    private void LogBakeFailure(string baselineName, string candidateName, Exception bakeFailure)
+    {
+        var cause = BuildBakeCause(bakeFailure);
+        var operation = ExtractIncusOperation(bakeFailure) ?? "baseline bake";
+        _log.LogWarning(
+            bakeFailure,
+            "Incus baseline bake for {BaselineName} failed at {Operation}: {BakeCause}; candidate {CandidateName} will be cleaned up",
+            baselineName,
+            operation,
+            cause,
+            candidateName);
+    }
+
+    private void RecordBakeFailure(string baselineName, Exception bakeFailure) =>
+        _blockedTracker.RecordFailure(ProviderId, baselineName, BuildBakeCause(bakeFailure));
+
+    private void ClearBakeFailure(string baselineName) =>
+        _blockedTracker.RecordSuccess(baselineName);
 
     private async Task EnsureHostPreflightAsync(IncusSandboxOptions options, CancellationToken ct)
     {

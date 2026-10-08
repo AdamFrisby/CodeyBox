@@ -65,6 +65,13 @@ public sealed class SandboxProviderBuildArgs
     public ArtifactAdmissionService? ArtifactAdmission { get; init; }
 
     /// <summary>
+    /// Shared baseline-bake failure tracker (hot path for the
+    /// <c>baseline_provisioning_blocked</c> alert and <c>/queue/status</c>).
+    /// Null creates a provider-private tracker (executor hosts, unit tests).
+    /// </summary>
+    public CodeyBox.Core.BaselineProvisioningBlockedTracker? BaselineBlockedTracker { get; init; }
+
+    /// <summary>
     /// Builds args whose option accessors read live executor configuration:
     /// every call observes the current <see cref="ExecutorOptions"/> value,
     /// so an operator edit lands on the next provider operation without an
@@ -136,7 +143,8 @@ public static class SharedSandboxProviderFactory
                 args.Timings,
                 args.ResourceUsage,
                 trustAccessor: RequireAccessor(args.ArtifactTrust, normalized),
-                admission: args.ArtifactAdmission);
+                admission: args.ArtifactAdmission,
+                blockedTracker: args.BaselineBlockedTracker);
         if (normalized == CodeyBox.Core.HostPlatformSupport.MultipassRemote)
             return BuildMultipassRemote(args, loggers);
         if (normalized == CodeyBox.Core.HostPlatformSupport.Sprites)

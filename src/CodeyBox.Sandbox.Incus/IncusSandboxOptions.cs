@@ -20,6 +20,8 @@ public sealed record IncusSandboxOptions
     public static readonly TimeSpan DefaultReadinessPollInterval = TimeSpan.FromSeconds(1);
     public static readonly TimeSpan DefaultMaxReadinessPollInterval = TimeSpan.FromSeconds(5);
     public static readonly TimeSpan DefaultProvisioningRetryRecheckIn = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan DefaultBaselineBakeRetryBaseDelay = TimeSpan.FromMinutes(5);
+    public static readonly TimeSpan DefaultBaselineBakeRetryMaxDelay = TimeSpan.FromHours(1);
     public static readonly TimeSpan DefaultInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(1);
     public static readonly TimeSpan MaximumInterruptedExecRecoveryRetryDelay = TimeSpan.FromSeconds(30);
     public const int DefaultInterruptedExecRecoveryRetryAttempts = 3;
@@ -185,6 +187,19 @@ public sealed record IncusSandboxOptions
     /// retries soon after the boot storm clears rather than being parked.
     /// </summary>
     public TimeSpan ProvisioningRetryRecheckIn { get; init; } = DefaultProvisioningRetryRecheckIn;
+    /// <summary>
+    /// Base delay for the exponential backoff applied to repeated deterministic
+    /// baseline-bake failures. The first bake-failure deferral rechecks after
+    /// this delay; each consecutive failure doubles it up to
+    /// <see cref="BaselineBakeRetryMaxDelay"/> with a small jitter so a
+    /// deterministic failure does not spin. Transient bake faults keep using
+    /// the short <see cref="ProvisioningRetryRecheckIn"/>. Hot-reloadable.
+    /// </summary>
+    public TimeSpan BaselineBakeRetryBaseDelay { get; init; } = DefaultBaselineBakeRetryBaseDelay;
+    /// <summary>
+    /// Upper bound for the deterministic bake-failure backoff. Hot-reloadable.
+    /// </summary>
+    public TimeSpan BaselineBakeRetryMaxDelay { get; init; } = DefaultBaselineBakeRetryMaxDelay;
     /// <summary>
     /// Allowlisted exact Incus error signatures classified as transient host
     /// infrastructure (incusd DB/storage contention, teardown unmount races,
@@ -357,6 +372,12 @@ public sealed record IncusSandboxOptions
         if (options.MaxReadinessPollInterval < options.ReadinessPollInterval)
             errors.Add($"{nameof(MaxReadinessPollInterval)} must be at least {nameof(ReadinessPollInterval)}.");
         RequirePositiveDuration(options.ProvisioningRetryRecheckIn, nameof(ProvisioningRetryRecheckIn), errors);
+        RequirePositiveDuration(options.BaselineBakeRetryBaseDelay, nameof(BaselineBakeRetryBaseDelay), errors);
+        RequirePositiveDuration(options.BaselineBakeRetryMaxDelay, nameof(BaselineBakeRetryMaxDelay), errors);
+        if (options.BaselineBakeRetryMaxDelay < options.BaselineBakeRetryBaseDelay)
+            errors.Add($"{nameof(BaselineBakeRetryMaxDelay)} must be at least {nameof(BaselineBakeRetryBaseDelay)}.");
+        if (options.BaselineBakeRetryMaxDelay > TimeSpan.FromHours(24))
+            errors.Add($"{nameof(BaselineBakeRetryMaxDelay)} must be no greater than 24 hours.");
         ValidateTransientInfrastructureSignatures(options, errors);
         try
         {

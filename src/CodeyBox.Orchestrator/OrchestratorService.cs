@@ -3473,7 +3473,8 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                     provEx.Operation,
                     provEx.ErrorClass,
                     deferredItem.State.ToString(),
-                    provEx.RecheckIn);
+                    provEx.RecheckIn,
+                    provEx.Detail);
 
                 if (_webhooks is not null)
                 {
@@ -3487,6 +3488,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                             provider = provEx.Provider,
                             operation = provEx.Operation,
                             errorClass = provEx.ErrorClass,
+                            detail = provEx.Detail,
                             resumeState = deferredItem.State.ToString(),
                             suggestedRetryAt = _time.GetUtcNow() + provEx.RecheckIn,
                         },

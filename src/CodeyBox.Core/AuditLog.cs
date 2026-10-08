@@ -373,11 +373,14 @@ public static class AuditLog
         string operation,
         string errorClass,
         string resumeState,
-        TimeSpan recheckIn) =>
-        Audit("sandbox.provisioning_deferred")
+        TimeSpan recheckIn,
+        string? detail = null,
+        Serilog.ILogger? logger = null) =>
+        Audit(logger, "sandbox.provisioning_deferred")
+            .ForContext("Detail", AuditSingleLine(detail, 1024))
             .Warning(
-                "Sandbox provisioning deferred for work item {WorkItemId}: provider={Provider} operation={Operation} errorClass={ErrorClass} resumeState={ResumeState} recheckIn={RecheckSeconds}s",
-                workItemId.ToString(), provider, operation, errorClass, resumeState, (long)recheckIn.TotalSeconds);
+                "Sandbox provisioning deferred for work item {WorkItemId}: provider={Provider} operation={Operation} errorClass={ErrorClass} resumeState={ResumeState} recheckIn={RecheckSeconds}s detail={Detail}",
+                workItemId.ToString(), provider, operation, errorClass, resumeState, (long)recheckIn.TotalSeconds, AuditSingleLine(detail, 1024));
 
     public static void SandboxAgentInfrastructureFailure(
         WorkItemId workItemId,
