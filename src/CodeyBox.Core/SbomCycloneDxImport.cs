@@ -18,6 +18,13 @@ public static class SbomCycloneDxImport
     private const int MaxPurlChars = 2048;
     private const int MaxBomRefChars = 1024;
 
+    // WHY: shared parser-nesting bound so one deeply nested document cannot exhaust
+    // the audit-path stack. JSON enforces MaxJsonDepth in JsonDocumentOptions;
+    // XML enforces MaxXmlDepth with an iterative XmlReader pre-scan (XmlReaderSettings
+    // exposes no MaxDepth property) before XmlDocument.Load.
+    private const int MaxJsonDepth = 32;
+    private const int MaxXmlDepth = 64;
+
     private static readonly HashSet<string> AllowedHashAlgorithms = new(StringComparer.OrdinalIgnoreCase)
     {
         "MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512",
@@ -50,7 +57,7 @@ public static class SbomCycloneDxImport
     {
         ArgumentNullException.ThrowIfNull(content);
         ArgumentNullException.ThrowIfNull(options);
-        if (!SbomCycloneDxOptionsIsUsable(options, out var optionsIssue))
+        if (!AreOptionsUsable(options, out var optionsIssue))
             return SbomImportResult.Failure(optionsIssue);
         if (content.Length == 0)
             return SbomImportResult.Failure(Issue("sbom.missing", "SBOM evidence is empty."));
@@ -91,7 +98,7 @@ public static class SbomCycloneDxImport
         return Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
     }
 
-    private static bool SbomCycloneDxOptionsIsUsable(SbomCycloneDxOptions options, out SbomValidationIssue issue)
+    private static bool AreOptionsUsable(SbomCycloneDxOptions options, out SbomValidationIssue issue)
     {
         if (SbomCycloneDxOptions.IsValid(options))
         {
@@ -107,14 +114,7 @@ public static class SbomCycloneDxImport
         JsonDocument doc;
         try
         {
-            var readerOptions = new JsonReaderOptions
-            {
-                MaxDepth = 32,
-                AllowTrailingCommas = false,
-                CommentHandling = JsonCommentHandling.Disallow,
-            };
-            doc = JsonDocument.Parse(content, new JsonDocumentOptions { MaxDepth = 32 });
-            _ = readerOptions;
+            doc = JsonDocument.Parse(content, new JsonDocumentOptions { MaxDepth = MaxJsonDepth });
         }
         catch (JsonException ex)
         {
@@ -123,11 +123,11 @@ public static class SbomCycloneDxImport
         }
         using (doc)
         {
-            return BuildDocument(doc.RootElement, "json", options, ct);
+            return BuildDocument(doc.RootElement, "json", options, ct, content);
         }
     }
 
-    private static SbomImportResult BuildDocument(JsonElement root, string format, SbomCycloneDxOptions options, CancellationToken ct)
+    private static SbomImportResult BuildDocument(JsonElement root, string format, SbomCycloneDxOptions options, CancellationToken ct, byte[] content)
     {
         if (root.ValueKind != JsonValueKind.Object)
             return SbomImportResult.Failure(Issue("sbom.malformed", "SBOM document root must be a JSON object."));
@@ -160,28 +160,13 @@ public static class SbomCycloneDxImport
 
         var components = new List<SbomComponent>(Math.Min(componentsEl.GetArrayLength(), 1024));
         var issues = new List<SbomValidationIssue>();
-        var seenBomRefs = new HashSet<string>(StringComparer.Ordinal);
-        var seenIdentityKeys = new HashSet<string>(StringComparer.Ordinal);
         var index = 0;
         foreach (var item in componentsEl.EnumerateArray())
         {
             ct.ThrowIfCancellationRequested();
             var component = ReadComponent(item, index, issues);
-            if (component is null)
-            {
-                index++;
-                continue;
-            }
-            if (!string.IsNullOrWhiteSpace(component.Identity.BomRef))
-            {
-                if (!seenBomRefs.Add(component.Identity.BomRef!.Trim()))
-                    issues.Add(Issue("sbom.duplicate-identity",
-                        $"Duplicate bom-ref '{component.Identity.BomRef}' at components[{index}]."));
-            }
-            if (!seenIdentityKeys.Add(component.Identity.IdentityKey))
-                issues.Add(Issue("sbom.duplicate-identity",
-                    $"Duplicate component identity '{component.Identity.IdentityKey}' at components[{index}] (purl qualifiers included; distinct components must not share an identity)."));
-            components.Add(component);
+            if (component is not null)
+                components.Add(component);
             index++;
         }
 
@@ -191,24 +176,76 @@ public static class SbomCycloneDxImport
             if (depsEl.ValueKind != JsonValueKind.Array)
                 return SbomImportResult.Failure(Issue("sbom.invalid-schema",
                     "SBOM 'dependencies' must be an array."));
-            var edgeCount = 0;
-            foreach (var dep in depsEl.EnumerateArray())
-                edgeCount += dep.TryGetProperty("dependsOn", out var d) && d.ValueKind == JsonValueKind.Array ? d.GetArrayLength() : 0;
-            if (depsEl.GetArrayLength() > options.MaxDependencies || edgeCount > options.MaxDependencies)
-                return SbomImportResult.Failure(Issue("sbom.oversized",
-                    "SBOM dependency graph exceeds the configured cap."));
-            var seenDepRefs = new HashSet<string>(StringComparer.Ordinal);
             foreach (var dep in depsEl.EnumerateArray())
             {
                 ct.ThrowIfCancellationRequested();
                 var edge = ReadDependency(dep, issues);
-                if (edge is null)
-                    continue;
-                if (!seenDepRefs.Add(edge.Ref))
-                    issues.Add(Issue("sbom.ambiguous-relationship",
-                        $"Ambiguous dependency entry: duplicate ref '{edge.Ref}'."));
-                dependencies.Add(edge);
+                if (edge is not null)
+                    dependencies.Add(edge);
             }
+        }
+
+        return FinalizeDocument(specVersion, format, producer, components, dependencies, issues, rootBomRef, content, options);
+    }
+
+    /// <summary>
+    /// The one shared validation core for every SBOM shape. Thin JSON and XML
+    /// adapters parse their syntax into components/dependencies/producer/root-ref
+    /// and delegate here, so caps, duplicate-identity checks, the known-ref set
+    /// (including the metadata root ref), relationship checks, and the content
+    /// digest basis are identical regardless of format.
+    /// </summary>
+    private static SbomImportResult FinalizeDocument(
+        string specVersion,
+        string format,
+        SbomProducerInfo producer,
+        List<SbomComponent> components,
+        List<SbomDependency> dependencies,
+        List<SbomValidationIssue> issues,
+        string? rootBomRef,
+        byte[] content,
+        SbomCycloneDxOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(producer);
+        ArgumentNullException.ThrowIfNull(components);
+        ArgumentNullException.ThrowIfNull(dependencies);
+        ArgumentNullException.ThrowIfNull(issues);
+        ArgumentNullException.ThrowIfNull(content);
+        ArgumentNullException.ThrowIfNull(options);
+
+        if (components.Count > options.MaxComponents)
+            return SbomImportResult.Failure(Issue("sbom.oversized",
+                $"SBOM carries {components.Count} components, exceeding the {options.MaxComponents} cap."));
+
+        var edgeCount = 0;
+        foreach (var edge in dependencies)
+            edgeCount += edge.DependsOn.Count;
+        if (dependencies.Count > options.MaxDependencies || edgeCount > options.MaxDependencies)
+            return SbomImportResult.Failure(Issue("sbom.oversized",
+                "SBOM dependency graph exceeds the configured cap."));
+
+        var seenBomRefs = new HashSet<string>(StringComparer.Ordinal);
+        var seenIdentityKeys = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < components.Count; index++)
+        {
+            var identity = components[index].Identity;
+            if (!string.IsNullOrWhiteSpace(identity.BomRef))
+            {
+                if (!seenBomRefs.Add(identity.BomRef!.Trim()))
+                    issues.Add(Issue("sbom.duplicate-identity",
+                        $"Duplicate bom-ref '{identity.BomRef}' at components[{index}]."));
+            }
+            if (!seenIdentityKeys.Add(identity.IdentityKey))
+                issues.Add(Issue("sbom.duplicate-identity",
+                    $"Duplicate component identity '{identity.IdentityKey}' at components[{index}] (purl qualifiers included; distinct components must not share an identity)."));
+        }
+
+        var seenDepRefs = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var edge in dependencies)
+        {
+            if (!seenDepRefs.Add(edge.Ref))
+                issues.Add(Issue("sbom.ambiguous-relationship",
+                    $"Ambiguous dependency entry: duplicate ref '{edge.Ref}'."));
         }
 
         if (issues.Count > 0)
@@ -236,7 +273,6 @@ public static class SbomCycloneDxImport
             }
         }
 
-        var contentDigest = DigestBytes(Encoding.UTF8.GetBytes(root.GetRawText()));
         return SbomImportResult.Success(new SbomDocument
         {
             SpecVersion = specVersion,
@@ -244,7 +280,7 @@ public static class SbomCycloneDxImport
             Producer = producer,
             Components = components,
             Dependencies = dependencies,
-            ContentDigest = contentDigest,
+            ContentDigest = DigestBytes(content),
             InventoryComplete = true,
         });
     }
@@ -454,7 +490,10 @@ public static class SbomCycloneDxImport
         string text;
         try
         {
-            text = Encoding.UTF8.GetString(content);
+            // WHY: strict decoding so invalid UTF-8 is rejected like malformed JSON,
+            // instead of silently lossy-replaced by Encoding.UTF8.GetString.
+            text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                .GetString(content);
         }
         catch (Exception ex)
         {
@@ -465,7 +504,29 @@ public static class SbomCycloneDxImport
         try
         {
             xml = new XmlDocument();
-            using var reader = XmlReader.Create(new System.IO.StringReader(text), SafeXmlSettings.Create());
+            // WHY: clone the shared XXE-hardened settings and bound document
+            // characters (XmlReaderSettings has no MaxDepth property, so nesting
+            // depth is enforced by an iterative pre-scan below: a deeply nested
+            // document within the byte cap must not exhaust the audit-path stack
+            // during XmlDocument.Load). The character bound tracks the configured
+            // byte cap (UTF-8 characters never exceed bytes).
+            static XmlReaderSettings DepthBoundSettings(SbomCycloneDxOptions options)
+            {
+                var settings = SafeXmlSettings.Create();
+                settings.MaxCharactersInDocument = options.MaxSbomBytes;
+                return settings;
+            }
+            using (var scan = XmlReader.Create(new System.IO.StringReader(text), DepthBoundSettings(options)))
+            {
+                while (scan.Read())
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (scan.Depth > MaxXmlDepth)
+                        return SbomImportResult.Failure(Issue("sbom.oversized",
+                            $"SBOM XML nesting exceeds the {MaxXmlDepth}-level depth cap."));
+                }
+            }
+            using var reader = XmlReader.Create(new System.IO.StringReader(text), DepthBoundSettings(options));
             xml.Load(reader);
         }
         catch (Exception ex)
@@ -488,12 +549,16 @@ public static class SbomCycloneDxImport
             return SbomImportResult.Failure(Issue("sbom.unsupported-spec",
                 $"SBOM specVersion '{specVersion}' is not supported (allowed: {string.Join(", ", options.SupportedSpecVersions)})."));
 
+        var producer = ReadXmlProducer(root);
+        var rootBomRef = ReadXmlRootBomRef(root);
+
+        if (!HasComponentsElement(root))
+            return SbomImportResult.Failure(Issue("sbom.invalid-schema",
+                "SBOM 'components' array is missing (partial inventory is rejected)."));
         var componentNodes = root.SelectNodes("c:components/c:component", NamespaceFor(root, namespaceManager))
             ?? root.SelectNodes("components/component");
         var components = new List<SbomComponent>();
         var issues = new List<SbomValidationIssue>();
-        var seenBomRefs = new HashSet<string>(StringComparer.Ordinal);
-        var seenIdentityKeys = new HashSet<string>(StringComparer.Ordinal);
         var nodeIndex = 0;
         if (componentNodes is not null)
         {
@@ -504,33 +569,17 @@ public static class SbomCycloneDxImport
             {
                 ct.ThrowIfCancellationRequested();
                 var component = ReadXmlComponent(node, nodeIndex, issues);
-                if (component is null)
-                {
-                    nodeIndex++;
-                    continue;
-                }
-                if (!string.IsNullOrWhiteSpace(component.Identity.BomRef))
-                {
-                    if (!seenBomRefs.Add(component.Identity.BomRef!.Trim()))
-                        issues.Add(Issue("sbom.duplicate-identity",
-                            $"Duplicate bom-ref '{component.Identity.BomRef}'."));
-                }
-                if (!seenIdentityKeys.Add(component.Identity.IdentityKey))
-                    issues.Add(Issue("sbom.duplicate-identity",
-                        $"Duplicate component identity '{component.Identity.IdentityKey}'."));
-                components.Add(component);
+                if (component is not null)
+                    components.Add(component);
                 nodeIndex++;
             }
         }
-        if (issues.Count > 0)
-            return SbomImportResult.Failure(issues);
 
         var dependencies = new List<SbomDependency>();
         var depNodes = root.SelectNodes("c:dependencies/c:dependency", NamespaceFor(root, namespaceManager))
             ?? root.SelectNodes("dependencies/dependency");
         if (depNodes is not null)
         {
-            var seenDepRefs = new HashSet<string>(StringComparer.Ordinal);
             foreach (XmlNode node in depNodes)
             {
                 ct.ThrowIfCancellationRequested();
@@ -555,45 +604,11 @@ public static class SbomCycloneDxImport
                     }
                     targets.Add(childRef!.Trim());
                 }
-                if (!seenDepRefs.Add(depRef!.Trim()))
-                    issues.Add(Issue("sbom.ambiguous-relationship",
-                        $"Ambiguous dependency entry: duplicate ref '{depRef!.Trim()}'."));
-                else
-                    dependencies.Add(new SbomDependency { Ref = depRef!.Trim(), DependsOn = targets });
-            }
-        }
-        if (issues.Count > 0)
-            return SbomImportResult.Failure(issues);
-
-        var knownRefs = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var c in components)
-        {
-            if (!string.IsNullOrWhiteSpace(c.Identity.BomRef))
-                knownRefs.Add(c.Identity.BomRef!.Trim());
-        }
-        foreach (var edge in dependencies)
-        {
-            if (!knownRefs.Contains(edge.Ref))
-                return SbomImportResult.Failure(Issue("sbom.ambiguous-relationship",
-                    $"Dependency ref '{edge.Ref}' does not match any component bom-ref."));
-            foreach (var target in edge.DependsOn)
-            {
-                if (!knownRefs.Contains(target))
-                    return SbomImportResult.Failure(Issue("sbom.ambiguous-relationship",
-                        $"Dependency target '{target}' of '{edge.Ref}' does not match any component bom-ref."));
+                dependencies.Add(new SbomDependency { Ref = depRef!.Trim(), DependsOn = targets });
             }
         }
 
-        return SbomImportResult.Success(new SbomDocument
-        {
-            SpecVersion = specVersion,
-            Format = "xml",
-            Producer = new SbomProducerInfo(),
-            Components = components,
-            Dependencies = dependencies,
-            ContentDigest = DigestBytes(content),
-            InventoryComplete = true,
-        });
+        return FinalizeDocument(specVersion, "xml", producer, components, dependencies, issues, rootBomRef, content, options);
     }
 
     private static XmlNamespaceManager NamespaceFor(XmlElement root, XmlNamespaceManager manager)
@@ -604,6 +619,122 @@ public static class SbomCycloneDxImport
         else
             manager.AddNamespace("c", "http://cyclonedx.org/schema/bom/1.5");
         return manager;
+    }
+
+    private static bool HasComponentsElement(XmlElement root)
+    {
+        foreach (XmlNode child in root.ChildNodes)
+        {
+            if (child.NodeType == XmlNodeType.Element
+                && string.Equals(child.LocalName, "components", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    private static string? ReadXmlRootBomRef(XmlElement root)
+    {
+        foreach (XmlNode child in root.ChildNodes)
+        {
+            if (child.NodeType != XmlNodeType.Element
+                || !string.Equals(child.LocalName, "metadata", StringComparison.Ordinal))
+                continue;
+            foreach (XmlNode entry in child.ChildNodes)
+            {
+                if (entry.NodeType == XmlNodeType.Element
+                    && string.Equals(entry.LocalName, "component", StringComparison.Ordinal))
+                {
+                    var bomRef = entry.Attributes?["bom-ref"]?.Value;
+                    if (!string.IsNullOrWhiteSpace(bomRef) && IsValidBomRef(bomRef!))
+                        return bomRef!.Trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static SbomProducerInfo ReadXmlProducer(XmlElement root)
+    {
+        string? serialNumber = null;
+        var serial = root.GetAttribute("serialNumber");
+        if (!string.IsNullOrWhiteSpace(serial))
+            serialNumber = serial.Trim();
+        var producer = string.Empty;
+        var toolVersion = string.Empty;
+        foreach (XmlNode child in root.ChildNodes)
+        {
+            if (child.NodeType != XmlNodeType.Element
+                || !string.Equals(child.LocalName, "metadata", StringComparison.Ordinal))
+                continue;
+            foreach (XmlNode entry in child.ChildNodes)
+            {
+                if (entry.NodeType != XmlNodeType.Element
+                    || !string.Equals(entry.LocalName, "tools", StringComparison.Ordinal))
+                    continue;
+                if (TryReadXmlTool(entry, out var name, out var version))
+                {
+                    producer = name;
+                    toolVersion = version;
+                    break;
+                }
+            }
+        }
+        return new SbomProducerInfo
+        {
+            Producer = producer,
+            ToolName = producer,
+            ToolVersion = toolVersion,
+            SerialNumber = serialNumber,
+        };
+    }
+
+    private static bool TryReadXmlTool(XmlNode tools, out string name, out string version)
+    {
+        name = string.Empty;
+        version = string.Empty;
+        foreach (XmlNode child in tools.ChildNodes)
+        {
+            if (child.NodeType != XmlNodeType.Element)
+                continue;
+            if (string.Equals(child.LocalName, "tool", StringComparison.Ordinal))
+            {
+                var toolName = ChildTextByLocalName(child, "name");
+                if (!string.IsNullOrWhiteSpace(toolName))
+                {
+                    name = toolName!.Trim();
+                    version = ChildTextByLocalName(child, "version")?.Trim() ?? string.Empty;
+                    return true;
+                }
+            }
+            if (string.Equals(child.LocalName, "components", StringComparison.Ordinal))
+            {
+                foreach (XmlNode component in child.ChildNodes)
+                {
+                    if (component.NodeType != XmlNodeType.Element
+                        || !string.Equals(component.LocalName, "component", StringComparison.Ordinal))
+                        continue;
+                    var componentName = ChildTextByLocalName(component, "name");
+                    if (!string.IsNullOrWhiteSpace(componentName))
+                    {
+                        name = componentName!.Trim();
+                        version = ChildTextByLocalName(component, "version")?.Trim() ?? string.Empty;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static string? ChildTextByLocalName(XmlNode node, string localName)
+    {
+        foreach (XmlNode child in node.ChildNodes)
+        {
+            if (child.NodeType == XmlNodeType.Element
+                && string.Equals(child.LocalName, localName, StringComparison.Ordinal))
+                return child.InnerText;
+        }
+        return null;
     }
 
     private static SbomComponent? ReadXmlComponent(XmlNode node, int index, List<SbomValidationIssue> issues)
@@ -625,9 +756,9 @@ public static class SbomCycloneDxImport
                 case "publisher": publisher = child.InnerText; break;
             }
         }
-        if (string.IsNullOrWhiteSpace(name))
+        if (string.IsNullOrWhiteSpace(name) || name!.Trim().Length > MaxSingleFieldChars)
         {
-            issues.Add(Issue("sbom.invalid-schema", $"SBOM XML component[{index}] has a missing 'name'."));
+            issues.Add(Issue("sbom.invalid-schema", $"SBOM XML component[{index}] has a missing or oversized 'name'."));
             return null;
         }
         if (bomRef is not null && !IsValidBomRef(bomRef))

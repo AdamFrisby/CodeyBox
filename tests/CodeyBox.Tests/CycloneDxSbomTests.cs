@@ -179,6 +179,144 @@ public sealed class CycloneDxSbomTests
     }
 
     [Fact]
+    public void Import_XmlMissingComponents_RejectedLikeJson()
+    {
+        const string xml = """
+            <bom xmlns="http://cyclonedx.org/schema/bom/1.5" specVersion="1.5">
+              <metadata><component bom-ref="my-app@1.0.0" type="application"><name>my-app</name></component></metadata>
+            </bom>
+            """;
+        var result = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(xml), "xml", Options);
+        Assert.False(result.Ok);
+        Assert.Contains(result.Issues, i => i.Code == "sbom.invalid-schema");
+    }
+
+    [Fact]
+    public void Import_XmlDeeplyNested_RejectedByDepthCap()
+    {
+        var nested = new StringBuilder("<bom xmlns=\"http://cyclonedx.org/schema/bom/1.5\" specVersion=\"1.5\"><metadata>");
+        for (var i = 0; i < 80; i++)
+            nested.Append($"<n{i}>");
+        nested.Append("deep");
+        for (var i = 79; i >= 0; i--)
+            nested.Append($"</n{i}>");
+        nested.Append("</metadata><components></components></bom>");
+        var result = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(nested.ToString()), "xml", Options);
+        Assert.False(result.Ok);
+        Assert.Contains(result.Issues, i => i.Code == "sbom.oversized");
+    }
+
+    [Fact]
+    public void Import_XmlDependencyCap_EnforcedLikeJson()
+    {
+        var capped = new SbomCycloneDxOptions
+        {
+            Enabled = true,
+            MaxSbomBytes = 1024 * 1024,
+            MaxComponents = 1000,
+            MaxDependencies = 1,
+        };
+        const string xml = """
+            <bom xmlns="http://cyclonedx.org/schema/bom/1.5" specVersion="1.5">
+              <components>
+                <component type="library" bom-ref="a"><name>a</name><purl>pkg:npm/a@1.0.0</purl></component>
+                <component type="library" bom-ref="b"><name>b</name><purl>pkg:npm/b@1.0.0</purl></component>
+              </components>
+              <dependencies>
+                <dependency ref="a"><dependency ref="b"/></dependency>
+                <dependency ref="b"/>
+              </dependencies>
+            </bom>
+            """;
+        var result = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(xml), "xml", capped);
+        Assert.False(result.Ok);
+        Assert.Contains(result.Issues, i => i.Code == "sbom.oversized");
+    }
+
+    [Fact]
+    public void Import_XmlRootBomRef_AdmittedLikeJson()
+    {
+        const string xml = """
+            <bom xmlns="http://cyclonedx.org/schema/bom/1.5" specVersion="1.5">
+              <metadata><component bom-ref="my-app@1.0.0" type="application"><name>my-app</name><version>1.0.0</version></component></metadata>
+              <components>
+                <component type="library" bom-ref="lodash@4.17.21"><name>lodash</name><version>4.17.21</version><purl>pkg:npm/lodash@4.17.21</purl></component>
+              </components>
+              <dependencies>
+                <dependency ref="my-app@1.0.0"><dependency ref="lodash@4.17.21"/></dependency>
+                <dependency ref="lodash@4.17.21"/>
+              </dependencies>
+            </bom>
+            """;
+        var result = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(xml), "xml", Options);
+        Assert.True(result.Ok);
+    }
+
+    [Fact]
+    public void Import_XmlProducer_RetainedLikeJson()
+    {
+        const string xml = """
+            <bom xmlns="http://cyclonedx.org/schema/bom/1.5" specVersion="1.5" serialNumber="urn:uuid:33333333-3333-3333-3333-333333333333">
+              <metadata><tools><components><component type="application"><name>cdxgen</name><version>11.0.0</version></component></components></tools></metadata>
+              <components>
+                <component type="library" bom-ref="lodash@4.17.21"><name>lodash</name><version>4.17.21</version><purl>pkg:npm/lodash@4.17.21</purl></component>
+              </components>
+            </bom>
+            """;
+        var result = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(xml), "xml", Options);
+        Assert.True(result.Ok);
+        Assert.Equal("cdxgen", result.Document!.Producer.Producer);
+        Assert.Equal("11.0.0", result.Document.Producer.ToolVersion);
+        Assert.Equal("urn:uuid:33333333-3333-3333-3333-333333333333", result.Document.Producer.SerialNumber);
+    }
+
+    [Fact]
+    public void Import_ContentDigest_BindsExactBytesInBothFormats()
+    {
+        var jsonBytes = Encoding.UTF8.GetBytes(NpmSbom);
+        var json = SbomCycloneDxImport.Import(jsonBytes, "json", Options);
+        Assert.True(json.Ok);
+        Assert.Equal(SbomCycloneDxImport.DigestBytes(jsonBytes), json.Document!.ContentDigest);
+
+        // WHY: the same document wrapped in extra whitespace must digest to its own
+        // exact bytes, not to the canonical root text — otherwise two different
+        // evidence blobs would share one binding digest.
+        var paddedBytes = Encoding.UTF8.GetBytes("\n  " + NpmSbom + "\n");
+        var padded = SbomCycloneDxImport.Import(paddedBytes, "json", Options);
+        Assert.True(padded.Ok);
+        Assert.Equal(SbomCycloneDxImport.DigestBytes(paddedBytes), padded.Document!.ContentDigest);
+        Assert.NotEqual(json.Document.ContentDigest, padded.Document.ContentDigest);
+
+        const string xml = """
+            <bom xmlns="http://cyclonedx.org/schema/bom/1.5" specVersion="1.5">
+              <components>
+                <component type="library" bom-ref="lodash@4.17.21">
+                  <name>lodash</name>
+                  <version>4.17.21</version>
+                  <purl>pkg:npm/lodash@4.17.21</purl>
+                </component>
+              </components>
+            </bom>
+            """;
+        var xmlBytes = Encoding.UTF8.GetBytes(xml);
+        var xmlResult = SbomCycloneDxImport.Import(xmlBytes, "xml", Options);
+        Assert.True(xmlResult.Ok);
+        Assert.Equal(SbomCycloneDxImport.DigestBytes(xmlBytes), xmlResult.Document!.ContentDigest);
+    }
+
+    [Fact]
+    public void Import_XmlOversizedName_RejectedLikeJson()
+    {
+        var bigName = new string('n', 3000);
+        var xml = "<bom xmlns=\"http://cyclonedx.org/schema/bom/1.5\" specVersion=\"1.5\"><components>"
+            + $"<component type=\"library\" bom-ref=\"big\"><name>{bigName}</name><purl>pkg:npm/big@1.0.0</purl></component>"
+            + "</components></bom>";
+        var result = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(xml), "xml", Options);
+        Assert.False(result.Ok);
+        Assert.Contains(result.Issues, i => i.Code == "sbom.invalid-schema");
+    }
+
+    [Fact]
     public void Import_MissingComponentsArray_RejectedAsPartialInventory()
     {
         const string noComponents = """{ "bomFormat": "CycloneDX", "specVersion": "1.5" }""";
