@@ -36,13 +36,13 @@ public static class SbomCycloneDxDiff
                 if (!VersionsEqual(before.Identity.Version, component.Identity.Version))
                 {
                     changes.Add(Change(SbomChangeKind.VersionChanged, key,
-                        $"Version changed for '{Display(component)}': '{before.Identity.Version ?? "(none)"}' → '{component.Identity.Version ?? "(none)"}'."));
+                        $"Version changed for '{Display(component)}': '{Safe(before.Identity.Version) ?? "(none)"}' → '{Safe(component.Identity.Version) ?? "(none)"}'."));
                 }
             }
             else if (TryFindVersionPredecessor(component, baseByKey, out var predecessor))
             {
                 changes.Add(Change(SbomChangeKind.VersionChanged, key,
-                    $"Version changed for '{DisplayName(component)}': '{predecessor!.Identity.Version ?? "(none)"}' → '{component.Identity.Version ?? "(none)"}' (identity '{key}'; was '{predecessor.Identity.IdentityKey}')."));
+                    $"Version changed for '{DisplayName(component)}': '{Safe(predecessor!.Identity.Version) ?? "(none)"}' → '{Safe(component.Identity.Version) ?? "(none)"}' (identity '{SbomCycloneDxImport.SanitizeToken(key)}'; was '{SbomCycloneDxImport.SanitizeToken(predecessor.Identity.IdentityKey)}')."));
             }
             else
             {
@@ -86,7 +86,7 @@ public static class SbomCycloneDxDiff
         ArgumentNullException.ThrowIfNull(baseline);
         ArgumentNullException.ThrowIfNull(candidate);
         if (!string.Equals(baseline.ProjectId, candidate.ProjectId, StringComparison.Ordinal))
-            return $"Baseline project '{baseline.ProjectId}' does not own candidate project '{candidate.ProjectId}'.";
+            return $"Baseline project '{SbomCycloneDxImport.SanitizeToken(baseline.ProjectId)}' does not own candidate project '{SbomCycloneDxImport.SanitizeToken(candidate.ProjectId)}'.";
         if (!string.Equals(baseline.ConfigDigest, candidate.ConfigDigest, StringComparison.Ordinal))
             return "Baseline config digest does not match the candidate configuration; re-approval under the current configuration is required.";
         if (!string.Equals(baseline.Document.ContentDigest, baseline.ContentDigest, StringComparison.Ordinal))
@@ -163,7 +163,8 @@ public static class SbomCycloneDxDiff
     /// <summary>
     /// Redacts secret-looking values from SBOM-derived text (logs, excerpts).
     /// SBOM documents are machine evidence: bearer tokens and secret-looking
-    /// assignments are never logged verbatim.
+    /// assignments are never logged verbatim. Residual control characters are
+    /// stripped per line so redacted text can never carry raw terminal escapes.
     /// </summary>
     public static string Redact(string value)
     {
@@ -176,6 +177,8 @@ public static class SbomCycloneDxDiff
             if (lower.Contains("bearer ") || lower.Contains("api_key") || lower.Contains("apikey")
                 || lower.Contains("secret") || lower.Contains("password") || lower.Contains("token="))
                 lines[i] = "[redacted]";
+            else
+                lines[i] = SbomCycloneDxImport.SanitizeToken(lines[i], int.MaxValue);
         }
         return string.Join('\n', lines);
     }
@@ -215,11 +218,11 @@ public static class SbomCycloneDxDiff
                 continue;
             var added = after.Except(before, StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
             var removed = before.Except(after, StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
-            var detail = new StringBuilder($"Dependency relationships changed for '{depRef}':");
+            var detail = new StringBuilder($"Dependency relationships changed for '{SbomCycloneDxImport.SanitizeToken(depRef)}':");
             if (added.Count > 0)
-                detail.Append($" added [{string.Join(", ", added)}];");
+                detail.Append($" added [{string.Join(", ", added.Select(SbomCycloneDxImport.SanitizeToken))}];");
             if (removed.Count > 0)
-                detail.Append($" removed [{string.Join(", ", removed)}];");
+                detail.Append($" removed [{string.Join(", ", removed.Select(SbomCycloneDxImport.SanitizeToken))}];");
             changes.Add(Change(SbomChangeKind.RelationshipChanged, depRef, detail.ToString().Trim()));
         }
         return changes;
@@ -283,16 +286,23 @@ public static class SbomCycloneDxDiff
         string.Equals(left?.Trim() ?? string.Empty, right?.Trim() ?? string.Empty, StringComparison.Ordinal);
 
     private static string Display(SbomComponent component) =>
+        // WHY: name/version/group/type are repository-controlled; display copies
+        // are sanitized (controls stripped, capped) so change detail and finding
+        // descriptions can never carry raw terminal/log control sequences.
+        // IdentityKey itself stays exact — StableFindingId hashes it.
         !string.IsNullOrWhiteSpace(component.Identity.Purl)
-            ? component.Identity.Purl!.Trim()
+            ? SbomCycloneDxImport.SanitizeToken(component.Identity.Purl)
             : string.IsNullOrWhiteSpace(component.Identity.Version)
-                ? $"{component.Identity.Name.Trim()} (ref '{component.Identity.BomRef}')"
-                : $"{component.Identity.Name.Trim()}@{component.Identity.Version!.Trim()} (ref '{component.Identity.BomRef}')";
+                ? $"{SbomCycloneDxImport.SanitizeToken(component.Identity.Name)} (ref '{SbomCycloneDxImport.SanitizeToken(component.Identity.BomRef)}')"
+                : $"{SbomCycloneDxImport.SanitizeToken(component.Identity.Name)}@{SbomCycloneDxImport.SanitizeToken(component.Identity.Version)} (ref '{SbomCycloneDxImport.SanitizeToken(component.Identity.BomRef)}')";
 
     private static string DisplayName(SbomComponent component) =>
         !string.IsNullOrWhiteSpace(component.Identity.Purl) && TrySplitPurl(component.Identity.Purl, out _, out var name, out _, out _)
-            ? "pkg:" + name
-            : component.Identity.Name;
+            ? "pkg:" + SbomCycloneDxImport.SanitizeToken(name)
+            : SbomCycloneDxImport.SanitizeToken(component.Identity.Name);
+
+    private static string? Safe(string? value) =>
+        value is null ? null : SbomCycloneDxImport.SanitizeToken(value);
 
     /// <summary>
     /// Splits a purl into type, full name (namespace + name), version, and qualifiers.

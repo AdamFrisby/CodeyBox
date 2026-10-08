@@ -18,6 +18,14 @@ public static class SbomCycloneDxImport
     private const int MaxPurlChars = 2048;
     private const int MaxBomRefChars = 1024;
 
+    // WHY: repository-controlled strings (names, versions, spec versions, hash
+    // algorithm labels) are embedded in human-readable issue messages that reach
+    // operator logs/UI. Embedded copies are single-line excerpts with control
+    // characters stripped so raw terminal/log control sequences can never ride
+    // along; the stored component model keeps the verbatim identifier.
+    private const int MaxEmbeddedTokenChars = 200;
+    private const int MaxIssueExcerptChars = 300;
+
     // WHY: shared parser-nesting bound so one deeply nested document cannot exhaust
     // the audit-path stack. JSON enforces MaxJsonDepth in JsonDocumentOptions;
     // XML enforces MaxXmlDepth with an iterative XmlReader pre-scan (XmlReaderSettings
@@ -67,7 +75,7 @@ public static class SbomCycloneDxImport
         var normalizedFormat = (format ?? string.Empty).Trim().ToLowerInvariant();
         if (!options.SupportedFormats.Any(f => string.Equals(f, normalizedFormat, StringComparison.Ordinal)))
             return SbomImportResult.Failure(Issue("sbom.unsupported-format",
-                $"SBOM format '{format}' is not supported (allowed: {string.Join(", ", options.SupportedFormats)})."));
+                $"SBOM format '{SanitizeToken(format)}' is not supported (allowed: {string.Join(", ", options.SupportedFormats)})."));
 
         try
         {
@@ -77,7 +85,7 @@ public static class SbomCycloneDxImport
                 "json" => ImportJson(content, options, ct),
                 "xml" => ImportXml(content, options, ct),
                 _ => SbomImportResult.Failure(Issue("sbom.unsupported-format",
-                    $"SBOM format '{format}' is not supported.")),
+                    $"SBOM format '{SanitizeToken(format)}' is not supported.")),
             };
         }
         catch (OperationCanceledException)
@@ -143,7 +151,7 @@ public static class SbomCycloneDxImport
         specVersion = specVersion!.Trim();
         if (!options.SupportedSpecVersions.Any(v => string.Equals(v, specVersion, StringComparison.Ordinal)))
             return SbomImportResult.Failure(Issue("sbom.unsupported-spec",
-                $"SBOM specVersion '{specVersion}' is not supported (allowed: {string.Join(", ", options.SupportedSpecVersions)})."));
+                $"SBOM specVersion '{SanitizeToken(specVersion)}' is not supported (allowed: {string.Join(", ", options.SupportedSpecVersions)})."));
 
         var producer = ReadProducer(root);
         var rootBomRef = ReadMetadataRootBomRef(root);
@@ -233,11 +241,11 @@ public static class SbomCycloneDxImport
             {
                 if (!seenBomRefs.Add(identity.BomRef!.Trim()))
                     issues.Add(Issue("sbom.duplicate-identity",
-                        $"Duplicate bom-ref '{identity.BomRef}' at components[{index}]."));
+                        $"Duplicate bom-ref '{SanitizeToken(identity.BomRef)}' at components[{index}]."));
             }
             if (!seenIdentityKeys.Add(identity.IdentityKey))
                 issues.Add(Issue("sbom.duplicate-identity",
-                    $"Duplicate component identity '{identity.IdentityKey}' at components[{index}] (purl qualifiers included; distinct components must not share an identity)."));
+                    $"Duplicate component identity '{SanitizeToken(identity.IdentityKey)}' at components[{index}] (purl qualifiers included; distinct components must not share an identity)."));
         }
 
         var seenDepRefs = new HashSet<string>(StringComparer.Ordinal);
@@ -245,7 +253,7 @@ public static class SbomCycloneDxImport
         {
             if (!seenDepRefs.Add(edge.Ref))
                 issues.Add(Issue("sbom.ambiguous-relationship",
-                    $"Ambiguous dependency entry: duplicate ref '{edge.Ref}'."));
+                    $"Ambiguous dependency entry: duplicate ref '{SanitizeToken(edge.Ref)}'."));
         }
 
         if (issues.Count > 0)
@@ -264,12 +272,12 @@ public static class SbomCycloneDxImport
         {
             if (!knownRefs.Contains(edge.Ref))
                 return SbomImportResult.Failure(Issue("sbom.ambiguous-relationship",
-                    $"Dependency ref '{edge.Ref}' does not match any component bom-ref."));
+                    $"Dependency ref '{SanitizeToken(edge.Ref)}' does not match any component bom-ref."));
             foreach (var target in edge.DependsOn)
             {
                 if (!knownRefs.Contains(target))
                     return SbomImportResult.Failure(Issue("sbom.ambiguous-relationship",
-                        $"Dependency target '{target}' of '{edge.Ref}' does not match any component bom-ref."));
+                        $"Dependency target '{SanitizeToken(target)}' of '{SanitizeToken(edge.Ref)}' does not match any component bom-ref."));
             }
         }
 
@@ -319,7 +327,7 @@ public static class SbomCycloneDxImport
         if (string.IsNullOrWhiteSpace(bomRef) && string.IsNullOrWhiteSpace(purl))
         {
             issues.Add(Issue("sbom.invalid-identity",
-                $"SBOM components[{index}] ('{name!.Trim()}') has neither purl nor bom-ref (partial inventory is rejected)."));
+                $"SBOM components[{index}] ('{SanitizeToken(name)}') has neither purl nor bom-ref (partial inventory is rejected)."));
             return null;
         }
 
@@ -335,7 +343,7 @@ public static class SbomCycloneDxImport
                 if (!IsValidHash(alg!, content!))
                 {
                     issues.Add(Issue("sbom.invalid-digest",
-                        $"SBOM components[{index}] carries an invalid '{alg}' digest."));
+                        $"SBOM components[{index}] carries an invalid '{SanitizeToken(alg)}' digest."));
                     return null;
                 }
                 hashes[alg!.Trim()] = content!.Trim().ToLowerInvariant();
@@ -547,7 +555,7 @@ public static class SbomCycloneDxImport
         specVersion = (specVersion ?? string.Empty).Trim();
         if (!options.SupportedSpecVersions.Any(v => string.Equals(v, specVersion, StringComparison.Ordinal)))
             return SbomImportResult.Failure(Issue("sbom.unsupported-spec",
-                $"SBOM specVersion '{specVersion}' is not supported (allowed: {string.Join(", ", options.SupportedSpecVersions)})."));
+                $"SBOM specVersion '{SanitizeToken(specVersion)}' is not supported (allowed: {string.Join(", ", options.SupportedSpecVersions)})."));
 
         var producer = ReadXmlProducer(root);
         var rootBomRef = ReadXmlRootBomRef(root);
@@ -598,7 +606,7 @@ public static class SbomCycloneDxImport
                     if (string.IsNullOrWhiteSpace(childRef) || !IsValidBomRef(childRef!) || !seenTargets.Add(childRef!.Trim()))
                     {
                         issues.Add(Issue("sbom.ambiguous-relationship",
-                            $"SBOM XML dependency '{depRef!.Trim()}' has an invalid or duplicated target."));
+                            $"SBOM XML dependency '{SanitizeToken(depRef)}' has an invalid or duplicated target."));
                         targets.Clear();
                         break;
                     }
@@ -774,7 +782,7 @@ public static class SbomCycloneDxImport
         if (string.IsNullOrWhiteSpace(bomRef) && string.IsNullOrWhiteSpace(purl))
         {
             issues.Add(Issue("sbom.invalid-identity",
-                $"SBOM XML component[{index}] ('{name!.Trim()}') has neither purl nor bom-ref."));
+                $"SBOM XML component[{index}] ('{SanitizeToken(name)}') has neither purl nor bom-ref."));
             return null;
         }
         var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -792,7 +800,7 @@ public static class SbomCycloneDxImport
                 if (!IsValidHash(alg!, content!))
                 {
                     issues.Add(Issue("sbom.invalid-digest",
-                        $"SBOM XML component[{index}] carries an invalid '{alg}' digest."));
+                        $"SBOM XML component[{index}] carries an invalid '{SanitizeToken(alg)}' digest."));
                     return null;
                 }
                 hashes[alg!.Trim()] = content!.Trim().ToLowerInvariant();
@@ -872,11 +880,37 @@ public static class SbomCycloneDxImport
     }
 
     private static SbomValidationIssue Issue(string code, string message) =>
-        new() { Code = code, Message = message };
+        new() { Code = code, Message = StripControls(message) };
+
+    /// <summary>
+    /// Single-line excerpt of a repository-controlled token (name, version,
+    /// spec version, algorithm label) for human-readable messages. Control
+    /// characters (newlines, ANSI escapes) are stripped and the result is
+    /// capped, so finding text can never carry raw terminal/log control
+    /// sequences. The stored model keeps the verbatim identifier.
+    /// </summary>
+    internal static string SanitizeToken(string? value, int maxLength = MaxEmbeddedTokenChars)
+    {
+        var stripped = StripControls(value ?? string.Empty).Trim();
+        return stripped.Length <= maxLength ? stripped : stripped[..maxLength];
+    }
+
+    private static string StripControls(string value)
+    {
+        if (string.IsNullOrEmpty(value) || value.All(c => !char.IsControl(c)))
+            return value;
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            if (!char.IsControl(c))
+                builder.Append(c);
+        }
+        return builder.ToString();
+    }
 
     private static string TrimOneLine(string message)
     {
-        var line = (message ?? string.Empty).Split('\n', 2)[0].Trim();
-        return line.Length <= 300 ? line : line[..300];
+        var line = StripControls(message ?? string.Empty).Split('\n', 2)[0].Trim();
+        return line.Length <= MaxIssueExcerptChars ? line : line[..MaxIssueExcerptChars];
     }
 }

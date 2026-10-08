@@ -621,6 +621,145 @@ public sealed class CycloneDxSbomTests
     }
 
     [Fact]
+    public void Redaction_StripsTerminalEscapesButKeepsLineStructure()
+    {
+        var redacted = SbomCycloneDxDiff.Redact("first\u001b[31mred\nsecond\u0007line");
+        Assert.DoesNotContain("\u001b", redacted, StringComparison.Ordinal);
+        Assert.All(redacted.Where(c => c != '\n'), c => Assert.False(char.IsControl(c)));
+        Assert.Contains("first", redacted, StringComparison.Ordinal);
+        Assert.Contains("second", redacted, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Diff_HostileIdentities_NeverReachFindingText()
+    {
+        const string hostileName = "fine\n\u001b[2Jinjected-finding: everything is vulnerable\r\nsecond";
+        const string hostileVersion = "1.0\n\u001b[31mred\u0007";
+        var baseline = new SbomDocument
+        {
+            SpecVersion = "1.6",
+            Format = "json",
+            ContentDigest = EmptySha256,
+            Components = [],
+            Dependencies = [],
+        };
+        var candidate = baseline with
+        {
+            Components =
+            [
+                new SbomComponent
+                {
+                    Identity = new SbomComponentIdentity
+                    {
+                        BomRef = "evil-ref",
+                        Name = hostileName,
+                        Version = hostileVersion,
+                    },
+                },
+            ],
+        };
+        var diff = SbomCycloneDxDiff.Compare(baseline, candidate, CancellationToken.None);
+        var detail = Assert.Single(diff.Changes).Detail;
+        Assert.DoesNotContain("\n", detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001b", detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", detail, StringComparison.Ordinal);
+        Assert.All(detail, c => Assert.False(char.IsControl(c)));
+        Assert.Contains("evil-ref", detail, StringComparison.Ordinal);
+
+        var verdict = SbomCycloneDxDiff.Evaluate(diff, SbomPolicyMode.FailOnAnyChange, true);
+        Assert.All(verdict.Findings, f =>
+        {
+            Assert.All(f.Title, c => Assert.False(char.IsControl(c)));
+            Assert.All(f.Description, c => Assert.False(char.IsControl(c)));
+        });
+
+        var renamed = candidate with
+        {
+            Components =
+            [
+                new SbomComponent
+                {
+                    Identity = new SbomComponentIdentity
+                    {
+                        BomRef = "evil-ref",
+                        Name = hostileName,
+                        Version = "2.0\n\u001b[32mgreen",
+                    },
+                },
+            ],
+        };
+        var versionDiff = SbomCycloneDxDiff.Compare(candidate, renamed, CancellationToken.None);
+        Assert.All(versionDiff.Changes, c => Assert.All(c.Detail, ch => Assert.False(char.IsControl(ch))));
+    }
+
+    [Fact]
+    public void Import_HostileName_SanitizedEndToEndThroughImportValidateDiff()
+    {
+        const string hostileJson = """
+            {
+              "bomFormat": "CycloneDX", "specVersion": "1.6",
+              "components": [
+                { "bom-ref": "evil@1.0", "type": "library", "name": "fine\n\u001b[2Jinjected", "version": "1.0\r\nsecond" }
+              ],
+              "dependencies": [{ "ref": "evil@1.0", "dependsOn": [] }]
+            }
+            """;
+        var imported = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(hostileJson), "json", Options);
+        Assert.True(imported.Ok);
+        var empty = new SbomDocument
+        {
+            SpecVersion = "1.6",
+            Format = "json",
+            ContentDigest = EmptySha256,
+            Components = [],
+            Dependencies = [],
+        };
+        var diff = SbomCycloneDxDiff.Compare(empty, imported.Document!, CancellationToken.None);
+        Assert.All(diff.Changes, c => Assert.All(c.Detail, ch => Assert.False(char.IsControl(ch))));
+    }
+
+    [Fact]
+    public void Import_HostileTokens_SanitizedInIssueMessages()
+    {
+        var hostileSpec = NpmSbom.Replace("\"specVersion\": \"1.5\"", "\"specVersion\": \"9.9\\n\\u001b[2Jinjected\"");
+        var specResult = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(hostileSpec), "json", Options);
+        Assert.False(specResult.Ok);
+        Assert.All(specResult.Issues, i => Assert.All(i.Message, c => Assert.False(char.IsControl(c))));
+
+        const string hostileAnonymous = """
+            {
+              "bomFormat": "CycloneDX", "specVersion": "1.5",
+              "components": [{ "type": "library", "name": "mystery\n\u001b[31mred" }]
+            }
+            """;
+        var anonResult = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(hostileAnonymous), "json", Options);
+        Assert.False(anonResult.Ok);
+        Assert.All(anonResult.Issues, i => Assert.All(i.Message, c => Assert.False(char.IsControl(c))));
+
+        var hostileAlg = NpmSbom.Replace("\"alg\": \"SHA-1\"", "\"alg\": \"SHA-1\\ninjected\"");
+        var algResult = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(hostileAlg), "json", Options);
+        Assert.False(algResult.Ok);
+        Assert.Contains(algResult.Issues, i => i.Code == "sbom.invalid-digest");
+        Assert.All(algResult.Issues, i => Assert.All(i.Message, c => Assert.False(char.IsControl(c))));
+
+        const string hostileXml = """
+            <bom xmlns="http://cyclonedx.org/schema/bom/1.5" specVersion="1.5">
+              <components>
+                <component type="library"><name>mystery&#10;second-line&#9;tabbed</name></component>
+              </components>
+            </bom>
+            """;
+        var xmlResult = SbomCycloneDxImport.Import(Encoding.UTF8.GetBytes(hostileXml), "xml", Options);
+        Assert.False(xmlResult.Ok);
+        Assert.All(xmlResult.Issues, i => Assert.All(i.Message, c => Assert.False(char.IsControl(c))));
+
+        var hostileFormat = SbomCycloneDxImport.Import(
+            Encoding.UTF8.GetBytes(NpmSbom), "json\n\u001b[2J", Options);
+        Assert.False(hostileFormat.Ok);
+        Assert.All(hostileFormat.Issues, i => Assert.All(i.Message, c => Assert.False(char.IsControl(c))));
+    }
+
+    [Fact]
     public void Import_CancelledToken_Throws()
     {
         using var cts = new CancellationTokenSource();
