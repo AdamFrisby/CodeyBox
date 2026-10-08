@@ -167,6 +167,7 @@
     <Project Path="plugins/sandbox/CodeyBox.GceSandboxPlugin/CodeyBox.GceSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.OpenStackSandboxPlugin/CodeyBox.OpenStackSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.HetznerSandboxPlugin/CodeyBox.HetznerSandboxPlugin.csproj" />
+    <Project Path="plugins/sandbox/CodeyBox.AzureSandboxPlugin/CodeyBox.AzureSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.BoxLiteSandboxPlugin/CodeyBox.BoxLiteSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.MicrosandboxPlugin/CodeyBox.MicrosandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.BlaxelSandboxPlugin/CodeyBox.BlaxelSandboxPlugin.csproj" />

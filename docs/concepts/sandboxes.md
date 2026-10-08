@@ -20,6 +20,7 @@ operational trade-off matches your deployment.
 | `modal`           | Hosted container (plugin, `codeybox.modal`)  | Modal account and token pair; plugin allowlisted and enabled     | Working — plugin, off by default |
 | `openstack`       | Hosted VM (plugin, `codeybox.openstack-sandbox`) | OpenStack application credential; plugin allowlisted and enabled | Working — plugin, off by default |
 | `hetzner`         | Hosted server (plugin, `codeybox.hetzner-sandbox`) | Hetzner Cloud API token (`HCLOUD_TOKEN`); plugin allowlisted and enabled | Working — plugin, off by default |
+| `azure`           | Hosted VM (plugin, `codeybox.azure-sandbox`) | Azure subscription/RG/VNet plus ARM token; plugin allowlisted and enabled | Working — plugin, off by default |
 
 Multipass and Incus are configured independently: selecting Incus is explicit
 and inherits none of Multipass's configuration, baselines, or lifecycle state.
@@ -875,6 +876,34 @@ choosing between them:
   exact default posture is not relied upon; named network profiles are
   refused.
 
+## `azure` — hosted VMs via the `codeybox.azure-sandbox` plugin
+
+Sandboxes run as ARM VMs on the operator's Azure subscription, contributed as
+a sandbox provider kind through the plugin trust model — off unless the
+operator allowlists **and** enables `codeybox.azure-sandbox`. Full operator
+reference lives in
+[`docs/extending/azure-sandbox-plugin.md`](../extending/azure-sandbox-plugin.md):
+prerequisites (subscription, resource group, VNet/subnet, pinned image, ARM
+token, SSH reachability), what it costs, and what it cannot do.
+
+The posture mirrors `openstack` (hosted guest, staged mounts,
+provider-owned network controls, `NotEnforced`) with differences that matter
+when choosing between them:
+
+- **Explicit Azure scope, no identity fallback.** Subscription, resource
+  group, region, VM size, VNet/subnet, and the immutable image version are
+  all required — there is no default-identity or `latest`-image fallback.
+  The ARM bearer token comes only from the host environment, never from
+  configuration.
+- **ARM-owned lifecycle.** One VM plus its NIC, network security group,
+  optional public IP, and OS disk per sandbox; long-running create/delete
+  operations are polled to verified terminal state, and cleanup revalidates
+  exact ownership at every delete. The resource group, VNet, and subnet are
+  caller-owned and never touched.
+- **No baseline capability.** The configured immutable image is the boot
+  source; content pins are refused loudly rather than silently ignored, and
+  no bake/snapshot path is advertised.
+
 ## Choosing
 
 | Use case                                                    | Pick                |
@@ -890,6 +919,7 @@ choosing between them:
 | Hosted containers with custom images/snapshots, high concurrency | `modal`         |
 | Hosted VMs on OpenStack with Incus-parity baselines, plugin-managed | `openstack`     |
 | Hosted Hetzner Cloud servers with approved-image pin, plugin-managed | `hetzner`       |
+| Hosted VMs on Azure with image-pinned VMs, plugin-managed           | `azure`         |
 
 ## Sandbox classes (`CodeyBox:SandboxClasses`)
 
@@ -975,6 +1005,7 @@ varies by provider:**
 | modal        | None — plugin kind, classified `NotEnforced`; named network profiles are refused (`AllowedHosts` is recorded intent only) |
 | openstack    | None — plugin kind, classified `NotEnforced`; named network profiles are refused (per-sandbox security group is best-effort only) |
 | hetzner      | None — plugin kind, classified `NotEnforced`; named network profiles are refused (per-sandbox firewall is best-effort only) |
+| azure        | None — plugin kind, classified `NotEnforced`; named network profiles are refused (per-sandbox security group is inbound-SSH-only best-effort; guest outbound is unfiltered) |
 
 The Multipass and Incus paths provide real per-host enforcement, configured
 once via `scripts/setup-host-networks.sh` and described in
