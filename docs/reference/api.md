@@ -443,7 +443,7 @@ Replay the audit-log events for a work item as a structured timeline.
 
 | Param | Description |
 |-------|-------------|
-| `kind` | Comma-separated list of event kinds to include (`state_transition`, `agent_started`, `agent_finished`, `auditor_run`, `iteration_complete`, `webhook_delivered`). Omit for all kinds. |
+| `kind` | Comma-separated list of event kinds to include (`state_transition`, `pickup`, `agent_started`, `agent_finished`, `agent_stuck`, `auditor_run`, `iteration_complete`, `webhook_delivered`, `recovery`, `watchdog_stuck`, `deferral`, `infra_failure`, `failure_classified`). Omit for all kinds. |
 | `since` | ISO-8601 timestamp. Only events at or after this time are returned. |
 | `iteration` | Integer. Only `auditor_run` and `iteration_complete` events for this audit iteration number are returned. |
 
@@ -490,8 +490,36 @@ Replay the audit-log events for a work item as a structured timeline.
 }
 ```
 
-Entries are sorted chronologically. The endpoint streams the audit log
-files line-by-line; it never loads a full log file into memory.
+Entries are sorted chronologically. Events sharing a timestamp keep their
+log-file order, so repeated reads are deterministic. The endpoint streams
+the audit log files line-by-line; it never loads a full log file into memory.
+Malformed lines (bad JSON, missing timestamp or event name) are skipped.
+
+**Reporting semantics and limits** (read this before triaging from a timeline):
+
+* A `pickup` is not a state transition: the dispatcher hands the item to a
+  worker without changing its lifecycle state. A pickup in `WorkComplete`
+  (e.g. after an in-place watchdog recovery) renders as
+  `Picked up by worker N in WorkComplete`, never as `Working → Working`.
+  Pickup records predating the `State`/`Attempt` fields render as
+  `state unknown — legacy record` instead of inferring `Working`.
+* `recovery` entries render the actually recorded `FromState → ToState`
+  pair, including same-state in-place recoveries
+  (`WorkComplete → WorkComplete`), plus the recorded attempt, worker,
+  trigger, and dependent-restore count where present. Absent fields stay
+  explicit (`not recorded`); the timeline never invents a cause, attempt
+  count, outcome, owner, or proof of progress.
+* `deferral` entries (quota, budget, disk, sandbox provisioning, paused
+  agent, durable-resume, provider-transient) render only the recorded
+  cause/resume-state/recheck. When the log carries no cause, the entry says
+  `no recorded cause; not inferred` — a bare `Queued` after a failed phase
+  must not be read as evidence for any particular cause.
+* `agent_finished` is the raw agent-process exit, not a phase verdict: a
+  green agent run can still be followed by a phase failure (infra check,
+  stuck probe, empty diff).
+* Summaries and details are bounded and flattened at the sink (control
+  characters stripped, values truncated); full payloads live in the audit
+  log files and artifact stores, not in timeline responses.
 
 **Caching**: timelines for work items in a terminal state (`Done`,
 `Failed`, `Cancelled`, `AuditFailed`) are cached in memory after the

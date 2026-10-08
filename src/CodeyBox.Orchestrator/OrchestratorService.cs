@@ -3404,7 +3404,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             }
 
             using var registration = _cancellations.Register(item.Id);
-            AuditLog.WorkItemPickedUp(workerIndex, item.Id);
+            AuditLog.WorkItemPickedUp(workerIndex, item.Id, item.State.ToString(), item.RecoveryAttempts);
             _dispatchLiveness?.NotePickedUp(item.Id);
             try
             {
