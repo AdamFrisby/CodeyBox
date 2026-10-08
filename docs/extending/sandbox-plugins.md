@@ -133,6 +133,10 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
   OpenStack Nova VMs (`ProviderKind: openstack`; `NotEnforced`
   classification, dedicated kernel, Incus-parity Glance baseline images,
   per-sandbox SSH keypairs and security groups).
+- [`hetzner-sandbox-plugin.md`](hetzner-sandbox-plugin.md) — hosted Hetzner
+  Cloud servers (`ProviderKind: hetzner`; `NotEnforced` classification,
+  dedicated kernel, approved-image pin, per-sandbox SSH keys, firewalls, and
+  optional floating IPs).
 - [`tart-sandbox-plugin.md`](tart-sandbox-plugin.md) — local Tart VMs on
   Apple Silicon macOS hosts (`ProviderKind: tart`; `NotEnforced`
   classification — macOS cannot provide nftables egress — OCI images,
