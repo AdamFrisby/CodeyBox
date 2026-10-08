@@ -294,10 +294,9 @@ public sealed class GceSandboxProviderTests
             Guid.NewGuid().ToString(), CancellationToken.None);
         var fetched = await client.GetZoneOperationAsync(
             "tok", "test-project", "europe-west1-b", op.Name, CancellationToken.None);
-        var raw = await harness.Http.GetStringAsync(
-            $"http://localhost/compute/v1/projects/test-project/zones/europe-west1-b/operations/{op.Name}",
-            CancellationToken.None);
-        Assert.Fail($"op={op.Name} error={fetched.ErrorCode} raw={raw}");
+        Assert.Equal(GceOperationStatus.Done, fetched.Status);
+        Assert.Equal("quotaExceeded", fetched.ErrorCode);
+        Assert.Contains("Quota exceeded", fetched.ErrorMessage, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -384,7 +383,7 @@ public sealed class GceSandboxProviderTests
     public async Task SshNeverReady_DefersAndCleansUp()
     {
         using var harness = NewHarness();
-        harness.Transport.FailAllRuns = true;
+        harness.TransportFactory.ConfigureCreated = t => t.FailAllRuns = true;
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             harness.CreateAsync(new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
         Assert.Equal("ssh-unready", ex.ErrorClass);
@@ -396,7 +395,7 @@ public sealed class GceSandboxProviderTests
     public async Task HostKeyMismatch_FailsClosed()
     {
         using var harness = NewHarness();
-        harness.Transport.FailWithMismatch = true;
+        harness.TransportFactory.ConfigureCreated = t => t.FailWithMismatch = true;
         var ex = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
             harness.CreateAsync(new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
         Assert.Equal("ssh-unready", ex.ErrorClass);
@@ -500,7 +499,7 @@ public sealed class GceSandboxProviderTests
     {
         using var harness = NewHarness();
         using var cts = new CancellationTokenSource();
-        harness.Transport.CancelOnFirstRun = cts;
+        harness.TransportFactory.ConfigureCreated = t => t.CancelOnFirstRun = cts;
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             harness.CreateAsync(new SandboxSpec { ImageReference = string.Empty }, cts.Token));
         Assert.Empty(harness.Cloud.Instances);
@@ -798,10 +797,12 @@ public sealed class GceSandboxProviderTests
     {
         public List<FakeTransport> Created { get; } = [];
         public List<string> EventLog { get; set; } = [];
+        public Action<FakeTransport>? ConfigureCreated { get; set; }
 
         public IRemoteHostTransport Create(GceSshTransportSpec spec)
         {
             var transport = new FakeTransport { EventLog = EventLog, SshTarget = spec.SshTarget };
+            ConfigureCreated?.Invoke(transport);
             Created.Add(transport);
             return transport;
         }

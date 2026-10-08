@@ -1021,7 +1021,8 @@ public sealed class GceApiClient
                 GceFailureKind.Protocol, operation,
                 "operation response carried no name; the request outcome is unknown, reconcile by resource identity.");
         }
-        return new GceOperation(name, ParseStatus(root), ErrorCode: null, ErrorMessage: null);
+        var (code, message) = ExtractOperationError(root);
+        return new GceOperation(name, ParseStatus(root), ErrorCode: code, ErrorMessage: message);
     }
 
     private static GceOperation ParseRegionOperation(JsonElement root, string operation) =>
@@ -1041,25 +1042,33 @@ public sealed class GceApiClient
         }
         if (root.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.Object)
         {
-            string? code = null;
-            string? message = null;
-            if (error.TryGetProperty("errors", out var errors) && errors.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var entry in errors.EnumerateArray())
-                {
-                    if (entry.ValueKind != JsonValueKind.Object)
-                        continue;
-                    code ??= entry.TryGetProperty("code", out var c) ? c.ToString() : null;
-                    message ??= entry.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.String
-                        ? m.GetString() : null;
-                }
-            }
-            message ??= error.TryGetProperty("message", out var top) && top.ValueKind == JsonValueKind.String
-                ? top.GetString() : null;
+            var (code, message) = ExtractOperationError(root);
             if (code is not null || message is not null)
                 return GceOperationStatus.Done;
         }
         return GceOperationStatus.Unknown;
+    }
+
+    private static (string? Code, string? Message) ExtractOperationError(JsonElement root)
+    {
+        if (!root.TryGetProperty("error", out var error) || error.ValueKind != JsonValueKind.Object)
+            return (null, null);
+        string? code = null;
+        string? message = null;
+        if (error.TryGetProperty("errors", out var errors) && errors.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in errors.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object)
+                    continue;
+                code ??= entry.TryGetProperty("code", out var c) ? c.ToString() : null;
+                message ??= entry.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.String
+                    ? m.GetString() : null;
+            }
+        }
+        message ??= error.TryGetProperty("message", out var top) && top.ValueKind == JsonValueKind.String
+            ? top.GetString() : null;
+        return (code, message);
     }
 
     private static GceInstance ParseInstance(JsonElement root)
