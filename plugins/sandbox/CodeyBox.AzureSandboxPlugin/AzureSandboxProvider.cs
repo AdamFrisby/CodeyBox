@@ -516,7 +516,7 @@ public sealed class AzureSandboxProvider :
         {
             var pip = await api.GetPublicIpAsync(credentials, ids.PublicIpId, opts.NetworkApiVersion, ct).ConfigureAwait(false);
             if (!string.IsNullOrWhiteSpace(pip?.IpAddress))
-                return pip.IpAddress.Trim();
+                return ValidateVmAddress(pip.IpAddress);
             throw new AzureApiException(
                 AzureFailureKind.Unexpected, "resolve sandbox address",
                 "public IP has no address after provisioning succeeded.");
@@ -535,10 +535,10 @@ public sealed class AzureSandboxProvider :
             {
                 var pip = await api.GetPublicIpAsync(credentials, nic.PublicIpId, opts.NetworkApiVersion, ct).ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(pip?.IpAddress))
-                    return pip.IpAddress.Trim();
+                    return ValidateVmAddress(pip.IpAddress);
             }
             if (!string.IsNullOrWhiteSpace(nic.PrivateIpAddress))
-                return nic.PrivateIpAddress.Trim();
+                return ValidateVmAddress(nic.PrivateIpAddress);
             if (_clock.GetUtcNow() >= deadline)
             {
                 throw new AzureApiException(
@@ -595,10 +595,32 @@ public sealed class AzureSandboxProvider :
         string knownHostsPath, string address, string hostPublicKey, CancellationToken ct)
     {
         _ = ct;
-        var line = address.Trim() + " " + hostPublicKey.Trim() + "\n";
+        var validatedAddress = ValidateVmAddress(address);
+        var key = (hostPublicKey ?? string.Empty).Trim();
+        if (key.Length == 0
+            || key.Any(ch => ch == '\n' || ch == '\r' || char.IsControl(ch)))
+            throw new InvalidOperationException("Host public key is not a single-line OpenSSH key.");
+        var line = validatedAddress + " " + key + "\n";
         await File.WriteAllTextAsync(knownHostsPath, line, CancellationToken.None).ConfigureAwait(false);
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(knownHostsPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+    }
+
+    /// <summary>
+    /// Validates a cloud-returned VM address before it reaches the SSH target
+    /// or the pinned known_hosts file. ARM JSON address fields are runtime
+    /// dependency output: only an exact IP literal is accepted, so a
+    /// newline-bearing or non-IP value fails provisioning loudly instead of
+    /// injecting extra known_hosts entries or redirecting the connection.
+    /// </summary>
+    private static string ValidateVmAddress(string? raw)
+    {
+        var candidate = (raw ?? string.Empty).Trim();
+        if (!IPAddress.TryParse(candidate, out var parsed))
+            throw new AzureApiException(
+                AzureFailureKind.Unexpected, "resolve sandbox address",
+                "cloud returned an invalid IP address literal; refusing to target it.");
+        return parsed.ToString();
     }
 
     private static async Task PrepareGuestFilesystemAsync(

@@ -125,7 +125,7 @@ public sealed record AzureCredentials(Uri ManagementBaseUri, string Subscription
             throw new InvalidOperationException(
                 $"Azure bearer token is not available: environment variable '{envVar}' is empty. " +
                 "Export a token (e.g. via `az account get-access-token`) without storing it in config files.");
-        return new AzureCredentials(baseUri, options.SubscriptionId.Trim(), token);
+        return new AzureCredentials(baseUri, AzureResourceIds.ValidateSegment(options.SubscriptionId, "SubscriptionId"), token);
     }
 
     internal static bool IsLoopbackHost(string host) =>
@@ -166,7 +166,7 @@ public static class AzureResourceIds
     public static string VmsListUrl(AzureCredentials credentials, string resourceGroup, string apiVersion) =>
         $"{ResourceGroupPrefix(credentials, resourceGroup)}/providers/Microsoft.Compute/virtualMachines?api-version={Uri.EscapeDataString(apiVersion)}";
 
-    private static string ValidateSegment(string value, string name)
+    internal static string ValidateSegment(string value, string name)
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new ArgumentException($"Azure resource name '{name}' must not be blank.", name);

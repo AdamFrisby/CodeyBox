@@ -234,6 +234,15 @@ public sealed class AzureSandboxProviderTests
     }
 
     [Fact]
+    public async Task SubscriptionId_WithPathSeparator_RefusedBeforeAnyCloudCall()
+    {
+        using var harness = NewHarness(configure: o => o with { SubscriptionId = "sub-1/evil?x=1" });
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            harness.Provider.CreateAsync(new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
+        Assert.Empty(harness.Cloud.Requests);
+    }
+
+    [Fact]
     public async Task SpecImageOverride_Latest_Rejected()
     {
         using var harness = NewHarness();
@@ -607,6 +616,7 @@ public sealed class AzureSandboxProviderTests
         try
         {
             Assert.NotEmpty(harness.Cloud.Nics);
+            Assert.Contains("10.0.0.5", harness.TransportFactory.LastTarget, StringComparison.Ordinal);
         }
         finally
         {
@@ -621,6 +631,19 @@ public sealed class AzureSandboxProviderTests
         harness.Cloud.LoopNextLink = true;
         await Assert.ThrowsAsync<AzureApiException>(() =>
             harness.Provider.ListAllManagedAsync(CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("not-an-ip")]
+    [InlineData("evil.example.com")]
+    [InlineData("10.0.0.5 extra")]
+    public async Task InvalidCloudAddress_RefusedLoudly_NeverReachesSshTarget(string address)
+    {
+        using var harness = NewHarness();
+        harness.Cloud.ForcedNicAddress = address;
+        await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            harness.Provider.CreateAsync(new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
+        Assert.Empty(harness.TransportFactory.Created);
     }
 
     // ------------------------------------------------------------------
@@ -957,6 +980,7 @@ public sealed class AzureSandboxProviderTests
         public bool StoreVmThenFailFirstPut { get; set; }
         public bool StoreForeignVmThenFailFirstPut { get; set; }
         public int NicNullAddressGets { get; set; }
+        public string? ForcedNicAddress { get; set; }
         public Action<string, string>? OnDelete { get; set; }
         private int _seq;
         private int _polls;
@@ -1094,7 +1118,7 @@ public sealed class AzureSandboxProviderTests
             }
             var resource = new FakeResource(name, new Dictionary<string, string>(tags, StringComparer.Ordinal));
             if (type == "networkInterfaces")
-                resource.ExtraAddress = NicNullAddressGets > 0 ? null : "10.0.0.5";
+                resource.ExtraAddress = ForcedNicAddress ?? (NicNullAddressGets > 0 ? null : "10.0.0.5");
             if (type == "publicIPAddresses")
                 resource.ExtraAddress = "20.30.40.50";
             if (type == "virtualMachines" && !Disks.ContainsKey(name + "-osdisk"))
@@ -1132,7 +1156,7 @@ public sealed class AzureSandboxProviderTests
             {
                 NicNullAddressGets--;
                 if (NicNullAddressGets == 0)
-                    resource.ExtraAddress = "10.0.0.5";
+                    resource.ExtraAddress = ForcedNicAddress ?? "10.0.0.5";
                 return Json(ResourceJson(ns, type, name, resource));
             }
             if (resource.MissingGets > 0)
