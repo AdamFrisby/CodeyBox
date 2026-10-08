@@ -80,6 +80,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     started_at           TEXT NOT NULL,
                     last_heartbeat_at    TEXT NOT NULL,
                     current_work_item_id TEXT,
+                    current_work_item_bound_at TEXT,
                     executor_host_id     TEXT,
                     max_concurrent_sandboxes INTEGER,
                     executor_network_profiles TEXT,
@@ -115,14 +116,15 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
-                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, executor_capabilities, cordoned, healthy, executor_active_phases)
-                VALUES ($id, $host, $pid, $started, $hb, $item, $exhost, $cap, $profiles, $creds, $caps, $cordoned, $healthy, $load)
+                INSERT INTO worker_registry (worker_id, host_name, process_id, started_at, last_heartbeat_at, current_work_item_id, current_work_item_bound_at, executor_host_id, max_concurrent_sandboxes, executor_network_profiles, executor_credentials, executor_capabilities, cordoned, healthy, executor_active_phases)
+                VALUES ($id, $host, $pid, $started, $hb, $item, $boundAt, $exhost, $cap, $profiles, $creds, $caps, $cordoned, $healthy, $load)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     host_name = excluded.host_name,
                     process_id = excluded.process_id,
                     started_at = excluded.started_at,
                     last_heartbeat_at = excluded.last_heartbeat_at,
                     current_work_item_id = excluded.current_work_item_id,
+                    current_work_item_bound_at = excluded.current_work_item_bound_at,
                     executor_host_id = excluded.executor_host_id,
                     max_concurrent_sandboxes = excluded.max_concurrent_sandboxes,
                     executor_network_profiles = excluded.executor_network_profiles,
@@ -163,6 +165,11 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
                     cmd.CommandText = """
                         UPDATE worker_registry
                         SET last_heartbeat_at = $hb, current_work_item_id = $item,
+                            current_work_item_bound_at = CASE
+                                WHEN $item IS NULL THEN NULL
+                                WHEN current_work_item_id IS $item THEN current_work_item_bound_at
+                                ELSE $hb
+                            END,
                             executor_active_phases = COALESCE($load, executor_active_phases)
                         WHERE worker_id = $id;
                         """;
@@ -401,6 +408,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         cmd.Parameters.AddWithValue("$started", reg.StartedAt.ToString("O"));
         cmd.Parameters.AddWithValue("$hb", reg.LastHeartbeatAt.ToString("O"));
         cmd.Parameters.AddWithValue("$item", (object?)reg.CurrentWorkItemId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$boundAt", reg.CurrentWorkItemBoundAt.HasValue ? reg.CurrentWorkItemBoundAt.Value.ToString("O") : (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$exhost", (object?)reg.ExecutorHostId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$cap", (object?)reg.MaxConcurrentSandboxes ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$profiles", (object?)SerializeStringList(reg.ExecutorNetworkProfiles) ?? DBNull.Value);
@@ -419,6 +427,7 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         StartedAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("started_at")), System.Globalization.CultureInfo.InvariantCulture),
         LastHeartbeatAt = DateTimeOffset.Parse(r.GetString(r.GetOrdinal("last_heartbeat_at")), System.Globalization.CultureInfo.InvariantCulture),
         CurrentWorkItemId = r.IsDBNull(r.GetOrdinal("current_work_item_id")) ? null : r.GetString(r.GetOrdinal("current_work_item_id")),
+        CurrentWorkItemBoundAt = HasColumn(r, "current_work_item_bound_at") && !r.IsDBNull(r.GetOrdinal("current_work_item_bound_at")) ? DateTimeOffset.Parse(r.GetString(r.GetOrdinal("current_work_item_bound_at")), System.Globalization.CultureInfo.InvariantCulture) : null,
         ExecutorHostId = r.IsDBNull(r.GetOrdinal("executor_host_id")) ? null : r.GetString(r.GetOrdinal("executor_host_id")),
         MaxConcurrentSandboxes = r.IsDBNull(r.GetOrdinal("max_concurrent_sandboxes")) ? null : r.GetInt32(r.GetOrdinal("max_concurrent_sandboxes")),
         ExecutorNetworkProfiles = r.IsDBNull(r.GetOrdinal("executor_network_profiles")) ? null : DeserializeStringList(r.GetString(r.GetOrdinal("executor_network_profiles"))),
@@ -440,11 +449,11 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
     }
 
     /// <summary>
-    /// Adds the executor-attribute columns to a <c>worker_registry</c> table
-    /// created by an older build. Fresh databases already carry the columns
-    /// via <c>CREATE TABLE</c>; this keeps pre-existing state files loading
-    /// instead of failing on the wider reads. Column definitions are source
-    /// literals, never caller input.
+    /// Adds columns introduced after a <c>worker_registry</c> table was first
+    /// created (executor attributes, then the watchdog bind-time column).
+    /// Fresh databases already carry the columns via <c>CREATE TABLE</c>; this
+    /// keeps pre-existing state files loading instead of failing on the wider
+    /// reads. Column definitions are source literals, never caller input.
     /// </summary>
     private static void EnsureExecutorColumns(SqliteConnection conn)
     {
@@ -478,6 +487,9 @@ public sealed class SqliteWorkerRegistry : IWorkerRegistry, IDisposable
         ("cordoned", "cordoned INTEGER NOT NULL DEFAULT 0"),
         ("healthy", "healthy INTEGER NOT NULL DEFAULT 1"),
         ("executor_active_phases", "executor_active_phases INTEGER"),
+        // Bind-time tracking for the progress watchdog's per-pickup grace:
+        // null for rows written before this column existed or with no bound item.
+        ("current_work_item_bound_at", "current_work_item_bound_at TEXT"),
     ];
 
     private static string? SerializeStringList(IReadOnlyList<string>? values) =>
