@@ -605,6 +605,54 @@ public sealed class GceSandboxProviderTests
     }
 
     [Fact]
+    public async Task OrphanSweep_KeepsForeignFirewall_TargetingLiveForeignInstance()
+    {
+        using var harness = NewHarness();
+        // Another owner shares the project/network: its live instance and SSH-ingress
+        // rule sit on the same network this host sweeps. Firewalls carry no labels,
+        // so only an all-owner live-target veto can tell this rule from an orphan.
+        harness.Cloud.SeedForeignInstance("codeybox-foreigner");
+        harness.Cloud.SeedForeignFirewall(
+            "codeybox-foreigner-fw", "projects/test-project/global/networks/test-net", "codeybox-foreigner");
+        harness.Cloud.SeedOwnedInstance("codeybox-sweepme", OwnerId);
+
+        await harness.Provider.DisposeLeakedAsync("codeybox-sweepme", CancellationToken.None);
+
+        Assert.True(harness.Cloud.Instances.ContainsKey("codeybox-foreigner"));
+        Assert.True(harness.Cloud.Firewalls.ContainsKey("codeybox-foreigner-fw"));
+    }
+
+    [Fact]
+    public async Task CleanupStatusReadFailure_RetainsIdentity_NeverClaimsDeletion()
+    {
+        using var harness = NewHarness();
+        var sandbox = await harness.CreateAsync(
+            new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
+        var name = sandbox.Id;
+        harness.Cloud.FailInstanceGet(1, 500, """{"error":{"code":500,"message":"backendError"}}""");
+        await sandbox.DisposeAsync();
+        Assert.True(harness.Cloud.Instances.ContainsKey(name));
+        Assert.Contains(name, harness.Provider.ListUnreconciled());
+    }
+
+    [Fact]
+    public async Task CleanupVerifyReadFailure_RetainsIdentity_UntilReconciled()
+    {
+        using var harness = NewHarness();
+        var sandbox = await harness.CreateAsync(
+            new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
+        var name = sandbox.Id;
+        harness.Cloud.SucceedGetTimes = 1;
+        harness.Cloud.FailInstanceGet(10, 500, """{"error":{"code":500,"message":"backendError"}}""");
+        await sandbox.DisposeAsync();
+        Assert.Contains(name, harness.Provider.ListUnreconciled());
+
+        harness.Cloud.FailGetTimes = 0;
+        await harness.Provider.DisposeLeakedAsync(name, CancellationToken.None);
+        Assert.Empty(harness.Provider.ListUnreconciled());
+    }
+
+    [Fact]
     public async Task RepeatedDisposal_IsIdempotent()
     {
         using var harness = NewHarness();
@@ -921,6 +969,17 @@ public sealed class GceSandboxProviderTests
         public bool OversizeNextInstanceGet { get; set; }
         public bool LeaveDeletedInstance { get; set; }
         public int PageSize { get; set; }
+        public int SucceedGetTimes { get; set; }
+        public int FailGetTimes { get; set; }
+        public int FailGetStatus { get; set; } = 500;
+        public string FailGetBody { get; set; } = """{"error":{"code":500,"message":"backendError"}}""";
+
+        public void FailInstanceGet(int times, int status, string body)
+        {
+            FailGetTimes = times;
+            FailGetStatus = status;
+            FailGetBody = body;
+        }
 
         public void FailInsert(int times, int status, string body)
         {
@@ -1112,6 +1171,15 @@ public sealed class GceSandboxProviderTests
 
         private HttpResponseMessage HandleGetInstance(string name)
         {
+            if (SucceedGetTimes > 0)
+            {
+                SucceedGetTimes--;
+            }
+            else if (FailGetTimes > 0)
+            {
+                FailGetTimes--;
+                return JsonResponse((HttpStatusCode)FailGetStatus, FailGetBody);
+            }
             if (CorruptNextInstanceGet)
             {
                 CorruptNextInstanceGet = false;
@@ -1152,14 +1220,23 @@ public sealed class GceSandboxProviderTests
 
         private HttpResponseMessage HandleListInstances(Dictionary<string, string> query)
         {
-            var items = Instances.Values.Where(i => !i.Deleted).OrderBy(i => i.Name, StringComparer.Ordinal).ToList();
+            IEnumerable<FakeInstance> items = Instances.Values.Where(i => !i.Deleted).OrderBy(i => i.Name, StringComparer.Ordinal).ToList();
+            if (query.TryGetValue("filter", out var filter) && !string.IsNullOrWhiteSpace(filter))
+            {
+                var owner = ExtractFilterValue(filter, "codeybox-owner");
+                if (owner is not null)
+                    items = items.Where(i => i.Labels.TryGetValue("codeybox-owner", out var o) && o == owner);
+                if (filter.Contains("codeybox-managed", StringComparison.Ordinal))
+                    items = items.Where(i => i.Labels.TryGetValue("codeybox-managed", out var m) && m == "true");
+            }
+            var ordered = items.ToList();
             query.TryGetValue("pageToken", out var pageToken);
             var start = 0;
             if (pageToken is not null)
                 start = int.Parse(pageToken, CultureInfo.InvariantCulture);
-            var page = PageSize > 0 ? PageSize : items.Count;
-            var slice = items.Skip(start).Take(page).ToList();
-            var next = start + slice.Count < items.Count ? (start + slice.Count).ToString(CultureInfo.InvariantCulture) : null;
+            var page = PageSize > 0 ? PageSize : ordered.Count;
+            var slice = ordered.Skip(start).Take(page).ToList();
+            var next = start + slice.Count < ordered.Count ? (start + slice.Count).ToString(CultureInfo.InvariantCulture) : null;
             var sb = new StringBuilder("{\"items\":[");
             sb.Append(string.Join(",", slice.Select(SerializeInstance)));
             sb.Append(']');
@@ -1392,6 +1469,17 @@ public sealed class GceSandboxProviderTests
                 result[Uri.UnescapeDataString(pair[..equals])] = Uri.UnescapeDataString(pair[(equals + 1)..]);
             }
             return result;
+        }
+
+        private static string? ExtractFilterValue(string filter, string key)
+        {
+            var marker = key + " = \"";
+            var index = filter.IndexOf(marker, StringComparison.Ordinal);
+            if (index < 0)
+                return null;
+            var start = index + marker.Length;
+            var end = filter.IndexOf('"', start);
+            return end < 0 ? null : filter[start..end];
         }
 
         private static HttpResponseMessage JsonResponse(HttpStatusCode status, string body) =>

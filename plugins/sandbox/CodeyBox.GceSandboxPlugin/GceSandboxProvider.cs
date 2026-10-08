@@ -634,9 +634,8 @@ public sealed class GceSandboxProvider :
     private static async Task WriteKnownHostsAsync(
         string knownHostsPath, string address, string hostPublicKey, CancellationToken ct)
     {
-        _ = ct;
         var line = address.Trim() + " " + hostPublicKey.Trim() + "\n";
-        await File.WriteAllTextAsync(knownHostsPath, line, CancellationToken.None).ConfigureAwait(false);
+        await File.WriteAllTextAsync(knownHostsPath, line, ct).ConfigureAwait(false);
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(knownHostsPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
@@ -728,16 +727,20 @@ public sealed class GceSandboxProvider :
         if (addressName is not null)
             await DeleteOwnedAddressAsync(api, token, opts, region, addressName, ownerId, ct).ConfigureAwait(false);
         if (firewallName is not null)
-            await DeleteOwnedFirewallAsync(api, token, opts, instanceName, firewallName, ownerId, ct).ConfigureAwait(false);
+            await DeleteOwnedFirewallAsync(api, token, opts, instanceName, firewallName, ct).ConfigureAwait(false);
         _unreconciled.TryRemove(instanceName, out _);
     }
 
     private async Task<bool> DeleteOwnedInstanceAsync(
         GceApiClient api, string token, GceSandboxOptions opts, string instanceName, string ownerId, CancellationToken ct)
     {
-        var existing = await TryGetAsync(
+        var (readOk, existing) = await TryGetAsync(
             () => api.GetInstanceAsync(token, opts.Project, opts.Zone, instanceName, ct),
-            "instance").ConfigureAwait(false);
+            "instance",
+            instanceName,
+            new GcePendingCleanup(instanceName, instanceName + "-fw", null, "instance status read failed; deletion unconfirmed")).ConfigureAwait(false);
+        if (!readOk)
+            return false;
         if (existing?.Name is null)
             return true;
         if (!IsOwnedBy(existing.Labels, ownerId))
@@ -769,9 +772,13 @@ public sealed class GceSandboxProvider :
             _log.LogWarning(ex, "GCE instance {Name}: deletion not confirmed; leak reaper will retry", instanceName);
             return false;
         }
-        var gone = await TryGetAsync(
+        var (verifyOk, gone) = await TryGetAsync(
             () => api.GetInstanceAsync(token, opts.Project, opts.Zone, instanceName, ct),
-            "instance").ConfigureAwait(false);
+            "instance",
+            instanceName,
+            new GcePendingCleanup(instanceName, instanceName + "-fw", null, "instance deletion unverified; status read failed")).ConfigureAwait(false);
+        if (!verifyOk)
+            return false;
         if (gone?.Name is not null)
         {
             _log.LogWarning("GCE instance {Name}: still present after delete confirmed; leak reaper will retry", instanceName);
@@ -783,9 +790,13 @@ public sealed class GceSandboxProvider :
     private async Task DeleteOwnedBootDiskAsync(
         GceApiClient api, string token, GceSandboxOptions opts, string instanceName, string ownerId, CancellationToken ct)
     {
-        var disk = await TryGetAsync(
+        var (diskReadOk, disk) = await TryGetAsync(
             () => api.GetDiskAsync(token, opts.Project, opts.Zone, instanceName, ct),
-            "disk").ConfigureAwait(false);
+            "disk",
+            instanceName,
+            new GcePendingCleanup(instanceName, instanceName + "-fw", null, "disk status read failed; deletion unconfirmed")).ConfigureAwait(false);
+        if (!diskReadOk)
+            return;
         if (disk?.Name is null)
             return;
         if (!IsOwnedBy(disk.Labels, ownerId))
@@ -800,9 +811,13 @@ public sealed class GceSandboxProvider :
             await api.WaitForZoneOperationAsync(
                 token, opts.Project, opts.Zone, operation.Name,
                 TimeSpan.FromSeconds(Math.Min(120, opts.ReadyTimeoutSeconds)), ct).ConfigureAwait(false);
-            var gone = await TryGetAsync(
+            var (diskVerifyOk, gone) = await TryGetAsync(
                 () => api.GetDiskAsync(token, opts.Project, opts.Zone, disk.Name, ct),
-                "disk").ConfigureAwait(false);
+                "disk",
+                instanceName,
+                new GcePendingCleanup(instanceName, instanceName + "-fw", null, "disk deletion unverified; status read failed")).ConfigureAwait(false);
+            if (!diskVerifyOk)
+                return;
             if (gone?.Name is not null)
             {
                 _log.LogWarning("GCE disk {Name}: still present after delete confirmed; leak reaper will retry", disk.Name);
@@ -820,9 +835,13 @@ public sealed class GceSandboxProvider :
         GceApiClient api, string token, GceSandboxOptions opts, string region,
         string addressName, string ownerId, CancellationToken ct)
     {
-        var existing = await TryGetAsync(
+        var (addressReadOk, existing) = await TryGetAsync(
             () => api.GetAddressAsync(token, opts.Project, region, addressName, ct),
-            "address").ConfigureAwait(false);
+            "address",
+            addressName,
+            new GcePendingCleanup(addressName, addressName, addressName, "address status read failed; deletion unconfirmed")).ConfigureAwait(false);
+        if (!addressReadOk)
+            return;
         if (existing?.Name is null)
             return;
         if (!IsOwnedBy(existing.Labels, ownerId))
@@ -837,9 +856,13 @@ public sealed class GceSandboxProvider :
             await api.WaitForRegionOperationAsync(
                 token, opts.Project, region, operation.Name,
                 TimeSpan.FromSeconds(Math.Min(120, opts.ReadyTimeoutSeconds)), ct).ConfigureAwait(false);
-            var gone = await TryGetAsync(
+            var (addressVerifyOk, gone) = await TryGetAsync(
                 () => api.GetAddressAsync(token, opts.Project, region, addressName, ct),
-                "address").ConfigureAwait(false);
+                "address",
+                addressName,
+                new GcePendingCleanup(addressName, addressName, addressName, "address deletion unverified; status read failed")).ConfigureAwait(false);
+            if (!addressVerifyOk)
+                return;
             if (gone?.Name is not null)
             {
                 _log.LogWarning("GCE address {Name}: still present after delete confirmed; leak reaper will retry", addressName);
@@ -855,13 +878,16 @@ public sealed class GceSandboxProvider :
 
     private async Task DeleteOwnedFirewallAsync(
         GceApiClient api, string token, GceSandboxOptions opts, string instanceName,
-        string firewallName, string ownerId, CancellationToken ct)
+        string firewallName, CancellationToken ct)
     {
-        _ = ownerId;
         var network = ResolveNetwork(opts);
-        var existing = await TryGetAsync(
+        var (firewallReadOk, existing) = await TryGetAsync(
             () => api.GetFirewallAsync(token, opts.Project, firewallName, ct),
-            "firewall").ConfigureAwait(false);
+            "firewall",
+            firewallName,
+            new GcePendingCleanup(instanceName, firewallName, null, "firewall status read failed; deletion unconfirmed")).ConfigureAwait(false);
+        if (!firewallReadOk)
+            return;
         if (existing?.Name is null)
             return;
         if (!IsOwnedFirewall(existing, firewallName, network, instanceName))
@@ -876,9 +902,13 @@ public sealed class GceSandboxProvider :
             await api.WaitForGlobalOperationAsync(
                 token, opts.Project, operation.Name,
                 TimeSpan.FromSeconds(Math.Min(120, opts.ReadyTimeoutSeconds)), ct).ConfigureAwait(false);
-            var gone = await TryGetAsync(
+            var (firewallVerifyOk, gone) = await TryGetAsync(
                 () => api.GetFirewallAsync(token, opts.Project, firewallName, ct),
-                "firewall").ConfigureAwait(false);
+                "firewall",
+                firewallName,
+                new GcePendingCleanup(instanceName, firewallName, null, "firewall deletion unverified; status read failed")).ConfigureAwait(false);
+            if (!firewallVerifyOk)
+                return;
             if (gone?.Name is not null)
             {
                 _log.LogWarning("GCE firewall {Name}: still present after delete confirmed; leak reaper will retry", firewallName);
@@ -892,16 +922,29 @@ public sealed class GceSandboxProvider :
         }
     }
 
-    private async Task<T?> TryGetAsync<T>(Func<Task<T?>> get, string kind) where T : class
+    /// <summary>
+    /// Best-effort status read that preserves the client's 404-vs-failure distinction:
+    /// a missing resource reports <c>(true, null)</c>, while any other read failure records
+    /// the pending cleanup (so the leak reaper retries instead of forgetting the resource)
+    /// and reports <c>(false, null)</c>. Callers must treat <c>ReadOk: false</c> as
+    /// "deletion unconfirmed", never as "resource absent".
+    /// </summary>
+    private async Task<(bool ReadOk, T? Value)> TryGetAsync<T>(
+        Func<Task<T?>> get, string kind, string reconcileKey, GcePendingCleanup readFailure) where T : class
     {
         try
         {
-            return await get().ConfigureAwait(false);
+            return (true, await get().ConfigureAwait(false));
+        }
+        catch (GceApiException ex) when (ex.Kind == GceFailureKind.NotFound)
+        {
+            return (true, null);
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "GCE cleanup: failed to read {Kind}; treating as unreconciled", kind);
-            return null;
+            _log.LogWarning(ex, "GCE cleanup: failed to read {Kind}; retaining {Resource} as unreconciled", kind, reconcileKey);
+            _unreconciled[reconcileKey] = readFailure;
+            return (false, null);
         }
     }
 
@@ -933,8 +976,14 @@ public sealed class GceSandboxProvider :
         var network = ResolveNetwork(opts);
         var swept = 0;
         var budget = Math.Max(1, Math.Min(opts.MaxListItems, 100));
-        var allInstanceNames = new HashSet<string>(
-            instances.Where(i => i.Name is not null).Select(i => i.Name!), StringComparer.Ordinal);
+        // Firewalls carry no ownership labels, so the live-target veto must see every
+        // owner's instances: the owner-scoped listing above cannot distinguish a foreign
+        // owner's live rule from an orphan. Skip deletion whenever the target tag names
+        // any existing managed instance, regardless of owner.
+        var allOwnerInstances = await api.ListInstancesAsync(
+            token, opts.Project, opts.Zone, ManagedFilter(), ct).ConfigureAwait(false);
+        var anyOwnerInstanceNames = new HashSet<string>(
+            allOwnerInstances.Where(i => i.Name is not null).Select(i => i.Name!), StringComparer.Ordinal);
         foreach (var firewall in await api.ListFirewallsAsync(token, opts.Project, filter: null, ct).ConfigureAwait(false))
         {
             if (swept >= budget)
@@ -944,12 +993,9 @@ public sealed class GceSandboxProvider :
             if (!string.Equals(firewall.Network, network, StringComparison.Ordinal))
                 continue;
             var target = firewall.TargetTags?.FirstOrDefault();
-            // Never remove a rule still serving any existing instance (owned or
-            // not): without labels the sweep cannot tell a foreign rule from an
-            // orphan by name, so a live target of any kind vetoes deletion.
-            if (target is not null && allInstanceNames.Contains(target))
+            if (target is not null && anyOwnerInstanceNames.Contains(target))
                 continue;
-            if ((target is not null && liveNames.Contains(target)) || linkedFirewalls.Contains(firewall.Name))
+            if (linkedFirewalls.Contains(firewall.Name))
                 continue;
             try
             {
@@ -1026,6 +1072,9 @@ public sealed class GceSandboxProvider :
 
     internal static string OwnerFilter(string ownerId) =>
         $"{GceNaming.ManagedLabelKey} = \"true\" AND {GceNaming.OwnerLabelKey} = \"{ownerId}\"";
+
+    internal static string ManagedFilter() =>
+        $"{GceNaming.ManagedLabelKey} = \"true\"";
 
     internal static string NewRequestId()
     {
