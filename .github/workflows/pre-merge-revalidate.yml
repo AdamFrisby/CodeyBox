@@ -227,7 +227,7 @@ jobs:
 
       - name: upload outcome artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           # PR number is the integrity anchor: post-status finds THIS PR's
           # outcome by THIS name; it never re-uses an artifact across PRs.
