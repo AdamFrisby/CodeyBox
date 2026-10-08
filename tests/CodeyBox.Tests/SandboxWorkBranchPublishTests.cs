@@ -264,12 +264,15 @@ public sealed class SandboxWorkBranchPublishTests : IDisposable
         // Regression demonstration: the pre-fix resumed-checkpoint sequence —
         // a single `push HEAD:<branch>` with no fetch/rebase — fails with a
         // non-fast-forward rejection once the target has advanced, which is
-        // exactly the sandbox-to-bare publication gap this fix closes.
+        // exactly the sandbox-to-bare publication gap this fix closes. The
+        // reconciling publisher then publishes the same divergence while
+        // preserving both sides.
         using var fixture = await PublishFixture.CreateAsync(_workspace, "work");
-        await fixture.OtherWriterCommitAsync(
+        var targetTip = await fixture.OtherWriterCommitAsync(
             "work", "target.txt", "target change\n", "target advance");
         await fixture.WriteAndCommitAsync(
             fixture.SandboxDir, "source.txt", "source change\n", "agent change");
+        var sourceTip = await fixture.RevParseAsync(fixture.SandboxDir, "HEAD");
 
         var (code, stdout, stderr) = await PublishFixture.RunGitNoThrowAsync(
             fixture.SandboxDir, "push", "origin", "HEAD:work");
@@ -287,6 +290,19 @@ public sealed class SandboxWorkBranchPublishTests : IDisposable
             combined.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
             || combined.Contains("fetch first", StringComparison.OrdinalIgnoreCase),
             $"expected a non-fast-forward rejection, got:{System.Environment.NewLine}{combined}");
+
+        // The SUT reconciles the same divergence the raw push could not.
+        var result = await fixture.PublishAsync("work");
+
+        Assert.True(result.Reconciled);
+        Assert.Equal(sourceTip, result.SourceSha);
+        Assert.Equal(targetTip, result.TargetSha);
+        var published = result.PublishedSha;
+        Assert.Equal(published, await fixture.RevParseAsync(fixture.RemoteDir, "refs/heads/work"));
+        Assert.True(await fixture.IsAncestorAsync(targetTip, published));
+        Assert.Equal("target change\n", await fixture.ShowFileAsync(published, "target.txt"));
+        Assert.Equal("source change\n", await fixture.ShowFileAsync(published, "source.txt"));
+        fixture.AssertPublicationDiscipline();
     }
 
     private static bool IsGitSubcommand(IReadOnlyList<string> argv, string subcommand)
