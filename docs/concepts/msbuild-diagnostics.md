@@ -45,7 +45,11 @@ For an applicable failed required build, and only then:
    least-data binary log (`-bl:<file>;ProjectImports=None` — no embedded
    imported-project content) to a fixed directory. No second build is
    executed for diagnostics; when disabled the executed command is
-   byte-identical to the historical one.
+   byte-identical to the historical one. Both variants are composed from one
+   shared script builder (`RequiredBuildScript`), so target discovery and
+   the isolated build environment (NuGet-home redirection, offline cache
+   preservation, telemetry off, heal sourcing, cleanup) are identical on
+   both paths — opted-in builds never run in a diverged environment.
 2. The verifier fetches at most `MaxBinlogsPerBuild` logs over bounded
    `stat`/`base64` execs (structured argv, allowlisted `target-N.binlog`
    names, per-file byte caps), records the exact commit SHA
@@ -54,7 +58,14 @@ For an applicable failed required build, and only then:
 3. Per-file evidence is merged into one attempt-bound
    `BuildDiagnosticsEvidence`: errors-first under `MaxDiagnostics`, causes
    re-linked, artifact refs (name + SHA-256 + size — never content)
-   attached, totals summed.
+   attached, totals summed. A listed log that yields nothing usable
+   (transfer loss, malformed framing, oversize payload, corrupt content,
+   unsupported version, or a listing cut short by a collection bound) is
+   never silently dropped: if any log survived, the merged evidence is
+   marked `Truncated` with a `partial-evidence` reason naming every lost
+   file, and the rendered repair-loop text carries that note; if none
+   survived, the result is explicit `InsufficientDiagnostics` naming the
+   lost files.
 4. The gate appends the rendered root-cause failures plus project/target
    context to the rework/audit finding text (`BuildFailureSummary` and the
    persisted `AuditResult` finding). The `Failed` outcome stands regardless.

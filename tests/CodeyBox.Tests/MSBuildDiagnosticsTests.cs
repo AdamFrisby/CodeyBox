@@ -740,6 +740,162 @@ public sealed class MSBuildDiagnosticsEnrichmentTests : IDisposable
     }
 
     [Fact]
+    public void CaptureScript_SharesDiscoveryAndIsolationWithDefaultScript()
+    {
+        var plain = SandboxRequiredBuildVerifier.BuildScript;
+        var capture = MSBuildDiagnosticsEnrichment.BuildScriptWithBinlogCapture;
+
+        // One shared discovery sequence: the capture variant restates nothing.
+        Assert.Contains(RequiredBuildScript.TargetDiscoveryFragment, plain, StringComparison.Ordinal);
+        Assert.Contains(RequiredBuildScript.TargetDiscoveryFragment, capture, StringComparison.Ordinal);
+
+        // Same isolated build environment on both paths: home redirection,
+        // offline cache preservation, telemetry off, heal sourcing, cleanup.
+        foreach (var marker in new[]
+        {
+            "export DOTNET_CLI_HOME=", "export HOME=", "export DOTNET_NOLOGO=1",
+            "NUGET_PACKAGES", "scripts/nuget-home-heal.sh",
+            "cleanup() { rm -rf \"$targets_file\" \"$dotnet_home\"; }",
+        })
+        {
+            Assert.Contains(marker, plain, StringComparison.Ordinal);
+            Assert.Contains(marker, capture, StringComparison.Ordinal);
+        }
+
+        // Only the capture variant adds binary logging to the same builds.
+        Assert.DoesNotContain("-bl:", plain, StringComparison.Ordinal);
+        Assert.Contains("-bl:", capture, StringComparison.Ordinal);
+        Assert.Contains("ProjectImports=None", capture, StringComparison.Ordinal);
+    }
+
+    private static Func<SandboxExec, SandboxExecResult> FailedBuildWithTwoBinlogs(
+        byte[] firstBinlog,
+        byte[] secondBinlog,
+        bool secondFetchFails) =>
+        exec =>
+        {
+            if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+            {
+                var script = exec.Argv[2];
+                if (script.Contains("codeybox-msbuild-binlogs", StringComparison.Ordinal)
+                    && script.Contains("-bl:", StringComparison.Ordinal))
+                    return BuildFailureResult("Build FAILED\nerror CS1525: Invalid expression term ';'\n");
+                if (script.Contains("ls -1", StringComparison.Ordinal))
+                    return new SandboxExecResult(0, "target-1.binlog\ntarget-2.binlog\n", string.Empty);
+                if (script.Contains("base64 -w0", StringComparison.Ordinal))
+                {
+                    var path = exec.Argv.Count > 4 ? exec.Argv[4] : string.Empty;
+                    var isSecond = path.EndsWith("target-2.binlog", StringComparison.Ordinal);
+                    if (isSecond && secondFetchFails)
+                        return new SandboxExecResult(1, string.Empty, "stat failed");
+                    var payload = isSecond ? secondBinlog : firstBinlog;
+                    return new SandboxExecResult(0, $"{payload.Length}\n{Convert.ToBase64String(payload)}", string.Empty);
+                }
+            }
+            if (exec.Argv is ["git", "rev-parse", "HEAD"])
+                return new SandboxExecResult(0, TestSha + "\n", string.Empty);
+            return new SandboxExecResult(0, string.Empty, string.Empty);
+        };
+
+    [Fact]
+    public async Task Verify_OneLostBinlog_KeepsFailureWithTruncatedEvidenceNamingLostFile()
+    {
+        var fixtures = await MSBuildFixtureBinlogs.GetAsync();
+        var (gitHost, repoId, workBranch) = await SetupRepoAsync(withDotnetMarker: true);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ScriptedSandboxProvider(FailedBuildWithTwoBinlogs(fixtures.FailingBuild, [], secondFetchFails: true)),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            NullLogger<SandboxRequiredBuildVerifier>.Instance,
+            () => new MSBuildDiagnosticsOptions { Enabled = true },
+            new MSBuildBinlogProducer(() => new MSBuildDiagnosticsOptions { Enabled = true }));
+
+        var result = await verifier.VerifyAsync(VerificationRequest(repoId, workBranch), CancellationToken.None);
+
+        // The authoritative outcome still stands: a build failure, not a pass.
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        Assert.NotNull(result.BuildDiagnostics);
+        var evidence = result.BuildDiagnostics;
+        // The surviving log's diagnostics are kept, but the subset must not
+        // masquerade as the whole attempt: truncated, with the lost file named.
+        Assert.Equal(BuildDiagnosticsStatus.Enriched, evidence.Status);
+        Assert.True(evidence.Truncated);
+        Assert.Contains("target-2.binlog", evidence.Reason ?? string.Empty, StringComparison.Ordinal);
+        Assert.True(evidence.TotalErrorCount >= 3, $"expected >= 3 errors, got {evidence.TotalErrorCount}");
+        var summary = RequiredBuildGate.BuildFailureSummary(result);
+        Assert.Contains("target-2.binlog", summary, StringComparison.Ordinal);
+        Assert.Contains("partial-evidence", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Verify_OneCorruptBinlog_KeepsFailureWithTruncatedEvidenceNamingLostFile()
+    {
+        var fixtures = await MSBuildFixtureBinlogs.GetAsync();
+        var corrupt = System.Text.Encoding.ASCII.GetBytes("definitely not a binary log");
+        var (gitHost, repoId, workBranch) = await SetupRepoAsync(withDotnetMarker: true);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ScriptedSandboxProvider(FailedBuildWithTwoBinlogs(fixtures.FailingBuild, corrupt, secondFetchFails: false)),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            NullLogger<SandboxRequiredBuildVerifier>.Instance,
+            () => new MSBuildDiagnosticsOptions { Enabled = true },
+            new MSBuildBinlogProducer(() => new MSBuildDiagnosticsOptions { Enabled = true }));
+
+        var result = await verifier.VerifyAsync(VerificationRequest(repoId, workBranch), CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        Assert.NotNull(result.BuildDiagnostics);
+        var evidence = result.BuildDiagnostics;
+        Assert.Equal(BuildDiagnosticsStatus.Enriched, evidence.Status);
+        Assert.True(evidence.Truncated);
+        Assert.Contains("target-2.binlog", evidence.Reason ?? string.Empty, StringComparison.Ordinal);
+        var summary = RequiredBuildGate.BuildFailureSummary(result);
+        Assert.Contains("target-2.binlog", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Verify_AllBinlogsLost_KeepsFailureWithExplicitGap()
+    {
+        var (gitHost, repoId, workBranch) = await SetupRepoAsync(withDotnetMarker: true);
+        var verifier = new SandboxRequiredBuildVerifier(
+            new ScriptedSandboxProvider(exec =>
+            {
+                if (exec.Argv.Count >= 3 && exec.Argv[0] == "sh" && exec.Argv[1] == "-c")
+                {
+                    var script = exec.Argv[2];
+                    if (script.Contains("codeybox-msbuild-binlogs", StringComparison.Ordinal)
+                        && script.Contains("-bl:", StringComparison.Ordinal))
+                        return BuildFailureResult("Build FAILED\n");
+                    if (script.Contains("ls -1", StringComparison.Ordinal))
+                        return new SandboxExecResult(0, "target-1.binlog\ntarget-2.binlog\n", string.Empty);
+                    if (script.Contains("base64 -w0", StringComparison.Ordinal))
+                        return new SandboxExecResult(1, string.Empty, "transport lost");
+                }
+                if (exec.Argv is ["git", "rev-parse", "HEAD"])
+                    return new SandboxExecResult(0, TestSha + "\n", string.Empty);
+                return new SandboxExecResult(0, string.Empty, string.Empty);
+            }),
+            gitHost,
+            new PipelineOptions { SandboxImageReference = "ignored" },
+            NullLogger<SandboxRequiredBuildVerifier>.Instance,
+            () => new MSBuildDiagnosticsOptions { Enabled = true },
+            new MSBuildBinlogProducer(() => new MSBuildDiagnosticsOptions { Enabled = true }));
+
+        var result = await verifier.VerifyAsync(VerificationRequest(repoId, workBranch), CancellationToken.None);
+
+        Assert.Equal(RequiredBuildVerificationStatus.Failed, result.Status);
+        Assert.NotNull(result.BuildDiagnostics);
+        var evidence = result.BuildDiagnostics;
+        // No usable log survived: explicit insufficient-diagnostics naming
+        // the lost files — never a pass, never silent.
+        Assert.Equal(BuildDiagnosticsStatus.InsufficientDiagnostics, evidence.Status);
+        Assert.Contains("target-1.binlog", evidence.Reason ?? string.Empty, StringComparison.Ordinal);
+        Assert.Contains("target-2.binlog", evidence.Reason ?? string.Empty, StringComparison.Ordinal);
+        var summary = RequiredBuildGate.BuildFailureSummary(result);
+        Assert.Contains("structured diagnostics unavailable", summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Verify_FailedBuildWithBinlog_AttachesBoundRootCauseEvidence()
     {
         var fixtures = await MSBuildFixtureBinlogs.GetAsync();

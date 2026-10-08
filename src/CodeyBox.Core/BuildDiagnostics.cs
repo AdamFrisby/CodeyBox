@@ -246,6 +246,11 @@ public static class BuildDiagnosticsFormatter
                 writer.Append($"{evidence.TotalErrorCount} error(s), {evidence.TotalWarningCount} warning(s)");
                 if (evidence.Truncated) writer.Append(" [truncated to producer bounds]");
                 writer.Append('.');
+                if (!string.IsNullOrWhiteSpace(evidence.Reason))
+                {
+                    writer.Append(" Note: ");
+                    writer.Append(SingleLine(evidence.Reason.Trim()));
+                }
                 foreach (var diagnostic in evidence.Diagnostics.Take(8))
                 {
                     writer.AppendLine();
