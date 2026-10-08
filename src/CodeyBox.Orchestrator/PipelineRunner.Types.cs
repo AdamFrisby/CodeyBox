@@ -175,17 +175,157 @@ internal sealed class AuditorAbsoluteTimeoutException(
 {
 }
 
+/// <summary>
+/// Sandbox-to-bare work-branch publication failed at a non-conflict stage
+/// (initial push, fetch, target-tip read, ancestry guard, post-reconcile
+/// push, tip verification, or post-push host sync) without rewriting any
+/// history. The agent turn is complete and both the source tree and the
+/// observed target tip are intact; only the push/reconcile/sync did not
+/// land, so the resume checkpoint is retained for a bounded retry. Carries
+/// the failing stage plus safe source/target identities for triage.
+/// Distinct from <see cref="SandboxPushReconcileConflictException"/>, which
+/// signals irreconcilable histories: labelling a transport/guard failure as
+/// a content conflict would be false evidence for the recovery policy, and a
+/// plain <see cref="InvalidOperationException"/> would be unmatchable by it.
+/// </summary>
+internal sealed class SandboxWorkBranchPublishException : InvalidOperationException
+{
+    public SandboxWorkBranchPublishException(
+        string branch,
+        string stage,
+        string? sourceSha = null,
+        string? targetSha = null,
+        string? detail = null,
+        Exception? inner = null)
+        : base(BuildMessage(branch, stage, sourceSha, targetSha, detail, inner), inner)
+    {
+        Branch = branch;
+        Stage = stage;
+        SourceSha = sourceSha;
+        TargetSha = targetSha;
+        Detail = detail;
+    }
+
+    /// <summary>Work branch whose publication did not land.</summary>
+    public string Branch { get; }
+
+    /// <summary>
+    /// Publication stage that failed: <c>push</c>, <c>fetch</c>,
+    /// <c>read-target</c>, <c>rebase-ancestry</c>,
+    /// <c>push-after-reconcile</c>, <c>verify-publication</c>, or
+    /// <c>sync</c>. Never a free-form git/sandbox message: only the raw
+    /// exception type name of a wrapped cause is included, never its text.
+    /// </summary>
+    public string Stage { get; }
+
+    /// <summary>Source tip the publisher tried to publish, when known.</summary>
+    public string? SourceSha { get; }
+
+    /// <summary>Target tip observed on the branch, when known.</summary>
+    public string? TargetSha { get; }
+
+    /// <summary>
+    /// Redacted, truncated diagnostic excerpt for the failing stage (never
+    /// raw git/sandbox output: secrets are scrubbed at the throw site, so
+    /// this message is safe for logs and operator surfaces).
+    /// </summary>
+    public string? Detail { get; }
+
+    /// <summary>
+    /// Walks the exception chain for this failure shape so the pipeline
+    /// recovery contract can classify it without matching on message text.
+    /// </summary>
+    public static bool TryFindIn(Exception? ex, out SandboxWorkBranchPublishException? found)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is SandboxWorkBranchPublishException match)
+            {
+                found = match;
+                return true;
+            }
+        }
+
+        found = null;
+        return false;
+    }
+
+    private static string BuildMessage(
+        string branch, string stage, string? sourceSha, string? targetSha, string? detail, Exception? inner)
+    {
+        var message = $"sandbox work-branch publication failed for branch '{branch}' at stage '{stage}'";
+        if (sourceSha is not null)
+            message += $" (source {sourceSha})";
+        if (targetSha is not null)
+            message += $" (target {targetSha})";
+        if (detail is not null)
+            message += $": {detail}";
+        if (inner is not null)
+            message += $" (cause: {inner.GetType().Name})";
+        return message + "; resolve the cause and retry — the resume checkpoint is retained for a bounded retry";
+    }
+}
+
 internal sealed class SandboxPushReconcileConflictException : InvalidOperationException
 {
-    public SandboxPushReconcileConflictException(string branch, string strategy)
-        : base($"sandbox {strategy} conflict while reconciling push of work branch '{branch}'; manual resolution required")
+    public SandboxPushReconcileConflictException(
+        string branch,
+        string strategy,
+        string? stage = null,
+        string? sourceSha = null,
+        string? targetSha = null)
+        : base(BuildMessage(branch, strategy, stage, sourceSha, targetSha))
     {
         Branch = branch;
         Strategy = strategy;
+        Stage = stage;
+        SourceSha = sourceSha;
+        TargetSha = targetSha;
     }
 
     public string Branch { get; }
     public string Strategy { get; }
+    public string? Stage { get; }
+    public string? SourceSha { get; }
+    public string? TargetSha { get; }
+
+    /// <summary>
+    /// Single source of truth for recognizing the sandbox-publication typed
+    /// conflict contract in an exception chain, mirroring
+    /// <see cref="CodeyBox.Core.UpstreamPushReconcileConflictException.TryFindIn"/>
+    /// for the later upstream boundary. Arbitrary message text never
+    /// qualifies — only the typed contract does.
+    /// </summary>
+    public static bool TryFindIn(
+        Exception? source,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out SandboxPushReconcileConflictException? conflict)
+    {
+        for (var current = source; current is not null; current = current.InnerException)
+        {
+            if (current is SandboxPushReconcileConflictException typed)
+            {
+                conflict = typed;
+                return true;
+            }
+        }
+
+        conflict = null;
+        return false;
+    }
+
+    private static string BuildMessage(
+        string branch, string strategy, string? stage, string? sourceSha, string? targetSha)
+    {
+        var message = $"sandbox {strategy} conflict while reconciling push of work branch '{branch}'";
+        if (stage is not null)
+            message += $" at stage '{stage}'";
+        if (sourceSha is not null || targetSha is not null)
+            message += $" (source {ToShortSha(sourceSha)} onto target {ToShortSha(targetSha)})";
+        return message + "; manual resolution required";
+    }
+
+    private static string ToShortSha(string? sha) =>
+        sha is not null && sha.Length >= 12 ? sha[..12] : "unknown";
 }
 
 internal sealed class MechanicalFixerException : InvalidOperationException
