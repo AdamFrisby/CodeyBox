@@ -823,7 +823,7 @@ public sealed class HetznerSandboxProvider :
         HetznerServer running, string? floatingIpAddress, CancellationToken ct)
     {
         if (!string.IsNullOrWhiteSpace(floatingIpAddress))
-            return floatingIpAddress.Trim();
+            return ValidateFloatingIpAddress(floatingIpAddress);
         var deadline = _clock.GetUtcNow() + TimeSpan.FromSeconds(opts.ReadyTimeoutSeconds);
         var attempt = 0;
         while (true)
@@ -848,6 +848,29 @@ public sealed class HetznerSandboxProvider :
             }
             await Task.Delay(NextPollDelay(opts, attempt++), _clock, ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Validates a floating-IP address string from the Hetzner Cloud API
+    /// response before it reaches the SSH target or the known_hosts trust
+    /// file. The API value is dependency runtime output (less-trusted): a
+    /// newline/space-bearing value would forge known_hosts entries and
+    /// redirect the outbound SSH connection, so anything that is not a plain
+    /// IPv4 literal is refused, mirroring <see cref="RunningServerAddress"/>.
+    /// Floating IPs are IPv4-only on Hetzner Cloud.
+    /// </summary>
+    internal static string ValidateFloatingIpAddress(string raw)
+    {
+        var candidate = raw.Trim();
+        if (IPAddress.TryParse(candidate, out var parsed)
+            && parsed.AddressFamily == AddressFamily.InterNetwork)
+        {
+            return candidate;
+        }
+
+        throw new HetznerApiException(
+            HetznerFailureKind.Unexpected, "resolve server address",
+            "floating IP response carried no usable public IPv4 address");
     }
 
     internal static string? RunningServerAddress(HetznerServer server, HetznerSandboxOptions opts)
@@ -938,7 +961,15 @@ public sealed class HetznerSandboxProvider :
         string knownHostsPath, string address, string hostPublicKey, CancellationToken ct)
     {
         _ = ct;
-        var line = address.Trim() + " " + hostPublicKey.Trim() + "\n";
+        var host = address.Trim();
+        if (!IPAddress.TryParse(host, out _))
+        {
+            throw new HetznerApiException(
+                HetznerFailureKind.Unexpected, "write known_hosts",
+                "refused to pin a host key for a non-IP address");
+        }
+
+        var line = host + " " + hostPublicKey.Trim() + "\n";
         await File.WriteAllTextAsync(knownHostsPath, line, CancellationToken.None).ConfigureAwait(false);
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(knownHostsPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);

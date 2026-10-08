@@ -187,6 +187,41 @@ public sealed class HetznerSandboxProviderTests
         Assert.Empty(harness.Cloud.Servers);
     }
 
+    [Theory]
+    [InlineData("203.0.113.7", "203.0.113.7")]
+    [InlineData("  203.0.113.7  ", "203.0.113.7")]
+    public void FloatingIp_Valid_IPv4_Accepted(string raw, string expected) =>
+        Assert.Equal(expected, HetznerSandboxProvider.ValidateFloatingIpAddress(raw));
+
+    [Theory]
+    [InlineData("203.0.113.7\nattacker ssh-ed25519 AAAAC3Nz")]
+    [InlineData("203.0.113.7 attacker.example")]
+    [InlineData("evil.example.com")]
+    [InlineData("2001:db8::1")]
+    [InlineData("999.999.999.999")]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void FloatingIp_UntrustedValue_Rejected(string raw) =>
+        Assert.Throws<HetznerApiException>(
+            () => HetznerSandboxProvider.ValidateFloatingIpAddress(raw));
+
+    [Fact]
+    public async Task FloatingIp_MaliciousValue_FailsClosed_And_CleansUp()
+    {
+        using var harness = NewHarness(configure: o => o with { FloatingIpHomeLocation = "fsn1" });
+        harness.Cloud.FloatingIpOverride = "203.0.113.7\nattacker ssh-ed25519 AAAAC3Nz";
+
+        var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => harness.Provider.CreateAsync(
+                new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
+        Assert.Equal("server-error", deferred.ErrorClass);
+        Assert.Empty(harness.TransportFactory.Created);
+        Assert.Empty(harness.Cloud.Servers);
+        Assert.Empty(harness.Cloud.SshKeys);
+        Assert.Empty(harness.Cloud.Firewalls);
+        Assert.Empty(harness.Cloud.FloatingIps);
+    }
+
     [Fact]
     public async Task Spec_ImageReference_Overrides_OptionsImage()
     {

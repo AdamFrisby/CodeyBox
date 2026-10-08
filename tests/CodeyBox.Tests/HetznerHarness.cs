@@ -210,6 +210,12 @@ internal sealed class FakeHetznerCloud : HttpMessageHandler
     public (HttpStatusCode Status, string Code, string Message, bool StoreServer)? FailNextServerCreate;
     public (HttpStatusCode Status, string Code, string Message)? FailNextSshKeyCreate;
     public string? NextCreateRetryAfterSeconds;
+    /// <summary>
+    /// Overrides the <c>ip</c> value returned for the next floating-IP
+    /// create, so tests can feed the provider a hostile API response
+    /// (e.g. newline-bearing) through the real HTTP parsing path.
+    /// </summary>
+    public string? FloatingIpOverride;
     private long _seq;
     private readonly object _lock = new();
 
@@ -575,7 +581,8 @@ internal sealed class FakeHetznerCloud : HttpMessageHandler
                 {
                     Id = id,
                     Name = root.GetProperty("name").GetString()!,
-                    Ip = "203.0.113." + (id % 200 + 10).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    Ip = FloatingIpOverride
+                        ?? "203.0.113." + (id % 200 + 10).ToString(System.Globalization.CultureInfo.InvariantCulture),
                     Server = root.TryGetProperty("server", out var serverEl)
                         && serverEl.ValueKind == JsonValueKind.Number ? serverEl.GetInt64() : null,
                     Labels = root.GetProperty("labels").EnumerateObject()
