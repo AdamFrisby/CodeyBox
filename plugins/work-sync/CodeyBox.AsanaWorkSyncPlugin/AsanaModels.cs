@@ -132,37 +132,6 @@ public sealed record AsanaTask
 }
 
 /// <summary>
-/// Asana story (comment or system event) shape, used only for duplicate
-/// detection before outbound writes. Only the text is read; unknown fields
-/// are ignored.
-/// </summary>
-public sealed record AsanaStory
-{
-    public string Gid { get; init; } = string.Empty;
-
-    public string Type { get; init; } = string.Empty;
-
-    public string Text { get; init; } = string.Empty;
-
-    /// <summary>
-    /// Parses one story object from a <c>GET /tasks/{gid}/stories</c> payload.
-    /// Nodes without text still parse (system stories carry no text); only a
-    /// non-object node yields null.
-    /// </summary>
-    public static AsanaStory? FromNode(JsonElement node)
-    {
-        if (node.ValueKind != JsonValueKind.Object)
-            return null;
-        return new AsanaStory
-        {
-            Gid = AsanaTask.Str(node, "gid"),
-            Type = AsanaTask.Str(node, "type"),
-            Text = AsanaTask.Str(node, "text"),
-        };
-    }
-}
-
-/// <summary>
 /// GID validation applied at every sink that accepts an Asana identifier.
 /// Asana GIDs are immutable numeric strings; anything else is a caller or
 /// configuration error and is refused before a request is built — never

@@ -51,7 +51,15 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
     {
         _questions.Dispose();
         _items.Dispose();
-        try { File.Delete(_dbPath); } catch { }
+        try
+        {
+            File.Delete(_dbPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best-effort temp-file cleanup: a leftover db in the temp
+            // directory is harmless and must not fail the test run.
+        }
         TestScratchDirectory.DeleteSqliteCompanions(_dbPath);
     }
 
@@ -1142,6 +1150,46 @@ public sealed class AsanaWorkSyncPluginTests : IDisposable
             () => api.GetAuthenticatedUserAsync(options));
         Assert.Equal(HttpStatusCode.Found, ex.StatusCode);
         Assert.Equal(1, requests);
+    }
+
+    [Fact]
+    public async Task HostileReasonPhrase_NeverReachesExceptionMessage()
+    {
+        // The runtime decodes a response's reason phrase byte-faithfully
+        // (Latin-1) and strips only CR/LF/NUL — a hostile or compromised
+        // endpoint can embed ESC/BEL/C1 controls. The failure message must
+        // carry the numeric status only, so no terminal escape reaches logs
+        // or persisted sync records.
+        var options = AsanaWorkSyncOptions.FromConfiguration(PluginConfig(BaseConfig()));
+        using var http = new HttpClient(new LambdaHandler((request, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                ReasonPhrase = "Bad Request\u001b[2J\u0007",
+                Content = new StringContent("""{"errors":[{"message":"bad input"}]}"""),
+                RequestMessage = request,
+            })));
+        var tokens = new AsanaTokenProvider(name => _env.TryGetValue(name, out var v) ? v : null);
+        var api = new AsanaRestClient(http, tokens);
+
+        var ex = await Assert.ThrowsAsync<AsanaApiException>(
+            () => api.GetAuthenticatedUserAsync(options));
+
+        Assert.Equal(HttpStatusCode.BadRequest, ex.StatusCode);
+        Assert.Contains("400", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u001b', ex.Message);
+        Assert.DoesNotContain('\u0007', ex.Message);
+        Assert.DoesNotContain("Bad Request", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DisposedPlugin_FailsFastOnUse()
+    {
+        var plugin = CreatePlugin();
+        UseRest();
+        plugin.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            async () => await PollAllAsync(plugin));
     }
 
     private sealed class LambdaHandler : HttpMessageHandler

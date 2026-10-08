@@ -591,6 +591,41 @@ public sealed class CredentialPlumbingTests
         Assert.Equal(TimeSpan.FromSeconds(30), injected.Timeout);
     }
 
+    [Fact]
+    public void LazyClient_EffectiveTimeout_Overrides_Construction_Timeout()
+    {
+        using var injected = new HttpClient(new CountingHandler(
+            (r, c) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK))));
+        // A backend enforcing per-attempt timeouts itself needs an infinite
+        // client-level timeout while construction still needs a finite one.
+        var holder = new LazyCredentialClient<HttpClient>(
+            () => TimeSpan.FromSeconds(30), http => http, injected,
+            effectiveTimeout: () => Timeout.InfiniteTimeSpan);
+        Assert.Same(injected, holder.Get());
+        Assert.Equal(Timeout.InfiniteTimeSpan, injected.Timeout);
+        holder.Dispose();
+    }
+
+    [Fact]
+    public void LazyClient_Get_After_Dispose_Throws_Instead_Of_Leaking()
+    {
+        var holder = new LazyCredentialClient<object>(
+            () => TimeSpan.FromSeconds(30), _ => new object());
+        holder.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => holder.Get());
+    }
+
+    [Fact]
+    public void LazyClient_Dispose_Is_Idempotent()
+    {
+        var holder = new LazyCredentialClient<object>(
+            () => TimeSpan.FromSeconds(30), _ => new object());
+        _ = holder.Get();
+        holder.Dispose();
+        holder.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => holder.Get());
+    }
+
     private static IConfigurationSection Section(Dictionary<string, string?> values)
     {
         var full = values.ToDictionary(

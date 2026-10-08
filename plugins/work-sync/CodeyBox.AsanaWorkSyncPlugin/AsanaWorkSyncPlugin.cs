@@ -44,37 +44,34 @@ public sealed class AsanaWorkSyncPlugin
     private readonly TimeProvider _clock;
     private readonly Func<string, string?> _env;
     private readonly IConfigurationSection? _testConfig;
+    private readonly LazyCredentialClient<AsanaRestClient> _clients;
 
     private IPluginHost? _host;
     private ILogger _logger = NullLogger.Instance;
-    private HttpClient? _http;
-    private AsanaTokenProvider? _tokens;
-    private AsanaRestClient? _api;
-    private readonly bool _ownsHttpClient;
-    private readonly object _clientLock = new();
     private bool _disposed;
 
     /// <summary>
-    /// Construction-time timeout for the owned no-redirect client. Never
-    /// enforced: <see cref="EnsureClients"/> immediately overrides it with
-    /// <see cref="Timeout.InfiniteTimeSpan"/> because per-attempt timeouts
-    /// come from the live <c>TimeoutSeconds</c> option. Exists only because
-    /// <see cref="CredentialHttp.CreateNoRedirectClient(TimeSpan)"/>
-    /// requires a finite value.
+    /// Construction-time timeout for the owned no-redirect client — the
+    /// shared holder applies it while building (<see
+    /// cref="CredentialHttp.CreateNoRedirectClient(TimeSpan)"/> requires a
+    /// finite value) and then pokes the effective timeout to
+    /// <see cref="Timeout.InfiniteTimeSpan"/>, because per-attempt timeouts
+    /// come from the live <c>TimeoutSeconds</c> option.
     /// </summary>
     private static readonly TimeSpan OwnedClientConstructionTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Production constructor. The plugin owns its HTTP client (see <see
-    /// cref="EnsureClients"/>) rather than sharing a host factory:
-    /// credential-bearing Asana traffic must never follow a redirect, which
-    /// would re-send the bearer token to the redirect target.
+    /// Production constructor. The plugin owns its HTTP client (built lazily
+    /// by the shared <see cref="LazyCredentialClient{TClient}"/> holder)
+    /// rather than sharing a host factory: credential-bearing Asana traffic
+    /// must never follow a redirect, which would re-send the bearer token to
+    /// the redirect target.
     /// </summary>
     public AsanaWorkSyncPlugin()
     {
         _clock = TimeProvider.System;
         _env = Environment.GetEnvironmentVariable;
-        _ownsHttpClient = true;
+        _clients = NewClientCache(injected: null);
     }
 
     /// <summary>Test constructor: explicit client, config, clock, and environment.</summary>
@@ -84,11 +81,11 @@ public sealed class AsanaWorkSyncPlugin
         TimeProvider? clock = null,
         Func<string, string?>? env = null)
     {
-        _http = http ?? throw new ArgumentNullException(nameof(http));
+        ArgumentNullException.ThrowIfNull(http);
         _testConfig = config ?? throw new ArgumentNullException(nameof(config));
         _clock = clock ?? TimeProvider.System;
         _env = env ?? Environment.GetEnvironmentVariable;
-        _ownsHttpClient = false;
+        _clients = NewClientCache(http);
     }
 
     /// <inheritdoc />
@@ -136,7 +133,7 @@ public sealed class AsanaWorkSyncPlugin
     {
         try
         {
-            var api = EnsureClients();
+            var api = _clients.Get();
             var identity = await api.GetAuthenticatedUserAsync(options, ct).ConfigureAwait(false);
             if (identity is null)
                 _logger.LogWarning("Asana /users/me returned no identity; continuing — polling remains the intake path");
@@ -169,7 +166,7 @@ public sealed class AsanaWorkSyncPlugin
             _logger.LogWarning("Asana poll skipped: no projects are mapped (ProjectMap is empty)");
             yield break;
         }
-        var api = EnsureClients();
+        var api = _clients.Get();
         var projectMap = ValidatedProjectMap(options);
         var cap = Math.Max(1, options.MaxItemsPerPoll);
         var count = 0;
@@ -324,29 +321,20 @@ public sealed class AsanaWorkSyncPlugin
         if (string.IsNullOrEmpty(status))
             return TrackerPostResult.UnmappedFor(update.State);
 
-        var api = EnsureClients();
+        var api = _clients.Get();
         var applied = await ApplyStatusAsync(api, options, update.ExternalId, status, ct).ConfigureAwait(false);
         if (applied is not null)
             return applied;
 
         var body = WorkSyncText.ClipComment(update.Body, update.WorkItemId);
-        var duplicate = await AlreadyPostedAsync(api, options, update.ExternalId, update.WorkItemId, body, null, ct)
-            .ConfigureAwait(false);
-        if (duplicate is true)
-            return new TrackerPostResult(TrackerPostOutcome.SkippedDuplicate,
-                Detail: $"identical story already present on task '{update.ExternalId}'");
-        try
-        {
-            var storyGid = await api.CreateStoryAsync(options, update.ExternalId, body, ct).ConfigureAwait(false);
-            return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: storyGid);
-        }
-        catch (AsanaApiException ex)
-        {
+        return await PostStoryDedupedAsync(
+            api, options, update.ExternalId, update.WorkItemId, body, questionTag: null,
+            duplicateDetail: $"identical story already present on task '{update.ExternalId}'",
             // The status change above already landed: report honestly instead
             // of pretending the whole post failed silently.
-            return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"Asana status '{status}' applied to task '{update.ExternalId}' but the story failed: {ex.Message}");
-        }
+            failureDetail: ex => $"Asana status '{status}' applied to task '{update.ExternalId}' " +
+                $"but the story failed: {ex.Message}",
+            ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -358,24 +346,14 @@ public sealed class AsanaWorkSyncPlugin
         if (GatePost(post.Namespace, post.ExternalId, options) is { } gate)
             return gate;
 
-        var api = EnsureClients();
+        var api = _clients.Get();
         var questionTag = WorkSyncQuestions.TagFor(post.QuestionId);
         var body = WorkSyncText.ClipComment($"{post.Body}\n\n{questionTag}", post.WorkItemId);
-        var duplicate = await AlreadyPostedAsync(api, options, post.ExternalId, post.WorkItemId, body, questionTag, ct)
-            .ConfigureAwait(false);
-        if (duplicate is true)
-            return new TrackerPostResult(TrackerPostOutcome.SkippedDuplicate,
-                Detail: $"question '{post.QuestionId}' already surfaced on task '{post.ExternalId}'");
-        try
-        {
-            var storyGid = await api.CreateStoryAsync(options, post.ExternalId, body, ct).ConfigureAwait(false);
-            return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: storyGid);
-        }
-        catch (AsanaApiException ex)
-        {
-            return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: $"Asana question post for task '{post.ExternalId}' failed: {ex.Message}");
-        }
+        return await PostStoryDedupedAsync(
+            api, options, post.ExternalId, post.WorkItemId, body, questionTag,
+            duplicateDetail: $"question '{post.QuestionId}' already surfaced on task '{post.ExternalId}'",
+            failureDetail: ex => $"Asana question post for task '{post.ExternalId}' failed: {ex.Message}",
+            ct).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -399,7 +377,7 @@ public sealed class AsanaWorkSyncPlugin
                     "add one to the source's state mapping or leave the item unsynced");
         }
 
-        var api = EnsureClients();
+        var api = _clients.Get();
         if (!string.IsNullOrEmpty(status))
         {
             var applied = await ApplyStatusAsync(api, options, report.ExternalId, status, ct).ConfigureAwait(false);
@@ -408,26 +386,53 @@ public sealed class AsanaWorkSyncPlugin
         }
 
         var body = WorkSyncText.ClipComment(report.Body, report.WorkItemId);
-        var duplicate = await AlreadyPostedAsync(api, options, report.ExternalId, report.WorkItemId, body, null, ct)
-            .ConfigureAwait(false);
+        return await PostStoryDedupedAsync(
+            api, options, report.ExternalId, report.WorkItemId, body, questionTag: null,
+            duplicateDetail: $"identical story already present on task '{report.ExternalId}'",
+            // When a status was applied above it already landed: report the
+            // partial application honestly instead of pretending the whole
+            // post failed untouched.
+            failureDetail: ex => string.IsNullOrEmpty(status)
+                ? $"Asana outcome post for task '{report.ExternalId}' failed: {ex.Message}"
+                : $"Asana status '{status}' applied to task '{report.ExternalId}' " +
+                    $"but the outcome story failed: {ex.Message}",
+            ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The dedup-scan-then-post skeleton all three story paths share: scan
+    /// the task's recent story texts for our loop-guard marker (and the
+    /// question tag when given), report <c>SkippedDuplicate</c> on a hit,
+    /// otherwise POST the story and translate an <see
+    /// cref="AsanaApiException"/> into a reported <c>Failed</c> whose detail
+    /// the caller phrases for its own partial-application state — one
+    /// implementation so the guard shape cannot drift between paths.
+    /// </summary>
+    /// <param name="questionTag">When set, a story carrying both the marker and this tag counts as a duplicate.</param>
+    /// <param name="failureDetail">Builds the reported failure detail from the thrown API error.</param>
+    private async Task<TrackerPostResult> PostStoryDedupedAsync(
+        AsanaRestClient api,
+        AsanaWorkSyncOptions options,
+        string taskGid,
+        WorkItemId workItemId,
+        string body,
+        string? questionTag,
+        string duplicateDetail,
+        Func<AsanaApiException, string> failureDetail,
+        CancellationToken ct)
+    {
+        var duplicate = await AlreadyPostedAsync(
+            api, options, taskGid, workItemId, body, questionTag, ct).ConfigureAwait(false);
         if (duplicate is true)
-            return new TrackerPostResult(TrackerPostOutcome.SkippedDuplicate,
-                Detail: $"identical story already present on task '{report.ExternalId}'");
+            return new TrackerPostResult(TrackerPostOutcome.SkippedDuplicate, Detail: duplicateDetail);
         try
         {
-            var storyGid = await api.CreateStoryAsync(options, report.ExternalId, body, ct).ConfigureAwait(false);
+            var storyGid = await api.CreateStoryAsync(options, taskGid, body, ct).ConfigureAwait(false);
             return new TrackerPostResult(TrackerPostOutcome.Posted, RemoteId: storyGid);
         }
         catch (AsanaApiException ex)
         {
-            // When a status was applied above it already landed: report the
-            // partial application honestly, like PostProgressAsync does,
-            // instead of pretending the whole post failed untouched.
-            return new TrackerPostResult(TrackerPostOutcome.Failed,
-                Detail: string.IsNullOrEmpty(status)
-                    ? $"Asana outcome post for task '{report.ExternalId}' failed: {ex.Message}"
-                    : $"Asana status '{status}' applied to task '{report.ExternalId}' " +
-                        $"but the outcome story failed: {ex.Message}");
+            return new TrackerPostResult(TrackerPostOutcome.Failed, Detail: failureDetail(ex));
         }
     }
 
@@ -436,8 +441,11 @@ public sealed class AsanaWorkSyncPlugin
         if (_disposed)
             return;
         _disposed = true;
-        if (_ownsHttpClient)
-            _http?.Dispose();
+        // The shared holder disposes only a client it built (an injected
+        // test client stays owned by its test), coordinates teardown with
+        // a construction in flight, and makes a post-dispose poll fail
+        // fast with ObjectDisposedException.
+        _clients.Dispose();
     }
 
     internal AsanaWorkSyncOptions CurrentOptions()
@@ -452,33 +460,22 @@ public sealed class AsanaWorkSyncPlugin
         return options;
     }
 
-    private AsanaRestClient EnsureClients()
-    {
-        if (_api is not null)
-            return _api;
-        lock (_clientLock)
-        {
-            if (_api is not null)
-                return _api;
-            if (_http is null)
-            {
-                // Credential-bearing traffic never follows redirects: a
-                // shared default handler follows up to 50 cross-origin
-                // hops and would re-send the bearer token to the redirect
-                // target, so this plugin owns a dedicated no-redirect
-                // client. Request timeouts are enforced per attempt from
-                // the live TimeoutSeconds option (a linked CTS in
-                // SendWithRetryAsync), so edits hot-reload; disable the
-                // client-level timeout on this owned client. An injected
-                // client is never mutated.
-                _http = CredentialHttp.CreateNoRedirectClient(OwnedClientConstructionTimeout);
-                _http.Timeout = Timeout.InfiniteTimeSpan;
-            }
-            _tokens = new AsanaTokenProvider(_env);
-            _api = new AsanaRestClient(_http, _tokens, _clock);
-            return _api;
-        }
-    }
+    /// <summary>
+    /// The lazy client pair every work-sync backend shares: an owned
+    /// no-redirect <see cref="HttpClient"/> (credential-bearing traffic can
+    /// never be bounced cross-origin with its bearer token) wrapped in the
+    /// typed REST client. Request timeouts are enforced per attempt from
+    /// the live <c>TimeoutSeconds</c> option (a linked CTS in
+    /// <c>AsanaRestClient.SendWithRetryAsync</c>), so edits hot-reload —
+    /// the effective client-level timeout is therefore infinite; only
+    /// construction needs the finite bound.
+    /// </summary>
+    private LazyCredentialClient<AsanaRestClient> NewClientCache(HttpClient? injected)
+        => new(
+            () => OwnedClientConstructionTimeout,
+            http => new AsanaRestClient(http, new AsanaTokenProvider(_env), _clock),
+            injected,
+            effectiveTimeout: () => Timeout.InfiniteTimeSpan);
 
     /// <summary>
     /// Applies a caller-resolved external status to the task. Returns a
@@ -557,10 +554,10 @@ public sealed class AsanaWorkSyncPlugin
         string? questionTag,
         CancellationToken ct)
     {
-        IReadOnlyList<AsanaStory> stories;
+        IReadOnlyList<string> storyTexts;
         try
         {
-            stories = await api.ListRecentStoriesAsync(options, taskGid, ct).ConfigureAwait(false);
+            storyTexts = await api.ListRecentStoryTextsAsync(options, taskGid, ct).ConfigureAwait(false);
         }
         catch (AsanaApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
@@ -573,17 +570,16 @@ public sealed class AsanaWorkSyncPlugin
             return null;
         }
         var marker = WorkSyncLoopGuard.MarkerFor(workItemId);
-        foreach (var story in stories)
+        foreach (var text in storyTexts)
         {
-            if (string.IsNullOrEmpty(story.Text)
-                || !story.Text.Contains(marker, StringComparison.Ordinal))
+            if (!text.Contains(marker, StringComparison.Ordinal))
                 continue;
             if (questionTag is not null)
             {
-                if (story.Text.Contains(questionTag, StringComparison.Ordinal))
+                if (text.Contains(questionTag, StringComparison.Ordinal))
                     return true;
             }
-            else if (string.Equals(story.Text, body, StringComparison.Ordinal))
+            else if (string.Equals(text, body, StringComparison.Ordinal))
             {
                 return true;
             }

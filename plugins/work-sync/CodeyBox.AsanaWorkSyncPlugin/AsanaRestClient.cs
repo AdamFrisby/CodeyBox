@@ -60,8 +60,11 @@ public sealed class AsanaRestClient
         "gid,name,notes,assignee.gid,assignee.name,tags.gid,tags.name," +
         "completed,projects.gid,memberships.section.name";
 
-    /// <summary>Story fields requested for duplicate detection.</summary>
-    internal const string StoryFields = "gid,type,text";
+    /// <summary>
+    /// Story fields requested for duplicate detection — only the text is
+    /// read, so only the text is fetched.
+    /// </summary>
+    internal const string StoryFields = "text";
 
     /// <summary>Maximum upstream error text surfaced in exception detail.</summary>
     internal const int MaxErrorChars = 300;
@@ -71,6 +74,14 @@ public sealed class AsanaRestClient
 
     /// <summary>Product token sent as User-Agent — no version, so it cannot drift.</summary>
     internal const string UserAgentProduct = "CodeyBox-AsanaWorkSync";
+
+    /// <summary>
+    /// Bound on the exponential-backoff shift: keeps <c>1L &lt;&lt;
+    /// attempt</c> far from overflow even for a directly-constructed options
+    /// object whose <c>RetryMaxAttempts</c> skipped the clamp — the delay
+    /// cap still applies on top.
+    /// </summary>
+    private const int MaxBackoffShift = 10;
 
     private readonly HttpClient _http;
     private readonly AsanaTokenProvider _tokens;
@@ -132,11 +143,13 @@ public sealed class AsanaRestClient
     }
 
     /// <summary>
-    /// Reads the most recent stories on a task for duplicate detection,
+    /// Reads the most recent story texts on a task for duplicate detection,
     /// bounded to <c>DedupScanLimit</c> (a single page: the API maximum page
-    /// is 100 and the scan limit is clamped to it).
+    /// is 100 and the scan limit is clamped to it). Only non-empty texts are
+    /// returned — gid/type are not fetched because the scan never reads
+    /// them.
     /// </summary>
-    public async Task<IReadOnlyList<AsanaStory>> ListRecentStoriesAsync(
+    public async Task<IReadOnlyList<string>> ListRecentStoryTextsAsync(
         AsanaWorkSyncOptions options, string taskGid, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -152,9 +165,8 @@ public sealed class AsanaRestClient
             || dataEl.ValueKind != JsonValueKind.Array)
             return [];
         return dataEl.EnumerateArray()
-            .Select(AsanaStory.FromNode)
-            .Where(s => s is not null)
-            .Cast<AsanaStory>()
+            .Select(el => AsanaTask.Str(el, "text"))
+            .Where(text => !string.IsNullOrEmpty(text))
             .ToList();
     }
 
@@ -381,10 +393,15 @@ public sealed class AsanaRestClient
                 // refusal covers any injected client whose handler follows
                 // them. A 3xx is untrusted upstream output — following it
                 // would re-send the bearer token to the redirect target —
-                // so it fails the request instead of being retried.
+                // so it fails the request instead of being retried. The
+                // server-controlled reason phrase is deliberately absent
+                // from the message: the runtime decodes it byte-faithfully
+                // (Latin-1) and strips only CR/LF/NUL, so ESC/BEL/C1 would
+                // smuggle terminal escapes into logs and persisted sync
+                // records. The numeric status identifies the failure.
                 if (CredentialHttp.IsRedirect(response.StatusCode))
                     throw new AsanaApiException(
-                        $"Asana API returned redirect {(int)response.StatusCode} {response.ReasonPhrase} " +
+                        $"Asana API returned redirect {(int)response.StatusCode} " +
                         $"for {request.Method} {request.RequestUri?.AbsolutePath}: redirects are refused " +
                         "and never followed with credentials.",
                         response.StatusCode);
@@ -435,7 +452,7 @@ public sealed class AsanaRestClient
             && hinted <= cap)
             return hinted;
         var baseMs = Math.Max(0, options.RetryBaseDelayMs);
-        var backoffMs = (double)baseMs * (1L << Math.Min(attempt, 10));
+        var backoffMs = (double)baseMs * (1L << Math.Min(attempt, MaxBackoffShift));
         var cappedMs = Math.Min(backoffMs, cap.TotalMilliseconds);
         return TimeSpan.FromMilliseconds(Math.Max(0, cappedMs));
     }
@@ -450,9 +467,12 @@ public sealed class AsanaRestClient
             response.Content, options.MaxResponseBytes, requestCt).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
+            // No ReasonPhrase: it is server-controlled text that survives
+            // with ESC/BEL/C1 controls intact — see the redirect refusal
+            // above. Relayed body detail is sanitised by ErrorDetail.
             var detail = ErrorDetail(body) is { } d ? $": {d}" : string.Empty;
             throw new AsanaApiException(
-                $"Asana API returned {(int)response.StatusCode} {response.ReasonPhrase} " +
+                $"Asana API returned {(int)response.StatusCode} " +
                 $"for {request.Method} {request.RequestUri?.AbsolutePath}{detail}.",
                 response.StatusCode);
         }
@@ -508,8 +528,10 @@ public sealed class AsanaRestClient
     /// </summary>
     private static string? ErrorDetail(string body)
     {
-        if (string.IsNullOrWhiteSpace(body) || body.Length > MaxErrorBodyChars)
+        if (string.IsNullOrWhiteSpace(body))
             return null;
+        if (body.Length > MaxErrorBodyChars)
+            return $"error body too large to parse ({body.Length} chars > {MaxErrorBodyChars})";
         try
         {
             using var doc = JsonDocument.Parse(body);
