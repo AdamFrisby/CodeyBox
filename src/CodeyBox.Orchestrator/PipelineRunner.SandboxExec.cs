@@ -342,58 +342,12 @@ public sealed partial class PipelineRunner
         File.Move(tempPath, configPath, overwrite: true);
     }
 
-    private async Task PushSandboxWorkBranchWithReconcileAsync(ISandbox sandbox, string branch, CancellationToken ct)
-    {
-        string[] pushArgv = ["git", "-C", SandboxConventions.WorkDir, "push", "origin", $"{branch}:{branch}"];
-        var push = await sandbox.ExecAsync(new SandboxExec { Argv = pushArgv }, ct);
-        if (push.Success)
-            return;
-
-        if (!IsNonFastForwardRejection(push.Stdout, push.Stderr))
-            throw PipelineAgentExecutor.CommandFailed(push, pushArgv);
-
-        _log.LogWarning(
-            "Sandbox push of work branch {Branch} was rejected as non-fast-forward; fetching and rebasing once",
-            branch);
-
-        var fetch = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir, "fetch", "--no-tags", "origin",
-                $"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
-        }, ct);
-        if (!fetch.Success)
-            throw new InvalidOperationException(
-                $"sandbox push reconcile fetch failed for branch '{branch}': {fetch.Stderr}");
-
-        var rebase = await sandbox.ExecAsync(new SandboxExec
-        {
-            Argv = ["git", "-C", SandboxConventions.WorkDir,
-                "-c", "user.name=CodeyBox",
-                "-c", "user.email=codeybox@localhost",
-                "rebase", $"origin/{branch}"],
-        }, ct);
-        if (!rebase.Success)
-        {
-            await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--abort"],
-            }, CancellationToken.None);
-            throw new SandboxPushReconcileConflictException(branch, "rebase");
-        }
-
-        push = await sandbox.ExecAsync(new SandboxExec { Argv = pushArgv }, ct);
-        if (!push.Success)
-            throw new InvalidOperationException(
-                $"sandbox push of work branch '{branch}' failed after reconcile: {push.Stderr}");
-    }
-
-    private static bool IsNonFastForwardRejection(string stdout, string stderr)
-    {
-        var output = stdout + "\n" + stderr;
-        return output.Contains("non-fast-forward", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("! [rejected]", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("fetch first", StringComparison.OrdinalIgnoreCase);
-    }
+    private async Task<SandboxWorkBranchPublication> PushSandboxWorkBranchWithReconcileAsync(ISandbox sandbox, string branch, CancellationToken ct) =>
+        await SandboxWorkBranchPublisher.PublishHeadAsync(
+            (exec, token) => sandbox.ExecAsync(exec, token),
+            branch,
+            _log,
+            ct).ConfigureAwait(false);
 
     // ── Stuck-probe integration ──────────────────────────────────────────────
 

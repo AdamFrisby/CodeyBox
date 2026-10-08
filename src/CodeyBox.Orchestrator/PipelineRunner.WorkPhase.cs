@@ -1177,12 +1177,40 @@ public sealed partial class PipelineRunner
 
                 if (resumingPreempt && checkpointContainedMeaningfulChanges)
                 {
+                    // The target work branch may have advanced since the
+                    // checkpoint was taken (a resumed turn is, by definition,
+                    // stale): publish through the same bounded fetch/rebase
+                    // contract as ordinary work so a non-fast-forward becomes
+                    // a reconciled push instead of a failed item. The helper
+                    // pushes HEAD (correct on resumed/detached checkouts),
+                    // pins both original tips before rewriting anything, and
+                    // throws on conflict, moving target, or uncertain
+                    // publication — all of which skip the checkpoint clear and
+                    // state sync below, leaving the checkpoint retryable.
+                    // The required build gate runs after publication, so a
+                    // rebased tip is always gated fresh.
                     await using (var pushScope = await TimingScope.BeginAsync(_timings, item.Id, agentPhase, "git.push_resumed_checkpoint_to_bare_repo",
                         activitySource: CodeyBoxActivities.Sandbox, log: _log))
                     {
-                        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "push", "origin", $"HEAD:{branch}");
+                        await PushSandboxWorkBranchWithReconcileAsync(sandbox, branch, ct);
                     }
-                    await sandbox.SyncStateToHostAsync(ct);
+                    try
+                    {
+                        await sandbox.SyncStateToHostAsync(ct);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // The push landed but host synchronization is
+                        // unconfirmed: publication is uncertain, so the
+                        // checkpoint must stay retryable rather than clear.
+                        // Wrapped (cause preserved, message sanitized) so the
+                        // recovery contract classifies it as infrastructure.
+                        throw new SandboxWorkBranchPublishException(branch, "sync", inner: ex);
+                    }
                     // HEAD is now durable on the work branch. A later build or
                     // probe infrastructure failure must retry from that branch,
                     // not replay the older source/session checkpoint.

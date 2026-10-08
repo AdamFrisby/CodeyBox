@@ -1579,6 +1579,21 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 item.Id, ex.Agent.Value, SanitizedAgentDetail.FromRaw(ex.Reason).Value);
             await TransitionNoActionRequiredAsync(item, project, ex, CancellationToken.None);
         }
+        catch (Exception ex) when (SandboxWorkBranchPublisher.IsPublicationFailure(ex))
+        {
+            // Sandbox-to-bare publication boundary: the agent turn completed
+            // and both histories are intact — only the push, reconcile, or
+            // host sync did not land. Infrastructure-shaped so the Failed
+            // transition keeps the resume checkpoint (via the existing
+            // CanPersistThrough mechanism) for a bounded operator retry
+            // instead of forcing the turn to be redone. The typed message
+            // stays in LastError for triage.
+            _log.LogWarning(
+                ex,
+                "Work item {Id} failed sandbox work-branch publication; checkpoint retained for bounded retry",
+                item.Id);
+            await TransitionFailed(item, ex.Message, CancellationToken.None, project, failureKind: WorkItemFailureKinds.Infrastructure);
+        }
         catch (Exception ex) when (SandboxDeferralGuard.IsExecutionTransportLoss(ex))
         {
             // Transport-loss shapes that escaped a phase's own conversion —
