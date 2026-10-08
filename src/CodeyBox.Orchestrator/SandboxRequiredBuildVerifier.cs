@@ -1,3 +1,4 @@
+using CodeyBox.Build.MSBuild;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging;
@@ -183,6 +184,8 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         """;
 
     private readonly ISandboxProvider _sandboxes;
+    private readonly Func<MSBuildDiagnosticsOptions>? _msBuildDiagnostics;
+    private readonly IBuildDiagnosticsProducer? _buildDiagnosticsProducer;
     private readonly IGitHost _gitHost;
     private readonly PipelineOptions _pipelineOptions;
     private readonly ILogger<SandboxRequiredBuildVerifier>? _logger;
@@ -191,12 +194,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         ISandboxProvider sandboxes,
         IGitHost gitHost,
         PipelineOptions pipelineOptions,
-        ILogger<SandboxRequiredBuildVerifier>? logger = null)
+        ILogger<SandboxRequiredBuildVerifier>? logger = null,
+        Func<MSBuildDiagnosticsOptions>? msBuildDiagnostics = null,
+        IBuildDiagnosticsProducer? buildDiagnosticsProducer = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
         _pipelineOptions = pipelineOptions;
         _logger = logger;
+        _msBuildDiagnostics = msBuildDiagnostics;
+        _buildDiagnosticsProducer = buildDiagnosticsProducer;
     }
 
     public async Task<RequiredBuildProbeResult> ProbeAsync(
@@ -451,6 +458,16 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         CancellationToken ct)
     {
         ISandbox? sandbox = null;
+        // Opted-in MSBuild diagnostics capture runs inside this same
+        // sandbox session: the capture script variant adds least-data
+        // `-bl` logging to each `dotnet build`; no second build is
+        // ever executed for diagnostics. When disabled the executed
+        // command is byte-identical to the historical one. Options are
+        // read once here so the script, fetch caps, and evidence binding
+        // agree for the whole verification.
+        var captureOptions = MSBuildDiagnosticsEnrichment.ReadOptions(_msBuildDiagnostics);
+        var captureDiagnostics = captureOptions.Enabled
+            && _buildDiagnosticsProducer is { IsEnabled: true };
         try
         {
             sandbox = await _sandboxes.CreateAsync(spec, ct);
@@ -478,10 +495,22 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     request.WorkBranch,
                     $"origin/{request.WorkBranch}");
 
+                // Opted-in MSBuild diagnostics capture runs inside this same
+                // sandbox session (see above): choose the script variant and
+                // configuration here; the command stays byte-identical to the
+                // historical one when disabled.
                 build = await sandbox.ExecAsync(new SandboxExec
                 {
-                    Argv = ["sh", "-c", BuildScript],
+                    Argv = ["sh", "-c", captureDiagnostics
+                        ? MSBuildDiagnosticsEnrichment.BuildScriptWithBinlogCapture
+                        : BuildScript],
                     WorkingDirectory = SandboxConventions.WorkDir,
+                    ExtraEnvironment = captureDiagnostics
+                        ? new Dictionary<string, string>
+                        {
+                            [MSBuildDiagnosticsEnrichment.BinlogConfigVariable] = captureOptions.BuildConfiguration,
+                        }
+                        : null,
                 }, buildCt);
             }
             catch (OperationCanceledException) when (buildTimeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
@@ -533,7 +562,26 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
                     redactedOutput);
             }
 
-            return RequiredBuildVerificationResult.Failed(build.ExitCode, redactedOutput);
+            // Failure-path enrichment only: the authoritative Failed outcome
+            // is already decided; diagnostics add causal context for the
+            // repair loop or an explicit insufficient-diagnostics note. Uses
+            // the caller's token (not the build budget, which is spent), and
+            // never throws for enrichment problems.
+            BuildDiagnosticsEvidence? diagnostics = null;
+            if (captureDiagnostics)
+            {
+                diagnostics = await MSBuildDiagnosticsEnrichment.EnrichFailedBuildAsync(
+                    sandbox,
+                    request.WorkBranch,
+                    captureOptions,
+                    _buildDiagnosticsProducer,
+                    ct).ConfigureAwait(false);
+            }
+
+            return RequiredBuildVerificationResult.Failed(build.ExitCode, redactedOutput) with
+            {
+                BuildDiagnostics = diagnostics,
+            };
         }
         finally
         {

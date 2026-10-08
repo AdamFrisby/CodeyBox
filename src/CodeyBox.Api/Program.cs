@@ -41,6 +41,7 @@ using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
+using CodeyBox.Build.MSBuild;
 using CodeyBox.DotnetTestRunnerPlugin;
 using CodeyBox.Core;
 using CodeyBox.Deployment;
@@ -433,6 +434,11 @@ builder.Services.AddOptions<AuditRunOptions>()
     .Validate(
         static opts => AuditRunOptions.IsValid(opts),
         $"{AuditRunOptions.SectionName} is invalid");
+// MSBuild structured build-diagnostics adapter (CodeyBox:MSBuildDiagnostics).
+// Disabled by default: registers the hot-reloadable options plus the
+// capability-based producer, but captures/parses nothing until the operator
+// opts in. See docs/concepts/msbuild-diagnostics.md.
+builder.Services.AddMSBuildBuildDiagnostics(builder.Configuration);
 // Post-merge baseline-production knobs
 // (Audit:TestSelection:BaselineProduction). Bound through AddOptions so
 // IOptionsMonitor<TestSelectionBaselineProductionOptions> hot-reloads the
@@ -1511,7 +1517,9 @@ builder.Services.AddSingleton<IRequiredBuildVerifier>(sp => new SandboxRequiredB
     sp.GetRequiredService<ISandboxProvider>(),
     sp.GetRequiredService<IGitHost>(),
     sp.GetRequiredService<PipelineOptions>(),
-    sp.GetRequiredService<ILogger<SandboxRequiredBuildVerifier>>()));
+    sp.GetRequiredService<ILogger<SandboxRequiredBuildVerifier>>(),
+    () => sp.GetRequiredService<IOptionsMonitor<MSBuildDiagnosticsOptions>>().CurrentValue,
+    sp.GetServices<IBuildDiagnosticsProducer>().FirstOrDefault(static p => p.ProviderId == MSBuildDiagnosticsOptions.ProviderId)));
 
 // --- Pull request service (in-memory by default) -----------------------------
 builder.Services.AddSingleton<IPullRequestService, InMemoryPullRequestService>();

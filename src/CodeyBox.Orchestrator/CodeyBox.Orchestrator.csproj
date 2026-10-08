@@ -41,6 +41,7 @@
     <ProjectReference Include="..\CodeyBox.Agents.Vibe\CodeyBox.Agents.Vibe.csproj" />
     <ProjectReference Include="..\CodeyBox.Upstream\CodeyBox.Upstream.csproj" />
     <ProjectReference Include="..\CodeyBox.Audit\CodeyBox.Audit.csproj" />
+    <ProjectReference Include="..\CodeyBox.Build.MSBuild\CodeyBox.Build.MSBuild.csproj" />
     <ProjectReference Include="..\CodeyBox.Projects\CodeyBox.Projects.csproj" />
   </ItemGroup>
 
