@@ -63,7 +63,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                     expires_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_extbuilds_project ON external_builds(project_id, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_extbuilds_idem ON external_builds(project_id, idempotency_key, idempotency_body_hash);
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_extbuilds_idem ON external_builds(project_id, idempotency_key, idempotency_body_hash) WHERE idempotency_key IS NOT NULL AND idempotency_body_hash IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_extbuilds_run ON external_builds(provider_run_id);
                 CREATE TABLE IF NOT EXISTS external_build_parks (
                     build_id TEXT PRIMARY KEY,
@@ -98,6 +98,19 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 alter.CommandText = "ALTER TABLE external_builds ADD COLUMN delivery_acked INTEGER NOT NULL DEFAULT 0;";
                 alter.ExecuteNonQuery();
             }
+            using (var dedupe = _conn.CreateCommand())
+            {
+                dedupe.CommandText = """
+                    DELETE FROM external_builds WHERE rowid NOT IN (
+                        SELECT MIN(rowid) FROM external_builds
+                        WHERE idempotency_key IS NOT NULL AND idempotency_body_hash IS NOT NULL
+                        GROUP BY project_id, idempotency_key, idempotency_body_hash)
+                    AND idempotency_key IS NOT NULL AND idempotency_body_hash IS NOT NULL;
+                    DROP INDEX IF EXISTS idx_extbuilds_idem;
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_extbuilds_idem ON external_builds(project_id, idempotency_key, idempotency_body_hash) WHERE idempotency_key IS NOT NULL AND idempotency_body_hash IS NOT NULL;
+                    """;
+                dedupe.ExecuteNonQuery();
+            }
         }
         finally
         {
@@ -119,7 +132,15 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 VALUES ($id,$sv,$p,$w,$ph,$it,$at,$st,$tj,$sj,$cd,$ik,$ih,$rq,$pr,$fo,$fe,$da,$pc,$tc,$ev,$fd,$ca,$ua,$co,$ex,$dl);
                 """;
             Bind(cmd, record);
-            cmd.ExecuteNonQuery();
+            try
+            {
+                cmd.ExecuteNonQuery();
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
+            {
+                throw new ExternalBuildConflictException(
+                    $"Duplicate external build for idempotency key '{record.IdempotencyKey}'.", ex);
+            }
         }
         finally
         {

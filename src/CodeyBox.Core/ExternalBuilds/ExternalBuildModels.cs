@@ -204,7 +204,7 @@ public static class ExternalBuildLifecycle
 }
 
 /// <summary>Typed errors; never flattened to bare strings at a boundary.</summary>
-public abstract class ExternalBuildException(string message) : InvalidOperationException(message);
+public abstract class ExternalBuildException(string message, Exception? inner = null) : InvalidOperationException(message, inner);
 public sealed class ExternalBuildNotEnabledException() : ExternalBuildException("External builds are not enabled.");
 public sealed class ExternalBuildTargetNotApprovedException(string target)
     : ExternalBuildException($"Build target '{target}' is not operator-approved.");
@@ -212,6 +212,6 @@ public sealed class ExternalBuildOwnershipException(string buildId)
     : ExternalBuildException($"Caller does not own external build '{buildId}'.");
 public sealed class ExternalBuildCapabilityExpiredException()
     : ExternalBuildException("Build capability has expired or was revoked.");
-public sealed class ExternalBuildConflictException(string detail) : ExternalBuildException(detail);
+public sealed class ExternalBuildConflictException(string detail, Exception? inner = null) : ExternalBuildException(detail, inner);
 public sealed class ExternalBuildReconciliationBlockedException(string detail) : ExternalBuildException(detail);
 public sealed class ExternalBuildBudgetExceededException(string detail) : ExternalBuildException(detail);

@@ -39,6 +39,50 @@ public sealed class ExternalBuildLifecycleTests
     }
 
     [Fact]
+    public async Task Start_ConcurrentDuplicate_SubmitsOnce()
+    {
+        var provider = new FakeSnapshotBuildProvider { PollsToTerminal = 100 };
+        var (service, _, _, _) = ExternalBuildTestKit.BuildService(provider);
+
+        var tasks = Enumerable.Range(0, 8).Select(_ =>
+            service.StartAsync(ExternalBuildTestKit.Request(), new ExternalBuildSubmitInput()));
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, r => Assert.Equal(results[0].Id, r.Id));
+        Assert.Equal(1, provider.SubmitCalls);
+    }
+
+    [Fact]
+    public async Task Start_ConcurrentDuplicate_AcrossInstances_SubmitsOnce()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "xb-idem-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var path = Path.Combine(dir, "state.db");
+            var clock = new ControllableClock(DateTimeOffset.UtcNow);
+            var opts = ExternalBuildTestKit.Options();
+            var provider = new FakeSnapshotBuildProvider { PollsToTerminal = 100 };
+            using var store = new SqliteExternalBuildStore(path);
+            var serviceA = new ExternalBuildService(store, [provider], () => opts, clock);
+            var serviceB = new ExternalBuildService(store, [provider], () => opts, clock);
+
+            var results = await Task.WhenAll(Enumerable.Range(0, 4).SelectMany(_ => new[]
+            {
+                serviceA.StartAsync(ExternalBuildTestKit.Request(), new ExternalBuildSubmitInput()),
+                serviceB.StartAsync(ExternalBuildTestKit.Request(), new ExternalBuildSubmitInput()),
+            }));
+
+            Assert.All(results, r => Assert.Equal(results[0].Id, r.Id));
+            Assert.Equal(1, provider.SubmitCalls);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task UncertainSubmit_ReconcilesWithoutDuplicatePaidRun()
     {
         var provider = new FakeSnapshotBuildProvider { FailNextSubmitUncertain = true };

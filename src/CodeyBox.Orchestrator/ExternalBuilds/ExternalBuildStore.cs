@@ -53,7 +53,17 @@ public sealed class InMemoryExternalBuildStore : IExternalBuildStore
 
     public Task CreateAsync(ExternalBuildRecord record, CancellationToken ct = default)
     {
-        lock (_gate) _records[record.Id] = record;
+        lock (_gate)
+        {
+            if (record.IdempotencyKey is not null && record.IdempotencyBodyHash is not null
+                && _records.Values.Any(r =>
+                    string.Equals(r.ProjectId, record.ProjectId, StringComparison.Ordinal)
+                    && string.Equals(r.IdempotencyKey, record.IdempotencyKey, StringComparison.Ordinal)
+                    && string.Equals(r.IdempotencyBodyHash, record.IdempotencyBodyHash, StringComparison.Ordinal)))
+                throw new ExternalBuildConflictException(
+                    $"Duplicate external build for idempotency key '{record.IdempotencyKey}'.");
+            _records[record.Id] = record;
+        }
         return Task.CompletedTask;
     }
 

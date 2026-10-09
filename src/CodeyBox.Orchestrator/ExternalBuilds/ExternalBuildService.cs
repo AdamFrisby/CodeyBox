@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CodeyBox.Core.ExternalBuilds;
 
 namespace CodeyBox.Orchestrator.ExternalBuilds;
@@ -20,6 +21,7 @@ public sealed class ExternalBuildService
     private readonly List<ExternalBuildCompletionEvent> _outbox = [];
     private readonly HashSet<string> _acked = new(StringComparer.Ordinal);
     private readonly string _owner = "svc-" + Guid.NewGuid().ToString("N")[..12];
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _startGates = new(StringComparer.Ordinal);
 
     public ExternalBuildService(
         IExternalBuildStore store,
@@ -64,34 +66,55 @@ public sealed class ExternalBuildService
         var existing = await _store.GetByIdempotencyAsync(request.ProjectId, idempotencyKey, bodyHash, ct).ConfigureAwait(false);
         if (existing is not null) return existing;
 
-        if (await _store.CountActiveAsync(request.ProjectId, ct).ConfigureAwait(false) >= opts.MaxQueuedPerProject)
-            throw new ExternalBuildBudgetExceededException("per-project queued build budget exceeded");
-        if (await _store.CountActiveForProviderAsync(approval.ProviderId, ct).ConfigureAwait(false) >= opts.MaxConcurrentPerProvider)
-            throw new ExternalBuildBudgetExceededException("per-provider concurrency budget exceeded");
-
-        var now = _clock.GetUtcNow();
-        var record = new ExternalBuildRecord
+        var gate = _startGates.GetOrAdd(request.ProjectId + "\0" + idempotencyKey + "\0" + bodyHash, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            Id = "xb-" + Guid.NewGuid().ToString("N")[..16],
-            ProjectId = request.ProjectId,
-            WorkItemId = request.WorkItemId,
-            Phase = request.Phase,
-            Iteration = request.Iteration,
-            Attempt = request.Attempt,
-            State = ExternalBuildState.IntentRecorded,
-            Target = target,
-            Source = request.Source,
-            ConfigDigest = configDigest,
-            IdempotencyKey = idempotencyKey,
-            IdempotencyBodyHash = bodyHash,
-            RequestId = Guid.NewGuid().ToString("N"),
-            DispatchAttempts = 0,
-            CreatedAt = now,
-            UpdatedAt = now,
-            ExpiresAt = now.AddSeconds(opts.BuildDeadlineSeconds),
-        };
-        await _store.CreateAsync(record, ct).ConfigureAwait(false);
-        return await DispatchAsync(record, provider, input, approval, ct).ConfigureAwait(false);
+            var recheck = await _store.GetByIdempotencyAsync(request.ProjectId, idempotencyKey, bodyHash, ct).ConfigureAwait(false);
+            if (recheck is not null) return recheck;
+
+            if (await _store.CountActiveAsync(request.ProjectId, ct).ConfigureAwait(false) >= opts.MaxQueuedPerProject)
+                throw new ExternalBuildBudgetExceededException("per-project queued build budget exceeded");
+            if (await _store.CountActiveForProviderAsync(approval.ProviderId, ct).ConfigureAwait(false) >= opts.MaxConcurrentPerProvider)
+                throw new ExternalBuildBudgetExceededException("per-provider concurrency budget exceeded");
+
+            var now = _clock.GetUtcNow();
+            var record = new ExternalBuildRecord
+            {
+                Id = "xb-" + Guid.NewGuid().ToString("N")[..16],
+                ProjectId = request.ProjectId,
+                WorkItemId = request.WorkItemId,
+                Phase = request.Phase,
+                Iteration = request.Iteration,
+                Attempt = request.Attempt,
+                State = ExternalBuildState.IntentRecorded,
+                Target = target,
+                Source = request.Source,
+                ConfigDigest = configDigest,
+                IdempotencyKey = idempotencyKey,
+                IdempotencyBodyHash = bodyHash,
+                RequestId = Guid.NewGuid().ToString("N"),
+                DispatchAttempts = 0,
+                CreatedAt = now,
+                UpdatedAt = now,
+                ExpiresAt = now.AddSeconds(opts.BuildDeadlineSeconds),
+            };
+            try
+            {
+                await _store.CreateAsync(record, ct).ConfigureAwait(false);
+            }
+            catch (ExternalBuildConflictException)
+            {
+                var winner = await _store.GetByIdempotencyAsync(request.ProjectId, idempotencyKey, bodyHash, ct).ConfigureAwait(false);
+                if (winner is not null) return winner;
+                throw;
+            }
+            return await DispatchAsync(record, provider, input, approval, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     public async Task<ExternalBuildRecord> ReconcileAsync(string buildId, CancellationToken ct = default)
