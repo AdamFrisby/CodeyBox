@@ -165,6 +165,7 @@
     <Project Path="plugins/notifications/CodeyBox.TeamsPlugin/CodeyBox.TeamsPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.DiscordPlugin/CodeyBox.DiscordPlugin.csproj" />
     <Project Path="plugins/notifications/CodeyBox.MatrixPlugin/CodeyBox.MatrixPlugin.csproj" />
+    <Project Path="plugins/notifications/CodeyBox.MattermostPlugin/CodeyBox.MattermostPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.DaytonaSandboxPlugin/CodeyBox.DaytonaSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.GceSandboxPlugin/CodeyBox.GceSandboxPlugin.csproj" />
     <Project Path="plugins/sandbox/CodeyBox.OpenStackSandboxPlugin/CodeyBox.OpenStackSandboxPlugin.csproj" />
