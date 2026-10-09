@@ -1,4 +1,6 @@
 using Microsoft.Extensions.Logging;
+using Serilog.Events;
+using System.Globalization;
 using CodeyBox.Core;
 
 namespace CodeyBox.Orchestrator;
@@ -91,6 +93,19 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _roundRobinCursors
         = new(StringComparer.OrdinalIgnoreCase);
+
+    // Routing-log dedup: a parked item re-picked on every wake (or any hot
+    // retry loop) would otherwise log the same routing evaluation at
+    // Information on every pass. The last emitted content is remembered per
+    // (item, line) and per probe reading; an identical repeat drops to Debug
+    // while a first sight, value change, or error stays Information. Bounded
+    // with clear-on-overflow: the worst case is one extra Information round,
+    // never unbounded memory.
+    private const int MaxTrackedRoutingLines = 4096;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string Scope, string Key), string> _lastRoutingLine
+        = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string Agent, string RouteKey, string ClassId), (double AvailablePct, DateTimeOffset? ResetAt, string? Notes)> _lastProbeReading
+        = new();
 
     private sealed record QuotaRetryAdmission(
         string RouteKey,
@@ -629,7 +644,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 pausedRejected.Add((member.Agent, pausedReason));
                 pausedMembers.Add(member);
                 if (commitDispatchSideEffects)
-                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
+                    LogRoutingLine(item.Id, $"rejected:paused:{member.Agent.Value}/{member.ModelId}", "Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, pausedReason));
                 continue;
             }
@@ -690,14 +705,14 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     pausedRejected.Add((member.Agent, pausedReason));
                     pausedMembers.Add(member);
                     if (commitDispatchSideEffects)
-                        _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
+                        LogRoutingLine(item.Id, $"rejected:paused:{member.Agent.Value}/{member.ModelId}", "Work item {Id}: rejected: {Reason}", item.Id, pausedReason);
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, pausedReason));
                     continue;
                 }
 
                 var smokeReason = $"smoke gate: {availability.Reason}";
                 if (commitDispatchSideEffects)
-                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
+                    LogRoutingLine(item.Id, $"rejected:smoke:{member.Agent.Value}/{member.ModelId}", "Work item {Id}: rejected: {Reason}", item.Id, smokeReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, smokeReason));
                 smokeExcluded.Add((member.Agent, member.ModelId));
                 if (member.Billing == AgentBilling.Subscription)
@@ -735,7 +750,15 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 {
                     var reason = FormatObservedFailureReason(member, seenAt, _time.GetUtcNow());
                     if (commitDispatchSideEffects)
-                        _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, reason);
+                        // Signature on the observation instant, not the rendered
+                        // relative age: the decision is unchanged while the
+                        // cosmetic "N seconds ago" text ticks.
+                        LogRoutingLine(
+                            item.Id,
+                            "rejected:observed",
+                            "Work item {Id}: rejected: {Reason}",
+                            [item.Id, reason],
+                            [member.Agent.Value, member.ModelId, seenAt]);
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reason));
                     continue;
                 }
@@ -756,11 +779,17 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 var running = _runningCounters?.GetRunning(member) ?? 0;
                 var capReason = $"per-agent cap: running={running} cap={cap}";
                 if (commitDispatchSideEffects)
-                    _log.LogInformation("Work item {Id}: rejected: {Reason}", item.Id, capReason);
+                    LogRoutingLine(item.Id, $"rejected:cap:{member.Agent.Value}/{member.ModelId}", "Work item {Id}: rejected: {Reason}", item.Id, capReason);
                 rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
                 capSaturatedMembers.Add(member);
                 if (commitDispatchSideEffects)
-                    AuditLog.ConcurrencyGated(item.Id, member.Agent, running, cap);
+                {
+                    var gatedChanged = ShouldLogRoutingInformation(
+                        $"item:{item.Id}", $"concurrency-gated:{member.Agent.Value}/{member.ModelId}", running, cap);
+                    AuditLog.ConcurrencyGated(
+                        item.Id, member.Agent, running, cap,
+                        level: gatedChanged ? LogEventLevel.Information : LogEventLevel.Debug);
+                }
                 continue;
             }
 
@@ -795,7 +824,13 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             }
 
             if (commitDispatchSideEffects)
-                AuditLog.QuotaProbed(member.Agent, member.RouteKey, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
+            {
+                var probeChanged = ProbeReadingChanged(
+                    member.Agent, member.RouteKey, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes);
+                AuditLog.QuotaProbed(
+                    member.Agent, member.RouteKey, classId, quota.AvailablePct, quota.ResetAt, snapshot.Notes,
+                    level: probeChanged ? LogEventLevel.Information : LogEventLevel.Debug);
+            }
 
             var knownQuotaUsable = KnownQuotaMeetsFloor(
                 member, quota, nowUtc, await GetMeasuredBurnAsync(member, ct));
@@ -835,7 +870,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                     var capReason = "per-agent cap reached";
                     if (commitDispatchSideEffects)
                     {
-                        _log.LogInformation("Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
+                        LogRoutingLine(item.Id, "spilling",
+                            "Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
                             item.Id, member.Agent, member.ModelId ?? "(default)", capReason);
                     }
                     rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, capReason));
@@ -875,7 +911,8 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                             var reservationReason = attempt.DenyReason ?? "quota reservation exhausted";
                             if (commitDispatchSideEffects)
                             {
-                                _log.LogInformation("Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
+                                LogRoutingLine(item.Id, "spilling",
+                                    "Work item {Id}: spilling past {Agent}/{Model}: {Reason}",
                                     item.Id, member.Agent, member.ModelId ?? "(default)", reservationReason);
                             }
                             rejected.Add((member.Agent, member.ModelId, entry.EffectiveScore, reservationReason));
@@ -919,21 +956,40 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
                 var modDesc = DescribeModifiers(cfg.TodModifiers, member.Agent, nowUtc);
                 if (commitDispatchSideEffects)
                 {
+                    // Signature on the decision shape (chosen/scores/rejected
+                    // members), not the rejection prose: cosmetic churn in a
+                    // reason (relative ages) must not re-promote an unchanged
+                    // decision to Information — the per-member line already
+                    // carries the reason and flips on its own stable key.
+                    var scoredChanged = ShouldLogRoutingInformation(
+                        $"item:{item.Id}",
+                        "router:scored",
+                        member.Agent.Value, member.ModelId, entry.BaseScore, entry.EffectiveScore, modDesc,
+                        string.Join(";", rejected.Select(static r => $"{r.Agent.Value}/{r.ModelId ?? "(default)"}/{r.EffectiveScore}")));
                     AuditLog.QuotaRouterScored(
                         item.Id, classId,
                         member.Agent, member.ModelId,
                         entry.BaseScore, entry.EffectiveScore, modDesc,
-                        rejected);
+                        rejected,
+                        level: scoredChanged ? LogEventLevel.Information : LogEventLevel.Debug);
                 }
 
                 if (commitDispatchSideEffects)
                 {
-                    _log.LogInformation(
+                    // Signature on the F1-rounded availability the operator
+                    // sees: sub-0.05 probe jitter must not re-promote an
+                    // unchanged routing to Information.
+                    LogRoutingLine(
+                        item.Id,
+                        "routed",
                         "Work item {Id}: routed to {Agent}/{Billing} model={Model} " +
                         "baseScore={Base} effectiveScore={Eff} (available={Avail:F1}%)",
-                        item.Id, member.Agent, member.Billing,
-                        member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
-                        quota.AvailablePct);
+                        [item.Id, member.Agent, member.Billing,
+                            member.ModelId ?? "(default)", entry.BaseScore, entry.EffectiveScore,
+                            quota.AvailablePct],
+                        [member.Agent.Value, member.Billing,
+                            member.ModelId, entry.BaseScore, entry.EffectiveScore,
+                            Math.Round(quota.AvailablePct, 1)]);
                 }
 
                 if (commitDispatchSideEffects && ShouldConsumeOnDispatch(quotaRetryAdmission))
@@ -1576,7 +1632,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _log.LogDebug(ex,
+                LogProbeThrew(ex, member, "threw:fallback",
                     "Quota probe for fallback candidate {Agent}/{Model} threw; treating as unknown",
                     member.Agent.Value, member.ModelId ?? "(default)");
                 snapshot = new AgentQuotaSnapshot
@@ -1891,7 +1947,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _log.LogDebug(ex,
+            LogProbeThrew(ex, member, "threw:resume",
                 "Quota probe for resume candidate {Agent}/{Model} threw; treating as unknown",
                 member.Agent.Value, member.ModelId ?? "(default)");
             snapshot = new AgentQuotaSnapshot
@@ -2229,7 +2285,7 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         {
             // Probe threw (transient API error). Treat it as unknown (-1) and
             // still apply the local-budget MIN rather than aborting routing.
-            _log.LogDebug(ex,
+            LogProbeThrew(ex, member, "threw",
                 "Quota probe for {Agent}/{Model} threw; treating as unknown",
                 member.Agent.Value, member.ModelId ?? "(default)");
             return AgentQuotaSnapshot.UnknownSnapshot(
@@ -2978,15 +3034,110 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         return resetAt;
     }
 
-    private void LogMemberExcluded(WorkItemId itemId, AgentMembership member, string reason)
-    {
-        _log.LogInformation(
+    private void LogMemberExcluded(WorkItemId itemId, AgentMembership member, string reason) =>
+        LogRoutingLine(
+            itemId,
+            "excluded",
             "Work item {Id}: excluded {Agent}/{Model}: {Reason}",
             itemId,
             member.Agent.Value,
             member.ModelId ?? "(default)",
             reason);
+
+    /// <summary>
+    /// Emits one per-evaluation routing line at Information the first time its
+    /// content is seen for <paramref name="itemId"/> (or when the content
+    /// changes) and at Debug for identical repeats. <paramref name="key"/>
+    /// names the line site; <paramref name="args"/> both render the template
+    /// and form the change signature, so every site whose template does not
+    /// name the member must fold the member identity into <paramref name="key"/>
+    /// (e.g. <c>$"rejected:{agent}/{model}"</c>) to keep two members sharing a
+    /// reason from collapsing into one entry. Sites whose rendered text
+    /// contains cosmetic churn that is not a decision change (relative ages)
+    /// must use the <paramref name="signatureArgs"/> overload instead.
+    /// </summary>
+    private void LogRoutingLine(WorkItemId itemId, string key, string template, params object?[] args) =>
+        LogRoutingLine(itemId, key, template, args, args);
+
+    private void LogRoutingLine(
+        WorkItemId itemId,
+        string key,
+        string template,
+        object?[] logArgs,
+        object?[] signatureArgs)
+    {
+        if (ShouldLogRoutingInformation($"item:{itemId}", key, signatureArgs))
+            _log.LogInformation(template, logArgs);
+        else
+            _log.LogDebug(template, logArgs);
     }
+
+    /// <summary>
+    /// Change detector behind <see cref="LogRoutingLine"/> and the audit-tier
+    /// routing events. Returns true on first sight or content change (caller
+    /// logs at Information), false for an identical repeat (caller logs at
+    /// Debug). Benign on races: a lost update only repeats one Information
+    /// line.
+    /// </summary>
+    private bool ShouldLogRoutingInformation(string scope, string key, params object?[] args)
+    {
+        var signature = BuildRoutingSignature(args);
+        var mapKey = (Scope: scope, Key: key);
+        if (_lastRoutingLine.TryGetValue(mapKey, out var last) && last == signature)
+            return false;
+        if (_lastRoutingLine.Count >= MaxTrackedRoutingLines)
+            _lastRoutingLine.Clear();
+        _lastRoutingLine[mapKey] = signature;
+        return true;
+    }
+
+    /// <summary>
+    /// Probe-result change detector: returns true on first sight or when the
+    /// reading differs from the last probe of the same (agent, route, class),
+    /// false for an identical repeat. Callers log quota probes at Debug on
+    /// <c>false</c> and at Information on <c>true</c>; probe errors bypass
+    /// this and go through <see cref="ShouldLogRoutingInformation"/> so a new
+    /// failure is always visible.
+    /// </summary>
+    private bool ProbeReadingChanged(
+        AgentKind agent,
+        string routeKey,
+        string classId,
+        double availablePct,
+        DateTimeOffset? resetAt,
+        string? notes)
+    {
+        var mapKey = (Agent: agent.Value, RouteKey: routeKey, ClassId: classId);
+        var reading = (AvailablePct: availablePct, ResetAt: resetAt, Notes: notes);
+        if (_lastProbeReading.TryGetValue(mapKey, out var last) && last == reading)
+            return false;
+        if (_lastProbeReading.Count >= MaxTrackedRoutingLines)
+            _lastProbeReading.Clear();
+        _lastProbeReading[mapKey] = reading;
+        return true;
+    }
+
+    /// <summary>
+    /// Emits a probe-failure line at Information on first sight (or when the
+    /// failing member or exception type changes) and at Debug for identical
+    /// repeats, keeping the exception attached in both cases. Probe errors
+    /// stay visible without spamming per evaluation while a provider is down.
+    /// </summary>
+    private void LogProbeThrew(Exception ex, AgentMembership member, string key, string template, params object?[] args)
+    {
+        if (ShouldLogRoutingInformation($"probe:{member.Agent.Value}/{member.RouteKey}", key, [member.Agent.Value, member.ModelId, ex.GetType().Name]))
+            _log.LogInformation(ex, template, args);
+        else
+            _log.LogDebug(ex, template, args);
+    }
+
+    private static string BuildRoutingSignature(object?[] args) =>
+        string.Join("|", args.Select(static a => a switch
+        {
+            null => "",
+            IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+            _ => a.ToString() ?? "",
+        }));
 
     /// <summary>
     /// Returns the absolute floor for one provider window name (e.g. <c>five_hour</c>).
@@ -3122,9 +3273,16 @@ public sealed class AgentClassRouter : IAgentQuotaAvailabilitySnapshot, IAgentQu
         var reason =
             $"rate-aware gate: running={running} >= fit={fit:F2} " +
             $"(avgBurn={estimate.AvgBurnPctPerItem:F1}% available={availablePct:F1}% samples={estimate.SampleCount} status={estimate.Status})";
+        // Signature on the rendered precision the operator sees: sub-cent fit
+        // jitter must not re-promote an unchanged refusal to Information.
+        var gatedChanged = ShouldLogRoutingInformation(
+            $"probe:{member.Agent.Value}/{member.RouteKey}", "rate-aware-gated",
+            running, Math.Round(fit, 2), Math.Round(estimate.AvgBurnPctPerItem, 1),
+            Math.Round(availablePct, 1), estimate.SampleCount, estimate.Status);
         AuditLog.RateAwareGated(
             member.Agent, member.ModelId, running, fit,
-            estimate.AvgBurnPctPerItem, availablePct, estimate.SampleCount, estimate.Status);
+            estimate.AvgBurnPctPerItem, availablePct, estimate.SampleCount, estimate.Status,
+            level: gatedChanged ? LogEventLevel.Information : LogEventLevel.Debug);
         return new QuotaGateDecision(false, reason);
     }
 
