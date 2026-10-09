@@ -137,6 +137,10 @@ not; `NotEnforced` providers are logged as a warning stating the restriction.
   Cloud servers (`ProviderKind: hetzner`; `NotEnforced` classification,
   dedicated kernel, approved-image pin, per-sandbox SSH keys, firewalls, and
   optional floating IPs).
+- [`ec2-sandbox-plugin.md`](ec2-sandbox-plugin.md) — hosted AWS EC2
+  instances (`ProviderKind: ec2`; `NotEnforced` classification, dedicated
+  kernel, pinned AMI, per-sandbox SSH key pairs and security groups, and
+  optional Elastic IPs).
 - [`tart-sandbox-plugin.md`](tart-sandbox-plugin.md) — local Tart VMs on
   Apple Silicon macOS hosts (`ProviderKind: tart`; `NotEnforced`
   classification — macOS cannot provide nftables egress — OCI images,

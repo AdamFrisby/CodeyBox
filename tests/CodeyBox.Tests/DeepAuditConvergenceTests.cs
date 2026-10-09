@@ -59,6 +59,14 @@ public sealed class DeepAuditConvergenceTests : IDisposable
 
         // Assert
         Assert.Equal(ReleaseState.Released, final);
+        // TransitionReleasedAsync commits the Released state before the
+        // release.published webhook is appended, so a poll tick can observe
+        // Released while the event is still in flight. Wait briefly for the
+        // event itself (mirrors the release.failed handling below).
+        var publishedDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (!_webhooks.Events.Any(e => e.Event == "release.published")
+            && DateTimeOffset.UtcNow < publishedDeadline)
+            await Task.Delay(20);
         Assert.Contains(_webhooks.Events, e => e.Event == "release.published");
     }
 
