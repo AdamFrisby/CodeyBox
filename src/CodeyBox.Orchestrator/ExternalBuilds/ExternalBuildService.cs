@@ -69,7 +69,7 @@ public sealed class ExternalBuildService
             throw new ExternalBuildTargetNotApprovedException(request.ApprovedTargetName + " (no provider)");
         if (request.Source is null) throw new ArgumentException("Source identity is required.", nameof(request));
         if (request.Source.CandidateRef is not null)
-            new ExternalBuildGitPublicationPolicy().ValidateRef(request.Source.CandidateRef);
+            ValidateCandidateRef(request.Source.CandidateRef, opts.AllowedCandidateRefPrefixes);
 
         var target = new ExternalBuildTargetKey
         {
@@ -225,6 +225,18 @@ public sealed class ExternalBuildService
         if (stamps.Count > MaxRateEntries)
             stamps.RemoveRange(0, stamps.Count - MaxRateEntries);
         windows[key] = stamps;
+    }
+
+    private static void ValidateCandidateRef(string candidateRef, List<string> allowedPrefixes)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidateRef);
+        foreach (var prefix in allowedPrefixes)
+        {
+            if (candidateRef.StartsWith(prefix, StringComparison.Ordinal))
+                return;
+        }
+        throw new InvalidOperationException(
+            $"Candidate ref '{candidateRef}' is outside the approved namespaces.");
     }
 
     private static string NormalizeIdempotencyKey(ExternalBuildStartRequest request, int maxChars)

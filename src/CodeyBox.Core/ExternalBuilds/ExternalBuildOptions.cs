@@ -148,6 +148,16 @@ public sealed class ExternalBuildOptions
     /// </summary>
     public int MaxIdempotencyKeyChars { get; set; } = 128;
 
+    /// <summary>
+    /// Approved temporary-candidate ref namespaces (exact prefix match).
+    /// Default <c>refs/candidates/</c>. Providers that can only dispatch
+    /// branch/tag refs (for example GitHub Actions) need the operator to
+    /// additionally allow a dispatchable branch namespace such as
+    /// <c>refs/heads/codeybox-candidates/</c>; the provider still validates
+    /// its own dispatchable subset at its sink. Hot-reloadable.
+    /// </summary>
+    public List<string> AllowedCandidateRefPrefixes { get; set; } = ["refs/candidates/"];
+
     public static bool IsValid(ExternalBuildOptions opts) =>
         opts.MaxConcurrentPerProject is >= 1 and <= 32
         && opts.MaxConcurrentPerProvider is >= 1 and <= 64
@@ -179,7 +189,10 @@ public sealed class ExternalBuildOptions
         && opts.HistoryRetentionDays is >= 1 and <= 365
         && opts.MaxHistorySamples is >= 100 and <= 1_000_000
         && opts.CapabilityLifetimeSeconds is >= 60 and <= 86400
-        && opts.MaxIdempotencyKeyChars is >= 16 and <= 1024;
+        && opts.MaxIdempotencyKeyChars is >= 16 and <= 1024
+        && opts.AllowedCandidateRefPrefixes.Count is >= 1 and <= 8
+        && opts.AllowedCandidateRefPrefixes.All(static p =>
+            !string.IsNullOrWhiteSpace(p) && p.StartsWith("refs/", StringComparison.Ordinal) && p.Length <= 128);
 }
 
 /// <summary>

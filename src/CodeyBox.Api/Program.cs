@@ -41,6 +41,7 @@ using CodeyBox.Audit.Llm;
 using CodeyBox.Audit.Llm.PlanAudit;
 using CodeyBox.Audit.Presets;
 using CodeyBox.Audit.Shell;
+using CodeyBox.Build.GitHubActions;
 using CodeyBox.Build.MSBuild;
 using CodeyBox.DotnetTestRunnerPlugin;
 using CodeyBox.Core;
@@ -439,6 +440,13 @@ builder.Services.AddOptions<AuditRunOptions>()
 // capability-based producer, but captures/parses nothing until the operator
 // opts in. See docs/concepts/msbuild-diagnostics.md.
 builder.Services.AddMSBuildBuildDiagnostics(builder.Configuration);
+// GitHub Actions execution/evidence adapter (CodeyBox:GitHubActionsBuilds).
+// Disabled by default: registers the hot-reloadable options plus the
+// binding store only. The HTTP transport and provider need the credentialed
+// overload with an explicit IGitHubTokenProvider; nothing dispatches, polls,
+// or reads artifacts until the operator opts in AND pins an approved
+// workflow. See docs/concepts/github-actions-builds.md.
+builder.Services.AddGitHubActionsExternalBuilds(builder.Configuration);
 // Post-merge baseline-production knobs
 // (Audit:TestSelection:BaselineProduction). Bound through AddOptions so
 // IOptionsMonitor<TestSelectionBaselineProductionOptions> hot-reloads the
