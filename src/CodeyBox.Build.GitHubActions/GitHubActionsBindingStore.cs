@@ -38,9 +38,10 @@ public interface IGitHubActionsBindingStore
 /// <summary>
 /// In-memory binding store with a hard entry cap and
 /// oldest-updated-first eviction, so a misconfigured caller cannot grow
-/// memory without bound. Single-host deployments share one instance across
-/// service restarts (registered singleton), which is what makes
-/// no-duplicate-run-after-restart hold.
+/// memory without bound. Lifetime is process-local only: bindings survive
+/// provider re-creation in-process (registered singleton) but are wiped by a
+/// process restart, so restart safety (no duplicate run after restart)
+/// requires a durable backing store, which this implementation does not provide.
 /// </summary>
 public sealed class InMemoryGitHubActionsBindingStore : IGitHubActionsBindingStore
 {
