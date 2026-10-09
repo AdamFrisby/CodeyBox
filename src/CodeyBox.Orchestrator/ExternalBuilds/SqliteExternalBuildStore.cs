@@ -85,6 +85,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                     completed_at TEXT NOT NULL,
                     cold_cache INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE INDEX IF NOT EXISTS idx_exthistory_completed ON external_build_history(completed_at DESC);
                 """;
             cmd.ExecuteNonQuery();
             using var migrate = _conn.CreateCommand();
@@ -455,13 +456,22 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
         return Task.CompletedTask;
     }
 
-    public Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(CancellationToken ct = default)
+    public Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(DateTimeOffset? since = null, int? limit = null, CancellationToken ct = default)
     {
+        if (limit is <= 0) throw new ArgumentOutOfRangeException(nameof(limit));
         _writeLock.Wait(ct);
         try
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT target_json, duration_ticks, completed_ok, completed_at, cold_cache FROM external_build_history ORDER BY completed_at DESC;";
+            // WHY the recency filter plus LIMIT: the history table grows once
+            // per successful build, so an unbounded full-table read lets a
+            // scoped caller driving completions force unbounded memory. Every
+            // caller passes both bounds.
+            cmd.CommandText = limit.HasValue
+                ? "SELECT target_json, duration_ticks, completed_ok, completed_at, cold_cache FROM external_build_history WHERE ($s IS NULL OR completed_at >= $s) ORDER BY completed_at DESC, id DESC LIMIT $l;"
+                : "SELECT target_json, duration_ticks, completed_ok, completed_at, cold_cache FROM external_build_history WHERE ($s IS NULL OR completed_at >= $s) ORDER BY completed_at DESC, id DESC;";
+            cmd.Parameters.AddWithValue("$s", since.HasValue ? (object)since.Value.ToString("O") : DBNull.Value);
+            if (limit.HasValue) cmd.Parameters.AddWithValue("$l", limit.Value);
             var list = new List<ExternalBuildDurationSample>();
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
@@ -472,6 +482,36 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                     DateTimeOffset.Parse(reader.GetString(3)),
                     reader.GetInt32(4) != 0));
             return Task.FromResult<IReadOnlyList<ExternalBuildDurationSample>>(list);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public Task<int> PruneHistoryAsync(DateTimeOffset cutoff, int maxRows, CancellationToken ct = default)
+    {
+        if (maxRows < 0) throw new ArgumentOutOfRangeException(nameof(maxRows));
+        _writeLock.Wait(ct);
+        try
+        {
+            var removed = 0;
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "DELETE FROM external_build_history WHERE completed_at < $c;";
+                cmd.Parameters.AddWithValue("$c", cutoff.ToString("O"));
+                removed += cmd.ExecuteNonQuery();
+            }
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = """
+                    DELETE FROM external_build_history WHERE id NOT IN (
+                        SELECT id FROM external_build_history ORDER BY completed_at DESC, id DESC LIMIT $m);
+                    """;
+                cmd.Parameters.AddWithValue("$m", maxRows);
+                removed += cmd.ExecuteNonQuery();
+            }
+            return Task.FromResult(removed);
         }
         finally
         {

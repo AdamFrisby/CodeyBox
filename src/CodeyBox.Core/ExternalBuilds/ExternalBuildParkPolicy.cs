@@ -109,17 +109,52 @@ public static class ExternalBuildParkPolicy
 /// <summary>In-memory comparable-duration history (production uses a durable store).</summary>
 public sealed class InMemoryExternalBuildHistory
 {
+    /// <summary>
+    /// Absolute safety bound so even a misconfigured caller cannot grow
+    /// memory without limit. The coordinator prunes to the configured
+    /// <c>MaxHistorySamples</c> (which never exceeds this) on every write.
+    /// </summary>
+    public const int AbsoluteMaxSamples = 1_000_000;
+
     private readonly object _gate = new();
     private readonly List<ExternalBuildDurationSample> _samples = [];
 
     public void Record(ExternalBuildDurationSample sample)
     {
         ArgumentNullException.ThrowIfNull(sample);
-        lock (_gate) _samples.Add(sample);
+        lock (_gate)
+        {
+            _samples.Add(sample);
+            if (_samples.Count > AbsoluteMaxSamples)
+                _samples.RemoveRange(0, _samples.Count - AbsoluteMaxSamples);
+        }
     }
 
     public IReadOnlyList<ExternalBuildDurationSample> Snapshot()
     {
         lock (_gate) return _samples.ToList();
+    }
+
+    /// <summary>
+    /// Drops samples older than <paramref name="cutoff"/>, then trims
+    /// oldest-first so at most <paramref name="maxRows"/> remain. Called by
+    /// the coordinator after every record so the per-completion growth path
+    /// stays bounded even when scheduled cleanup never runs. Idempotent.
+    /// </summary>
+    public int Prune(DateTimeOffset cutoff, int maxRows)
+    {
+        if (maxRows < 0) throw new ArgumentOutOfRangeException(nameof(maxRows));
+        lock (_gate)
+        {
+            var removed = _samples.RemoveAll(s => s.CompletedAt < cutoff);
+            var excess = _samples.Count - maxRows;
+            if (excess > 0)
+            {
+                _samples.Sort(static (a, b) => a.CompletedAt.CompareTo(b.CompletedAt));
+                _samples.RemoveRange(0, excess);
+                removed += excess;
+            }
+            return removed;
+        }
     }
 }

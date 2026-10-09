@@ -169,7 +169,13 @@ options (`ExternalBuildOptions`, defaults OFF):
   and stay retriable under the existing poll bound.
 
 `CleanupAsync` deletes terminal records past retention; no ghost builds
-survive restart (non-terminal records reconcile on next poll). Artifact ingestion (`ExternalBuildArtifactGuard`) checks
+survive restart (non-terminal records reconcile on next poll). Duration
+history (`external_build_history`, one row per successful build) is bounded
+independently of build-row retention: `HistoryRetentionDays` (30) prunes
+stale samples and `MaxHistorySamples` (10,000) caps total rows oldest-first.
+`CleanupAsync` prunes, the per-completion delivery path prunes after every
+record (so growth between cleanups stays bounded), and history reads always
+carry a recency filter plus `LIMIT`. Artifact ingestion (`ExternalBuildArtifactGuard`) checks
 size/decompression/entry limits before buffering, rejects traversal and
 symlinks, verifies digests, enforces https exact-host URL allowlists,
 redacts secrets, and never executes downloaded artifacts.

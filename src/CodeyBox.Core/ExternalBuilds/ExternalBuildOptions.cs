@@ -120,6 +120,23 @@ public sealed class ExternalBuildOptions
     /// <summary>Retention days for terminal build records. Default 30.</summary>
     public int RetentionDays { get; set; } = 30;
 
+    /// <summary>
+    /// Retention days for persisted duration-history samples
+    /// (<c>external_build_history</c>). Samples older than this are pruned by
+    /// <c>CleanupAsync</c> and excluded from bounded history reads. Aligns
+    /// with the predictor's stale-sample horizon. Default 30.
+    /// </summary>
+    public int HistoryRetentionDays { get; set; } = 30;
+
+    /// <summary>
+    /// Max persisted duration-history samples kept in the durable store.
+    /// Both scheduled cleanup and the per-completion delivery path prune
+    /// oldest-first down to this bound, and history reads never return more
+    /// than this many rows, so a scoped caller driving completions cannot
+    /// grow the table or a read without bound. Default 10,000.
+    /// </summary>
+    public int MaxHistorySamples { get; set; } = 10_000;
+
     /// <summary>Scoped sandbox capability lifetime in seconds. Default 3600.</summary>
     public int CapabilityLifetimeSeconds { get; set; } = 3600;
 
@@ -159,6 +176,8 @@ public sealed class ExternalBuildOptions
         && opts.MaxArchiveEntries is >= 1 and <= 500_000
         && opts.MaxDiagnosticsChars is >= 256 and <= 1024 * 1024
         && opts.RetentionDays is >= 1 and <= 365
+        && opts.HistoryRetentionDays is >= 1 and <= 365
+        && opts.MaxHistorySamples is >= 100 and <= 1_000_000
         && opts.CapabilityLifetimeSeconds is >= 60 and <= 86400
         && opts.MaxIdempotencyKeyChars is >= 16 and <= 1024;
 }

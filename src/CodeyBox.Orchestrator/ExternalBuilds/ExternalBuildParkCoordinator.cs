@@ -57,7 +57,15 @@ public sealed class ExternalBuildParkCoordinator
         if (ExternalBuildLifecycle.IsTerminal(record.State))
             return null;
         var opts = _options();
-        var history = _history.Snapshot().Concat(await _store.ListSamplesAsync(ct).ConfigureAwait(false)).ToList();
+        var now = _clock.GetUtcNow();
+        // WHY the recency filter plus LIMIT: the history table grows once per
+        // successful build, so an unbounded full-table read lets a scoped
+        // caller driving completions force unbounded memory on every park
+        // decision. The predictor already ignores stale samples, so the SQL
+        // filter matches estimator semantics.
+        var cutoff = now.AddDays(-opts.HistoryRetentionDays);
+        var history = _history.Snapshot().Concat(
+            await _store.ListSamplesAsync(cutoff, opts.MaxHistorySamples, ct).ConfigureAwait(false)).ToList();
         var decision = ExternalBuildParkPolicy.Decide(
             record.Target, history, opts.HistorySampleSize,
             opts.MinSamplesForPrediction,
@@ -150,6 +158,15 @@ public sealed class ExternalBuildParkCoordinator
                     true, record.CompletedAt ?? _clock.GetUtcNow(), ColdCache: false);
                 _history.Record(sample);
                 await _store.RecordSampleAsync(sample, ct).ConfigureAwait(false);
+                // WHY prune on the write path, not only in scheduled
+                // cleanup: this delivery path is what grows the table (one
+                // row per successful build), so bounding here keeps a scoped
+                // caller from growing it without bound between cleanups.
+                var historyOpts = _options();
+                var sampleCutoff = _clock.GetUtcNow().AddDays(-historyOpts.HistoryRetentionDays);
+                var maxSamples = historyOpts.MaxHistorySamples;
+                _history.Prune(sampleCutoff, maxSamples);
+                await _store.PruneHistoryAsync(sampleCutoff, maxSamples, ct).ConfigureAwait(false);
             }
         }
         return delivered;

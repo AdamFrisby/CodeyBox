@@ -28,7 +28,19 @@ public interface IExternalBuildStore
     Task<ExternalBuildParkRecord?> GetParkAsync(string buildId, CancellationToken ct = default);
     Task RemoveParkAsync(string buildId, CancellationToken ct = default);
     Task RecordSampleAsync(ExternalBuildDurationSample sample, CancellationToken ct = default);
-    Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(CancellationToken ct = default);
+    /// <summary>
+    /// Bounded history read: only samples at or after <paramref name="since"/>
+    /// (when supplied) are returned, newest first, capped at
+    /// <paramref name="limit"/> rows (when supplied). Callers must pass both
+    /// so a large table is never loaded whole into memory.
+    /// </summary>
+    Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(DateTimeOffset? since = null, int? limit = null, CancellationToken ct = default);
+    /// <summary>
+    /// Deletes samples older than <paramref name="cutoff"/>, then trims
+    /// oldest-first so at most <paramref name="maxRows"/> remain. Returns
+    /// the number of rows deleted. Idempotent.
+    /// </summary>
+    Task<int> PruneHistoryAsync(DateTimeOffset cutoff, int maxRows, CancellationToken ct = default);
 }
 
 /// <summary>Persisted park wait: reason/estimate/sample count survive restart.</summary>
@@ -175,8 +187,34 @@ public sealed class InMemoryExternalBuildStore : IExternalBuildStore
         return Task.CompletedTask;
     }
 
-    public Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(CancellationToken ct = default)
+    public Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(DateTimeOffset? since = null, int? limit = null, CancellationToken ct = default)
     {
-        lock (_gate) return Task.FromResult<IReadOnlyList<ExternalBuildDurationSample>>(_samples.ToList());
+        if (limit is <= 0) throw new ArgumentOutOfRangeException(nameof(limit));
+        lock (_gate) return Task.FromResult<IReadOnlyList<ExternalBuildDurationSample>>(
+            _samples
+                .Where(s => since is null || s.CompletedAt >= since.Value)
+                .OrderByDescending(s => s.CompletedAt)
+                .Take(limit ?? int.MaxValue)
+                .ToList());
+    }
+
+    public Task<int> PruneHistoryAsync(DateTimeOffset cutoff, int maxRows, CancellationToken ct = default)
+    {
+        if (maxRows < 0) throw new ArgumentOutOfRangeException(nameof(maxRows));
+        lock (_gate)
+        {
+            var removed = _samples.RemoveAll(s => s.CompletedAt < cutoff);
+            var excess = _samples.Count - maxRows;
+            if (excess > 0)
+            {
+                var drop = _samples
+                    .OrderBy(s => s.CompletedAt)
+                    .Take(excess)
+                    .ToList();
+                foreach (var s in drop) _samples.Remove(s);
+                removed += drop.Count;
+            }
+            return Task.FromResult(removed);
+        }
     }
 }

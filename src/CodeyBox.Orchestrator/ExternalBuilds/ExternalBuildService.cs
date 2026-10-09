@@ -385,8 +385,14 @@ public sealed class ExternalBuildService
     public async Task CleanupAsync(CancellationToken ct = default)
     {
         var opts = _options();
+        var now = _clock.GetUtcNow();
         await _store.DeleteOlderThanAsync(
-            _clock.GetUtcNow().AddDays(-opts.RetentionDays), ct).ConfigureAwait(false);
+            now.AddDays(-opts.RetentionDays), ct).ConfigureAwait(false);
+        // WHY history is pruned here too: external_build_history grows once
+        // per successful build, so retention limited to build rows alone
+        // would still leak the history table without bound.
+        await _store.PruneHistoryAsync(
+            now.AddDays(-opts.HistoryRetentionDays), opts.MaxHistorySamples, ct).ConfigureAwait(false);
     }
 
     private async Task<ExternalBuildRecord> DispatchAsync(
