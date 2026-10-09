@@ -211,6 +211,34 @@ public interface IUpstreamRemote
         => Task.FromResult<UpstreamRepositoryMetadata?>(null);
 
     /// <summary>
+    /// Reads the current head sha of <paramref name="branch"/> on the forge
+    /// without touching any local ref. Returns <c>null</c> when this upstream
+    /// kind cannot report branch tips or the branch does not exist.
+    /// Unsupported is non-fatal: callers fall back to the push-alone path or
+    /// require explicit ownership confirmation.
+    /// </summary>
+    Task<string?> GetBranchHeadShaAsync(
+        string branch, CancellationToken ct = default)
+        => Task.FromResult<string?>(null);
+
+    /// <summary>
+    /// Lists the full commit messages reachable from <paramref name="head"/>
+    /// (a branch name or commit sha) but not from <paramref name="baseBranch"/>,
+    /// oldest first. Used to prove a stale owned-branch tip is CodeyBox's own
+    /// history (see <see cref="BranchOwnershipPolicy"/>) before a
+    /// lease-guarded rewrite. At most <paramref name="maxCommits"/> messages
+    /// are returned and each is truncated to a bounded size; when the
+    /// exclusive set is larger, implementations report what they can and
+    /// callers treat the oversized range as unverifiable. Returns
+    /// <c>null</c> when this upstream kind cannot list branch commits.
+    /// Unsupported is non-fatal: callers refuse the rewrite unless the
+    /// operator explicitly confirms ownership.
+    /// </summary>
+    Task<IReadOnlyList<string>?> ListBranchCommitMessagesAsync(
+        string baseBranch, string head, int maxCommits, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<string>?>(null);
+
+    /// <summary>
     /// Forge capability seam for audit check-run publication. Returns whether
     /// this remote can publish structured audit findings as forge check runs.
     /// The default reports unsupported so non-GitHub forges (noop,

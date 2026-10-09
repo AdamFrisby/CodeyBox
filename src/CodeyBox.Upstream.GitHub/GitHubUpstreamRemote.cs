@@ -42,6 +42,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly ITimingStore? _timings;
     private readonly IPullRequestDescriptionGenerator? _descriptionGenerator;
     private readonly CommitAttribution _attribution;
+    private readonly UpstreamBranchOwnershipSnapshot _ownership;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
@@ -50,7 +51,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         GitHubUpstreamOptions opts,
         ITimingStore? timings = null,
         IPullRequestDescriptionGenerator? descriptionGenerator = null,
-        CommitAttribution? attribution = null)
+        CommitAttribution? attribution = null,
+        UpstreamBranchOwnershipSnapshot? ownership = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -63,6 +65,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         _timings = timings;
         _descriptionGenerator = descriptionGenerator;
         _attribution = attribution ?? CommitAttribution.Default;
+        _ownership = ownership ?? new UpstreamBranchOwnershipSnapshot(new UpstreamBranchOwnershipOptions());
         if (!IsValidRemoteName(_opts.Owner))
             throw new ArgumentException($"GitHub Owner contains invalid characters: '{_opts.Owner}'", nameof(opts));
         if (!IsValidRemoteName(_opts.Repository))
@@ -466,6 +469,164 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             detail.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{detail.Number}",
             status,
             detail.Merged ? detail.MergeCommitSha : null);
+    }
+
+    /// <inheritdoc />
+    public async Task<string?> GetBranchHeadShaAsync(string branch, CancellationToken ct = default)
+    {
+        Validation.ValidateBranchName(branch, nameof(branch));
+        var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/branches/{Uri.EscapeDataString(branch)}";
+        using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
+        using var resp = await SendAsync(req, ct);
+        if (resp.StatusCode == HttpStatusCode.NotFound)
+            return null;
+        if (!resp.IsSuccessStatusCode)
+        {
+            AuditLog.UpstreamApiCallFailed("GET /branches", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+            return null;
+        }
+        var detail = await resp.Content.ReadFromJsonAsync<GitHubBranchDetail>(ct);
+        var sha = detail?.Commit?.Sha?.Trim();
+        if (string.IsNullOrWhiteSpace(sha))
+            return null;
+        try
+        {
+            Validation.ValidateCommitSha(sha, "branch head sha");
+        }
+        catch (ArgumentException)
+        {
+            _log.LogWarning(
+                "GitHub branch '{Branch}' reported an invalid head sha; ignoring",
+                SanitizeForLog(branch));
+            return null;
+        }
+        return sha.ToLowerInvariant();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<string>?> ListBranchCommitMessagesAsync(
+        string baseBranch, string head, int maxCommits, CancellationToken ct = default)
+    {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        if (string.IsNullOrWhiteSpace(head))
+            throw new ArgumentException("head must not be empty", nameof(head));
+        if (IsCommitSha(head))
+            Validation.ValidateCommitSha(head, nameof(head));
+        else
+            Validation.ValidateBranchName(head, nameof(head));
+        if (maxCommits < 1)
+            return null;
+
+        const int perPage = 100;
+        const int maxMessageBytes = 32768;
+        var pageSize = Math.Min(perPage, maxCommits);
+        var messages = new List<string>();
+        for (var page = 1; ; page++)
+        {
+            var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/compare/" +
+                $"{Uri.EscapeDataString(baseBranch)}...{Uri.EscapeDataString(head)}" +
+                $"?per_page={pageSize}&page={page}";
+            using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
+            using var resp = await SendAsync(req, ct);
+            if (!resp.IsSuccessStatusCode)
+            {
+                AuditLog.UpstreamApiCallFailed("GET /compare", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                _log.LogDebug(
+                    "GitHub compare {Base}...{Head} returned {Status}; ownership unverifiable",
+                    SanitizeForLog(baseBranch), SanitizeForLog(head), (int)resp.StatusCode);
+                return null;
+            }
+            var comparison = await resp.Content.ReadFromJsonAsync<GitHubCompareResponse>(ct);
+            if (comparison is null)
+                return null;
+            if (comparison.TotalCommits > maxCommits)
+            {
+                _log.LogDebug(
+                    "GitHub compare {Base}...{Head} reports {Total} exclusive commits (cap {Cap}); ownership unverifiable",
+                    SanitizeForLog(baseBranch), SanitizeForLog(head), comparison.TotalCommits, maxCommits);
+                return null;
+            }
+            foreach (var commit in comparison.Commits ?? [])
+            {
+                var message = commit.Commit?.Message;
+                if (string.IsNullOrWhiteSpace(message))
+                    continue;
+                messages.Add(TruncateMessageTail(message.Trim(), maxMessageBytes));
+            }
+            if ((comparison.Commits?.Count ?? 0) < pageSize)
+                break;
+        }
+        return messages;
+    }
+
+    /// <summary>
+    /// Proves a diverged remote tip is CodeyBox's own history by listing the
+    /// commits exclusive of <paramref name="baseBranch"/> through the compare
+    /// API and requiring every one to carry the configured trailers. An empty
+    /// exclusive set is safe (the tip sits at or behind the base, so nothing
+    /// foreign can be lost); any unreadable, oversized, or unmarked range is
+    /// unverified — never assumed. Never throws except on cancellation.
+    /// </summary>
+    private async Task<bool> TryVerifyRemoteTipOwnedAsync(
+        string baseBranch, string remoteSha, CancellationToken ct)
+    {
+        try
+        {
+            var options = _ownership.Current;
+            var keys = options.RequiredTrailerKeys ?? [];
+            if (keys.Length == 0)
+                return false;
+            var messages = await ListBranchCommitMessagesAsync(
+                baseBranch, remoteSha, Math.Max(1, options.MaxCommitsToVerify), ct).ConfigureAwait(false);
+            if (messages is null)
+                return false;
+            if (messages.Count == 0)
+                return true;
+            return BranchOwnershipPolicy.AreAllCommitsOwned(messages, keys);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                "Ownership verification of remote tip {Sha} failed ({Message}); treating as unverified",
+                SanitizeForLog(remoteSha), ex.Message);
+            return false;
+        }
+    }
+
+    private static bool IsCommitSha(string value)
+    {
+        if (value.Length is < 40 or > 64)
+            return false;
+        foreach (var c in value)
+        {
+            if (!Uri.IsHexDigit(c))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Bounds one forge-supplied commit message to <paramref name="maxBytes"/>.
+    /// Trailers live at the end of the message, so an over-long message keeps
+    /// its tail (where ownership proof looks) rather than its head, with the
+    /// cut marked. Incomplete UTF-8 sequences at the cut are backed off.
+    /// </summary>
+    private static string TruncateMessageTail(string value, int maxBytes)
+    {
+        if (Encoding.UTF8.GetByteCount(value) <= maxBytes)
+            return value;
+        const string marker = "…[truncated]\n";
+        var markerBytes = Encoding.UTF8.GetByteCount(marker);
+        var keepBytes = Math.Max(0, maxBytes - markerBytes);
+        var bytes = Encoding.UTF8.GetBytes(value);
+        var start = bytes.Length - keepBytes;
+        while (start < bytes.Length && (bytes[start] & 0xC0) == 0x80)
+            start++;
+        return marker + Encoding.UTF8.GetString(bytes, start, bytes.Length - start);
     }
 
     /// <summary>
@@ -936,16 +1097,36 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
 
         var expected = request.ExpectedRemoteHeadSha?.Trim();
+        string leaseBase;
         if (string.IsNullOrWhiteSpace(expected))
-            throw new UpstreamOwnedBranchDivergedException(request.WorkBranch, remoteSha, localTip);
-        if (!string.Equals(expected, remoteSha, StringComparison.OrdinalIgnoreCase))
-            throw await BuildLeaseMismatchWithActualAsync(
-                request, expected, remoteSha, upstreamEnv, ct).ConfigureAwait(false);
+        {
+            // No recorded prior push to lease from: accept the remote tip as
+            // CodeyBox's own history only when every commit exclusive of the
+            // base carries the configured CodeyBox trailers. A single
+            // unmarked commit keeps the refusal — a third party's history is
+            // never rewritten without the operator's explicit re-drive
+            // confirmation. Verification failures (unreadable commits,
+            // oversized ranges, transient API errors) are unverified, never
+            // assumed.
+            if (!await TryVerifyRemoteTipOwnedAsync(request.BaseBranch, remoteSha, ct).ConfigureAwait(false))
+                throw new UpstreamOwnedBranchDivergedException(request.WorkBranch, remoteSha, localTip);
+            leaseBase = remoteSha;
+            _log.LogInformation(
+                "Work branch {WorkBranch} remote tip {Sha} proven CodeyBox-owned by commit trailers; rewriting under lease",
+                SanitizeForLog(request.WorkBranch), leaseBase);
+        }
+        else
+        {
+            if (!string.Equals(expected, remoteSha, StringComparison.OrdinalIgnoreCase))
+                throw await BuildLeaseMismatchWithActualAsync(
+                    request, expected, remoteSha, upstreamEnv, ct).ConfigureAwait(false);
+            leaseBase = remoteSha;
+        }
 
         try
         {
             await _gitHost.PushBranchWithLeaseAsync(
-                request.RepositoryId, repoUrl, request.WorkBranch, remoteSha, upstreamEnv, ct);
+                request.RepositoryId, repoUrl, request.WorkBranch, leaseBase, upstreamEnv, ct);
         }
         catch (UpstreamLeaseMismatchException ex)
         {
@@ -2412,6 +2593,16 @@ internal sealed record GitHubMergeResponse(
 
 internal sealed record GitHubPullRequestCommitResponse(
     [property: JsonPropertyName("commit")] GitHubPullRequestCommitDetail? Commit);
+
+internal sealed record GitHubBranchDetail(
+    [property: JsonPropertyName("commit")] GitHubBranchCommitRef? Commit);
+
+internal sealed record GitHubBranchCommitRef(
+    [property: JsonPropertyName("sha")] string? Sha);
+
+internal sealed record GitHubCompareResponse(
+    [property: JsonPropertyName("total_commits")] int TotalCommits,
+    [property: JsonPropertyName("commits")] IReadOnlyList<GitHubPullRequestCommitResponse>? Commits);
 
 internal sealed record GitHubPullRequestCommitDetail(
     [property: JsonPropertyName("message")] string? Message);

@@ -63,10 +63,11 @@ public sealed class StaleUpstreamRedriveDetector : BackgroundService
         {
             _log.LogWarning(
                 "Stranded upstream push: work item {Id} ('{Title}') is {State} with open PR #{Pr} ({Url}) on owned branch '{Branch}' (PR head {HeadSha}, last pushed {LastPushed}). " +
-                "Re-drive with POST /workitems/{Id}/redrive-upstream after confirming no third party pushed to the branch. Reason: {Reason}",
+                "Re-drive with POST /workitems/{Id}/redrive-upstream after confirming no third party pushed to the branch; " +
+                "pass {{\"confirmOwnership\": true}} when the branch has no recorded push or PR. Reason: {Reason}",
                 candidate.WorkItemId, candidate.Title, candidate.State,
-                candidate.PullRequestNumber, candidate.PullRequestUrl, candidate.WorkBranch,
-                candidate.PullRequestHeadSha, candidate.LastPushedWorkBranchSha ?? "(unrecorded)",
+                candidate.PullRequestNumber?.ToString() ?? "(none)", candidate.PullRequestUrl ?? "(none)", candidate.WorkBranch,
+                candidate.PullRequestHeadSha ?? "(none)", candidate.LastPushedWorkBranchSha ?? "(unrecorded)",
                 candidate.WorkItemId, candidate.Reason);
         }
     }

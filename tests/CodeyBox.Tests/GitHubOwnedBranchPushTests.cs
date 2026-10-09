@@ -76,6 +76,65 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
     }
 
     [Fact]
+    public async Task DivergedNoRecord_TrailerTip_PushesUnderLeaseAndReusesPr()
+    {
+        var workBranch = NewBranch();
+        using var setup = await SetupAsync();
+        // The previous attempt's head carries CodeyBox trailers but was never
+        // recorded on the item; the new head is composed on a fresh base and
+        // shares no history with it.
+        const string trailerMessage =
+            "previous attempt head\n\n" +
+            "CodeyBox-WorkItem: 6f2c9a1e3b4d5f6a7b8c9d0e1f2a3b4c\n" +
+            "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>";
+        var oldHead = await CommitBranchFileAsync(setup.UpstreamBare, workBranch, "old.txt", "old\n", trailerMessage);
+        var newHead = await RecomposeHostBranchOnFreshBaseAsync(setup.HostPath, workBranch);
+
+        var (owner, repo) = SplitGithubUrl(setup.GithubUrl);
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(Json(new // GET /compare/main...old: the stale tip is CodeyBox's own
+        {
+            total_commits = 1,
+            commits = new[] { new { sha = oldHead, commit = new { message = trailerMessage } } },
+        }));
+        handler.Enqueue(ValidationFailed()); // create → 422, an open PR already tracks the branch
+        handler.Enqueue(JsonList(new[] { new { number = 612 } })); // open PR listing
+        handler.Enqueue(Json(new // GET /pulls/612: open, head == pushed tip
+        {
+            number = 612,
+            html_url = $"https://github.com/{owner}/{repo}/pull/612",
+            state = "open",
+            merged = false,
+            mergeable = true,
+            mergeable_state = "clean",
+            head = new { @ref = workBranch, sha = newHead, user = new { login = owner } },
+            @base = new { @ref = "main", sha = "basesha" },
+        }));
+        handler.Enqueue(JsonList(Array.Empty<object>())); // GET /pulls/612/commits for squash message
+        handler.Enqueue(Json(new // PUT /pulls/612/merge
+        {
+            sha = "merge-sha-612",
+            merged = true,
+        }));
+        var remote = BuildRemote(setup.Host, handler, owner, repo, setup.Token, AutoMerge: true);
+
+        var outcome = await remote.CompleteAsync(
+            SampleRequest(setup.RepoId, workBranch, "squash", ExpectedRemoteHeadSha: null),
+            CancellationToken.None);
+
+        // The trailer-proven tip is rewritten under lease and the existing
+        // PR follows the new head through to merge.
+        Assert.Equal("merge-sha-612", outcome.MergedSha);
+        Assert.Equal(612, outcome.PullRequestNumber);
+        Assert.Equal(newHead, outcome.PushedWorkBranchSha);
+        var (_, tip, _) = await TestSupport.RunGit(setup.UpstreamBare, "rev-parse", workBranch);
+        Assert.Equal(newHead, tip.Trim());
+        Assert.Contains(setup.Shim.Invocations, i => i.Contains("--force-with-lease="));
+        Assert.Contains(handler.Requests, r =>
+            r.RequestUri!.ToString().Contains("/compare/", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ThirdPartyPush_LeaseMismatchParksWithoutClobber()
     {
         var workBranch = NewBranch();
@@ -116,9 +175,18 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
         var handler = new FakeHttpMessageHandler();
         var remote = BuildRemote(setup.Host, handler, owner, repo, setup.Token, AutoMerge: true);
 
-        // No ExpectedRemoteHeadSha: CodeyBox cannot prove the remote tip is
-        // its own history, so it must refuse — distinctly from a merge
-        // conflict, which would route into conflict-rework.
+        // No ExpectedRemoteHeadSha: the remote tip ("old work", no CodeyBox
+        // trailers) cannot be proven to be CodeyBox's own history, so the
+        // push must refuse — distinctly from a merge conflict, which would
+        // route into conflict-rework. The compare API is consulted for the
+        // trailer proof; the refusal leaves the remote intact and issues no
+        // PR call.
+        handler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(
+                """{"total_commits":1,"commits":[{"sha":"abc","commit":{"message":"old work"}}]}""",
+                Encoding.UTF8, "application/json"),
+        });
         var ex = await Assert.ThrowsAsync<UpstreamOwnedBranchDivergedException>(() =>
             remote.CompleteAsync(
                 SampleRequest(setup.RepoId, workBranch, "squash", ExpectedRemoteHeadSha: null),
@@ -127,10 +195,12 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
         Assert.Equal(workBranch, ex.Branch);
         Assert.Equal(oldHead, ex.RemoteSha);
         Assert.Contains("not a merge conflict", ex.Message);
+        Assert.Contains("confirmOwnership", ex.Message);
         Assert.False(UpstreamPushReconcileConflictException.TryFindIn(ex, out _));
         var (_, tip, _) = await TestSupport.RunGit(setup.UpstreamBare, "rev-parse", workBranch);
         Assert.Equal(oldHead, tip.Trim());
-        Assert.Empty(handler.Requests);
+        Assert.Single(handler.Requests);
+        Assert.Contains("/compare/", handler.Requests[0].RequestUri!.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

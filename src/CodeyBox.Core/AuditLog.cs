@@ -557,6 +557,18 @@ public static class AuditLog
                 "Stale-base PR detected for project {ProjectId}: #{PrNumber} {HeadBranch} → {BaseBranch} (head sha {HeadSha}) is open with merge conflicts; needs operator rebase",
                 projectId.Value, prNumber, headBranch, baseBranch, headSha);
 
+    /// <summary>
+    /// The operator explicitly asserted a stale branch tip is CodeyBox's own
+    /// history via the re-drive <c>confirmOwnership</c> flag, bypassing the
+    /// commit-trailer proof. Logged and audited so a later clobber dispute
+    /// can attribute the rewrite to the confirming operator call.
+    /// </summary>
+    public static void UpstreamRedriveOwnershipConfirmed(WorkItemId id, string branch, string sha) =>
+        Audit("upstream.redrive_ownership_confirmed")
+            .Information(
+                "Upstream re-drive ownership confirmed by operator for work item {WorkItemId}: branch {Branch} tip {Sha} asserted as CodeyBox's own history",
+                id.ToString(), branch, sha);
+
     // ── Authentication ───────────────────────────────────────────────────────
 
     /// <summary>

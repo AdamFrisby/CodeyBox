@@ -14,13 +14,14 @@ new value on the next read.
 
 Hot-reloadable today:
 
-- `Projects` — adding a new project takes effect on the next pickup.
-- `CommitAttribution` — attribution switches take effect on the next commit (hot-reloaded through the shared policy snapshot; per-project overrides win). Removing
+- `Projects` — adding a new project takes effect on the next pickup. Removing
   a project that still has non-terminal work items is **rejected** by an
   `IValidateOptions<ProjectsOptions>` and the prior project list is retained;
   the repository keeps its own last-good snapshot because rejected options do
   not invoke its reload callback. The operator sees an `OptionsValidationException`
   naming the project, and knows to cancel / wait for the in-flight items first.
+- `CommitAttribution` — attribution switches take effect on the next commit (hot-reloaded through the shared policy snapshot; per-project overrides win).
+- `UpstreamBranchOwnership` — ownership-proof trailers and verification cap take effect on the next push or re-drive.
 - `TemplateDirectory` — task-template files are read fresh from this directory
   on each list or queue request. Adding, editing, or removing `*.json` files
   requires no restart.
@@ -618,6 +619,22 @@ Controls whether CodeyBox stamps its name into commits and pull requests. All th
 | `PullRequestFooter` | `true` | The `*Co-Authored-By: CodeyBox ...* 🤖 Generated ...` footer in GitHub PR bodies. When `false`, PR bodies carry no CodeyBox footer. |
 
 Per-project override: set `CommitAttribution` on a project (or under `Defaults`) — any set flag wins over the host default; unset flags inherit. See `docs/concepts/projects.md`.
+
+## `UpstreamBranchOwnership`
+
+Proves a stale CodeyBox-owned branch tip is CodeyBox's own history when no prior push was recorded. Hot-reloadable: edits take effect on the next push or re-drive.
+
+```json
+"UpstreamBranchOwnership": {
+  "RequiredTrailerKeys": ["CodeyBox-WorkItem", "Co-Authored-By"],
+  "MaxCommitsToVerify": 100
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `RequiredTrailerKeys` | `["CodeyBox-WorkItem", "Co-Authored-By"]` | Trailer keys that must each appear in the trailer block of every commit exclusive of the base. `Co-Authored-By` additionally requires its value to name CodeyBox. An empty list never proves ownership. |
+| `MaxCommitsToVerify` | `100` | Upper bound on the exclusive commits examined, enforced before buffering. A larger exclusive set is unverifiable and refused unless the operator passes `{"confirmOwnership": true}` on the re-drive. |
 
 ## `WorkerPoolHealthWatchdog`
 

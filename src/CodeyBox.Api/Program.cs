@@ -2782,6 +2782,19 @@ builder.Services.AddSingleton<CodeyBox.Core.CommitAttributionPolicy>(sp =>
     new CodeyBox.Core.CommitAttributionPolicy(
         sp.GetRequiredService<CodeyBox.Core.CommitAttributionSnapshot>()));
 
+// Branch-ownership proof — which commit trailers mark a stale owned-branch
+// tip as CodeyBox's own history when no prior push was recorded. Bound from
+// CodeyBox:UpstreamBranchOwnership and refreshed through the same
+// IOptionsMonitor<CodeyBoxOptions>.OnChange path so edits take effect on the
+// next push or re-drive without a restart.
+builder.Services.AddSingleton<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>(sp =>
+{
+    var monitor = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    var live = new CodeyBox.Core.UpstreamBranchOwnershipSnapshot(monitor.CurrentValue.UpstreamBranchOwnership.Clone());
+    monitor.OnChange(opts => live.Replace(opts.UpstreamBranchOwnership.Clone()));
+    return live;
+});
+
 builder.Services.AddSingleton<TransitionHealthOptions>(sp =>
 {
     var cbOpts = sp.GetRequiredService<IOptions<CodeyBoxOptions>>().Value;
@@ -4853,7 +4866,8 @@ builder.Services.AddSingleton<UpstreamRedriveService>(sp => new UpstreamRedriveS
     sp.GetRequiredService<IProjectRepository>(),
     sp.GetRequiredService<IUpstreamRemoteFactory>(),
     sp.GetRequiredService<WorkItemRetrier>(),
-    sp.GetRequiredService<ILogger<UpstreamRedriveService>>()));
+    sp.GetRequiredService<ILogger<UpstreamRedriveService>>(),
+    sp.GetRequiredService<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>()));
 builder.Services.AddHostedService(sp => new StaleUpstreamRedriveDetector(
     sp.GetRequiredService<UpstreamRedriveService>(),
     sp.GetRequiredService<ILogger<StaleUpstreamRedriveDetector>>()));
@@ -6789,6 +6803,14 @@ namespace CodeyBox.Api
         /// commit. Per-project overrides win over these host defaults.
         /// </summary>
         public CodeyBox.Core.CommitAttributionOptions CommitAttribution { get; set; } = new();
+
+        /// <summary>
+        /// Ownership proof for stale CodeyBox-owned branch tips with no
+        /// recorded push: which commit trailers must mark every exclusive
+        /// commit, and how many commits are examined. Hot-reloadable: the
+        /// snapshot takes effect on the next push or re-drive.
+        /// </summary>
+        public CodeyBox.Core.UpstreamBranchOwnershipOptions UpstreamBranchOwnership { get; set; } = new();
 
         /// <summary>
         /// Pipeline transition-health metric tuning. Controls the

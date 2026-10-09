@@ -9,15 +9,29 @@ namespace CodeyBox.Core;
 /// purely the stale remote ref left by a previous attempt. The item must be
 /// parked with this message (never routed into conflict-rework) until the
 /// operator re-drives the upstream step, which records the observed remote
-/// sha as the lease base.
+/// sha as the lease base. The message names the working re-drive endpoint
+/// and the exact ownership flag so the operator is never pointed at a
+/// refused action.
 /// </summary>
 public sealed class UpstreamOwnedBranchDivergedException : InvalidOperationException
 {
+    /// <summary>
+    /// Re-drive endpoint template named in the park message. The
+    /// <c>{id}</c> placeholder is the work item id; the message keeps it
+    /// symbolic because the push layer does not know the item id.
+    /// </summary>
+    public const string RedriveEndpointTemplate = "POST /workitems/{id}/redrive-upstream";
+
+    /// <summary>Exact request flag that asserts the remote tip is CodeyBox's own history.</summary>
+    public const string ConfirmOwnershipFlag = "confirmOwnership";
+
     public UpstreamOwnedBranchDivergedException(string branch, string remoteSha, string localSha)
         : base($"work branch '{branch}' is not a fast-forward of its previous upstream push " +
             $"(remote {remoteSha}, local {localSha}); this is not a merge conflict — the work was already recomposed on a fresh base. " +
             "CodeyBox has no recorded prior push for this branch, so it cannot prove the remote tip is its own history. " +
-            "Re-drive the upstream step after confirming no third party pushed to the branch.")
+            $"Re-drive the upstream step with {RedriveEndpointTemplate} after confirming no third party pushed to the branch. " +
+            "When every commit on the remote tip carries the CodeyBox trailers the rewrite is accepted automatically; " +
+            $"otherwise the re-drive must pass {{\"{ConfirmOwnershipFlag}\": true}} to assert the remote tip is CodeyBox's own history.")
     {
         Branch = branch;
         RemoteSha = remoteSha;
