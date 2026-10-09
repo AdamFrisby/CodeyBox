@@ -48,7 +48,8 @@ public sealed record ExternalBuildProviderStatus(
     ExternalBuildExecutionPhase Phase,
     ExternalBuildEvidence? Evidence,
     string? Detail,
-    DateTimeOffset ObservedAt);
+    DateTimeOffset ObservedAt,
+    decimal? ActualCost = null);
 
 public sealed record ExternalBuildCancelResult(bool Confirmed, string? Detail);
 

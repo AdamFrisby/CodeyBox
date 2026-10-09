@@ -141,6 +141,17 @@ public sealed record ExternalBuildRecord
     public DateTimeOffset? ExpiresAt { get; init; }
     /// <summary>True once a terminal completion was delivered through the acknowledged outbox.</summary>
     public bool DeliveryAcked { get; init; }
+    /// <summary>
+    /// Cost units reserved at dispatch from the project's reserved-cost
+    /// budget. Counts toward the budget only while non-terminal; released
+    /// exactly once when the build reaches terminal state.
+    /// </summary>
+    public decimal ReservedCost { get; init; }
+    /// <summary>
+    /// Provider-confirmed actual cost, set at terminal transition. Null until
+    /// terminal. Defaults to the reservation when the provider reports none.
+    /// </summary>
+    public decimal? ActualCost { get; init; }
 }
 
 /// <summary>Pure lifecycle transitions.</summary>
@@ -215,4 +226,14 @@ public sealed class ExternalBuildCapabilityExpiredException()
 public sealed class ExternalBuildConflictException(string detail, Exception? inner = null) : ExternalBuildException(detail, inner);
 public sealed class ExternalBuildInvalidRequestException(string detail) : ExternalBuildException(detail);
 public sealed class ExternalBuildReconciliationBlockedException(string detail) : ExternalBuildException(detail);
-public sealed class ExternalBuildBudgetExceededException(string detail) : ExternalBuildException(detail);
+public class ExternalBuildBudgetExceededException(string detail) : ExternalBuildException(detail);
+/// <summary>
+/// Dispatch or poll throttled: either the local start-rate window is full or
+/// the provider answered with a rate-limit (HTTP 429 equivalent). Retriable
+/// after <see cref="RetryAfter"/>; intent stays durable — never a silent pass.
+/// </summary>
+public sealed class ExternalBuildRateLimitedException(string detail, TimeSpan? retryAfter = null)
+    : ExternalBuildBudgetExceededException(detail)
+{
+    public TimeSpan? RetryAfter { get; } = retryAfter;
+}

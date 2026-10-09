@@ -31,6 +31,17 @@ public sealed class ExternalBuildService
     private readonly string _owner = "svc-" + Guid.NewGuid().ToString("N")[..12];
     private readonly SemaphoreSlim[] _startStripes = Enumerable.Range(0, StartStripeCount)
         .Select(_ => new SemaphoreSlim(1, 1)).ToArray();
+    // Rolling start-rate windows (admission throttling). Entries are pruned
+    // to the last 60 seconds on every check and the lists are hard-capped,
+    // so memory stays bounded regardless of caller behavior. Uses the
+    // injected clock, so tests stay deterministic. A restart resets the
+    // windows (fail-open for admission only; dispatch idempotency still holds
+    // via the durable store, so no duplicate paid run can result).
+    private const int RateWindowSeconds = 60;
+    private const int MaxRateEntries = 10_000;
+    private readonly object _rateGate = new();
+    private readonly Dictionary<string, List<DateTimeOffset>> _startsPerProvider = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<DateTimeOffset>> _startsPerProject = new(StringComparer.Ordinal);
 
     public ExternalBuildService(
         IExternalBuildStore store,
@@ -84,6 +95,24 @@ public sealed class ExternalBuildService
                 throw new ExternalBuildBudgetExceededException("per-project queued build budget exceeded");
             if (await _store.CountActiveForProviderAsync(approval.ProviderId, ct).ConfigureAwait(false) >= opts.MaxConcurrentPerProvider)
                 throw new ExternalBuildBudgetExceededException("per-provider concurrency budget exceeded");
+            if (await _store.CountActiveForProviderAsync(approval.ProviderId, ct).ConfigureAwait(false) >= opts.MaxLicenseSeatsPerProvider)
+                throw new ExternalBuildBudgetExceededException(
+                    $"provider '{approval.ProviderId}' license-seat capacity exhausted ({opts.MaxLicenseSeatsPerProvider} seats)");
+            if (await _store.CountActiveAsync(request.ProjectId, ct).ConfigureAwait(false) >= opts.MaxLicenseSeatsPerProject)
+                throw new ExternalBuildBudgetExceededException(
+                    $"project '{request.ProjectId}' license-seat capacity exhausted ({opts.MaxLicenseSeatsPerProject} seats)");
+            var reservedActive = await _store.ListActiveAsync(request.ProjectId, ct).ConfigureAwait(false);
+            var reservedSum = reservedActive.Sum(r => r.ReservedCost);
+            if (reservedSum + opts.DefaultReservedCost > opts.MaxReservedCostPerProject)
+                throw new ExternalBuildBudgetExceededException(
+                    $"project '{request.ProjectId}' reserved-cost budget exceeded ({reservedSum} reserved, {opts.DefaultReservedCost} requested, cap {opts.MaxReservedCostPerProject})");
+            // Admission throttle runs before the intent write so a throttled
+            // start leaves no orphan IntentRecorded row behind to consume
+            // queued/seat/cost budgets. A duplicate racing the same key may
+            // burn one 60-second rate slot before losing the idempotency
+            // claim; that slot expires on its own and can never cause a
+            // duplicate paid run (the store claim decides the winner).
+            CheckStartRate(request.ProjectId, approval.ProviderId, opts);
 
             var now = _clock.GetUtcNow();
             var record = new ExternalBuildRecord
@@ -101,6 +130,7 @@ public sealed class ExternalBuildService
                 IdempotencyKey = idempotencyKey,
                 IdempotencyBodyHash = bodyHash,
                 RequestId = Guid.NewGuid().ToString("N"),
+                ReservedCost = opts.DefaultReservedCost,
                 DispatchAttempts = 0,
                 CreatedAt = now,
                 UpdatedAt = now,
@@ -128,6 +158,73 @@ public sealed class ExternalBuildService
     {
         var hash = (uint)StringComparer.Ordinal.GetHashCode(gateKey);
         return _startStripes[hash % (uint)StartStripeCount];
+    }
+
+    /// <summary>
+    /// Rolling-window admission throttle. Throws
+    /// <see cref="ExternalBuildRateLimitedException"/> (a budget error, so
+    /// existing budget catch sites still apply) when either window is full,
+    /// and records the admitted start otherwise. Both windows are checked
+    /// before either is recorded, so a rejection never burns quota.
+    /// Reservations still release via terminal transition even if the caller
+    /// drops the returned record.
+    /// </summary>
+    private void CheckStartRate(string projectId, string providerId, ExternalBuildOptions opts)
+    {
+        var now = _clock.GetUtcNow();
+        var cutoff = now.AddSeconds(-RateWindowSeconds);
+        lock (_rateGate)
+        {
+            var providerStamps = PruneWindow(_startsPerProvider, providerId, cutoff);
+            var projectStamps = PruneWindow(_startsPerProject, projectId, cutoff);
+            var limited = false;
+            var retryAfter = TimeSpan.Zero;
+            if (providerStamps.Count >= opts.MaxStartsPerMinutePerProvider)
+            {
+                limited = true;
+                retryAfter = RetryAfter(providerStamps, now);
+            }
+            if (projectStamps.Count >= opts.MaxStartsPerMinutePerProject)
+            {
+                limited = true;
+                var projectWait = RetryAfter(projectStamps, now);
+                if (projectWait > retryAfter) retryAfter = projectWait;
+            }
+            if (limited)
+                throw new ExternalBuildRateLimitedException(
+                    $"start rate limit exceeded (provider '{providerId}', project '{projectId}'); retry after {retryAfter.TotalSeconds:N0}s",
+                    retryAfter);
+            RecordStamp(_startsPerProvider, providerId, providerStamps, now);
+            RecordStamp(_startsPerProject, projectId, projectStamps, now);
+        }
+    }
+
+    private static List<DateTimeOffset> PruneWindow(
+        Dictionary<string, List<DateTimeOffset>> windows, string key, DateTimeOffset cutoff)
+    {
+        if (!windows.TryGetValue(key, out var stamps))
+        {
+            stamps = [];
+            windows[key] = stamps;
+        }
+        stamps.RemoveAll(s => s <= cutoff);
+        return stamps;
+    }
+
+    private static TimeSpan RetryAfter(List<DateTimeOffset> stamps, DateTimeOffset now)
+    {
+        var wait = stamps[0].AddSeconds(RateWindowSeconds) - now;
+        return wait < TimeSpan.Zero ? TimeSpan.Zero : wait;
+    }
+
+    private static void RecordStamp(
+        Dictionary<string, List<DateTimeOffset>> windows, string key,
+        List<DateTimeOffset> stamps, DateTimeOffset now)
+    {
+        stamps.Add(now);
+        if (stamps.Count > MaxRateEntries)
+            stamps.RemoveRange(0, stamps.Count - MaxRateEntries);
+        windows[key] = stamps;
     }
 
     private static string NormalizeIdempotencyKey(ExternalBuildStartRequest request, int maxChars)
@@ -205,6 +302,7 @@ public sealed class ExternalBuildService
         {
             State = ExternalBuildState.Cancelled,
             TerminalCause = cause,
+            ActualCost = record.ActualCost ?? record.ReservedCost,
             CompletedAt = now,
             UpdatedAt = now,
             FenceOwner = null,
@@ -225,6 +323,7 @@ public sealed class ExternalBuildService
                     TerminalCause = result.Confirmed
                         ? ExternalBuildTerminalCause.ProviderConfirmedCancellation
                         : cause,
+                    ActualCost = latest.ActualCost ?? latest.ReservedCost,
                     FailureDetail = result.Detail,
                     CompletedAt = latest.CompletedAt ?? _clock.GetUtcNow(),
                     UpdatedAt = _clock.GetUtcNow(),
@@ -307,6 +406,21 @@ public sealed class ExternalBuildService
         {
             result = await provider.SubmitAsync(dispatched, input, ct).ConfigureAwait(false);
         }
+        catch (ExternalBuildRateLimitedException ex)
+        {
+            // Provider backpressure (HTTP 429 equivalent): keep the durable
+            // uncertain intent so reconciliation can retry by request identity
+            // (no duplicate paid run), but surface the throttle so the caller
+            // backs off until RetryAfter instead of polling hot.
+            var throttled = dispatched with
+            {
+                State = ExternalBuildState.SubmitUncertain,
+                FailureDetail = "provider rate-limited submit: " + ex.Message,
+                UpdatedAt = _clock.GetUtcNow(),
+            };
+            await ClaimAsync(dispatched, throttled, ct).ConfigureAwait(false);
+            throw;
+        }
         catch (Exception ex)
         {
             var failed = dispatched with
@@ -347,6 +461,29 @@ public sealed class ExternalBuildService
         try
         {
             status = await provider.GetStatusAsync(record.ProviderRunId!, ct).ConfigureAwait(false);
+        }
+        catch (ExternalBuildRateLimitedException ex)
+        {
+            // Provider poll throttled: retriable backoff, not a reachability
+            // failure. The retry-after hint is surfaced in the detail so
+            // operators can see the backpressure; the poll bound still caps
+            // a provider that throttles forever.
+            var limited = record with
+            {
+                PollCount = record.PollCount + 1,
+                FailureDetail = "provider poll rate-limited"
+                    + (ex.RetryAfter.HasValue ? $"; retry after {ex.RetryAfter.Value.TotalSeconds:N0}s" : string.Empty)
+                    + ": " + ex.Message,
+                UpdatedAt = _clock.GetUtcNow(),
+            };
+            if (limited.PollCount >= opts.MaxPollAttempts)
+            {
+                limited = await ClaimAsync(record, limited, ct).ConfigureAwait(false);
+                return await TransitionAsync(limited, ExternalBuildState.ReconciliationBlocked,
+                    cause: ExternalBuildTerminalCause.ReconciliationImpossible,
+                    detail: "provider unreachable; poll bound reached", ct).ConfigureAwait(false);
+            }
+            return await ClaimAsync(record, limited, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -389,6 +526,10 @@ public sealed class ExternalBuildService
             {
                 var collecting = record with { State = ExternalBuildState.Collecting, UpdatedAt = now };
                 collecting = await ClaimAsync(record, collecting, ct).ConfigureAwait(false);
+                // Reserved cost releases exactly once here: the record leaves
+                // the active set, so its reservation no longer counts toward
+                // the project cap. Actual cost is what the provider confirms;
+                // providers that report none settle at the reservation.
                 var terminal = collecting with
                 {
                     State = status.Phase == ExternalBuildExecutionPhase.Succeeded
@@ -401,6 +542,7 @@ public sealed class ExternalBuildService
                             ? ExternalBuildTerminalCause.ProviderConfirmedCancellation
                             : ExternalBuildTerminalCause.ProviderFailed,
                     Evidence = status.Evidence,
+                    ActualCost = status.ActualCost ?? collecting.ReservedCost,
                     FailureDetail = status.Detail,
                     CompletedAt = now,
                     UpdatedAt = now,
@@ -432,14 +574,16 @@ public sealed class ExternalBuildService
         ExternalBuildTerminalCause cause, string? detail, CancellationToken ct)
     {
         var now = _clock.GetUtcNow();
+        var terminal = ExternalBuildLifecycle.IsTerminal(state);
         var next = record with
         {
             State = state,
             TerminalCause = cause,
+            ActualCost = terminal ? record.ActualCost ?? record.ReservedCost : record.ActualCost,
             FailureDetail = detail,
             UpdatedAt = now,
-            CompletedAt = ExternalBuildLifecycle.IsTerminal(state) ? now : record.CompletedAt,
-            FenceOwner = ExternalBuildLifecycle.IsTerminal(state) ? null : record.FenceOwner,
+            CompletedAt = terminal ? now : record.CompletedAt,
+            FenceOwner = terminal ? null : record.FenceOwner,
         };
         await ClaimAsync(record, next, ct).ConfigureAwait(false);
         if (ExternalBuildLifecycle.IsTerminal(state))

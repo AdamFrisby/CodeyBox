@@ -34,6 +34,18 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
     /// <summary>When true, submits throw a transient error (retryable).</summary>
     public bool FailNextSubmitTransient { get; set; }
 
+    /// <summary>When true, the next submit throws a rate-limit (HTTP 429 equivalent).</summary>
+    public bool FailNextSubmitRateLimited { get; set; }
+
+    /// <summary>Retry-after hint carried by the next injected rate-limit. Default 30s.</summary>
+    public TimeSpan RateLimitedRetryAfter { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>When true, the next status poll throws a rate-limit.</summary>
+    public bool FailNextPollRateLimited { get; set; }
+
+    /// <summary>Actual cost reported with terminal statuses. Null settles at the reservation.</summary>
+    public decimal? TerminalActualCost { get; set; }
+
     public int SubmitCalls { get { lock (_gate) return _submitCalls; } }
 
     /// <summary>Scripted terminal evidence per run; defaults to passing evidence.</summary>
@@ -55,6 +67,11 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
                 FailNextSubmitTransient = false;
                 throw new InvalidOperationException("fake transient provider fault");
             }
+            if (FailNextSubmitRateLimited)
+            {
+                FailNextSubmitRateLimited = false;
+                throw new ExternalBuildRateLimitedException("fake provider is throttled", RateLimitedRetryAfter);
+            }
             if (FailNextSubmitUncertain)
             {
                 FailNextSubmitUncertain = false;
@@ -74,6 +91,11 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
     {
         lock (_gate)
         {
+            if (FailNextPollRateLimited)
+            {
+                FailNextPollRateLimited = false;
+                throw new ExternalBuildRateLimitedException("fake provider poll throttled", RateLimitedRetryAfter);
+            }
             if (!_runs.TryGetValue(providerRunId, out var run))
                 return Task.FromResult(new ExternalBuildProviderStatus(
                     ExternalBuildExecutionPhase.Unknown, null, "unknown run", DateTimeOffset.UtcNow));
@@ -89,7 +111,7 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
                 ? EvidenceFactory(run.Intent)
                 : PassingEvidence(providerRunId, run.SourceDigest);
             return Task.FromResult(new ExternalBuildProviderStatus(
-                ExternalBuildExecutionPhase.Succeeded, evidence, null, DateTimeOffset.UtcNow));
+                ExternalBuildExecutionPhase.Succeeded, evidence, null, DateTimeOffset.UtcNow, TerminalActualCost));
         }
     }
 

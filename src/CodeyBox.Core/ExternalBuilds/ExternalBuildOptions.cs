@@ -28,6 +28,44 @@ public sealed class ExternalBuildOptions
     /// <summary>Max concurrently dispatched provider runs per provider id. Default 4.</summary>
     public int MaxConcurrentPerProvider { get; set; } = 4;
 
+    /// <summary>
+    /// License-seat capacity per provider id: max non-terminal builds holding
+    /// a provider-side license/toolchain seat. Distinct from
+    /// <see cref="MaxConcurrentPerProvider"/> (dispatch concurrency): seats
+    /// model paid license scarcity, concurrency models host throughput.
+    /// Default 8.
+    /// </summary>
+    public int MaxLicenseSeatsPerProvider { get; set; } = 8;
+
+    /// <summary>
+    /// License-seat capacity per project: max non-terminal builds of one
+    /// project holding any provider seat. Default 16.
+    /// </summary>
+    public int MaxLicenseSeatsPerProject { get; set; } = 16;
+
+    /// <summary>
+    /// Cost units reserved per build at dispatch (neutral credits; adapters
+    /// map to provider currency). Released when the build reaches terminal
+    /// state. Default 1.
+    /// </summary>
+    public decimal DefaultReservedCost { get; set; } = 1m;
+
+    /// <summary>
+    /// Max sum of reserved (non-terminal) cost per project. A start whose
+    /// reservation would exceed this is rejected. Default 100.
+    /// </summary>
+    public decimal MaxReservedCostPerProject { get; set; } = 100m;
+
+    /// <summary>
+    /// Max admitted starts per rolling 60-second window, per provider id.
+    /// Throttles dispatch bursts; provider 429s surface as
+    /// <see cref="ExternalBuildRateLimitedException"/>. Default 60.
+    /// </summary>
+    public int MaxStartsPerMinutePerProvider { get; set; } = 60;
+
+    /// <summary>Max admitted starts per rolling 60-second window, per project. Default 60.</summary>
+    public int MaxStartsPerMinutePerProject { get; set; } = 60;
+
     /// <summary>Max queued (non-terminal) builds per project. Default 20.</summary>
     public int MaxQueuedPerProject { get; set; } = 20;
 
@@ -96,6 +134,12 @@ public sealed class ExternalBuildOptions
     public static bool IsValid(ExternalBuildOptions opts) =>
         opts.MaxConcurrentPerProject is >= 1 and <= 32
         && opts.MaxConcurrentPerProvider is >= 1 and <= 64
+        && opts.MaxLicenseSeatsPerProvider is >= 1 and <= 1024
+        && opts.MaxLicenseSeatsPerProject is >= 1 and <= 1024
+        && opts.DefaultReservedCost is >= 0 and <= 1_000_000
+        && opts.MaxReservedCostPerProject is >= 0 and <= 10_000_000
+        && opts.MaxStartsPerMinutePerProvider is >= 1 and <= 100_000
+        && opts.MaxStartsPerMinutePerProject is >= 1 and <= 100_000
         && opts.MaxQueuedPerProject is >= 1 and <= 500
         && opts.BuildDeadlineSeconds is >= 60 and <= 86400
         && opts.PollIntervalSeconds is >= 1 and <= 600

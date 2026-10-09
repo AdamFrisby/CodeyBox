@@ -19,7 +19,9 @@ adapters (GitHub Actions, Unity Build Automation) are follow-on work and are
 1. Sandbox calls `build/start` with a host-issued scoped capability.
 2. Service validates: enabled, operator-approved target (exact name match —
    never arbitrary endpoints/commands), budgets (per-project/per-provider
-   concurrency, queued cap). Caller-supplied idempotency keys are trimmed and
+   concurrency, queued cap, license-seat capacity, reserved-cost budget,
+   start rate limits — all checked before any intent row is written).
+   Caller-supplied idempotency keys are trimmed and
    rejected when over `MaxIdempotencyKeyChars` (default 128) or containing
    control characters; duplicate submits serialize on a fixed 16-stripe
    single-flight lock pool (bounded memory — no per-key table) with the
@@ -135,10 +137,39 @@ match. Any edit/configuration change/rework invalidates prior evidence.
 
 ## Budgets, cleanup, artifacts
 
-Concurrency, queued caps, deadlines, poll/retry bounds, and retention are
-hot-reloadable options. `CleanupAsync` deletes terminal records past
-retention; no ghost builds survive restart (non-terminal records reconcile
-on next poll). Artifact ingestion (`ExternalBuildArtifactGuard`) checks
+Concurrency, queued caps, license-seat capacity, reserved-cost budgets, start
+rate limits, deadlines, poll/retry bounds, and retention are hot-reloadable
+options (`ExternalBuildOptions`, defaults OFF):
+
+- `MaxConcurrentPerProject` (2) / `MaxConcurrentPerProvider` (4) /
+  `MaxQueuedPerProject` (20) bound dispatch concurrency and queue depth.
+- `MaxLicenseSeatsPerProvider` (8) / `MaxLicenseSeatsPerProject` (16) bound
+  paid license/toolchain seats, distinctly from dispatch concurrency
+  (throughput) — a build holds one seat while non-terminal and releases it
+  exactly once on terminal transition (success, failure, or any cancel
+  cause). Both seat checks run before intent is persisted, so a rejected
+  start leaves no orphan row behind.
+- `DefaultReservedCost` (1) reserves neutral cost units per build at
+  dispatch; `MaxReservedCostPerProject` (100) caps the sum of reservations
+  held by non-terminal builds. The reservation releases exactly once when
+  the build leaves the active set. `ExternalBuildRecord.ReservedCost` carries
+  the reservation and `ActualCost` carries the provider-confirmed actual,
+  settled at every terminal transition (provider-reported value when the
+  adapter supplies one via `ExternalBuildProviderStatus.ActualCost`,
+  otherwise the reservation).
+- `MaxStartsPerMinutePerProvider` (60) / `MaxStartsPerMinutePerProject` (60)
+  throttle admission over a rolling 60-second window (injected clock, bounded
+  memory, pruned on every check). Over-limit starts throw the typed
+  `ExternalBuildRateLimitedException` (a budget error, with `RetryAfter`)
+  before any intent row is written. A provider answering with backpressure
+  (HTTP 429 equivalent) throws the same typed error from
+  `SubmitAsync`/`GetStatusAsync`: submits keep the durable uncertain intent
+  and rethrow so the caller backs off while reconciliation retries by
+  request identity (no duplicate paid run); polls record the backoff hint
+  and stay retriable under the existing poll bound.
+
+`CleanupAsync` deletes terminal records past retention; no ghost builds
+survive restart (non-terminal records reconcile on next poll). Artifact ingestion (`ExternalBuildArtifactGuard`) checks
 size/decompression/entry limits before buffering, rejects traversal and
 symlinks, verifies digests, enforces https exact-host URL allowlists,
 redacts secrets, and never executes downloaded artifacts.
@@ -150,5 +181,9 @@ Implement `IExternalBuildProvider` (`ProviderId`, capability flags,
 `ReadArtifactAsync`). Reuse the shared lifecycle — do not fork
 submit/reconcile/cancel semantics. Honor idempotent request identity
 (`ExternalBuildRecord.RequestId`): duplicate submits with the same request
-id must return the same provider run, never a second paid run. Keep vendor
-types out of Core. Toolchain-specific parsing belongs in the adapter.
+id must return the same provider run, never a second paid run. Report the
+provider-confirmed actual cost via `ExternalBuildProviderStatus.ActualCost`
+(when absent, the service settles actual at the reservation); signal
+throttling by throwing `ExternalBuildRateLimitedException` with a
+`RetryAfter` hint so the orchestrator backs off and reconciles by request
+identity. Keep vendor types out of Core. Toolchain-specific parsing belongs in the adapter.

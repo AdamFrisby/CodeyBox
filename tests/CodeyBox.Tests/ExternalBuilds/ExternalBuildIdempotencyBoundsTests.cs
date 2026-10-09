@@ -59,7 +59,19 @@ public sealed class ExternalBuildIdempotencyBoundsTests
     {
         var provider = new FakeSnapshotBuildProvider();
         var (service, _, _, _) = ExternalBuildTestKit.BuildService(
-            provider, o => { o.MaxConcurrentPerProvider = 100; o.MaxQueuedPerProject = 100; });
+            provider, o =>
+            {
+                o.MaxConcurrentPerProvider = 100;
+                o.MaxQueuedPerProject = 100;
+                // The gate-boundedness probe starts 64 concurrent builds, so
+                // lift the orthogonal budget dimensions (seats, cost, rate)
+                // the same way the concurrency caps are lifted.
+                o.MaxLicenseSeatsPerProvider = 100;
+                o.MaxLicenseSeatsPerProject = 100;
+                o.MaxReservedCostPerProject = 1000m;
+                o.MaxStartsPerMinutePerProvider = 1000;
+                o.MaxStartsPerMinutePerProject = 1000;
+            });
 
         var stripes = (System.Reflection.FieldInfo?)typeof(ExternalBuildService)
             .GetField("_startStripes", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);

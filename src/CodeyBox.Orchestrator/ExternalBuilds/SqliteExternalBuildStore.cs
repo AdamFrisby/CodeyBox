@@ -98,6 +98,21 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 alter.CommandText = "ALTER TABLE external_builds ADD COLUMN delivery_acked INTEGER NOT NULL DEFAULT 0;";
                 alter.ExecuteNonQuery();
             }
+            // Reserved-vs-actual cost (deliverable 7): additive columns with
+            // defaults so pre-existing databases and rows keep loading.
+            // Decimals ride as invariant-culture TEXT to avoid REAL rounding.
+            if (!columns.Contains("reserved_cost"))
+            {
+                using var alter = _conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE external_builds ADD COLUMN reserved_cost TEXT NOT NULL DEFAULT '0';";
+                alter.ExecuteNonQuery();
+            }
+            if (!columns.Contains("actual_cost"))
+            {
+                using var alter = _conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE external_builds ADD COLUMN actual_cost TEXT;";
+                alter.ExecuteNonQuery();
+            }
             using (var dedupe = _conn.CreateCommand())
             {
                 dedupe.CommandText = """
@@ -128,8 +143,9 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 INSERT INTO external_builds (id, schema_version, project_id, work_item_id, phase, iteration, attempt,
                     state, target_json, source_json, config_digest, idempotency_key, idempotency_body_hash,
                     request_id, provider_run_id, fence_owner, fence_epoch, dispatch_attempts, poll_count,
-                    terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at, delivery_acked)
-                VALUES ($id,$sv,$p,$w,$ph,$it,$at,$st,$tj,$sj,$cd,$ik,$ih,$rq,$pr,$fo,$fe,$da,$pc,$tc,$ev,$fd,$ca,$ua,$co,$ex,$dl);
+                    terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at, delivery_acked,
+                    reserved_cost, actual_cost)
+                VALUES ($id,$sv,$p,$w,$ph,$it,$at,$st,$tj,$sj,$cd,$ik,$ih,$rq,$pr,$fo,$fe,$da,$pc,$tc,$ev,$fd,$ca,$ua,$co,$ex,$dl,$rc,$ac);
                 """;
             Bind(cmd, record);
             try
@@ -276,7 +292,8 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 UPDATE external_builds SET state=$st, target_json=$tj, source_json=$sj, config_digest=$cd,
                     request_id=$rq, provider_run_id=$pr, fence_owner=$fo, fence_epoch=$fe,
                     dispatch_attempts=$da, poll_count=$pc, terminal_cause=$tc, evidence_json=$ev,
-                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex, delivery_acked=$dl
+                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex, delivery_acked=$dl,
+                    reserved_cost=$rc, actual_cost=$ac
                 WHERE id=$id AND state=$expected AND ((fence_owner IS NULL AND $efo IS NULL) OR fence_owner = $efo);
                 """;
             cmd.Parameters.AddWithValue("$id", buildId);
@@ -469,7 +486,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
         " target_json, source_json, config_digest, idempotency_key, idempotency_body_hash," +
         " request_id, provider_run_id, fence_owner, fence_epoch, dispatch_attempts, poll_count," +
         " terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at," +
-        " delivery_acked";
+        " delivery_acked, reserved_cost, actual_cost";
 
     private static void Bind(SqliteCommand cmd, ExternalBuildRecord r)
     {
@@ -505,11 +522,27 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
         cmd.Parameters.AddWithValue("$co", r.CompletedAt?.ToString("O") ?? (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$ex", r.ExpiresAt?.ToString("O") ?? (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$dl", r.DeliveryAcked ? 1 : 0);
+        cmd.Parameters.AddWithValue("$rc", r.ReservedCost.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        cmd.Parameters.AddWithValue("$ac", r.ActualCost.HasValue
+            ? (object)r.ActualCost.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : DBNull.Value);
     }
 
     private static ExternalBuildRecord Read(SqliteDataReader reader)
     {
         string? Null(int i) => reader.IsDBNull(i) ? null : reader.GetString(i);
+        // Ordinal-safe cost reads: rows written before the cost columns were
+        // added (or a reader over an older projection) default to unreserved.
+        decimal Reserved(int i) =>
+            reader.FieldCount > i && !reader.IsDBNull(i)
+            && decimal.TryParse(reader.GetString(i), System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture, out var v)
+                ? v : 0m;
+        decimal? Actual(int i) =>
+            reader.FieldCount > i && !reader.IsDBNull(i)
+            && decimal.TryParse(reader.GetString(i), System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture, out var v)
+                ? v : null;
         var schemaVersion = reader.GetInt32(1);
         if (schemaVersion > ExternalBuildRecord.CurrentSchemaVersion)
             throw new InvalidOperationException($"Unsupported external_builds schema version {schemaVersion}.");
@@ -542,6 +575,8 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
             CompletedAt = Null(24) is { } c ? DateTimeOffset.Parse(c) : null,
             ExpiresAt = Null(25) is { } e ? DateTimeOffset.Parse(e) : null,
             DeliveryAcked = reader.FieldCount > 26 && !reader.IsDBNull(26) && reader.GetInt32(26) != 0,
+            ReservedCost = Reserved(27),
+            ActualCost = Actual(28),
         };
     }
 }
