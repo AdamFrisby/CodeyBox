@@ -192,6 +192,15 @@ public sealed class ExternalBuildSandboxTools
             throw new InvalidOperationException("Provider returned a different artifact than requested.");
         var error = ExternalBuildArtifactGuard.ValidatePayload(payload, opts);
         if (error is not null) throw new InvalidOperationException("Artifact rejected: " + error);
+        // Bind the fetched bytes to the authorized listing: list and read are
+        // separate provider calls, so a TOCTOU or run-confusion substitution
+        // must not silently yield unauthenticated bytes.
+        if (!string.Equals(payload.ContentDigestSha256, listed.ContentDigestSha256, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"Artifact '{artifactName}' digest does not match the authorized listing; refusing substituted bytes.");
+        if (payload.Content.LongLength != listed.SizeBytes)
+            throw new InvalidOperationException(
+                $"Artifact '{artifactName}' size does not match the authorized listing; refusing substituted bytes.");
         return payload;
     }
 

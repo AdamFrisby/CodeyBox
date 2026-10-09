@@ -112,9 +112,10 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
         {
             if (!_runs.TryGetValue(providerRunId, out _))
                 return Task.FromResult<IReadOnlyList<ExternalBuildArtifactRef>>([]);
-            var digest = Core.ExternalBuilds.ExternalBuildProvenance.DigestText(providerRunId + ":pkg");
+            var content = FakePackageContent(providerRunId);
+            var digest = Core.ExternalBuilds.ExternalBuildProvenance.DigestBytes(content);
             return Task.FromResult<IReadOnlyList<ExternalBuildArtifactRef>>(
-                [new ExternalBuildArtifactRef("package.zip", 128, digest, "application/zip")]);
+                [new ExternalBuildArtifactRef("package.zip", content.Length, digest, "application/zip")]);
         }
     }
 
@@ -122,11 +123,14 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
     {
         if (!string.Equals(artifactName, "package.zip", StringComparison.Ordinal))
             throw new InvalidOperationException($"Unknown artifact '{artifactName}'.");
-        var content = System.Text.Encoding.UTF8.GetBytes("fake-package:" + providerRunId);
+        var content = FakePackageContent(providerRunId);
         return Task.FromResult(new ExternalBuildArtifactPayload(
             artifactName, content, "application/zip",
             Core.ExternalBuilds.ExternalBuildProvenance.DigestBytes(content)));
     }
+
+    private static byte[] FakePackageContent(string providerRunId)
+        => System.Text.Encoding.UTF8.GetBytes("fake-package:" + providerRunId);
 
     public void MarkTerminalDelivered(string providerRunId)
     {

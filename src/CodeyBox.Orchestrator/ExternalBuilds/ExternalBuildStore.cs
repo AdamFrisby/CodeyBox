@@ -3,9 +3,13 @@ using CodeyBox.Core.ExternalBuilds;
 namespace CodeyBox.Orchestrator.ExternalBuilds;
 
 /// <summary>
-/// Durable store for external-build records. All mutating paths use
-/// compare-and-set on (state, fence) so concurrent writers cannot corrupt,
-/// lose, or cross-contaminate builds.
+/// Durable store for external-build records. Record state transitions go
+/// through <see cref="IExternalBuildStore.TryClaimAsync"/> compare-and-set on
+/// (state, fence) so concurrent writers cannot corrupt, lose, or
+/// cross-contaminate builds. Delivery acknowledgement, park records, duration
+/// samples, and retention deletes are idempotent single-effect writes, not
+/// state transitions. There is no blind record overwrite: route every state
+/// mutation through TryClaimAsync.
 /// </summary>
 public interface IExternalBuildStore
 {
@@ -17,7 +21,6 @@ public interface IExternalBuildStore
     Task<int> CountActiveAsync(string projectId, CancellationToken ct = default);
     Task<int> CountActiveForProviderAsync(string providerId, CancellationToken ct = default);
     Task<bool> TryClaimAsync(string buildId, ExternalBuildState expectedState, string? expectedFence, ExternalBuildRecord updated, CancellationToken ct = default);
-    Task UpdateAsync(ExternalBuildRecord record, CancellationToken ct = default);
     Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default);
     Task<IReadOnlyList<ExternalBuildRecord>> ListUnackedTerminalsAsync(CancellationToken ct = default);
     Task MarkDeliveredAsync(string buildId, CancellationToken ct = default);
@@ -105,12 +108,6 @@ public sealed class InMemoryExternalBuildStore : IExternalBuildStore
             _records[buildId] = updated;
             return Task.FromResult(true);
         }
-    }
-
-    public Task UpdateAsync(ExternalBuildRecord record, CancellationToken ct = default)
-    {
-        lock (_gate) _records[record.Id] = record;
-        return Task.CompletedTask;
     }
 
     public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)

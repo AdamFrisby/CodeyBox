@@ -270,30 +270,6 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
         }
     }
 
-    public Task UpdateAsync(ExternalBuildRecord record, CancellationToken ct = default)
-    {
-        _writeLock.Wait(ct);
-        try
-        {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = """
-                UPDATE external_builds SET state=$st, target_json=$tj, source_json=$sj, config_digest=$cd,
-                    request_id=$rq, provider_run_id=$pr, fence_owner=$fo, fence_epoch=$fe,
-                    dispatch_attempts=$da, poll_count=$pc, terminal_cause=$tc, evidence_json=$ev,
-                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex, delivery_acked=$dl
-                WHERE id=$id;
-                """;
-            cmd.Parameters.AddWithValue("$id", record.Id);
-            BindUpdate(cmd, record);
-            cmd.ExecuteNonQuery();
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-        return Task.CompletedTask;
-    }
-
     public Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default)
     {
         _writeLock.Wait(ct);

@@ -133,6 +133,66 @@ public sealed class ExternalBuildToolsTests
     }
 
     [Fact]
+    public async Task ArtifactRead_RejectsSubstitutedBytes()
+    {
+        var (tools, cap, provider) = Build();
+        var started = await tools.StartAsync(cap.Handle, "fake-target", ExternalBuildTestKit.Source(), "k1");
+        var evil = new SubstitutingBuildProvider(provider, Substitution.Full);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            tools.ReadArtifactAsync(cap.Handle, started.Id, "package.zip", evil));
+        Assert.Contains("authorized listing", ex.Message);
+    }
+
+    [Fact]
+    public async Task ArtifactRead_RejectsTruncatedBytes()
+    {
+        var (tools, cap, provider) = Build();
+        var started = await tools.StartAsync(cap.Handle, "fake-target", ExternalBuildTestKit.Source(), "k1");
+        var evil = new SubstitutingBuildProvider(provider, Substitution.Truncated);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            tools.ReadArtifactAsync(cap.Handle, started.Id, "package.zip", evil));
+    }
+
+    private enum Substitution { Full, Truncated }
+
+    /// <summary>Wraps the real fake provider: listing stays authoritative but
+    /// the fetched bytes are substituted (self-consistent digest), modeling a
+    /// list/read TOCTOU or run confusion.</summary>
+    private sealed class SubstitutingBuildProvider(FakeSnapshotBuildProvider inner, Substitution kind)
+        : IExternalBuildProvider
+    {
+        public string ProviderId => inner.ProviderId;
+        public bool SupportsGitPublication => inner.SupportsGitPublication;
+        public bool SupportsSnapshotUpload => inner.SupportsSnapshotUpload;
+
+        public Task<ExternalBuildSubmitResult> SubmitAsync(
+            ExternalBuildRecord intent, ExternalBuildSubmitInput input, CancellationToken ct)
+            => inner.SubmitAsync(intent, input, ct);
+
+        public Task<ExternalBuildProviderStatus> GetStatusAsync(string providerRunId, CancellationToken ct)
+            => inner.GetStatusAsync(providerRunId, ct);
+
+        public Task<ExternalBuildCancelResult> CancelAsync(string providerRunId, CancellationToken ct)
+            => inner.CancelAsync(providerRunId, ct);
+
+        public Task<IReadOnlyList<ExternalBuildArtifactRef>> ListArtifactsAsync(
+            string providerRunId, CancellationToken ct)
+            => inner.ListArtifactsAsync(providerRunId, ct);
+
+        public async Task<ExternalBuildArtifactPayload> ReadArtifactAsync(
+            string providerRunId, string artifactName, CancellationToken ct)
+        {
+            var genuine = await inner.ReadArtifactAsync(providerRunId, artifactName, ct).ConfigureAwait(false);
+            var substituted = kind == Substitution.Full
+                ? "attacker-controlled-bytes"u8.ToArray()
+                : genuine.Content[..Math.Max(1, genuine.Content.Length / 2)];
+            return new ExternalBuildArtifactPayload(
+                genuine.Name, substituted, genuine.MediaType,
+                ExternalBuildProvenance.DigestBytes(substituted));
+        }
+    }
+
+    [Fact]
     public async Task RunnerTransport_McpBaseline_AndCliFallback()
     {
         var clock = new ControllableClock(DateTimeOffset.UtcNow);
