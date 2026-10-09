@@ -1,9 +1,11 @@
 using System.Globalization;
 using System.Net;
 using System.Text;
+using CodeyBox.Api;
 using CodeyBox.Core;
 using CodeyBox.Ec2SandboxPlugin;
 using CodeyBox.HostProcess;
+using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
 using CodeyBox.Sandbox.MultipassRemote;
 
@@ -25,6 +27,64 @@ public sealed class Ec2SandboxProviderTests
 
     private static Ec2Harness NewHarness(Func<Ec2SandboxOptions, Ec2SandboxOptions>? configure = null) =>
         new(configure);
+
+    // ------------------------------------------------------------------
+    // Registration and egress classification
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void Kind_IsNotRegisteredAsBuiltin()
+    {
+        using var harness = NewHarness();
+        Assert.Equal("ec2", harness.Provider.Name);
+        Assert.Equal("codeybox.ec2-sandbox", Ec2SandboxOptions.PluginId);
+        Assert.False(SandboxProviderKinds.IsRegistered("ec2"),
+            "plugin kinds must never collide with built-in provider kinds");
+    }
+
+    [Fact]
+    public void EgressClassification_IsNotEnforced_RegardlessOfPluginClaims()
+    {
+        using var harness = NewHarness();
+        Assert.Equal(EgressEnforcementLocation.NotEnforced,
+            HostPlatformSupport.GetEgressEnforcement(harness.Provider.Name));
+        // Even a plugin claiming dedicated-kernel isolation cannot promote the kind.
+        Assert.Equal(EgressEnforcementLocation.NotEnforced,
+            HostPlatformSupport.GetEgressEnforcement(Ec2SandboxOptions.ProviderKind));
+        Assert.Equal(SandboxIsolationLevel.DedicatedKernel, harness.Provider.IsolationLevel);
+    }
+
+    [Fact]
+    public void Catalog_SelectsKindByMemberProviderKind_AndSharesInstanceAcrossMembers()
+    {
+        using var harness = NewHarness();
+        var catalog = new PluginSandboxProviderCatalog([(Ec2SandboxOptions.PluginId, harness.Provider)]);
+        Assert.True(catalog.IsPluginKind("ec2"));
+        Assert.True(catalog.TryGetProvider("ec2", out var resolved));
+        Assert.Same(harness.Provider, resolved);
+
+        var registry = new SandboxProviderRegistry(
+            kind => catalog.TryGetProvider(kind, out var p) ? p : throw new InvalidOperationException(kind),
+            pluginKinds: catalog.Kinds);
+        var member1 = new SandboxMember { MemberId = "e1", ProviderKind = "ec2", Capacity = 2, PreferenceScore = 50 };
+        var member2 = new SandboxMember { MemberId = "e2", ProviderKind = "ec2", Capacity = 4, PreferenceScore = 50 };
+        Assert.Same(registry.Resolve(member1), registry.Resolve(member2));
+    }
+
+    [Fact]
+    public void CapabilityGate_DropsUndeclaredWellKnownTags_KeepsDeclaredAndCustom()
+    {
+        using var harness = NewHarness();
+        var member = new SandboxMember
+        {
+            MemberId = "e1", ProviderKind = "ec2", Capacity = 2, PreferenceScore = 50,
+            Capabilities = ["suspend-resume", "teardown", "org-clearance-tag"],
+        };
+        var projected = SandboxProviderCapabilityGate.ApplyProviderCapabilities(member, harness.Provider);
+        Assert.Contains("teardown", projected.Capabilities);
+        Assert.Contains("org-clearance-tag", projected.Capabilities); // operator clearance tags pass through
+        Assert.DoesNotContain("suspend-resume", projected.Capabilities);
+    }
 
     // ------------------------------------------------------------------
     // Full lifecycle
@@ -195,17 +255,39 @@ public sealed class Ec2SandboxProviderTests
     public async Task ElasticIp_MaliciousValue_FailsClosed_And_CleansUp()
     {
         using var harness = NewHarness(o => o with { AllocateElasticIp = true });
-        harness.Cloud.NextPublicIpOverride = "10.0.0.1\nMITM known_hosts injection";
-        // The address override applies to the launched instance path as well:
-        // the provider must refuse the hostile value and clean up everything.
-        var ex = await Assert.ThrowsAsync<Ec2ApiException>(
+        harness.Cloud.NextElasticIpOverride = "10.0.0.1\nMITM known_hosts injection";
+        // The allocation response carried a hostile value: the client refuses
+        // it before any SSH target is built, and everything is reaped — the
+        // allocation included, reconciled by its request tag even though its
+        // id never reached the host.
+        var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
             () => harness.Provider.CreateAsync(
                 new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
-        Assert.Contains("usable public IP", ex.Message, StringComparison.Ordinal);
-        Assert.Empty(harness.Cloud.KeyPairs);
-        Assert.Empty(harness.Cloud.SecurityGroups);
+        Assert.Contains("usable public IP", deferred.Detail, StringComparison.Ordinal);
         foreach (var instance in harness.Cloud.Instances.Values)
             Assert.Equal("terminated", instance.State);
+        Assert.Empty(harness.Cloud.KeyPairs);
+        Assert.Empty(harness.Cloud.SecurityGroups);
+        Assert.Empty(harness.Cloud.Addresses);
+    }
+
+    [Fact]
+    public async Task InstanceIp_MaliciousValue_FailsClosed_And_CleansUp()
+    {
+        using var harness = NewHarness();
+        harness.Cloud.NextPublicIpOverride = "10.0.0.1\nMITM known_hosts injection";
+        // A present-but-unparseable instance address fails fast (no
+        // timeout wait, no SSH at an unconfirmed target) with full cleanup:
+        // no allocation exists on this path.
+        var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => harness.Provider.CreateAsync(
+                new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
+        Assert.Contains("usable public IP", deferred.Detail, StringComparison.Ordinal);
+        foreach (var instance in harness.Cloud.Instances.Values)
+            Assert.Equal("terminated", instance.State);
+        Assert.Empty(harness.Cloud.KeyPairs);
+        Assert.Empty(harness.Cloud.SecurityGroups);
+        Assert.Empty(harness.Cloud.Addresses);
     }
 
     [Fact]
@@ -213,11 +295,14 @@ public sealed class Ec2SandboxProviderTests
     {
         using var harness = NewHarness();
         const string otherAmi = "ami-abcdef0123456789a";
-        using var sandbox = await harness.Provider.CreateAsync(
-            new SandboxSpec { ImageReference = otherAmi }, CancellationToken.None);
         // The fake only knows the default AMI: an unknown pin fails loudly at
         // the AMI verification step, before any instance is launched.
-        Assert.Fail("expected InvalidOperationException for an unknown AMI pin");
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Provider.CreateAsync(
+                new SandboxSpec { ImageReference = otherAmi }, CancellationToken.None));
+        Assert.Contains(otherAmi, ex.Message, StringComparison.Ordinal);
+        Assert.Empty(harness.Cloud.RunBodies);
+        Assert.Empty(harness.Cloud.Instances);
     }
 
     [Fact]
@@ -296,7 +381,7 @@ public sealed class Ec2SandboxProviderTests
             CreateSecurityGroup = false,
             SecurityGroupIds = ["sg-0123456789abcdef0"],
         });
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
         var runBody = harness.Cloud.RunBodies.Single();
         Assert.Equal("sg-0123456789abcdef0", runBody["NetworkInterface.1.Group.1"]);
@@ -405,9 +490,9 @@ public sealed class Ec2SandboxProviderTests
     public async Task KnownHosts_Pins_GeneratedHostKey()
     {
         using var harness = NewHarness();
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
-        var knownHosts = await File.ReadAllTextAsync(harness.SshTempDir(sandbox.Id));
+        var knownHosts = await File.ReadAllTextAsync(Path.Combine(harness.SshTempDir(sandbox.Id), "known_hosts"));
         Assert.Contains(FakeEc2KeyGenerator.HostPublicKey, knownHosts, StringComparison.Ordinal);
         Assert.StartsWith("192.0.2.10 ", knownHosts, StringComparison.Ordinal);
     }
@@ -416,7 +501,7 @@ public sealed class Ec2SandboxProviderTests
     public async Task MidExec_TransportLoss_Maps_To_ExecutionUnavailable()
     {
         using var harness = NewHarness();
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
         harness.Transport.ThrowTransportLossOnRun = true;
         await Assert.ThrowsAsync<SandboxExecutionUnavailableException>(
@@ -427,7 +512,7 @@ public sealed class Ec2SandboxProviderTests
     public async Task OutputLimits_Propagate_To_Transport_And_Result()
     {
         using var harness = NewHarness();
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
         var payload = new string('x', 10_000);
         harness.Transport.OnRun = (_, _) => new ProcessRunResult(0, payload, "err");
@@ -499,7 +584,7 @@ public sealed class Ec2SandboxProviderTests
             () => harness.Provider.CreateAsync(
                 new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
         Assert.Equal("quota-exhausted", deferred.ErrorClass);
-        Assert.True(deferred.RetryAfter >= TimeSpan.FromMinutes(5));
+        Assert.True(deferred.RecheckIn >= TimeSpan.FromMinutes(5));
         Assert.Empty(harness.Cloud.Instances);
         Assert.Empty(harness.Cloud.KeyPairs);
         Assert.Empty(harness.Cloud.SecurityGroups);
@@ -516,13 +601,15 @@ public sealed class Ec2SandboxProviderTests
             () => harness.Provider.CreateAsync(
                 new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
         Assert.Equal("unauthorized", deferred.ErrorClass);
-        Assert.True(deferred.RetryAfter >= TimeSpan.FromMinutes(5));
+        Assert.True(deferred.RecheckIn >= TimeSpan.FromMinutes(5));
     }
 
     [Fact]
     public async Task Throttled429_Defers_With_BaseRecheck()
     {
-        using var harness = NewHarness();
+        // One attempt only: the ambiguous throttle cannot reconcile (nothing
+        // was stored) and no resubmit is allowed, so provisioning defers.
+        using var harness = NewHarness(o => o with { MaxRunAttempts = 1 });
         harness.Cloud.FailNextRun = (
             (HttpStatusCode)429, "RequestThrottled", "slow down", false);
 
@@ -589,7 +676,7 @@ public sealed class Ec2SandboxProviderTests
         harness.Cloud.FailNextRun = (
             (HttpStatusCode)429, "RequestThrottled", "slow down", true);
 
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
 
         Assert.Single(harness.Cloud.Instances);
@@ -620,7 +707,7 @@ public sealed class Ec2SandboxProviderTests
             (HttpStatusCode)429, "RequestThrottled", "slow down", true);
         harness.Cloud.BlindDescribeCalls = 2;
 
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
 
         Assert.Single(harness.Cloud.Instances);
@@ -632,8 +719,9 @@ public sealed class Ec2SandboxProviderTests
     {
         using var harness = NewHarness(o => o with { MaxRunAttempts = 2 });
         harness.Cloud.MalformedNextResponse = true;
+        harness.Cloud.MalformedAction = "RunInstances";
 
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
 
         // The malformed run response reconciled by request tag (one launch
@@ -641,6 +729,25 @@ public sealed class Ec2SandboxProviderTests
         Assert.Single(harness.Cloud.RunBodies);
         Assert.Single(harness.Cloud.Instances);
         Assert.Equal(sandbox.Id, harness.Cloud.Instances.Values.Single().Tags["Name"]);
+    }
+
+    [Fact]
+    public async Task OversizedResponse_FailsClosed_And_CleansUp()
+    {
+        using var harness = NewHarness();
+        harness.Cloud.OversizedNextResponse = true;
+        harness.Cloud.OversizedAction = "DescribeInstances";
+
+        // The over-cap body is refused, never parsed: provisioning defers and
+        // the launched instance, key pair and security group are reaped.
+        var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(
+            () => harness.Provider.CreateAsync(
+                new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None));
+        Assert.Contains("byte cap", deferred.Detail, StringComparison.Ordinal);
+        foreach (var instance in harness.Cloud.Instances.Values)
+            Assert.Equal("terminated", instance.State);
+        Assert.Empty(harness.Cloud.KeyPairs);
+        Assert.Empty(harness.Cloud.SecurityGroups);
     }
 
     // ------------------------------------------------------------------
@@ -720,10 +827,10 @@ public sealed class Ec2SandboxProviderTests
 
             await harness.Provider.DisposeLeakedAsync(orphanName, CancellationToken.None);
 
-            Assert.Empty(cloud.Instances.Where(kv => kv.Value.State != "terminated"));
+            Assert.DoesNotContain(cloud.Instances, kv => kv.Value.State != "terminated");
             Assert.Empty(cloud.KeyPairs);
             Assert.Empty(cloud.SecurityGroups);
-            Assert.Empty(cloud.Addresses.Where(kv => kv.Value.InstanceId is not null));
+            Assert.DoesNotContain(cloud.Addresses, kv => kv.Value.InstanceId is not null);
 
             // Repeated disposal is a clean no-op.
             await harness.Provider.DisposeLeakedAsync(orphanName, CancellationToken.None);
@@ -763,17 +870,24 @@ public sealed class Ec2SandboxProviderTests
     public async Task CleanupFailure_Retained_And_Visible_For_Reaper()
     {
         using var harness = NewHarness();
-        using var sandbox = await harness.Provider.CreateAsync(
+        await using var sandbox = await harness.Provider.CreateAsync(
             new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
         var name = sandbox.Id;
         harness.Cloud.FailInstanceDelete = true;
 
-        await harness.Provider.DisposeLeakedAsync(name, CancellationToken.None);
+        // The failure stays visible: leak disposal reports it instead of
+        // claiming a deletion that never happened.
+        await Assert.ThrowsAsync<AggregateException>(
+            () => harness.Provider.DisposeLeakedAsync(name, CancellationToken.None));
 
         // Termination refused: the instance keeps its tags, so the reaper can retry.
         var instance = harness.Cloud.Instances.Values.Single();
         Assert.Equal("running", instance.State);
         Assert.Equal(Ec2Harness.OwnerId, instance.Tags["codeybox-owner"]);
+        Assert.Contains(
+            await harness.Provider.ListAllManagedAsync(CancellationToken.None),
+            m => m.Name == name);
+        harness.Cloud.FailInstanceDelete = false;
     }
 
     [Fact]
@@ -785,7 +899,7 @@ public sealed class Ec2SandboxProviderTests
             orphanName = cloud.SeedOrphan(Ec2Harness.OwnerId, seeder.Options);
         using (var live = new Ec2Harness(sharedCloud: cloud))
         {
-            using var sandbox = await live.Provider.CreateAsync(
+            await using var sandbox = await live.Provider.CreateAsync(
                 new SandboxSpec { ImageReference = string.Empty }, CancellationToken.None);
             var liveName = sandbox.Id;
 

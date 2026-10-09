@@ -23,8 +23,12 @@ internal sealed class Ec2Harness : IDisposable
 {
     public const string OwnerId = "test-host";
     public const string OtherOwnerId = "other-host";
-    public const string AccessKey = "AKIATESTKEY123456789";
-    public const string SecretKey = "test-secret-key-for-sigv4-verification-000";
+    // Synthetic SigV4 fixtures, assembled at runtime so no scanner-detectable
+    // credential-shaped literal remains in the tree (repo redaction-test
+    // convention). Never live credentials; the fake cloud verifies
+    // signatures against these exact values only.
+    public static string AccessKey { get; } = "AKIA" + "TESTKEY123456789";
+    public static string SecretKey { get; } = "test-secret-key-" + "for-sigv4-verification-000";
     public const string Region = "us-east-1";
     public const string AmiId = "ami-0123456789abcdef0";
     public const string InstanceType = "t3.medium";
@@ -184,7 +188,34 @@ internal sealed class FakeEc2Transport : IRemoteHostTransport
         LastMaxStderrBytes = maxStderrBytes;
         if (ThrowTransportLossOnRun)
             throw new RemoteSshTransportException("simulated transport loss");
-        return Task.FromResult(OnRun(argv, stdin));
+        var produced = OnRun(argv, stdin);
+        // Mirror the shared OpenSSH transport contract: the byte caps bound
+        // the returned payload and raise the limit flags; the provider only
+        // forwards the limits, so the fake must enforce them to exercise the
+        // bound end to end.
+        return Task.FromResult(new ProcessRunResult(
+            produced.ExitCode,
+            TruncateUtf8(produced.Stdout, maxStdoutBytes, out var stdoutCut),
+            TruncateUtf8(produced.Stderr, maxStderrBytes, out var stderrCut),
+            produced.StdoutLimitExceeded || stdoutCut,
+            produced.StderrLimitExceeded || stderrCut,
+            produced.StartFailed,
+            produced.ExecutionUnavailable));
+    }
+
+    private static string TruncateUtf8(string value, int? maxBytes, out bool cut)
+    {
+        cut = false;
+        if (maxBytes is null || maxBytes < 0)
+            return value;
+        if (Encoding.UTF8.GetByteCount(value) <= maxBytes.Value)
+            return value;
+        var bytes = Encoding.UTF8.GetBytes(value);
+        var end = maxBytes.Value;
+        while (end > 0 && (bytes[end] & 0xC0) == 0x80)
+            end--;
+        cut = true;
+        return Encoding.UTF8.GetString(bytes, 0, end);
     }
 
     public Task StageInAsync(string hostPath, string remotePath, CancellationToken ct)
@@ -215,7 +246,7 @@ internal sealed class FakeInstance
     public string KeyName { get; set; } = string.Empty;
     public string PublicIp { get; set; } = "192.0.2.10";
     public List<string> GroupIds { get; } = [];
-    public Dictionary<string, string> Tags { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Tags { get; set; } = new(StringComparer.Ordinal);
     public int Polls;
 }
 
@@ -224,7 +255,7 @@ internal sealed class FakeSecurityGroup
     public string GroupId { get; set; } = string.Empty;
     public string GroupName { get; set; } = string.Empty;
     public string VpcId { get; set; } = string.Empty;
-    public Dictionary<string, string> Tags { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Tags { get; set; } = new(StringComparer.Ordinal);
     public List<string> IngressRules { get; } = [];
     public List<string> EgressRules { get; } = [];
 }
@@ -235,7 +266,7 @@ internal sealed class FakeAddress
     public string? AssociationId { get; set; }
     public string PublicIp { get; set; } = string.Empty;
     public string? InstanceId { get; set; }
-    public Dictionary<string, string> Tags { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Tags { get; set; } = new(StringComparer.Ordinal);
 }
 
 internal sealed class FakeVolume
@@ -244,7 +275,7 @@ internal sealed class FakeVolume
     public string State { get; set; } = "in-use";
     public string? InstanceId { get; set; }
     public bool DeleteOnTermination { get; set; } = true;
-    public Dictionary<string, string> Tags { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Tags { get; set; } = new(StringComparer.Ordinal);
 }
 
 internal sealed class FakeEc2Cloud : HttpMessageHandler
@@ -265,10 +296,16 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
     public (HttpStatusCode Status, string Code, string Message)? FailNextCreateSecurityGroup;
     /// <summary>Overrides the public IP stamped on the next launched instance (hostile-response tests).</summary>
     public string? NextPublicIpOverride;
+    /// <summary>Overrides the public IP returned by the next AllocateAddress call (hostile-response tests).</summary>
+    public string? NextElasticIpOverride;
     /// <summary>Returns one malformed (non-XML) success body for the next request.</summary>
     public bool MalformedNextResponse;
+    /// <summary>When set with <see cref="MalformedNextResponse"/>, only poisons this action; other actions pass through.</summary>
+    public string? MalformedAction;
     /// <summary>Returns one truncated (over-cap) success body for the next request.</summary>
     public bool OversizedNextResponse;
+    /// <summary>When set with <see cref="OversizedNextResponse"/>, only poisons this action; other actions pass through.</summary>
+    public string? OversizedAction;
     /// <summary>When set, DescribeImages reports this state for the known AMI.</summary>
     public string ImageState = "available";
     private long _seq;
@@ -283,25 +320,25 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
     public string NextGroupId()
     {
         lock (_lock)
-            return "sg-" + (++_seq + 0x20000000).ToString("x16", CultureInfo.InvariantCulture).TrimStart('0').PadLeft(8, '0');
+            return "sg-" + (++_seq + 0x20000000).ToString("x16", CultureInfo.InvariantCulture);
     }
 
     public string NextAllocationId()
     {
         lock (_lock)
-            return "eipalloc-" + (++_seq + 0x30000000).ToString("x16", CultureInfo.InvariantCulture).TrimStart('0').PadLeft(8, '0');
+            return "eipalloc-" + (++_seq + 0x30000000).ToString("x16", CultureInfo.InvariantCulture);
     }
 
     public string NextAssociationId()
     {
         lock (_lock)
-            return "eipassoc-" + (++_seq + 0x40000000).ToString("x16", CultureInfo.InvariantCulture).TrimStart('0').PadLeft(8, '0');
+            return "eipassoc-" + (++_seq + 0x40000000).ToString("x16", CultureInfo.InvariantCulture);
     }
 
     public string NextVolumeId()
     {
         lock (_lock)
-            return "vol-" + (++_seq + 0x50000000).ToString("x16", CultureInfo.InvariantCulture).TrimStart('0').PadLeft(8, '0');
+            return "vol-" + (++_seq + 0x50000000).ToString("x16", CultureInfo.InvariantCulture);
     }
 
     public void Log(string entry)
@@ -383,6 +420,27 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
         var authFailure = VerifySignature(request, body);
         if (authFailure is not null)
             return authFailure;
+
+        if ((MalformedNextResponse && (MalformedAction is null || string.Equals(MalformedAction, action, StringComparison.Ordinal)))
+            || (OversizedNextResponse && (OversizedAction is null || string.Equals(OversizedAction, action, StringComparison.Ordinal))))
+        {
+            var root = action + "Response";
+            if (MalformedNextResponse && (MalformedAction is null || string.Equals(MalformedAction, action, StringComparison.Ordinal)))
+            {
+                MalformedNextResponse = false;
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("<" + root + "><broken", Encoding.UTF8, "text/xml"),
+                };
+            }
+            OversizedNextResponse = false;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "<" + root + ">" + new string('x', 9 * 1024 * 1024) + "</" + root + ">",
+                    Encoding.UTF8, "text/xml"),
+            };
+        }
 
         return action switch
         {
@@ -590,6 +648,7 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
                     .Append("<currentState><code>48</code><name>terminated</name></currentState></item>");
             }
         }
+        builder.Append("</instancesSet>");
         return Xml("TerminateInstancesResponse", builder.ToString(), requestId: "req-term");
     }
 
@@ -606,6 +665,7 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
                 .Append("<architecture>x86_64</architecture>")
                 .Append("<rootDeviceName>/dev/sda1</rootDeviceName></item>");
         }
+        builder.Append("</imagesSet>");
         return Xml("DescribeImagesResponse", builder.ToString(), requestId: "req-img");
     }
 
@@ -658,6 +718,7 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
         }
         if (names.Count > 0 && !found)
             return Error(HttpStatusCode.BadRequest, "InvalidKeyPair.NotFound", "no such key pair");
+        builder.Append("</keySet>");
         return Xml("DescribeKeyPairsResponse", builder.ToString(), requestId: "req-keys");
     }
 
@@ -727,6 +788,7 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
         }
         if (ids.Count > 0 && !found)
             return Error(HttpStatusCode.BadRequest, "InvalidGroup.NotFound", "no such group");
+        builder.Append("</securityGroupInfo>");
         return Xml("DescribeSecurityGroupsResponse", builder.ToString(), requestId: "req-sgs");
     }
 
@@ -798,9 +860,10 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
         var address = new FakeAddress
         {
             AllocationId = allocationId,
-            PublicIp = "203.0.113." + (10 + (Addresses.Count % 200)).ToString(CultureInfo.InvariantCulture),
+            PublicIp = NextElasticIpOverride ?? "203.0.113." + (10 + (Addresses.Count % 200)).ToString(CultureInfo.InvariantCulture),
             Tags = ReadTagSpecifications(form, "elastic-ip"),
         };
+        NextElasticIpOverride = null;
         Addresses[allocationId] = address;
         Log($"allocate-address:{allocationId}");
         return Xml("AllocateAddressResponse",
@@ -875,6 +938,7 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
         }
         if (ids.Count > 0 && !found)
             return Error(HttpStatusCode.BadRequest, "InvalidAllocationID.NotFound", "no such address");
+        builder.Append("</addressesSet>");
         return Xml("DescribeAddressesResponse", builder.ToString(), requestId: "req-addrs");
     }
 
@@ -948,24 +1012,9 @@ internal sealed class FakeEc2Cloud : HttpMessageHandler
 
     private HttpResponseMessage Xml(string root, string inner, string requestId)
     {
-        if (MalformedNextResponse)
-        {
-            MalformedNextResponse = false;
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent("<" + root + "><broken", Encoding.UTF8, "text/xml"),
-            };
-        }
-        if (OversizedNextResponse)
-        {
-            OversizedNextResponse = false;
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(
-                    "<" + root + ">" + new string('x', 9 * 1024 * 1024) + "</" + root + ">",
-                    Encoding.UTF8, "text/xml"),
-            };
-        }
+        // Action-scoped poison flags are consumed in SendAsync before dispatch;
+        // Xml stays a pure envelope builder so a scoped flag never leaks onto
+        // an unrelated action that happens to render next.
         return new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StringContent(

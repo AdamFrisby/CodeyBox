@@ -488,6 +488,14 @@ public sealed class Ec2SandboxProvider :
         {
             if (!IsOwnedBy(instance.Tags, ownerId))
                 continue;
+            // EC2 keeps reporting terminated instances for a while after the
+            // delete call returns; they hold no resources and must not look
+            // managed, or the leak reaper would chase them forever.
+            if (string.Equals(instance.State, "terminated", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(instance.State, "shutting-down", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
             var name = instance.Tags!.TryGetValue("Name", out var nameTag) ? nameTag : instance.InstanceId;
             if (string.IsNullOrWhiteSpace(name)
                 || !name.StartsWith(opts.InstanceNamePrefix, StringComparison.Ordinal))
@@ -544,6 +552,23 @@ public sealed class Ec2SandboxProvider :
             VerifyOwnedInstance(match, ownerId, name);
             tracked.InstanceId = match.InstanceId;
             tracked.RequestId = match.Tags!.TryGetValue(RequestTag, out var request) ? request : null;
+        }
+        else
+        {
+            // No owned instance under this name: fail closed when the name
+            // belongs to someone else's instance instead of reporting a
+            // cleanup that never happened. A name with no instance at all
+            // stays a clean idempotent no-op (post-cleanup repeats).
+            var namesakes = await api.DescribeInstancesByTagAsync(
+                credentials, new Dictionary<string, string> { ["Name"] = name }, ct).ConfigureAwait(false);
+            if (namesakes.Any(i => string.Equals(
+                    i.Tags is not null && i.Tags.TryGetValue("Name", out var nameTag) ? nameTag : i.InstanceId,
+                    name, StringComparison.Ordinal)))
+            {
+                throw new ArgumentException(
+                    $"EC2 sandbox name '{name}' is not a managed sandbox of this host; " +
+                    "refusing to clean another owner's instance.", nameof(name));
+            }
         }
         await DeleteOwnedInstanceSetAsync(
             api, credentials, opts, ownerId, tracked, throwOnFailure: true, ct).ConfigureAwait(false);
@@ -885,9 +910,13 @@ public sealed class Ec2SandboxProvider :
                     foreach (var groupId in instance.SecurityGroupIds)
                         liveGroupIds.Add(groupId);
                 }
+                // Only a live instance keeps its request tag alive: a
+                // terminated instance will never use its keypair, group,
+                // address or volumes again, so its set must sweep even
+                // while EC2 still reports the dead instance record.
+                if (instance.Tags!.TryGetValue(RequestTag, out var request) && !string.IsNullOrEmpty(request))
+                    liveRequests.Add(request);
             }
-            if (instance.Tags!.TryGetValue(RequestTag, out var request) && !string.IsNullOrEmpty(request))
-                liveRequests.Add(request);
         }
         var swept = 0;
         var budget = Math.Max(1, Math.Min(opts.MaxListItems, 1000));
@@ -1052,6 +1081,16 @@ public sealed class Ec2SandboxProvider :
             var address = RunningInstanceAddress(running);
             if (address is not null)
                 return address;
+            // A present-but-unparseable address is a hostile or corrupt cloud
+            // response, never a slow one: fail closed now instead of polling
+            // until the timeout and then SSHing at an unconfirmed target.
+            if (!string.IsNullOrWhiteSpace(running.PublicIpAddress))
+            {
+                throw new Ec2ApiException(
+                    Ec2FailureKind.Unexpected, "resolve instance address",
+                    $"instance '{running.InstanceId}' exposed no usable public IP address; " +
+                    "refusing to target it.");
+            }
             var refreshed = await api.DescribeInstanceAsync(credentials, running.InstanceId!, ct).ConfigureAwait(false);
             if (refreshed is not null)
             {
