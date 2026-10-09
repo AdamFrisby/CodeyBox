@@ -274,6 +274,7 @@ public sealed class AzureApiClient
         AzureCredentials credentials, string vmId, string apiVersion, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(credentials);
+        RequireInScopeResourceId(credentials, vmId, "get virtual machine");
         var (status, body) = await SendAsync(
             credentials, HttpMethod.Get, AppendApiVersion(vmId, apiVersion), content: null, "get virtual machine", ct,
             throwOnNotFound: false).ConfigureAwait(false);
@@ -292,6 +293,7 @@ public sealed class AzureApiClient
     {
         ArgumentNullException.ThrowIfNull(credentials);
         ArgumentException.ThrowIfNullOrWhiteSpace(jsonBody);
+        RequireInScopeResourceId(credentials, vmId, "create virtual machine");
         var url = AppendApiVersion(vmId, apiVersion);
         using var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
         using var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = content };
@@ -428,6 +430,7 @@ public sealed class AzureApiClient
     public async Task<AzureNic?> GetNicAsync(
         AzureCredentials credentials, string nicId, string apiVersion, CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, nicId, "get network interface");
         var (status, body) = await SendAsync(
             credentials, HttpMethod.Get, AppendApiVersion(nicId, apiVersion), content: null, "get network interface", ct,
             throwOnNotFound: false).ConfigureAwait(false);
@@ -442,6 +445,7 @@ public sealed class AzureApiClient
         TimeSpan waitTimeout,
         CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, nicId, "create network interface");
         var url = AppendApiVersion(nicId, apiVersion);
         using var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
         using var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = content };
@@ -453,6 +457,7 @@ public sealed class AzureApiClient
     public async Task<AzureNsg?> GetNsgAsync(
         AzureCredentials credentials, string nsgId, string apiVersion, CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, nsgId, "get network security group");
         var (status, body) = await SendAsync(
             credentials, HttpMethod.Get, AppendApiVersion(nsgId, apiVersion), content: null, "get network security group", ct,
             throwOnNotFound: false).ConfigureAwait(false);
@@ -467,6 +472,7 @@ public sealed class AzureApiClient
         TimeSpan waitTimeout,
         CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, nsgId, "create network security group");
         var url = AppendApiVersion(nsgId, apiVersion);
         using var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
         using var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = content };
@@ -478,6 +484,7 @@ public sealed class AzureApiClient
     public async Task<AzurePublicIp?> GetPublicIpAsync(
         AzureCredentials credentials, string pipId, string apiVersion, CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, pipId, "get public IP address");
         var (status, body) = await SendAsync(
             credentials, HttpMethod.Get, AppendApiVersion(pipId, apiVersion), content: null, "get public IP address", ct,
             throwOnNotFound: false).ConfigureAwait(false);
@@ -492,6 +499,7 @@ public sealed class AzureApiClient
         TimeSpan waitTimeout,
         CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, pipId, "create public IP address");
         var url = AppendApiVersion(pipId, apiVersion);
         using var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
         using var request = new HttpRequestMessage(HttpMethod.Put, url) { Content = content };
@@ -503,6 +511,7 @@ public sealed class AzureApiClient
     public async Task<AzureDisk?> GetDiskAsync(
         AzureCredentials credentials, string diskId, string apiVersion, CancellationToken ct)
     {
+        RequireInScopeResourceId(credentials, diskId, "get managed disk");
         var (status, body) = await SendAsync(
             credentials, HttpMethod.Get, AppendApiVersion(diskId, apiVersion), content: null, "get managed disk", ct,
             throwOnNotFound: false).ConfigureAwait(false);
@@ -525,6 +534,7 @@ public sealed class AzureApiClient
     {
         ArgumentNullException.ThrowIfNull(credentials);
         ArgumentException.ThrowIfNullOrWhiteSpace(resourceId);
+        RequireInScopeResourceId(credentials, resourceId, operation);
         var url = AppendApiVersion(resourceId, apiVersion);
         using var request = new HttpRequestMessage(HttpMethod.Delete, url);
         HttpResponseMessage response = await SendRawAsync(credentials, request, operation, ct).ConfigureAwait(false);
@@ -1078,8 +1088,38 @@ public sealed class AzureApiClient
     /// </summary>
     internal string RequireInScopeUrl(AzureCredentials credentials, string url, string operation)
     {
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var candidate))
+        ArgumentNullException.ThrowIfNull(credentials);
+        if (string.IsNullOrWhiteSpace(url))
+            throw new AzureApiException(AzureFailureKind.InvalidResponse, operation, "server returned an empty poll URL; refusing to follow it.");
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var candidate))
             throw new AzureApiException(AzureFailureKind.InvalidResponse, operation, "server returned a relative poll URL; refusing to follow it.");
+        AssertInScope(credentials, candidate, operation, "poll URL");
+        return url;
+    }
+
+    /// <summary>
+    /// Refuses to send the bearer token to a cloud-returned resource id that
+    /// leaves the configured management origin or subscription scope.
+    /// ARM <c>id</c> fields (VM NIC references, NIC public-IP references,
+    /// listed-resource ids) are dependency runtime output and therefore
+    /// untrusted: every id reaches a bearer-token sink only through this
+    /// guard, which runs inside the sink methods themselves so future callers
+    /// inherit the check.
+    /// </summary>
+    internal string RequireInScopeResourceId(AzureCredentials credentials, string resourceId, string operation)
+    {
+        ArgumentNullException.ThrowIfNull(credentials);
+        if (string.IsNullOrWhiteSpace(resourceId))
+            throw new AzureApiException(AzureFailureKind.InvalidResponse, operation, "server returned an empty resource id; refusing to follow it.");
+        var stripped = StripQuery(resourceId.Trim());
+        if (!Uri.TryCreate(stripped, UriKind.Absolute, out var candidate))
+            throw new AzureApiException(AzureFailureKind.InvalidResponse, operation, "server returned a relative resource id; refusing to follow it.");
+        AssertInScope(credentials, candidate, operation, "resource id");
+        return resourceId;
+    }
+
+    private static void AssertInScope(AzureCredentials credentials, Uri candidate, string operation, string label)
+    {
         var baseUri = credentials.ManagementBaseUri;
         if (!string.Equals(candidate.Scheme, baseUri.Scheme, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(candidate.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase)
@@ -1087,16 +1127,15 @@ public sealed class AzureApiClient
         {
             throw new AzureApiException(
                 AzureFailureKind.InvalidResponse, operation,
-                "server returned a poll URL outside the configured management origin; refusing to follow it.");
+                $"server returned a {label} outside the configured management origin; refusing to follow it.");
         }
         var scopePrefix = $"/subscriptions/{credentials.SubscriptionId}/";
         if (!candidate.AbsolutePath.StartsWith(scopePrefix, StringComparison.OrdinalIgnoreCase))
         {
             throw new AzureApiException(
                 AzureFailureKind.InvalidResponse, operation,
-                "server returned a poll URL outside the configured subscription scope; refusing to follow it.");
+                $"server returned a {label} outside the configured subscription scope; refusing to follow it.");
         }
-        return url;
     }
 
     private static string? HeaderUrl(HttpResponseMessage response, string name)

@@ -586,6 +586,45 @@ public sealed class AzureSandboxProviderTests
         Assert.Empty(harness.Cloud.Vms);
     }
 
+    [Fact]
+    public async Task CloudReturnedNicId_OutsideScope_RefusedWithoutDelete()
+    {
+        using var harness = NewHarness();
+        var orphan = await harness.Cloud.SeedOrphanAsync(OwnerId, withPublicIp: false);
+        var vmId = $"http://localhost/subscriptions/{SubscriptionId}/resourceGroups/{ResourceGroup}/providers/Microsoft.Compute/virtualMachines/{orphan}";
+        harness.Cloud.NextGetBodyOverride =
+            "{\"id\":\"" + vmId + "\",\"name\":\"" + orphan + "\",\"location\":\"westeurope\"," +
+            "\"tags\":{\"codeybox.managed\":\"true\",\"codeybox.owner\":\"" + OwnerId + "\",\"codeybox.request-id\":\"seeded\"}," +
+            "\"properties\":{\"provisioningState\":\"Succeeded\"," +
+            "\"networkProfile\":{\"networkInterfaces\":[{\"id\":\"https://attacker.example/subscriptions/" + SubscriptionId + "/steal\"}]}}}";
+        var ex = await Assert.ThrowsAsync<AzureApiException>(() =>
+            harness.Provider.DisposeLeakedAsync(orphan, CancellationToken.None));
+        Assert.Equal(AzureFailureKind.InvalidResponse, ex.Kind);
+        Assert.DoesNotContain(
+            harness.Cloud.Requests,
+            r => r.StartsWith("DELETE ", StringComparison.Ordinal));
+        Assert.Contains(orphan, harness.Cloud.NamesOf("virtualMachines"));
+    }
+
+    [Theory]
+    [InlineData("https://attacker.example/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Network/networkInterfaces/evil-nic")]
+    [InlineData("http://localhost/subscriptions/other-sub/resourceGroups/rg-1/providers/Microsoft.Network/networkInterfaces/evil-nic")]
+    [InlineData("/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.Network/networkInterfaces/evil-nic")]
+    public async Task CloudReturnedResourceId_OutsideScope_NeverSendsBearerToken(string evilId)
+    {
+        using var harness = NewHarness();
+        var http = new HttpClient(harness.Cloud, disposeHandler: false) { Timeout = Timeout.InfiniteTimeSpan };
+        var api = new AzureApiClient(http);
+        var credentials = new AzureCredentials(new Uri("http://localhost/"), SubscriptionId, "test-token");
+        var getEx = await Assert.ThrowsAsync<AzureApiException>(() =>
+            api.GetNicAsync(credentials, evilId, "2024-05-01", CancellationToken.None));
+        Assert.Equal(AzureFailureKind.InvalidResponse, getEx.Kind);
+        var deleteEx = await Assert.ThrowsAsync<AzureApiException>(() =>
+            api.DeleteByIdAsync(credentials, evilId, "2024-05-01", "sweep orphan test", TimeSpan.FromSeconds(5), CancellationToken.None));
+        Assert.Equal(AzureFailureKind.InvalidResponse, deleteEx.Kind);
+        Assert.Empty(harness.Cloud.Requests);
+    }
+
     [Theory]
     [InlineData("{not json")]
     [InlineData("""{"value": [truncated""")]

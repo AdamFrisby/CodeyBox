@@ -426,7 +426,11 @@ public sealed class AzureSandboxProvider :
             if (!IsOwned(vm.Tags, ownerId))
                 throw new InvalidOperationException(
                     $"Refusing to delete Azure VM '{name}': ownership tags do not match this host.");
-            var nicId = vm.NicId ?? ids.NicId;
+            // vm.NicId is cloud-returned (untrusted): reject out-of-scope ids
+            // before any credentialed request. The sink revalidates as well.
+            var nicId = vm.NicId is null
+                ? ids.NicId
+                : api.RequireInScopeResourceId(credentials, vm.NicId, "delete virtual machine");
             var diskId = vm.OsDiskName is not null
                 ? AzureResourceIds.DiskId(credentials, opts.ResourceGroupName, vm.OsDiskName)
                 : ids.DiskId;
@@ -533,6 +537,8 @@ public sealed class AzureSandboxProvider :
                     "network interface is missing after VM provisioning succeeded.");
             if (nic.PublicIpId is not null)
             {
+                // Cloud-returned reference: scope-check before the credentialed read.
+                api.RequireInScopeResourceId(credentials, nic.PublicIpId, "resolve sandbox address");
                 var pip = await api.GetPublicIpAsync(credentials, nic.PublicIpId, opts.NetworkApiVersion, ct).ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(pip?.IpAddress))
                     return ValidateVmAddress(pip.IpAddress);
@@ -903,6 +909,8 @@ public sealed class AzureSandboxProvider :
                 continue;
             try
             {
+                // Listed ids are cloud-returned: scope-check before the credentialed delete.
+                api.RequireInScopeResourceId(credentials, resource.Id, "sweep orphan " + resourceType);
                 if (await api.DeleteByIdAsync(
                     credentials, resource.Id, apiVersion, "sweep orphan " + resourceType,
                     TimeSpan.FromSeconds(Math.Min(60, Math.Clamp(opts.ReadyTimeoutSeconds, 30, 3600))),
