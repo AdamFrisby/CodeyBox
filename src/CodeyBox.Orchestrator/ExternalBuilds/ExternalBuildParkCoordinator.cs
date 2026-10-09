@@ -57,8 +57,9 @@ public sealed class ExternalBuildParkCoordinator
         if (ExternalBuildLifecycle.IsTerminal(record.State))
             return null;
         var opts = _options();
+        var history = _history.Snapshot().Concat(await _store.ListSamplesAsync(ct).ConfigureAwait(false)).ToList();
         var decision = ExternalBuildParkPolicy.Decide(
-            record.Target, _history.Snapshot(), opts.HistorySampleSize,
+            record.Target, history, opts.HistorySampleSize,
             opts.MinSamplesForPrediction,
             Enum.TryParse<ParkEstimator>(opts.Estimator, out var est) ? est : ParkEstimator.Median,
             _clock.GetUtcNow(), coldCache);
@@ -72,6 +73,10 @@ public sealed class ExternalBuildParkCoordinator
             record.Id, record.WorkItemId, record.Phase, record.Iteration, record.Attempt,
             effective, _clock.GetUtcNow(), "ckpt-" + record.Id);
         lock (_gate) _parked[record.Id] = parked;
+        await _store.SaveParkAsync(new ExternalBuildParkRecord(
+            parked.BuildId, parked.WorkItemId, parked.Phase, parked.Iteration, parked.Attempt,
+            parked.Decision.Reason, parked.Decision.PredictedDuration?.Ticks,
+            parked.Decision.SampleCount, parked.ParkedAt, parked.CheckpointId), ct).ConfigureAwait(false);
         return parked;
     }
 
@@ -87,21 +92,42 @@ public sealed class ExternalBuildParkCoordinator
     {
         ArgumentNullException.ThrowIfNull(resumeAsync);
         var delivered = new List<string>();
+        var candidates = new List<string>();
         foreach (var evt in _service.DrainOutbox())
+            if (!candidates.Contains(evt.BuildId, StringComparer.Ordinal))
+                candidates.Add(evt.BuildId);
+        foreach (var terminal in await _store.ListUnackedTerminalsAsync(ct).ConfigureAwait(false))
+            if (!candidates.Contains(terminal.Id, StringComparer.Ordinal))
+                candidates.Add(terminal.Id);
+        foreach (var buildId in candidates)
         {
-            var record = await _store.GetAsync(evt.BuildId, ct).ConfigureAwait(false);
-            if (record is null) { _service.AckDelivery(evt.BuildId); continue; }
+            var record = await _store.GetAsync(buildId, ct).ConfigureAwait(false);
+            if (record is null) { _service.AckDelivery(buildId); continue; }
+            if (record.DeliveryAcked) { _service.AckDelivery(record.Id); continue; }
+            if (!ExternalBuildLifecycle.IsTerminal(record.State)) continue;
             lock (_gate)
             {
                 if (_resumed.Contains(record.Id)) { _service.AckDelivery(record.Id); continue; }
-                if (_parked.TryGetValue(record.Id, out var parked)
-                    && (parked.Attempt != record.Attempt || parked.Iteration != record.Iteration
-                        || !string.Equals(parked.Phase, record.Phase, StringComparison.Ordinal)
-                        || !string.Equals(parked.WorkItemId, record.WorkItemId, StringComparison.Ordinal)))
-                {
-                    _service.AckDelivery(record.Id);
-                    continue;
-                }
+            }
+            var durablePark = await _store.GetParkAsync(record.Id, ct).ConfigureAwait(false);
+            ParkedWait? parked = null;
+            lock (_gate) _parked.TryGetValue(record.Id, out parked);
+            parked ??= durablePark is null ? null : new ParkedWait(
+                durablePark.BuildId, durablePark.WorkItemId, durablePark.Phase,
+                durablePark.Iteration, durablePark.Attempt,
+                new ExternalBuildParkDecision(
+                    true,
+                    durablePark.EstimateTicks.HasValue ? TimeSpan.FromTicks(durablePark.EstimateTicks.Value) : null,
+                    durablePark.SampleCount, durablePark.Reason),
+                durablePark.ParkedAt, durablePark.CheckpointId);
+            if (parked is not null
+                && (parked.Attempt != record.Attempt || parked.Iteration != record.Iteration
+                    || !string.Equals(parked.Phase, record.Phase, StringComparison.Ordinal)
+                    || !string.Equals(parked.WorkItemId, record.WorkItemId, StringComparison.Ordinal)))
+            {
+                _service.AckDelivery(record.Id);
+                await _store.MarkDeliveredAsync(record.Id, ct).ConfigureAwait(false);
+                continue;
             }
             var resumeKind = DetermineResumeKind(record);
             await resumeAsync(record, resumeKind, ct).ConfigureAwait(false);
@@ -112,13 +138,19 @@ public sealed class ExternalBuildParkCoordinator
                 _deliveries++;
             }
             _service.AckDelivery(record.Id);
+            await _store.MarkDeliveredAsync(record.Id, ct).ConfigureAwait(false);
+            await _store.RemoveParkAsync(record.Id, ct).ConfigureAwait(false);
             delivered.Add(record.Id);
             if (record.State == ExternalBuildState.Succeeded && record.Evidence is not null)
-                _history.Record(new ExternalBuildDurationSample(
+            {
+                var sample = new ExternalBuildDurationSample(
                     record.Target,
                     record.CompletedAt.HasValue && record.CreatedAt != default
                         ? record.CompletedAt.Value - record.CreatedAt : TimeSpan.FromMinutes(1),
-                    true, record.CompletedAt ?? _clock.GetUtcNow(), ColdCache: false));
+                    true, record.CompletedAt ?? _clock.GetUtcNow(), ColdCache: false);
+                _history.Record(sample);
+                await _store.RecordSampleAsync(sample, ct).ConfigureAwait(false);
+            }
         }
         return delivered;
     }
@@ -137,6 +169,16 @@ public sealed class ExternalBuildParkCoordinator
     public bool IsParkedKnownWait(string buildId)
     {
         lock (_gate) return _parked.ContainsKey(buildId);
+    }
+
+    /// <summary>Durable known-wait check: consults memory first, then the persisted park.</summary>
+    public async Task<bool> IsParkedKnownWaitAsync(string buildId, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            if (_parked.ContainsKey(buildId)) return true;
+        }
+        return await _store.GetParkAsync(buildId, ct).ConfigureAwait(false) is not null;
     }
 
     /// <summary>Required evidence outstanding: audit/merge must not advance.</summary>

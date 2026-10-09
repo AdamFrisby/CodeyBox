@@ -36,6 +36,9 @@ public static class ExternalBuildParkPolicy
     /// <summary>Samples older than this are stale and ignored. Default 30 days.</summary>
     public static readonly TimeSpan MaxSampleAge = TimeSpan.FromDays(30);
 
+    /// <summary>Samples at or above this duration are truncated-run outliers, never successful builds.</summary>
+    public static readonly TimeSpan MaxSampleDuration = TimeSpan.FromHours(24);
+
     public static ExternalBuildParkDecision Decide(
         ExternalBuildTargetKey target,
         IReadOnlyList<ExternalBuildDurationSample> history,
@@ -57,7 +60,7 @@ public static class ExternalBuildParkPolicy
                 && now - s.CompletedAt <= MaxSampleAge
                 && (!coldCache.HasValue || s.ColdCache == coldCache.Value)
                 && s.Duration > TimeSpan.Zero
-                && s.Duration < TimeSpan.FromHours(24))
+                && s.Duration < MaxSampleDuration)
             .OrderByDescending(s => s.CompletedAt)
             .Take(sampleSize)
             .Select(s => s.Duration)

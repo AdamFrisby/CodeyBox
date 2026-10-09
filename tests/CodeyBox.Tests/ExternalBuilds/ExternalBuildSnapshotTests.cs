@@ -84,6 +84,29 @@ public sealed class ExternalBuildSnapshotTests
     }
 
     [Fact]
+    public void VerifyAgainstContent_PassesForExactBytes_AndFailsAfterSubstitution()
+    {
+        var tracked = new List<(string, byte[], string)> { ("a.cs", Bytes("one"), "100644") };
+        var snapshot = ExternalBuildSnapshotBuilder.Freeze(tracked, [], []);
+        Assert.True(ExternalBuildSnapshotBuilder.VerifyAgainstContent(snapshot, tracked, [], []));
+        Assert.False(ExternalBuildSnapshotBuilder.VerifyAgainstContent(
+            snapshot, new List<(string, byte[], string)> { ("a.cs", Bytes("tampered"), "100644") }, [], []));
+        Assert.False(ExternalBuildSnapshotBuilder.VerifyAgainstContent(
+            snapshot with { SourceDigestSha256 = new string('0', 64) }, tracked, [], []));
+    }
+
+    [Fact]
+    public void Freeze_ComputesPolicyDigest_FromEffectivePolicy()
+    {
+        var @default = ExternalBuildSnapshotBuilder.Freeze([("a.cs", Bytes("a"), "100644")], [], []);
+        var custom = ExternalBuildSnapshotBuilder.Freeze(
+            [("a.cs", Bytes("a"), "100644")], [], [],
+            new ExternalBuildSnapshotPolicy { MaxFiles = 7 });
+        Assert.Equal(64, @default.PolicyDigest.Length);
+        Assert.NotEqual(@default.PolicyDigest, custom.PolicyDigest);
+    }
+
+    [Fact]
     public void GitPublicationPolicy_ConfinesCandidateRefs()
     {
         var policy = new ExternalBuildGitPublicationPolicy();

@@ -98,7 +98,21 @@ public static class ExternalBuildSnapshotBuilder
         return new ExternalBuildSnapshot(
             "snap-" + digest[..16], digest,
             files.OrderBy(f => f.RelativePath, StringComparer.Ordinal).ToList(),
-            total, deletions.Count > 0, "policy-default");
+            total, deletions.Count > 0, ComputePolicyDigest(policy));
+    }
+
+    public static string ComputePolicyDigest(ExternalBuildSnapshotPolicy policy)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        var payload = string.Join('\0', policy.ExcludePrefixes)
+            + '\0' + string.Join('\0', policy.ExcludeExactNames)
+            + '\0' + policy.MaxPathChars
+            + '\0' + policy.MaxTotalBytes
+            + '\0' + policy.MaxFiles
+            + '\0' + policy.MaxFileBytes
+            + '\0' + policy.MaterializeLfsBlobs
+            + '\0' + string.Join('\0', policy.MaterializedSubmodules);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
     }
 
     public static string Normalize(string rel)
@@ -128,16 +142,23 @@ public static class ExternalBuildSnapshotBuilder
     }
 
     /// <summary>
-    /// Verifies a snapshot digest over the captured entries (post-transfer check).
+    /// Verifies a snapshot against the actual captured bytes (post-transfer
+    /// check). Re-freezes the supplied content and compares the recomputed
+    /// source digest with exact equality; any mismatch fails closed.
     /// </summary>
-    public static bool VerifyDigest(ExternalBuildSnapshot snapshot)
+    public static bool VerifyAgainstContent(
+        ExternalBuildSnapshot snapshot,
+        IReadOnlyList<(string RelativePath, byte[] Content, string Mode)> tracked,
+        IReadOnlyList<string> deletions,
+        IReadOnlyList<(string RelativePath, byte[] Content, string Mode)> untracked,
+        ExternalBuildSnapshotPolicy? policy = null)
     {
-        var rebuilt = Freeze(
-            snapshot.Files.Select(f => (f.RelativePath, new byte[f.ByteSize], f.Mode)).ToList(),
-            snapshot.HasDeletions ? ["__deletions-present__"] : [],
-            []);
-        _ = rebuilt;
-        return !string.IsNullOrWhiteSpace(snapshot.SourceDigestSha256) && snapshot.SourceDigestSha256.Length == 64;
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var rebuilt = Freeze(tracked, deletions, untracked, policy);
+        return string.Equals(rebuilt.SourceDigestSha256, snapshot.SourceDigestSha256, StringComparison.Ordinal)
+            && rebuilt.TotalBytes == snapshot.TotalBytes
+            && rebuilt.Files.Count == snapshot.Files.Count
+            && rebuilt.HasDeletions == snapshot.HasDeletions;
     }
 }
 

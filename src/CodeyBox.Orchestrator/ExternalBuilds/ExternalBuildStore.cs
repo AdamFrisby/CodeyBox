@@ -19,12 +19,34 @@ public interface IExternalBuildStore
     Task<bool> TryClaimAsync(string buildId, ExternalBuildState expectedState, string? expectedFence, ExternalBuildRecord updated, CancellationToken ct = default);
     Task UpdateAsync(ExternalBuildRecord record, CancellationToken ct = default);
     Task<int> DeleteOlderThanAsync(DateTimeOffset cutoff, CancellationToken ct = default);
+    Task<IReadOnlyList<ExternalBuildRecord>> ListUnackedTerminalsAsync(CancellationToken ct = default);
+    Task MarkDeliveredAsync(string buildId, CancellationToken ct = default);
+    Task SaveParkAsync(ExternalBuildParkRecord park, CancellationToken ct = default);
+    Task<ExternalBuildParkRecord?> GetParkAsync(string buildId, CancellationToken ct = default);
+    Task RemoveParkAsync(string buildId, CancellationToken ct = default);
+    Task RecordSampleAsync(ExternalBuildDurationSample sample, CancellationToken ct = default);
+    Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(CancellationToken ct = default);
 }
+
+/// <summary>Persisted park wait: reason/estimate/sample count survive restart.</summary>
+public sealed record ExternalBuildParkRecord(
+    string BuildId,
+    string WorkItemId,
+    string Phase,
+    int Iteration,
+    int Attempt,
+    string Reason,
+    long? EstimateTicks,
+    int SampleCount,
+    DateTimeOffset ParkedAt,
+    string CheckpointId);
 
 public sealed class InMemoryExternalBuildStore : IExternalBuildStore
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, ExternalBuildRecord> _records = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ExternalBuildParkRecord> _parks = new(StringComparer.Ordinal);
+    private readonly List<ExternalBuildDurationSample> _samples = [];
 
     public Task CreateAsync(ExternalBuildRecord record, CancellationToken ct = default)
     {
@@ -101,5 +123,53 @@ public sealed class InMemoryExternalBuildStore : IExternalBuildStore
             foreach (var id in dead) _records.Remove(id);
             return Task.FromResult(dead.Count);
         }
+    }
+
+    public Task<IReadOnlyList<ExternalBuildRecord>> ListUnackedTerminalsAsync(CancellationToken ct = default)
+    {
+        lock (_gate) return Task.FromResult<IReadOnlyList<ExternalBuildRecord>>(
+            _records.Values
+                .Where(r => ExternalBuildLifecycle.IsTerminal(r.State) && !r.DeliveryAcked)
+                .ToList());
+    }
+
+    public Task MarkDeliveredAsync(string buildId, CancellationToken ct = default)
+    {
+        lock (_gate)
+        {
+            if (_records.TryGetValue(buildId, out var cur) && !cur.DeliveryAcked)
+                _records[buildId] = cur with { DeliveryAcked = true };
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task SaveParkAsync(ExternalBuildParkRecord park, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(park);
+        lock (_gate) _parks[park.BuildId] = park;
+        return Task.CompletedTask;
+    }
+
+    public Task<ExternalBuildParkRecord?> GetParkAsync(string buildId, CancellationToken ct = default)
+    {
+        lock (_gate) return Task.FromResult(_parks.TryGetValue(buildId, out var p) ? p : null);
+    }
+
+    public Task RemoveParkAsync(string buildId, CancellationToken ct = default)
+    {
+        lock (_gate) _parks.Remove(buildId);
+        return Task.CompletedTask;
+    }
+
+    public Task RecordSampleAsync(ExternalBuildDurationSample sample, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sample);
+        lock (_gate) _samples.Add(sample);
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(CancellationToken ct = default)
+    {
+        lock (_gate) return Task.FromResult<IReadOnlyList<ExternalBuildDurationSample>>(_samples.ToList());
     }
 }

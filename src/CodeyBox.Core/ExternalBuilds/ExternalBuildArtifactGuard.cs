@@ -13,6 +13,9 @@ public static class ExternalBuildArtifactGuard
 {
     public const int MaxArtifactNameChars = 256;
 
+    /// <summary>Max archive expansion ratio (uncompressed:compressed) before a zip-bomb is assumed.</summary>
+    public const long MaxExpansionRatio = 100;
+
     public static string? ValidateRef(ExternalBuildArtifactRef artifact, ExternalBuildOptions options)
     {
         ArgumentNullException.ThrowIfNull(artifact);
@@ -70,8 +73,8 @@ public static class ExternalBuildArtifactGuard
             if (totalUncompressed > options.MaxDecompressedBytes)
                 return "archive exceeds decompression cap";
         }
-        if (totalCompressed > 0 && totalUncompressed > totalCompressed * 100)
-            return "archive expansion ratio exceeds 100x (zip-bomb guard)";
+        if (totalCompressed > 0 && totalUncompressed > totalCompressed * MaxExpansionRatio)
+            return $"archive expansion ratio exceeds {MaxExpansionRatio}x (zip-bomb guard)";
         return null;
     }
 

@@ -19,6 +19,7 @@ public sealed class ExternalBuildService
     private readonly object _outboxGate = new();
     private readonly List<ExternalBuildCompletionEvent> _outbox = [];
     private readonly HashSet<string> _acked = new(StringComparer.Ordinal);
+    private readonly string _owner = "svc-" + Guid.NewGuid().ToString("N")[..12];
 
     public ExternalBuildService(
         IExternalBuildStore store,
@@ -45,6 +46,8 @@ public sealed class ExternalBuildService
         if (!_providers.TryGetValue(approval.ProviderId, out var provider))
             throw new ExternalBuildTargetNotApprovedException(request.ApprovedTargetName + " (no provider)");
         if (request.Source is null) throw new ArgumentException("Source identity is required.", nameof(request));
+        if (request.Source.CandidateRef is not null)
+            new ExternalBuildGitPublicationPolicy().ValidateRef(request.Source.CandidateRef);
 
         var target = new ExternalBuildTargetKey
         {
@@ -145,28 +148,36 @@ public sealed class ExternalBuildService
             UpdatedAt = now,
             FenceOwner = null,
         };
-        await _store.UpdateAsync(cancelled, ct).ConfigureAwait(false);
+        await ClaimAsync(record, cancelled, ct).ConfigureAwait(false);
+        cancelled = (await _store.GetAsync(buildId, ct).ConfigureAwait(false)) ?? cancelled;
         if (record.ProviderRunId is not null && _providers.TryGetValue(record.Target.ProviderId, out var provider))
         {
             try
             {
                 var result = await provider.CancelAsync(record.ProviderRunId, ct).ConfigureAwait(false);
-                var reconciled = cancelled with
+                var latest = await _store.GetAsync(buildId, ct).ConfigureAwait(false) ?? cancelled;
+                if (ExternalBuildLifecycle.IsTerminal(latest.State) && latest.State != ExternalBuildState.Cancelled)
+                    return latest;
+                var reconciled = latest with
                 {
+                    State = ExternalBuildState.Cancelled,
                     TerminalCause = result.Confirmed
                         ? ExternalBuildTerminalCause.ProviderConfirmedCancellation
                         : cause,
                     FailureDetail = result.Detail,
+                    CompletedAt = latest.CompletedAt ?? _clock.GetUtcNow(),
                     UpdatedAt = _clock.GetUtcNow(),
+                    FenceOwner = null,
                 };
-                await _store.UpdateAsync(reconciled, ct).ConfigureAwait(false);
+                await ClaimAsync(latest, reconciled, ct).ConfigureAwait(false);
                 return reconciled;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                var noted = cancelled with { FailureDetail = "cancel raced completion: " + ex.Message, UpdatedAt = _clock.GetUtcNow() };
-                await _store.UpdateAsync(noted, ct).ConfigureAwait(false);
+                var latest = await _store.GetAsync(buildId, ct).ConfigureAwait(false) ?? cancelled;
+                var noted = latest with { FailureDetail = "cancel raced completion: " + ex.GetType().Name + ": " + ex.Message, UpdatedAt = _clock.GetUtcNow() };
+                await ClaimAsync(latest, noted, ct).ConfigureAwait(false);
                 return await ReconcileAsync(buildId, ct).ConfigureAwait(false);
             }
         }
@@ -182,7 +193,7 @@ public sealed class ExternalBuildService
             throw new ExternalBuildConflictException("Cannot adopt a terminal build.");
         var now = _clock.GetUtcNow();
         var adopted = record with { ProviderRunId = providerRunId, State = ExternalBuildState.Queued, UpdatedAt = now };
-        await _store.UpdateAsync(adopted, ct).ConfigureAwait(false);
+        await ClaimAsync(record, adopted, ct).ConfigureAwait(false);
         return adopted;
     }
 
@@ -229,7 +240,7 @@ public sealed class ExternalBuildService
             DispatchAttempts = record.DispatchAttempts + 1,
             UpdatedAt = now,
         };
-        await _store.UpdateAsync(dispatched, ct).ConfigureAwait(false);
+        dispatched = await ClaimAsync(record, dispatched, ct).ConfigureAwait(false);
         ExternalBuildSubmitResult result;
         try
         {
@@ -240,11 +251,10 @@ public sealed class ExternalBuildService
             var failed = dispatched with
             {
                 State = ExternalBuildState.SubmitUncertain,
-                FailureDetail = "submit threw before acceptance: " + ex.Message,
+                FailureDetail = "submit threw before acceptance: " + ex.GetType().Name + ": " + ex.Message,
                 UpdatedAt = _clock.GetUtcNow(),
             };
-            await _store.UpdateAsync(failed, ct).ConfigureAwait(false);
-            return failed;
+            return await ClaimAsync(dispatched, failed, ct).ConfigureAwait(false);
         }
         if (provider is FakeExternalBuildProviderBase fake && result.ProviderRunId is not null)
             fake.AttachIntent(result.ProviderRunId, dispatched);
@@ -256,8 +266,7 @@ public sealed class ExternalBuildService
                 FailureDetail = result.Error ?? "provider did not accept",
                 UpdatedAt = _clock.GetUtcNow(),
             };
-            await _store.UpdateAsync(uncertain, ct).ConfigureAwait(false);
-            return uncertain;
+            return await ClaimAsync(dispatched, uncertain, ct).ConfigureAwait(false);
         }
         var queued = dispatched with
         {
@@ -266,8 +275,7 @@ public sealed class ExternalBuildService
             FailureDetail = null,
             UpdatedAt = _clock.GetUtcNow(),
         };
-        await _store.UpdateAsync(queued, ct).ConfigureAwait(false);
-        return queued;
+        return await ClaimAsync(dispatched, queued, ct).ConfigureAwait(false);
     }
 
     private async Task<ExternalBuildRecord> ObserveProviderAsync(
@@ -279,15 +287,22 @@ public sealed class ExternalBuildService
         {
             status = await provider.GetStatusAsync(record.ProviderRunId!, ct).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            var bumped = record with { PollCount = record.PollCount + 1, UpdatedAt = _clock.GetUtcNow() };
+            var bumped = record with
+            {
+                PollCount = record.PollCount + 1,
+                FailureDetail = "provider poll failed: " + ex.GetType().Name + ": " + ex.Message,
+                UpdatedAt = _clock.GetUtcNow(),
+            };
             if (bumped.PollCount >= opts.MaxPollAttempts)
+            {
+                bumped = await ClaimAsync(record, bumped, ct).ConfigureAwait(false);
                 return await TransitionAsync(bumped, ExternalBuildState.ReconciliationBlocked,
                     cause: ExternalBuildTerminalCause.ReconciliationImpossible,
                     detail: "provider unreachable; poll bound reached", ct).ConfigureAwait(false);
-            await _store.UpdateAsync(bumped, ct).ConfigureAwait(false);
-            return bumped;
+            }
+            return await ClaimAsync(record, bumped, ct).ConfigureAwait(false);
         }
         var now = _clock.GetUtcNow();
         switch (status.Phase)
@@ -305,15 +320,14 @@ public sealed class ExternalBuildService
                     return await TransitionAsync(record, ExternalBuildState.Failed,
                         cause: ExternalBuildTerminalCause.DeadlineExceeded, detail: "build deadline exceeded", ct).ConfigureAwait(false);
                 var bumped = record with { State = next, PollCount = record.PollCount + 1, UpdatedAt = now };
-                await _store.UpdateAsync(bumped, ct).ConfigureAwait(false);
-                return bumped;
+                return await ClaimAsync(record, bumped, ct).ConfigureAwait(false);
             }
             case ExternalBuildExecutionPhase.Succeeded:
             case ExternalBuildExecutionPhase.Failed:
             case ExternalBuildExecutionPhase.Cancelled:
             {
                 var collecting = record with { State = ExternalBuildState.Collecting, UpdatedAt = now };
-                await _store.UpdateAsync(collecting, ct).ConfigureAwait(false);
+                collecting = await ClaimAsync(record, collecting, ct).ConfigureAwait(false);
                 var terminal = collecting with
                 {
                     State = status.Phase == ExternalBuildExecutionPhase.Succeeded
@@ -331,7 +345,7 @@ public sealed class ExternalBuildService
                     UpdatedAt = now,
                     FenceOwner = null,
                 };
-                await _store.UpdateAsync(terminal, ct).ConfigureAwait(false);
+                await ClaimAsync(collecting, terminal, ct).ConfigureAwait(false);
                 lock (_outboxGate) _outbox.Add(new ExternalBuildCompletionEvent(terminal.Id, terminal.State, now));
                 if (provider is FakeExternalBuildProviderBase fake && terminal.ProviderRunId is not null)
                     fake.MarkTerminalDelivered(terminal.ProviderRunId);
@@ -341,11 +355,13 @@ public sealed class ExternalBuildService
             {
                 var bumped = record with { PollCount = record.PollCount + 1, UpdatedAt = now };
                 if (bumped.PollCount >= opts.MaxPollAttempts)
+                {
+                    bumped = await ClaimAsync(record, bumped, ct).ConfigureAwait(false);
                     return await TransitionAsync(bumped, ExternalBuildState.ReconciliationBlocked,
                         cause: ExternalBuildTerminalCause.ReconciliationImpossible,
                         detail: "provider run unknown; refusing silent pass", ct).ConfigureAwait(false);
-                await _store.UpdateAsync(bumped, ct).ConfigureAwait(false);
-                return bumped;
+                }
+                return await ClaimAsync(record, bumped, ct).ConfigureAwait(false);
             }
         }
     }
@@ -364,9 +380,27 @@ public sealed class ExternalBuildService
             CompletedAt = ExternalBuildLifecycle.IsTerminal(state) ? now : record.CompletedAt,
             FenceOwner = ExternalBuildLifecycle.IsTerminal(state) ? null : record.FenceOwner,
         };
-        await _store.UpdateAsync(next, ct).ConfigureAwait(false);
+        await ClaimAsync(record, next, ct).ConfigureAwait(false);
         if (ExternalBuildLifecycle.IsTerminal(state))
             lock (_outboxGate) _outbox.Add(new ExternalBuildCompletionEvent(next.Id, next.State, now));
+        return next;
+    }
+
+    /// <summary>
+    /// Compare-and-set write: persists <paramref name="next"/> only when the
+    /// stored record still has <paramref name="expected"/>'s (state, fence).
+    /// Losing a race throws a typed conflict instead of silently overwriting
+    /// a concurrent writer's state; callers re-read before retrying.
+    /// </summary>
+    private async Task<ExternalBuildRecord> ClaimAsync(
+        ExternalBuildRecord expected, ExternalBuildRecord next, CancellationToken ct)
+    {
+        next = ExternalBuildLifecycle.IsTerminal(next.State)
+            ? next with { FenceOwner = null }
+            : next with { FenceOwner = _owner, FenceEpoch = expected.FenceEpoch + 1 };
+        if (!await _store.TryClaimAsync(expected.Id, expected.State, expected.FenceOwner, next, ct).ConfigureAwait(false))
+            throw new ExternalBuildConflictException(
+                $"Concurrent update to external build '{expected.Id}'; state moved under this writer.");
         return next;
     }
 }

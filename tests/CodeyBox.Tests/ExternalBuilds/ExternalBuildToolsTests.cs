@@ -15,7 +15,7 @@ public sealed class ExternalBuildToolsTests
         var store = new InMemoryExternalBuildStore();
         var provider = new FakeSnapshotBuildProvider();
         var service = new ExternalBuildService(store, [provider], () => opts, clock);
-        var tools = new ExternalBuildSandboxTools(service, store, () => opts, clock);
+        var tools = new ExternalBuildSandboxTools(service, store, () => opts, clock, [provider]);
         var cap = tools.IssueCapability("proj", "w1", "work", 1, 1);
         return (tools, cap, provider);
     }
@@ -91,13 +91,34 @@ public sealed class ExternalBuildToolsTests
         var opts = ExternalBuildTestKit.Options();
         opts.MaxDiagnosticsChars = 32;
         var store = new InMemoryExternalBuildStore();
-        var provider = new FakeSnapshotBuildProvider();
+        var provider = new FakeSnapshotBuildProvider
+        {
+            EvidenceFactory = _ => new ExternalBuildEvidence
+            {
+                Compile = ExternalBuildDimensionOutcome.Passed,
+                Tests = ExternalBuildDimensionOutcome.Passed,
+                Package = ExternalBuildDimensionOutcome.Passed,
+                SourceDigestSha256 = new string('a', 64),
+                ProviderRunId = "run-1",
+                WorkflowIdentity = "bearer SECRET-should-be-redacted-0123456789\n" + new string('w', 200),
+                ApprovedTargetName = "fake-target",
+                Toolchain = "fake-toolchain-1",
+                Platform = "fake-platform-1",
+                Configuration = "release",
+                Authoritative = true,
+                CapturedAt = DateTimeOffset.UtcNow,
+            },
+            PollsToTerminal = 1,
+        };
         var service = new ExternalBuildService(store, [provider], () => opts, clock);
-        var tools = new ExternalBuildSandboxTools(service, store, () => opts, clock);
+        var tools = new ExternalBuildSandboxTools(service, store, () => opts, clock, [provider]);
         var cap = tools.IssueCapability("proj", "w1", "work", 1, 1);
         var started = await tools.StartAsync(cap.Handle, "fake-target", ExternalBuildTestKit.Source(), "k1");
+        await tools.StatusAsync(cap.Handle, started.Id);
         var text = await tools.DiagnosticsAsync(cap.Handle, started.Id);
         Assert.True(text.Length <= 32 + "[...truncated]".Length);
+        Assert.Contains("[redacted]", text);
+        Assert.DoesNotContain("SECRET-should-be-redacted", text);
     }
 
     [Fact]

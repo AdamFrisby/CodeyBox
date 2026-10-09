@@ -65,8 +65,39 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 CREATE INDEX IF NOT EXISTS idx_extbuilds_project ON external_builds(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_extbuilds_idem ON external_builds(project_id, idempotency_key, idempotency_body_hash);
                 CREATE INDEX IF NOT EXISTS idx_extbuilds_run ON external_builds(provider_run_id);
+                CREATE TABLE IF NOT EXISTS external_build_parks (
+                    build_id TEXT PRIMARY KEY,
+                    work_item_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    iteration INTEGER NOT NULL DEFAULT 0,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL,
+                    estimate_ticks INTEGER,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    parked_at TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS external_build_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_json TEXT NOT NULL,
+                    duration_ticks INTEGER NOT NULL,
+                    completed_ok INTEGER NOT NULL DEFAULT 1,
+                    completed_at TEXT NOT NULL,
+                    cold_cache INTEGER NOT NULL DEFAULT 0
+                );
                 """;
             cmd.ExecuteNonQuery();
+            using var migrate = _conn.CreateCommand();
+            migrate.CommandText = "PRAGMA table_info(external_builds);";
+            var columns = new HashSet<string>(StringComparer.Ordinal);
+            using (var reader = migrate.ExecuteReader())
+                while (reader.Read()) columns.Add(reader.GetString(1));
+            if (!columns.Contains("delivery_acked"))
+            {
+                using var alter = _conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE external_builds ADD COLUMN delivery_acked INTEGER NOT NULL DEFAULT 0;";
+                alter.ExecuteNonQuery();
+            }
         }
         finally
         {
@@ -84,8 +115,8 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 INSERT INTO external_builds (id, schema_version, project_id, work_item_id, phase, iteration, attempt,
                     state, target_json, source_json, config_digest, idempotency_key, idempotency_body_hash,
                     request_id, provider_run_id, fence_owner, fence_epoch, dispatch_attempts, poll_count,
-                    terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at)
-                VALUES ($id,$sv,$p,$w,$ph,$it,$at,$st,$tj,$sj,$cd,$ik,$ih,$rq,$pr,$fo,$fe,$da,$pc,$tc,$ev,$fd,$ca,$ua,$co,$ex);
+                    terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at, delivery_acked)
+                VALUES ($id,$sv,$p,$w,$ph,$it,$at,$st,$tj,$sj,$cd,$ik,$ih,$rq,$pr,$fo,$fe,$da,$pc,$tc,$ev,$fd,$ca,$ua,$co,$ex,$dl);
                 """;
             Bind(cmd, record);
             cmd.ExecuteNonQuery();
@@ -224,7 +255,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 UPDATE external_builds SET state=$st, target_json=$tj, source_json=$sj, config_digest=$cd,
                     request_id=$rq, provider_run_id=$pr, fence_owner=$fo, fence_epoch=$fe,
                     dispatch_attempts=$da, poll_count=$pc, terminal_cause=$tc, evidence_json=$ev,
-                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex
+                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex, delivery_acked=$dl
                 WHERE id=$id AND state=$expected AND ((fence_owner IS NULL AND $efo IS NULL) OR fence_owner = $efo);
                 """;
             cmd.Parameters.AddWithValue("$id", buildId);
@@ -249,7 +280,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
                 UPDATE external_builds SET state=$st, target_json=$tj, source_json=$sj, config_digest=$cd,
                     request_id=$rq, provider_run_id=$pr, fence_owner=$fo, fence_epoch=$fe,
                     dispatch_attempts=$da, poll_count=$pc, terminal_cause=$tc, evidence_json=$ev,
-                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex
+                    failure_detail=$fd, updated_at=$ua, completed_at=$co, expires_at=$ex, delivery_acked=$dl
                 WHERE id=$id;
                 """;
             cmd.Parameters.AddWithValue("$id", record.Id);
@@ -279,13 +310,169 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
         }
     }
 
+    public Task<IReadOnlyList<ExternalBuildRecord>> ListUnackedTerminalsAsync(CancellationToken ct = default)
+    {
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT " + Columns + " FROM external_builds WHERE state IN ('Succeeded','Failed','Cancelled','ReconciliationBlocked') AND delivery_acked = 0;";
+            var list = new List<ExternalBuildRecord>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) list.Add(Read(reader));
+            return Task.FromResult<IReadOnlyList<ExternalBuildRecord>>(list);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public Task MarkDeliveredAsync(string buildId, CancellationToken ct = default)
+    {
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE external_builds SET delivery_acked = 1 WHERE id = $id;";
+            cmd.Parameters.AddWithValue("$id", buildId);
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task SaveParkAsync(ExternalBuildParkRecord park, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(park);
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO external_build_parks (build_id, work_item_id, phase, iteration, attempt, reason, estimate_ticks, sample_count, parked_at, checkpoint_id)
+                VALUES ($b,$w,$ph,$it,$at,$r,$e,$s,$p,$c)
+                ON CONFLICT(build_id) DO UPDATE SET work_item_id=$w, phase=$ph, iteration=$it, attempt=$at,
+                    reason=$r, estimate_ticks=$e, sample_count=$s, parked_at=$p, checkpoint_id=$c;
+                """;
+            cmd.Parameters.AddWithValue("$b", park.BuildId);
+            cmd.Parameters.AddWithValue("$w", park.WorkItemId);
+            cmd.Parameters.AddWithValue("$ph", park.Phase);
+            cmd.Parameters.AddWithValue("$it", park.Iteration);
+            cmd.Parameters.AddWithValue("$at", park.Attempt);
+            cmd.Parameters.AddWithValue("$r", park.Reason);
+            cmd.Parameters.AddWithValue("$e", park.EstimateTicks.HasValue ? (object)park.EstimateTicks.Value : DBNull.Value);
+            cmd.Parameters.AddWithValue("$s", park.SampleCount);
+            cmd.Parameters.AddWithValue("$p", park.ParkedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$c", park.CheckpointId);
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task<ExternalBuildParkRecord?> GetParkAsync(string buildId, CancellationToken ct = default)
+    {
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT build_id, work_item_id, phase, iteration, attempt, reason, estimate_ticks, sample_count, parked_at, checkpoint_id FROM external_build_parks WHERE build_id = $b;";
+            cmd.Parameters.AddWithValue("$b", buildId);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read()) return Task.FromResult<ExternalBuildParkRecord?>(null);
+            return Task.FromResult<ExternalBuildParkRecord?>(new ExternalBuildParkRecord(
+                reader.GetString(0), reader.GetString(1), reader.GetString(2),
+                reader.GetInt32(3), reader.GetInt32(4), reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetInt64(6), reader.GetInt32(7),
+                DateTimeOffset.Parse(reader.GetString(8)), reader.GetString(9)));
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public Task RemoveParkAsync(string buildId, CancellationToken ct = default)
+    {
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM external_build_parks WHERE build_id = $b;";
+            cmd.Parameters.AddWithValue("$b", buildId);
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task RecordSampleAsync(ExternalBuildDurationSample sample, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(sample);
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO external_build_history (target_json, duration_ticks, completed_ok, completed_at, cold_cache)
+                VALUES ($t,$d,$o,$c,$cc);
+                """;
+            cmd.Parameters.AddWithValue("$t", JsonSerializer.Serialize(sample.Target, JsonOpts));
+            cmd.Parameters.AddWithValue("$d", sample.Duration.Ticks);
+            cmd.Parameters.AddWithValue("$o", sample.CompletedSuccessfully ? 1 : 0);
+            cmd.Parameters.AddWithValue("$c", sample.CompletedAt.ToString("O"));
+            cmd.Parameters.AddWithValue("$cc", sample.ColdCache ? 1 : 0);
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<ExternalBuildDurationSample>> ListSamplesAsync(CancellationToken ct = default)
+    {
+        _writeLock.Wait(ct);
+        try
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT target_json, duration_ticks, completed_ok, completed_at, cold_cache FROM external_build_history ORDER BY completed_at DESC;";
+            var list = new List<ExternalBuildDurationSample>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                list.Add(new ExternalBuildDurationSample(
+                    JsonSerializer.Deserialize<ExternalBuildTargetKey>(reader.GetString(0), JsonOpts)!,
+                    TimeSpan.FromTicks(reader.GetInt64(1)),
+                    reader.GetInt32(2) != 0,
+                    DateTimeOffset.Parse(reader.GetString(3)),
+                    reader.GetInt32(4) != 0));
+            return Task.FromResult<IReadOnlyList<ExternalBuildDurationSample>>(list);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public void Dispose() => _conn.Dispose();
 
     private const string Columns =
         "id, schema_version, project_id, work_item_id, phase, iteration, attempt, state," +
         " target_json, source_json, config_digest, idempotency_key, idempotency_body_hash," +
         " request_id, provider_run_id, fence_owner, fence_epoch, dispatch_attempts, poll_count," +
-        " terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at";
+        " terminal_cause, evidence_json, failure_detail, created_at, updated_at, completed_at, expires_at," +
+        " delivery_acked";
 
     private static void Bind(SqliteCommand cmd, ExternalBuildRecord r)
     {
@@ -320,6 +507,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
         cmd.Parameters.AddWithValue("$ua", r.UpdatedAt.ToString("O"));
         cmd.Parameters.AddWithValue("$co", r.CompletedAt?.ToString("O") ?? (object)DBNull.Value);
         cmd.Parameters.AddWithValue("$ex", r.ExpiresAt?.ToString("O") ?? (object)DBNull.Value);
+        cmd.Parameters.AddWithValue("$dl", r.DeliveryAcked ? 1 : 0);
     }
 
     private static ExternalBuildRecord Read(SqliteDataReader reader)
@@ -356,6 +544,7 @@ public sealed class SqliteExternalBuildStore : IExternalBuildStore, IDisposable
             UpdatedAt = DateTimeOffset.Parse(reader.GetString(23)),
             CompletedAt = Null(24) is { } c ? DateTimeOffset.Parse(c) : null,
             ExpiresAt = Null(25) is { } e ? DateTimeOffset.Parse(e) : null,
+            DeliveryAcked = reader.FieldCount > 26 && !reader.IsDBNull(26) && reader.GetInt32(26) != 0,
         };
     }
 }

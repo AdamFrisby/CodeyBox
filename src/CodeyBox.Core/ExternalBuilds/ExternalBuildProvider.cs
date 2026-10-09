@@ -69,6 +69,9 @@ public sealed record ExternalBuildCallback(
 
 public static class ExternalBuildCallbackValidator
 {
+    /// <summary>Max clock skew accepted for provider callbacks coming from the future.</summary>
+    public static readonly TimeSpan MaxFutureClockSkew = TimeSpan.FromMinutes(5);
+
     public static string? Validate(
         ExternalBuildCallback callback, string expectedProviderId,
         DateTimeOffset now, TimeSpan maxAge,
@@ -80,7 +83,7 @@ public static class ExternalBuildCallbackValidator
             return "provider mismatch";
         if (string.IsNullOrWhiteSpace(callback.ProviderRunId) || string.IsNullOrWhiteSpace(callback.BuildId))
             return "missing run identity";
-        if (callback.SentAt > now + TimeSpan.FromMinutes(5))
+        if (callback.SentAt > now + MaxFutureClockSkew)
             return "callback from the future";
         if (now - callback.SentAt > maxAge)
             return "stale callback";

@@ -30,6 +30,7 @@ public sealed class ExternalBuildSandboxTools
     private readonly IExternalBuildStore _store;
     private readonly Func<ExternalBuildOptions> _options;
     private readonly TimeProvider _clock;
+    private readonly IReadOnlyDictionary<string, IExternalBuildProvider> _providers;
     private readonly object _gate = new();
     private readonly Dictionary<string, ExternalBuildCapability> _capabilities = new(StringComparer.Ordinal);
 
@@ -37,12 +38,14 @@ public sealed class ExternalBuildSandboxTools
         ExternalBuildService service,
         IExternalBuildStore store,
         Func<ExternalBuildOptions> options,
-        TimeProvider? clock = null)
+        TimeProvider? clock = null,
+        IEnumerable<IExternalBuildProvider>? providers = null)
     {
         _service = service ?? throw new ArgumentNullException(nameof(service));
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _clock = clock ?? TimeProvider.System;
+        _providers = (providers ?? []).ToDictionary(p => p.ProviderId, p => p, StringComparer.Ordinal);
     }
 
     public ExternalBuildCapability IssueCapability(
@@ -115,18 +118,43 @@ public sealed class ExternalBuildSandboxTools
     }
 
     public async Task<IReadOnlyList<ExternalBuildArtifactRef>> ListArtifactsAsync(
+        string handle, string buildId, CancellationToken ct = default)
+    {
+        var cap = Require(handle);
+        var record = await OwnedAsync(cap, buildId, ct).ConfigureAwait(false);
+        return await ListCoreAsync(record, ResolveProvider(record), ct).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<ExternalBuildArtifactRef>> ListArtifactsAsync(
         string handle, string buildId, IExternalBuildProvider provider, CancellationToken ct = default)
     {
         var cap = Require(handle);
         var record = await OwnedAsync(cap, buildId, ct).ConfigureAwait(false);
+        return await ListCoreAsync(record, RequireMatchingProvider(record, provider), ct).ConfigureAwait(false);
+    }
+
+    private async Task<IReadOnlyList<ExternalBuildArtifactRef>> ListCoreAsync(
+        ExternalBuildRecord record, IExternalBuildProvider provider, CancellationToken ct)
+    {
         if (record.ProviderRunId is null) return [];
         var refs = await provider.ListArtifactsAsync(record.ProviderRunId, ct).ConfigureAwait(false);
         var opts = _options();
+        if (refs.Count > opts.MaxArtifactsPerBuild)
+            throw new InvalidOperationException(
+                $"Provider listed {refs.Count} artifacts, exceeding the {opts.MaxArtifactsPerBuild} cap; refusing unbounded ingestion.");
         var safe = new List<ExternalBuildArtifactRef>();
-        foreach (var r in refs.Take(opts.MaxArtifactsPerBuild))
-            if (ExternalBuildArtifactGuard.ValidateRef(r, opts) is null)
+        foreach (var r in refs)
+            if (ValidateListedRef(r, opts) is null)
                 safe.Add(r);
         return safe;
+    }
+
+    public async Task<ExternalBuildArtifactPayload> ReadArtifactAsync(
+        string handle, string buildId, string artifactName, CancellationToken ct = default)
+    {
+        var cap = Require(handle);
+        var record = await OwnedAsync(cap, buildId, ct).ConfigureAwait(false);
+        return await ReadCoreAsync(record, ResolveProvider(record), artifactName, ct).ConfigureAwait(false);
     }
 
     public async Task<ExternalBuildArtifactPayload> ReadArtifactAsync(
@@ -134,12 +162,74 @@ public sealed class ExternalBuildSandboxTools
     {
         var cap = Require(handle);
         var record = await OwnedAsync(cap, buildId, ct).ConfigureAwait(false);
+        return await ReadCoreAsync(record, RequireMatchingProvider(record, provider), artifactName, ct).ConfigureAwait(false);
+    }
+
+    private async Task<ExternalBuildArtifactPayload> ReadCoreAsync(
+        ExternalBuildRecord record, IExternalBuildProvider provider, string artifactName, CancellationToken ct)
+    {
+        var nameError = ValidateRequestedName(artifactName, _options());
+        if (nameError is not null) throw new ArgumentException(nameError, nameof(artifactName));
         if (record.ProviderRunId is null)
             throw new InvalidOperationException("Build has no provider run yet.");
+        var refs = await provider.ListArtifactsAsync(record.ProviderRunId, ct).ConfigureAwait(false);
+        var opts = _options();
+        if (refs.Count > opts.MaxArtifactsPerBuild)
+            throw new InvalidOperationException(
+                $"Provider listed {refs.Count} artifacts, exceeding the {opts.MaxArtifactsPerBuild} cap; refusing unbounded ingestion.");
+        ExternalBuildArtifactRef? listed = null;
+        foreach (var r in refs)
+            if (string.Equals(r.Name, artifactName, StringComparison.Ordinal)
+                && ValidateListedRef(r, opts) is null)
+                listed = r;
+        if (listed is null)
+            throw new InvalidOperationException($"Artifact '{artifactName}' is not listed for this run.");
+        if (listed.SizeBytes > opts.MaxArtifactBytes)
+            throw new InvalidOperationException(
+                $"Artifact '{artifactName}' reports {listed.SizeBytes} bytes, exceeding the {opts.MaxArtifactBytes}-byte cap; refusing to buffer.");
         var payload = await provider.ReadArtifactAsync(record.ProviderRunId, artifactName, ct).ConfigureAwait(false);
-        var error = ExternalBuildArtifactGuard.ValidatePayload(payload, _options());
+        if (!string.Equals(payload.Name, artifactName, StringComparison.Ordinal))
+            throw new InvalidOperationException("Provider returned a different artifact than requested.");
+        var error = ExternalBuildArtifactGuard.ValidatePayload(payload, opts);
         if (error is not null) throw new InvalidOperationException("Artifact rejected: " + error);
         return payload;
+    }
+
+    private IExternalBuildProvider ResolveProvider(ExternalBuildRecord record)
+    {
+        if (_providers.TryGetValue(record.Target.ProviderId, out var provider))
+            return provider;
+        throw new ExternalBuildTargetNotApprovedException(
+            record.Target.ProviderId + " (no host-resolved provider)");
+    }
+
+    private static IExternalBuildProvider RequireMatchingProvider(
+        ExternalBuildRecord record, IExternalBuildProvider provider)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        if (!string.Equals(provider.ProviderId, record.Target.ProviderId, StringComparison.Ordinal))
+            throw new ExternalBuildTargetNotApprovedException(
+                provider.ProviderId + " (does not own this build run)");
+        return provider;
+    }
+
+    private static string? ValidateRequestedName(string artifactName, ExternalBuildOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(artifactName) || artifactName.Length > ExternalBuildArtifactGuard.MaxArtifactNameChars)
+            return "artifact name missing or too long";
+        var normalized = artifactName.Replace('\\', '/');
+        if (normalized.StartsWith('/') || normalized.Contains("..", StringComparison.Ordinal))
+            return "artifact name escapes its directory";
+        if (artifactName.Length > 0 && options.MaxArtifactBytes <= 0)
+            return "artifact ingestion is disabled by configuration";
+        return null;
+    }
+
+    private static string? ValidateListedRef(ExternalBuildArtifactRef artifact, ExternalBuildOptions options)
+    {
+        if (!string.Equals(artifact.Name, artifact.Name.Trim(), StringComparison.Ordinal))
+            return "artifact name has surrounding whitespace";
+        return ExternalBuildArtifactGuard.ValidateRef(artifact, options);
     }
 
     private ExternalBuildCapability Require(string handle)

@@ -38,7 +38,10 @@ adapters (GitHub Actions, Unity Build Automation) are follow-on work and are
    (fence cleared on terminal transition).
 
 Exclusive ownership uses compare-and-set on `(state, fence)` in
-`TryClaimAsync`; concurrent writers cannot corrupt or cross-contaminate data.
+`TryClaimAsync`; every production mutation in `ExternalBuildService` routes
+through it, so concurrent writers get a typed conflict instead of silently
+overwriting each other. Cancel re-reads the record after the provider call,
+so a concurrent completion is never overwritten by a stale cancel write.
 
 ## Candidate handoff (including uncommitted work)
 
@@ -50,7 +53,9 @@ intended untracked source. Excluded: credentials (`.env`, `secrets.json`),
 host files, private agent scratchpads/transcripts, and caches (see
 `ExternalBuildSnapshotPolicy`). Size/path bounds are enforced before
 buffering; the snapshot digest (SHA-256 over ordered path+content+mode plus
-deletions) is verified by the provider path.
+deletions) is verified post-transfer with `VerifyAgainstContent`, which
+re-freezes the actual bytes and compares digests with exact equality. The
+policy digest is computed over the effective capture policy.
 
 LFS: only pinned pointer blobs are captured unless the policy materializes
 them. Submodules: pinned commits are recorded; contents only for listed
@@ -64,7 +69,12 @@ to the frozen snapshot digest.
 ## Sandbox tools and transports
 
 `ExternalBuildSandboxTools` exposes build/start, status, result, cancel,
-bounded diagnostics, and artifact list/read. Caller identity is a
+bounded diagnostics, and artifact list/read. Artifact reads validate the
+requested name before any fetch, confirm membership in the run's listed
+refs with exact-match equality, refuse listed sizes above the cap before
+buffering, resolve the provider host-side from the approved-target map
+(caller-supplied providers must exactly match the build's provider), and
+verify the payload digest after the fetch. Caller identity is a
 host-issued expiring/revocable capability scoped to
 project/work item/phase/iteration/attempt; ownership is rechecked at each
 sink and stale/foreign handles are rejected. Only operator-approved
@@ -98,7 +108,12 @@ capacity while parked (no model process or session slot is held to poll),
 and delivers completion exactly once to the right
 work item/phase/iteration/attempt via the durable outbox with acknowledged
 delivery — surviving restarts, disconnected transports, TTL expiry, and
-sandbox recovery. Completed-before-park never parks; completed-during-park
+sandbox recovery. Delivery acknowledgement, park waits (reason/estimate/
+sample count), and duration history are persisted in the durable store
+(`external_builds.delivery_acked`, `external_build_parks`,
+`external_build_history`); a restarted instance re-emits undelivered
+terminal completions by scanning unacknowledged terminals, not just the
+live outbox. Completed-before-park never parks; completed-during-park
 delivers once. Parked builds report as known waits, not stalled workers.
 Audit/merge gates stay closed while evidence is outstanding.
 

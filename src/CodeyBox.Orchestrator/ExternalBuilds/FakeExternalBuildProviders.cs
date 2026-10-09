@@ -61,7 +61,7 @@ public abstract class FakeExternalBuildProviderBase : IExternalBuildProvider
                 return Task.FromResult(new ExternalBuildSubmitResult(false, null, "timeout before acceptance", Uncertain: true));
             }
             if (SupportsGitPublication && input.CandidateRef is null && input.Snapshot is not null && !SupportsSnapshotUpload)
-                return Task.FromResult(new ExternalBuildSubmitResult(false, "snapshot not supported by git-only provider", null));
+                return Task.FromResult(new ExternalBuildSubmitResult(false, null, "snapshot not supported by git-only provider"));
             var runId = $"{ProviderId}-run-{++_sequence}";
             _runs[runId] = new FakeRun(intent.Source.SourceDigestSha256, intent.Id, PollsToTerminal);
             if (!string.IsNullOrWhiteSpace(intent.RequestId))

@@ -139,6 +139,8 @@ public sealed record ExternalBuildRecord
     public DateTimeOffset UpdatedAt { get; init; }
     public DateTimeOffset? CompletedAt { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
+    /// <summary>True once a terminal completion was delivered through the acknowledged outbox.</summary>
+    public bool DeliveryAcked { get; init; }
 }
 
 /// <summary>Pure lifecycle transitions.</summary>
