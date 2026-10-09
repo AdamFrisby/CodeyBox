@@ -153,7 +153,13 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
 
         // The bare repo is gone in this fixture, so the resume itself is
         // refused — but the operator authorization (recording the observed
-        // tip as the lease base) must already be persisted.
+        // tip as the lease base) must already be persisted. The remote tip
+        // carries CodeyBox trailers, so the no-recorded-push ownership gate
+        // passes without an explicit confirmation flag.
+        fixture.Remote.BranchCommitMessages =
+        [
+            "agent work\n\nCodeyBox-WorkItem: x\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+        ];
         var result = await fixture.Redrive.RedriveAsync(item.Id, CancellationToken.None);
 
         Assert.False(result.Success);
@@ -223,6 +229,8 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
     private sealed class StubListingUpstreamRemote : IUpstreamRemote
     {
         public List<UpstreamPullRequest> OpenPullRequests { get; } = new();
+        public IReadOnlyList<string>? BranchCommitMessages { get; set; }
+        public string? BranchHeadSha { get; set; }
         public string Name => "stub-listing-upstream";
 
         public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
@@ -237,6 +245,13 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
         public Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(string branchPrefix, CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<UpstreamPullRequest>>(
                 OpenPullRequests.Where(p => p.HeadBranch.StartsWith(branchPrefix, StringComparison.Ordinal)).ToList());
+
+        public Task<string?> GetBranchHeadShaAsync(string branch, CancellationToken ct = default)
+            => Task.FromResult(BranchHeadSha);
+
+        public Task<IReadOnlyList<string>?> ListBranchCommitMessagesAsync(
+            string baseBranch, string head, int maxCommits, CancellationToken ct = default)
+            => Task.FromResult(BranchCommitMessages);
     }
 
     private sealed class StubTaskQueue : ITaskQueue

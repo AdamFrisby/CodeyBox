@@ -211,13 +211,27 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
         {
             var (owner, repo) = SplitGithubUrl(githubUrl);
             var remote = BuildRemote(host, handler, owner, repo, token, "rebase");
+            // The stale tip ("remote work", no CodeyBox trailers) cannot be
+            // proven to be CodeyBox's own history, so the trailer proof is
+            // consulted and the push still parks distinctly.
+            handler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        total_commits = 1,
+                        commits = new[] { new { sha = "abc", commit = new { message = "remote work" } } },
+                    }),
+                    Encoding.UTF8, "application/json"),
+            });
             var ex = await Assert.ThrowsAsync<UpstreamOwnedBranchDivergedException>(() =>
                 remote.CompleteAsync(SampleRequest(repoId, workBranch, "rebase"), CancellationToken.None));
             Assert.Equal(workBranch, ex.Branch);
             Assert.False(UpstreamPushReconcileConflictException.TryFindIn(ex, out _));
             Assert.DoesNotContain(token, ex.Message);
             Assert.DoesNotContain(token, ex.Branch);
-            Assert.Empty(handler.Requests);
+            var compareCall = Assert.Single(handler.Requests);
+            Assert.Contains("/compare/", compareCall.RequestUri!.ToString(), StringComparison.Ordinal);
             // The stale remote tip is untouched.
             var (_, content, _) = await TestSupport.RunGit(upstreamBare, "show", $"{workBranch}:conflict.txt");
             Assert.Equal("remote\n", content);

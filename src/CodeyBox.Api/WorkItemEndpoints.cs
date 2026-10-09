@@ -468,12 +468,19 @@ internal static class WorkItemEndpoints
     /// fails the lease and parks — authorization covers the observed tip,
     /// never a blind overwrite.
     ///
+    /// When the item has no recorded PR number, the open PR is discovered by
+    /// head branch and recorded; when no open PR exists, the push is re-driven
+    /// alone and the pipeline opens a fresh PR. When the branch has no
+    /// recorded push, the remote tip must prove itself via commit trailers
+    /// unless <c>confirmOwnership</c> is true (logged and audited).
+    ///
     /// Returns 202 when the re-drive is armed, 404 when the item does not
     /// exist, 409 when the state/branch/PR preconditions do not hold or the
     /// retry is refused.
     /// </summary>
     private static async Task<IResult> RedriveUpstreamAsync(
         string id,
+        RedriveUpstreamRequest? body,
         IWorkItemStore store,
         UpstreamRedriveService redrive,
         CancellationToken ct)
@@ -481,7 +488,7 @@ internal static class WorkItemEndpoints
         var (item, err) = await ResolveWorkItemAsync(id, store, ct);
         if (err is not null) return err;
 
-        var result = await redrive.RedriveAsync(item!.Id, ct);
+        var result = await redrive.RedriveAsync(item!.Id, body?.ConfirmOwnership == true, ct);
         if (!result.Success)
         {
             var notFound = result.Error?.Contains("not found", StringComparison.OrdinalIgnoreCase) == true;
@@ -2310,6 +2317,13 @@ public sealed record AgentControlDto(
     DateTimeOffset? ExpiresAt = null);
 
 public sealed record RetryWorkItemRequest(string? From, int? WorkTimeoutMinutes = null);
+
+/// <summary>
+/// Operator-authorized upstream re-drive flag: when true, the operator
+/// asserts the stale branch tip is CodeyBox's own history, bypassing the
+/// commit-trailer proof. Logged and audited.
+/// </summary>
+public sealed record RedriveUpstreamRequest(bool ConfirmOwnership = false);
 
 public sealed record DelegateWorkItemRequest(string? Note = null);
 

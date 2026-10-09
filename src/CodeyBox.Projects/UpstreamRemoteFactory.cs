@@ -39,6 +39,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly ICompletionClient? _completionClient;
     private readonly ILogger<CompletionPullRequestDescriptionGenerator>? _completionLog;
     private readonly CodeyBox.Core.CommitAttributionPolicy? _attributionPolicy;
+    private readonly CodeyBox.Core.UpstreamBranchOwnershipSnapshot? _ownership;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -54,7 +55,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         GitHubAppStore? githubApps = null,
         ICompletionClient? completionClient = null,
         ILogger<CompletionPullRequestDescriptionGenerator>? completionLog = null,
-        CodeyBox.Core.CommitAttributionPolicy? attributionPolicy = null)
+        CodeyBox.Core.CommitAttributionPolicy? attributionPolicy = null,
+        CodeyBox.Core.UpstreamBranchOwnershipSnapshot? ownership = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -69,6 +71,7 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _completionClient = completionClient;
         _completionLog = completionLog;
         _attributionPolicy = attributionPolicy;
+        _ownership = ownership;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])
@@ -115,7 +118,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                     PullRequestTitleTemplate = u.PullRequestTitleTemplate,
                     PrDescription = MapPrDescriptionOptions(u.PrDescription),
                 }, _timings, BuildDescriptionGenerator(u.PrDescription),
-                    _attributionPolicy?.Resolve(project));
+                    _attributionPolicy?.Resolve(project),
+                    _ownership);
 
             case "git-generic":
                 return new GitGenericUpstreamRemote(_gitHost, new GitGenericUpstreamOptions
