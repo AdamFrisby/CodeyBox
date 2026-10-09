@@ -7,6 +7,7 @@
     <ProjectReference Include="..\CodeyBox.Deployment\CodeyBox.Deployment.csproj" />
     <ProjectReference Include="..\CodeyBox.AdminSeed\CodeyBox.AdminSeed.csproj" />
     <ProjectReference Include="..\CodeyBox.Orchestrator\CodeyBox.Orchestrator.csproj" />
+    <ProjectReference Include="..\CodeyBox.Build.GitHubActions\CodeyBox.Build.GitHubActions.csproj" />
     <ProjectReference Include="..\CodeyBox.Build.MSBuild\CodeyBox.Build.MSBuild.csproj" />
     <ProjectReference Include="..\CodeyBox.Sandbox.Process\CodeyBox.Sandbox.Process.csproj" />
     <ProjectReference Include="..\CodeyBox.Agents\CodeyBox.Agents.csproj" />
