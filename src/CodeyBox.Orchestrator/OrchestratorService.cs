@@ -2962,6 +2962,10 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         // recovery reaper when the worker died.
         bool agentSlotReserved = false;
         QuotaReservationLease? quotaReservation = null;
+        // Hoisted so the pre-pipeline deferral catches below can include the
+        // project in the deferral webhook even when routing (which runs after
+        // the project load) is what threw.
+        Project? project = null;
 
         try
         {
@@ -3040,7 +3044,8 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             }
 
             // Load the project once for quota routing and budget caps.
-            Project? project = null;
+            // (Declared above the pickup try so the pre-pipeline deferral
+            // catches can reference it.)
             if (_projects is not null)
             {
                 try { project = await _projects.GetAsync(item.ProjectId, ct); }
@@ -3445,62 +3450,12 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                 // disk.deferred webhook so existing alerting fires, then
                 // schedule a re-pickup. In-flight items already running on
                 // other workers are not touched.
-                var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
-                AuditLog.DiskDeferred(deferredItem.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
-                if (_webhooks is not null)
-                {
-                    _ = _webhooks.PublishAsync(new WebhookEvent
-                    {
-                        Event = "disk.deferred",
-                        WorkItem = deferredItem,
-                        Project = project,
-                        Details = new
-                        {
-                            mountPath = dskEx.MountPath,
-                            freeBytes = dskEx.FreeBytes,
-                            thresholdBytes = dskEx.ThresholdBytes,
-                            suggestedRetryAt = _time.GetUtcNow() + dskEx.RecheckIn,
-                        },
-                    }, CancellationToken.None);
-                }
-                ScheduleDeferredRequeue(item.Id, dskEx.RecheckIn, ct);
+                await ParkSandboxDiskDeferredAsync(item, project, dskEx, ct);
                 return;
             }
             catch (SandboxProvisioningDeferredException provEx)
             {
-                var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
-                AuditLog.SandboxProvisioningDeferred(
-                    deferredItem.Id,
-                    provEx.Provider,
-                    provEx.Operation,
-                    provEx.ErrorClass,
-                    deferredItem.State.ToString(),
-                    provEx.RecheckIn,
-                    provEx.Detail);
-
-                if (_webhooks is not null)
-                {
-                    _ = _webhooks.PublishAsync(new WebhookEvent
-                    {
-                        Event = "sandbox.provisioning_deferred",
-                        WorkItem = deferredItem,
-                        Project = project,
-                        Details = new
-                        {
-                            provider = provEx.Provider,
-                            operation = provEx.Operation,
-                            errorClass = provEx.ErrorClass,
-                            detail = provEx.Detail,
-                            resumeState = deferredItem.State.ToString(),
-                            suggestedRetryAt = _time.GetUtcNow() + provEx.RecheckIn,
-                        },
-                    }, CancellationToken.None);
-                }
-
-                _log.LogWarning(
-                    "Worker {WorkerId} deferring {Id}: sandbox provisioning transient ({Provider}/{Operation}, {ErrorClass}); resumeState={ResumeState}",
-                    workerIndex, id, provEx.Provider, provEx.Operation, provEx.ErrorClass, deferredItem.State);
-                ScheduleDeferredRequeue(item.Id, provEx.RecheckIn, ct);
+                await ParkSandboxProvisioningDeferredAsync(workerIndex, id, item, project, provEx, ct);
                 return;
             }
             catch (Exception ex)
@@ -3508,6 +3463,24 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                 _log.LogError(ex, "Worker {WorkerId} unexpected failure on {Id}", workerIndex, id);
                 exitReason = $"pipeline-exception:{ex.GetType().Name}";
             }
+        }
+        catch (SandboxDiskDeferredException dskEx)
+        {
+            // Pre-pipeline deferral: agent-class routing's smoke gate warms the
+            // baseline (EnsureBaselineImageAsync) before the pipeline runs, so
+            // a bake failure or disk-guard refusal surfaces here, outside the
+            // pipeline try above. Park with the same park-until-RecheckIn
+            // semantics: without this the exception escapes the worker, the
+            // slot-release wake re-picks the still-Queued item immediately, and
+            // the dispatcher re-evaluates (and re-logs routing for) the item in
+            // a tight loop until the disk fills or the baseline heals.
+            await ParkSandboxDiskDeferredAsync(item, project, dskEx, ct);
+            return;
+        }
+        catch (SandboxProvisioningDeferredException provEx)
+        {
+            await ParkSandboxProvisioningDeferredAsync(workerIndex, id, item, project, provEx, ct);
+            return;
         }
         finally
         {
@@ -4187,6 +4160,93 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
             return reset;
 
         return await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? current;
+    }
+
+    /// <summary>
+    /// Parks a disk-guard deferral: resets the item to its infrastructure
+    /// resume state, emits the audit + <c>disk.deferred</c> webhook so existing
+    /// alerting fires, and schedules the re-pickup after
+    /// <see cref="SandboxProvisioningDeferredException.RecheckIn"/>. Shared by
+    /// the pipeline-time and pre-pipeline (routing smoke gate) catch sites so
+    /// both park identically. In-flight items already running on other workers
+    /// are not touched.
+    /// </summary>
+    private async Task ParkSandboxDiskDeferredAsync(
+        WorkItem item,
+        Project? project,
+        SandboxDiskDeferredException dskEx,
+        CancellationToken scheduleCt)
+    {
+        var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+        AuditLog.DiskDeferred(deferredItem.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
+        if (_webhooks is not null)
+        {
+            _ = _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "disk.deferred",
+                WorkItem = deferredItem,
+                Project = project,
+                Details = new
+                {
+                    mountPath = dskEx.MountPath,
+                    freeBytes = dskEx.FreeBytes,
+                    thresholdBytes = dskEx.ThresholdBytes,
+                    suggestedRetryAt = _time.GetUtcNow() + dskEx.RecheckIn,
+                },
+            }, CancellationToken.None);
+        }
+        ScheduleDeferredRequeue(item.Id, dskEx.RecheckIn, scheduleCt);
+    }
+
+    /// <summary>
+    /// Parks a sandbox-provisioning deferral: resets the item to its
+    /// infrastructure resume state, emits the audit + <c>sandbox.provisioning_deferred</c>
+    /// webhook, and schedules the re-pickup after
+    /// <see cref="SandboxProvisioningDeferredException.RecheckIn"/>. Shared by
+    /// the pipeline-time and pre-pipeline (routing smoke gate) catch sites so
+    /// both park identically.
+    /// </summary>
+    private async Task ParkSandboxProvisioningDeferredAsync(
+        int workerIndex,
+        WorkItemId id,
+        WorkItem item,
+        Project? project,
+        SandboxProvisioningDeferredException provEx,
+        CancellationToken scheduleCt)
+    {
+        var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+        AuditLog.SandboxProvisioningDeferred(
+            deferredItem.Id,
+            provEx.Provider,
+            provEx.Operation,
+            provEx.ErrorClass,
+            deferredItem.State.ToString(),
+            provEx.RecheckIn,
+            provEx.Detail);
+
+        if (_webhooks is not null)
+        {
+            _ = _webhooks.PublishAsync(new WebhookEvent
+            {
+                Event = "sandbox.provisioning_deferred",
+                WorkItem = deferredItem,
+                Project = project,
+                Details = new
+                {
+                    provider = provEx.Provider,
+                    operation = provEx.Operation,
+                    errorClass = provEx.ErrorClass,
+                    detail = provEx.Detail,
+                    resumeState = deferredItem.State.ToString(),
+                    suggestedRetryAt = _time.GetUtcNow() + provEx.RecheckIn,
+                },
+            }, CancellationToken.None);
+        }
+
+        _log.LogWarning(
+            "Worker {WorkerId} deferring {Id}: sandbox provisioning transient ({Provider}/{Operation}, {ErrorClass}); resumeState={ResumeState}",
+            workerIndex, id, provEx.Provider, provEx.Operation, provEx.ErrorClass, deferredItem.State);
+        ScheduleDeferredRequeue(item.Id, provEx.RecheckIn, scheduleCt);
     }
 
     /// <summary>

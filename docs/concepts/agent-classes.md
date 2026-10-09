@@ -697,11 +697,15 @@ All routing decisions are emitted as `Audit=true` events:
 
 | Event name | When |
 |------------|------|
-| `quota_router.probed` | After each probe call (agent, class, available %). |
-| `quota_router.scored` | Once per pickup: chosen member's base/effective score and applied modifiers; all rejected members with their scores and reasons. |
+| `quota_router.probed` | After each probe call (agent, class, available %). Information on first sight or a changed reading, Debug for identical repeats; probe errors always surface at Information on first sight. |
+| `quota_router.scored` | Once per pickup: chosen member's base/effective score and applied modifiers; all rejected members with their scores and reasons. Information on first sight or a changed decision, Debug for identical repeats. |
 | `quota_router.waiting` | When all Subscription members are exhausted. |
 | `quota_router.deferred` | When the orchestrator schedules a deferred re-enqueue. |
 | `quota_router.audit_fallthrough` | When the audit agent's quota was low and the pipeline fell through to the work agent. |
+
+The per-evaluation `Work item …: routed to / rejected: / excluded …` log lines follow the
+same rule: Information on first sight or change for that item, Debug for identical repeats,
+so a parked item that is re-evaluated on every wake does not spam the log at Information.
 
 ## Startup validation
 

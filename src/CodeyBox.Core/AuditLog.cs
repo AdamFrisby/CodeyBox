@@ -1,5 +1,6 @@
 using Serilog;
 using Serilog.Context;
+using Serilog.Events;
 
 namespace CodeyBox.Core;
 
@@ -1437,14 +1438,22 @@ public static class AuditLog
 
     // ── Quota router ─────────────────────────────────────────────────────────
 
-    public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>
+    /// <summary>
+    /// Emitted for every quota probe reading consulted on the dispatch path.
+    /// Repetitive evaluations of the same item re-probe the same members, so
+    /// callers pass <see cref="LogEventLevel.Debug"/> when the reading is
+    /// unchanged since the last probe and <see cref="LogEventLevel.Information"/>
+    /// on first sight or value change; errors are always surfaced by the
+    /// caller at <see cref="LogEventLevel.Information"/> or above.
+    /// </summary>
+    public static void QuotaProbed(AgentKind agent, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null, LogEventLevel level = LogEventLevel.Information) =>
         Audit("quota_router.probed")
-            .Information("Quota probe: agent={Agent} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
+            .Write(level, "Quota probe: agent={Agent} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
                 agent.Value, classId, availablePct, resetAt, notes);
 
-    public static void QuotaProbed(AgentKind agent, string instanceId, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null) =>
+    public static void QuotaProbed(AgentKind agent, string instanceId, string classId, double availablePct, DateTimeOffset? resetAt, string? notes = null, LogEventLevel level = LogEventLevel.Information) =>
         Audit("quota_router.probed")
-            .Information("Quota probe: agent={Agent} instance={AgentInstance} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
+            .Write(level, "Quota probe: agent={Agent} instance={AgentInstance} class={ClassId} available={AvailablePct:F1}% resetAt={ResetAt} notes={Notes}",
                 agent.Value, instanceId, classId, availablePct, resetAt, notes);
 
     public static void QuotaRouterWaiting(string classId, WorkItemId id, TimeSpan recheckIn) =>
@@ -1581,6 +1590,14 @@ public static class AuditLog
     /// chosen member's scores and all rejected members with their reject reasons,
     /// enabling post-hoc inspection of routing decisions without re-running.
     /// </summary>
+    /// <summary>
+    /// Emitted when the router commits to a class member on the dispatch path.
+    /// Repetitive evaluations of the same item usually reach the same decision,
+    /// so callers pass <see cref="LogEventLevel.Debug"/> when the chosen
+    /// member, scores, and rejection set are unchanged since the last
+    /// evaluation and <see cref="LogEventLevel.Information"/> on first sight
+    /// or change.
+    /// </summary>
     public static void QuotaRouterScored(
         WorkItemId id,
         string classId,
@@ -1589,9 +1606,11 @@ public static class AuditLog
         int chosenBaseScore,
         int chosenEffectiveScore,
         string appliedModifiers,
-        IEnumerable<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)> rejected) =>
+        IEnumerable<(AgentKind Agent, string? ModelId, int EffectiveScore, string RejectReason)> rejected,
+        LogEventLevel level = LogEventLevel.Information) =>
         Audit("quota_router.scored")
-            .Information(
+            .Write(
+                level,
                 "Quota router scored: workItem={WorkItemId} class={ClassId} " +
                 "chosen={Agent}/{ModelId} baseScore={BaseScore} effectiveScore={EffectiveScore} modifiers={Modifiers} " +
                 "rejected=[{Rejected}]",
@@ -1606,11 +1625,15 @@ public static class AuditLog
     /// Emitted when the orchestrator skips a dispatch because the routed agent's
     /// per-agent concurrency cap is at its ceiling. Distinct from
     /// <c>quota_router.deferred</c>: quota was fine, the operator-set cap was the
-    /// constraint.
+    /// constraint. Repetitive evaluations of the same item hit the same ceiling,
+    /// so the router passes <see cref="LogEventLevel.Debug"/> for an unchanged
+    /// (agent, running, cap) reading and <see cref="LogEventLevel.Information"/>
+    /// on first sight or change.
     /// </summary>
-    public static void ConcurrencyGated(WorkItemId id, AgentKind agent, int running, int cap) =>
+    public static void ConcurrencyGated(WorkItemId id, AgentKind agent, int running, int cap, LogEventLevel level = LogEventLevel.Information) =>
         Audit("concurrency.gated_per_agent")
-            .Information(
+            .Write(
+                level,
                 "Concurrency gate: work item {WorkItemId} skipped — per-agent cap reached for {Agent}: running={Running} cap={Cap}",
                 id.ToString(), agent.Value, running, cap);
 
@@ -1635,7 +1658,10 @@ public static class AuditLog
     /// even though the raw <c>availablePct</c> is still above the MinQuotaPct
     /// floor. Distinct from <c>quota_router.scored</c>'s "quota exhausted"
     /// reject reason so operators can tell apart "no quota" from "would overrun
-    /// the window if we run another".
+    /// the window if we run another". Repetitive evaluations usually recompute
+    /// the same refusal, so the router passes <see cref="LogEventLevel.Debug"/>
+    /// for an unchanged reading and <see cref="LogEventLevel.Information"/> on
+    /// first sight or change.
     /// </summary>
     public static void RateAwareGated(
         AgentKind agent,
@@ -1645,9 +1671,11 @@ public static class AuditLog
         double avgBurnPct,
         double availablePct,
         int sampleCount,
-        AgentBurnEstimateStatus status) =>
+        AgentBurnEstimateStatus status,
+        LogEventLevel level = LogEventLevel.Information) =>
         Audit("concurrency.gated_rate_aware")
-            .Information(
+            .Write(
+                level,
                 "Rate-aware gate: {Agent}/{Model} running={Running} >= fit={FitInWindow:F2} (avgBurn={AvgBurnPct:F1}% available={AvailablePct:F1}% samples={Samples} status={Status})",
                 agent.Value, modelId ?? "(default)", running, fitInWindow, avgBurnPct, availablePct, sampleCount, status);
 
