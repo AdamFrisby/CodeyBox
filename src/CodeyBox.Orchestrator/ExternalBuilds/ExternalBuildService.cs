@@ -1,4 +1,5 @@
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using CodeyBox.Core.ExternalBuilds;
 
 namespace CodeyBox.Orchestrator.ExternalBuilds;
@@ -13,6 +14,13 @@ namespace CodeyBox.Orchestrator.ExternalBuilds;
 /// </summary>
 public sealed class ExternalBuildService
 {
+    // WHY fixed stripes instead of one SemaphoreSlim per idempotency key: a
+    // per-key table keyed by sandbox-supplied keys grows without bound (one
+    // entry per distinct key, never evicted). Stripes bound memory to a
+    // constant while still serializing duplicate submits; correctness never
+    // depends on the lock alone because the store recheck + compare-and-set
+    // claim decides the winner.
+    private const int StartStripeCount = 16;
     private readonly IExternalBuildStore _store;
     private readonly IReadOnlyDictionary<string, IExternalBuildProvider> _providers;
     private readonly Func<ExternalBuildOptions> _options;
@@ -21,7 +29,8 @@ public sealed class ExternalBuildService
     private readonly List<ExternalBuildCompletionEvent> _outbox = [];
     private readonly HashSet<string> _acked = new(StringComparer.Ordinal);
     private readonly string _owner = "svc-" + Guid.NewGuid().ToString("N")[..12];
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _startGates = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim[] _startStripes = Enumerable.Range(0, StartStripeCount)
+        .Select(_ => new SemaphoreSlim(1, 1)).ToArray();
 
     public ExternalBuildService(
         IExternalBuildStore store,
@@ -59,14 +68,12 @@ public sealed class ExternalBuildService
         };
         var configDigest = ExternalBuildLifecycle.ComputeConfigDigest(target, request.AdapterParameters);
         var bodyHash = ExternalBuildLifecycle.BodyHash(request, configDigest);
-        var idempotencyKey = string.IsNullOrWhiteSpace(request.IdempotencyKey)
-            ? $"ext-{request.WorkItemId}-{request.Phase}-{request.Iteration}-{request.Attempt}-{request.ApprovedTargetName}"
-            : request.IdempotencyKey.Trim();
+        var idempotencyKey = NormalizeIdempotencyKey(request, opts.MaxIdempotencyKeyChars);
 
         var existing = await _store.GetByIdempotencyAsync(request.ProjectId, idempotencyKey, bodyHash, ct).ConfigureAwait(false);
         if (existing is not null) return existing;
 
-        var gate = _startGates.GetOrAdd(request.ProjectId + "\0" + idempotencyKey + "\0" + bodyHash, _ => new SemaphoreSlim(1, 1));
+        var gate = ForStripe(request.ProjectId + "\0" + idempotencyKey + "\0" + bodyHash);
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -115,6 +122,37 @@ public sealed class ExternalBuildService
         {
             gate.Release();
         }
+    }
+
+    private SemaphoreSlim ForStripe(string gateKey)
+    {
+        var hash = (uint)StringComparer.Ordinal.GetHashCode(gateKey);
+        return _startStripes[hash % (uint)StartStripeCount];
+    }
+
+    private static string NormalizeIdempotencyKey(ExternalBuildStartRequest request, int maxChars)
+    {
+        if (string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        {
+            var generated = $"ext-{request.WorkItemId}-{request.Phase}-{request.Iteration}-{request.Attempt}-{request.ApprovedTargetName}";
+            if (generated.Length <= maxChars)
+                return generated;
+            var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(generated)))[..16].ToLowerInvariant();
+            return "ext-" + digest;
+        }
+        var key = request.IdempotencyKey.Trim();
+        if (key.Length == 0)
+            throw new ExternalBuildInvalidRequestException("Idempotency key must not be blank.");
+        if (key.Length > maxChars)
+            throw new ExternalBuildInvalidRequestException(
+                $"Idempotency key must be <= {maxChars} chars.");
+        foreach (var ch in key)
+        {
+            if (char.IsControl(ch))
+                throw new ExternalBuildInvalidRequestException(
+                    "Idempotency key must not contain control characters.");
+        }
+        return key;
     }
 
     public async Task<ExternalBuildRecord> ReconcileAsync(string buildId, CancellationToken ct = default)

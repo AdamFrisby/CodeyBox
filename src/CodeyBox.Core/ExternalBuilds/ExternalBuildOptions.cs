@@ -85,6 +85,14 @@ public sealed class ExternalBuildOptions
     /// <summary>Scoped sandbox capability lifetime in seconds. Default 3600.</summary>
     public int CapabilityLifetimeSeconds { get; set; } = 3600;
 
+    /// <summary>
+    /// Max chars accepted for a caller-supplied idempotency key. Default 128.
+    /// Bounds the single-flight gate key and the persisted idempotency column
+    /// so a sandbox caller minting distinct keys cannot grow memory without
+    /// bound. Hot-reloadable.
+    /// </summary>
+    public int MaxIdempotencyKeyChars { get; set; } = 128;
+
     public static bool IsValid(ExternalBuildOptions opts) =>
         opts.MaxConcurrentPerProject is >= 1 and <= 32
         && opts.MaxConcurrentPerProvider is >= 1 and <= 64
@@ -107,7 +115,8 @@ public sealed class ExternalBuildOptions
         && opts.MaxArchiveEntries is >= 1 and <= 500_000
         && opts.MaxDiagnosticsChars is >= 256 and <= 1024 * 1024
         && opts.RetentionDays is >= 1 and <= 365
-        && opts.CapabilityLifetimeSeconds is >= 60 and <= 86400;
+        && opts.CapabilityLifetimeSeconds is >= 60 and <= 86400
+        && opts.MaxIdempotencyKeyChars is >= 16 and <= 1024;
 }
 
 /// <summary>

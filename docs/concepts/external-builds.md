@@ -19,7 +19,11 @@ adapters (GitHub Actions, Unity Build Automation) are follow-on work and are
 1. Sandbox calls `build/start` with a host-issued scoped capability.
 2. Service validates: enabled, operator-approved target (exact name match —
    never arbitrary endpoints/commands), budgets (per-project/per-provider
-   concurrency, queued cap).
+   concurrency, queued cap). Caller-supplied idempotency keys are trimmed and
+   rejected when over `MaxIdempotencyKeyChars` (default 128) or containing
+   control characters; duplicate submits serialize on a fixed 16-stripe
+   single-flight lock pool (bounded memory — no per-key table) with the
+   store recheck + compare-and-set claim deciding the winner.
 3. Intent is persisted (`IntentRecorded`) **before** dispatch — crash windows
    before/after provider acceptance both recover.
 4. Dispatch moves to `SubmitUncertain`; on acceptance to `Queued` with the
