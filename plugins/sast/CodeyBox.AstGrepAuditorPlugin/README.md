@@ -44,6 +44,16 @@ configuration, invalid rule) is infrastructure — never a pass.
   so a repository-resolved project is authored by the audit subject. Prefer
   operator `Config` pointing outside the worktree where the ruleset must not
   be subject-authored.
+- **Inline `ast-grep-ignore` comments (residual subject-controlled bypass).**
+  An `ast-grep-ignore` or `ast-grep-ignore: rule-id` comment in scanned
+  source suppresses findings on the same or following line (or the whole
+  file from the first line), including `error`-severity (blocking) rules.
+  The pinned `0.45.3` `ast-grep scan` offers no flag disabling them
+  (`--no-ignore` covers only ignore files; the remaining scan flags are
+  target and severity selectors), so the auditor passes no such flag.
+  Operator `Config` does not mitigate this surface because the comments live
+  in the scanned source, not the project — treat a clean verdict as
+  "no unsuppressed matches", not proof the subject suppressed nothing.
 - **Findings under excluded prefixes.** `ExcludePaths` is a finding filter —
   ast-grep still scans those files (minus what ignore files exclude), but
   findings under `vendor/`, `third_party/`, `node_modules/` are dropped.

@@ -76,7 +76,15 @@ namespace CodeyBox.AstGrepAuditorPlugin;
 /// scoped config to a project outside the worktree. Target selection honors
 /// the repository's ignore files (gitignore-style); that is standard target
 /// enumeration, and the <c>ExcludePaths</c> finding filter applies on top of
-/// it.</para>
+/// it. Separately, inline <c>ast-grep-ignore</c> comments in scanned source
+/// (<c>ast-grep-ignore</c> or <c>ast-grep-ignore: rule-id</c>, suppressing the
+/// same or following line, or the whole file from the first line) suppress
+/// findings, including error-severity (blocking) rules, and the pinned 0.45.3
+/// <c>ast-grep scan</c> offers no flag disabling them (<c>--no-ignore</c> covers
+/// only ignore files; the remaining scan flags are target and severity selectors).
+/// The auditor therefore passes no such flag and documents the surface instead:
+/// operator <c>Config</c> does not mitigate it because the comments live in the
+/// scanned source, not the project.</para>
 /// </summary>
 [CodeyBoxPlugin(
     id: PluginId,
