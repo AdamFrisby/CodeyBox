@@ -62,6 +62,7 @@
     <Project Path="src/CodeyBox.Notifications/CodeyBox.Notifications.csproj" />
   </Folder>
   <Folder Name="/plugins/">
+    <Project Path="plugins/auditors-api-compatibility/CodeyBox.ApiCompatAuditorPlugin/CodeyBox.ApiCompatAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.AsyncApiAuditorPlugin/CodeyBox.AsyncApiAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.BufAuditorPlugin/CodeyBox.BufAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-api-compatibility/CodeyBox.CargoSemverChecksAuditorPlugin/CodeyBox.CargoSemverChecksAuditorPlugin.csproj" />
