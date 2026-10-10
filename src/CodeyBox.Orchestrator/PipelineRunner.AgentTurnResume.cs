@@ -1179,7 +1179,7 @@ public sealed partial class PipelineRunner
         };
     }
 
-    private static async Task<bool> CheckpointContainsMeaningfulAgentChangesAsync(
+    private static async Task<bool> IsPreTurnCommitAncestorOfCheckpointAsync(
         ISandbox sandbox,
         string preTurnCommitSha,
         string checkpointCommitSha,
@@ -1199,15 +1199,130 @@ public sealed partial class PipelineRunner
             KillOnOutputLimit = true,
         }, ct);
         PipelineAgentExecutor.ThrowIfExecutionUnavailable(ancestry);
-        if (ancestry.ExitCode == 1)
+        return ancestry.ExitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => throw new InvalidOperationException(
+                $"Failed to verify durable agent-turn checkpoint ancestry (exit {ancestry.ExitCode})."),
+        };
+    }
+
+    /// <summary>
+    /// True when the published checkpoint commit no longer descends from the
+    /// pre-turn work-branch tip, e.g. the branch was rebased onto a fresh base
+    /// or recomposed by restart recovery after the checkpoint was written. The
+    /// checkpoint tree is then unusable, but that says nothing about the work.
+    /// The checkpoint commit resolves from its content binding for typed refs,
+    /// or from the published ref for legacy preempt checkpoints. Both shapes
+    /// are canonical hex after this resolution, so the merge-base argv below
+    /// carries no untrusted flag characters.
+    /// </summary>
+    private static async Task<bool> IsStaleAgentTurnCheckpointAsync(
+        ISandbox sandbox,
+        string preemptCheckpointRef,
+        string checkpointBranch,
+        string? preTurnCommitSha,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(preTurnCommitSha))
+            throw new InvalidOperationException("Durable agent-turn resume has no pre-turn source commit.");
+        string checkpointCommitSha;
+        if (AgentTurnCheckpointRef.TryParse(preemptCheckpointRef, out var typedRef)
+            && typedRef is not null)
+        {
+            checkpointCommitSha = typedRef.SourceCommitSha;
+        }
+        else
+        {
+            var resolved = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv =
+                [
+                    "git", "-C", SandboxConventions.WorkDir,
+                    "rev-parse", "--verify", $"origin/{checkpointBranch}",
+                ],
+                MaxStdoutBytes = 4096,
+                MaxStderrBytes = 4096,
+                KillOnOutputLimit = true,
+            }, ct);
+            PipelineAgentExecutor.ThrowIfExecutionUnavailable(resolved);
+            if (!resolved.Success)
+            {
+                throw new InvalidOperationException(
+                    "Failed to resolve the durable agent-turn checkpoint ref.");
+            }
+            checkpointCommitSha = resolved.Stdout.Trim();
+        }
+
+        return !await IsPreTurnCommitAncestorOfCheckpointAsync(
+            sandbox,
+            preTurnCommitSha,
+            checkpointCommitSha,
+            ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Atomically discards a stale durable agent-turn checkpoint lineage. The
+    /// work branch is untouched, so the caller restarts the turn fresh from
+    /// the current branch tip. Refuses — never silently drops — a
+    /// retained-sandbox recovery lease: provider-owned state stays
+    /// authoritative with the operator retry/cancel path.
+    /// </summary>
+    private async Task<WorkItem> DiscardStaleAgentTurnCheckpointAsync(
+        WorkItem item,
+        string reason,
+        CancellationToken ct)
+    {
+        if (item.AgentTurnRecoveryLease is not null)
+        {
+            throw new InvalidOperationException(
+                "Cannot discard a retained-sandbox recovery lease for a stale durable agent-turn checkpoint; retry the retained agent turn or cancel the item so provider cleanup remains authoritative.");
+        }
+
+        var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
+        if (current.AgentTurnRecoveryLease is not null)
+        {
+            throw new InvalidOperationException(
+                "Cannot discard a retained-sandbox recovery lease for a stale durable agent-turn checkpoint; retry the retained agent turn or cancel the item so provider cleanup remains authoritative.");
+        }
+
+        var discarded = current with
+        {
+            PreemptedAt = null,
+            PreemptCheckpoint = null,
+            AgentTurnResumeCheckpoint = null,
+            AgentTurnRecoveryLease = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        if (!await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                discarded, current.State, current.UpdatedAt, ct).ConfigureAwait(false))
+        {
+            throw new InvalidOperationException(
+                "Work item changed while its stale durable agent-turn checkpoint was being discarded.");
+        }
+
+        _log.LogInformation(
+            "Discarding durable agent-turn resume checkpoint for work item {Id}: {Reason}",
+            item.Id,
+            reason);
+        return discarded;
+    }
+
+    private static async Task<bool> CheckpointContainsMeaningfulAgentChangesAsync(
+        ISandbox sandbox,
+        string preTurnCommitSha,
+        string checkpointCommitSha,
+        CancellationToken ct)
+    {
+        if (!await IsPreTurnCommitAncestorOfCheckpointAsync(
+                sandbox,
+                preTurnCommitSha,
+                checkpointCommitSha,
+                ct).ConfigureAwait(false))
         {
             throw new InvalidDataException(
                 "Durable agent-turn checkpoint no longer descends from its pre-turn work-branch commit.");
-        }
-        if (!ancestry.Success)
-        {
-            throw new InvalidOperationException(
-                $"Failed to verify durable agent-turn checkpoint ancestry (exit {ancestry.ExitCode}).");
         }
 
         return await HasMeaningfulAgentChangesAsync(
