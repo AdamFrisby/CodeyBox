@@ -116,6 +116,7 @@
     <Project Path="plugins/auditors-linting/CodeyBox.SwiftlintAuditorPlugin/CodeyBox.SwiftlintAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PyrightAuditorPlugin/CodeyBox.PyrightAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PhpstanAuditorPlugin/CodeyBox.PhpstanAuditorPlugin.csproj" />
+    <Project Path="plugins/auditors-linting/CodeyBox.PsalmAuditorPlugin/CodeyBox.PsalmAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.DetektAuditorPlugin/CodeyBox.DetektAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.PmdAuditorPlugin/CodeyBox.PmdAuditorPlugin.csproj" />
     <Project Path="plugins/auditors-linting/CodeyBox.RoslynatorAuditorPlugin/CodeyBox.RoslynatorAuditorPlugin.csproj" />

@@ -107,6 +107,7 @@
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.SwiftlintAuditorPlugin\CodeyBox.SwiftlintAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PyrightAuditorPlugin\CodeyBox.PyrightAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PhpstanAuditorPlugin\CodeyBox.PhpstanAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PsalmAuditorPlugin\CodeyBox.PsalmAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.DetektAuditorPlugin\CodeyBox.DetektAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.PmdAuditorPlugin\CodeyBox.PmdAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\auditors-linting\CodeyBox.RoslynatorAuditorPlugin\CodeyBox.RoslynatorAuditorPlugin.csproj" />
