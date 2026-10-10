@@ -927,6 +927,23 @@ public sealed class LocalGitHost : IGitHost
         };
     }
 
+    public async Task<string?> FindMergeBaseAsync(string repositoryId, string firstCommit, string secondCommit, CancellationToken ct = default)
+    {
+        if (!LooksLikeSha(firstCommit))
+            throw new ArgumentException("First commit must be a full commit sha.", nameof(firstCommit));
+        if (!LooksLikeSha(secondCommit))
+            throw new ArgumentException("Second commit must be a full commit sha.", nameof(secondCommit));
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        var rc = await RunGitAsync(path, ct, "merge-base", firstCommit, secondCommit);
+        return rc.ExitCode switch
+        {
+            0 => rc.Stdout.Trim(),
+            1 => null,
+            _ => throw new InvalidOperationException($"git merge-base failed: {rc.Stderr}"),
+        };
+    }
+
     public async Task ResetWorkBranchToBaseAsync(
         string repositoryId,
         string workBranch,

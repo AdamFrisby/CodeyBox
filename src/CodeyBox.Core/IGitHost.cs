@@ -450,6 +450,21 @@ public interface IGitHost
         => throw new NotSupportedException("This git host does not support host-side ancestry checks.");
 
     /// <summary>
+    /// Returns the best common ancestor (merge-base) of two full commit shas
+    /// in the host bare repo (<c>git merge-base</c>), or null when the commits
+    /// share no history. Used to recover an interrupted turn's true base when
+    /// the work branch moved after the turn staged: the fork point of the
+    /// current tip and the checkpoint source is that base. Unknown commits
+    /// and real git failures throw; callers that can fall back to the raw tip
+    /// catch and degrade.
+    ///
+    /// Default throws <see cref="NotSupportedException"/> so test fakes that
+    /// cannot run git behave as before.
+    /// </summary>
+    Task<string?> FindMergeBaseAsync(string repositoryId, string firstCommit, string secondCommit, CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side merge-base resolution.");
+
+    /// <summary>
     /// Resets <paramref name="workBranch"/> in the host bare repo so it points
     /// at <paramref name="baseBranch"/>'s head, discarding any prior-attempt
     /// commits on the work branch. If the work branch does not exist, it is

@@ -407,13 +407,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await _store.UpdateAsync((await _store.GetAsync(item.Id, ct) ?? item) with { WorkBranch = workBranch }, ct);
             }
 
-            // Snapshot the branch tip that the interrupted turn started from
-            // before the pickup rebase below can move the durable work ref. The
-            // checkpoint commit is later compared against this exact commit so a
-            // resumed no-op is accepted only when the interrupted turn had
-            // already produced meaningful source changes.
+            // Snapshot the baseline the interrupted turn staged from before
+            // the pickup rebase below can move the durable work ref. The
+            // checkpoint commit is later compared against this exact commit so
+            // a resumed no-op is accepted only when the interrupted turn had
+            // already produced meaningful source changes. Resolved as the fork
+            // point of the tip and the checkpoint source (not the raw tip) so
+            // a branch that moved after the turn staged does not mislabel the
+            // baseline; RunAgentPhaseAsync recomputes the same value to cover
+            // routes that never entered here with resume metadata.
             var resumePreTurnCommitSha = resumingPreempt
-                ? await ResolveAgentTurnPreTurnCommitAsync(repoId, workBranch, baseBranch, ct)
+                ? await ResolveAgentTurnResumeBaseAsync(
+                    repoId, workBranch, baseBranch, CheckpointSourceSha(item.PreemptCheckpoint), ct)
                 : null;
 
             // Fresh work-phase entry (a new WI, or a retry-from-work) must
@@ -1195,30 +1200,7 @@ public sealed partial class PipelineRunner : IPipelineRunner
         catch (MergeConflictResolutionFailedException ex)
         {
             _log.LogWarning("Work item {Id} merge conflict resolution failed: {Error}", item.Id, ex.Message);
-            var current = await _store.GetAsync(item.Id, CancellationToken.None) ?? item;
-            var attributed = ex.Agent is { } failedAgent
-                ? current with
-                {
-                    Agent = failedAgent,
-                    AgentInstanceId = current.Agent == failedAgent ? current.AgentInstanceId : null,
-                }
-                : current;
-            var failed = attributed.With(
-                WorkItemState.MergeConflictResolutionFailed,
-                ex.Message,
-                failureKind: ex.FailureKind);
-            await _store.UpdateAsync(failed, CancellationToken.None);
-            await RecordMergeConflictFailureAttributionAsync(failed, ex);
-            var mergeFailedRevision = await BuildTerminalRevisionAsync(failed, CancellationToken.None);
-            await _webhooks.PublishAsync(new WebhookEvent
-            {
-                Event = "work_item.merge_conflict_resolution_failed",
-                WorkItem = failed,
-                Project = project,
-                PromptRevision = mergeFailedRevision?.PromptRevision,
-                RevisionAtCompletion = mergeFailedRevision?.RevisionAtCompletion,
-                RevisionMatches = mergeFailedRevision?.RevisionMatches,
-            }, CancellationToken.None);
+            await ParkMergeConflictResolutionFailedAsync(item, project, ex, CancellationToken.None);
         }
         catch (AgentPausedException ex)
         {
@@ -1581,6 +1563,38 @@ public sealed partial class PipelineRunner : IPipelineRunner
         }
         catch (Exception ex) when (SandboxWorkBranchPublisher.IsPublicationFailure(ex))
         {
+            if (SandboxPushReconcileConflictException.TryFindIn(ex, out var pushConflict))
+            {
+                // Genuine content conflict: the agent's new commits collided
+                // with a concurrently advanced work-branch tip and the
+                // mechanical rebase could not settle it. Route into the
+                // existing conflict-rework machine (bounded by its attempt
+                // cap) so the divergence is resolved rather than dropped;
+                // when routing is unavailable or the cap is exhausted, park at
+                // MergeConflictResolutionFailed — resumable, with both tips on
+                // the record — and never fail the item terminally for this.
+                _log.LogWarning(
+                    "Work item {Id} hit an irreconcilable work-branch push conflict: {Error}",
+                    item.Id, pushConflict.Message);
+                var reworkOutcome = await TryRouteWorkBranchPushConflictAsync(item, CancellationToken.None);
+                if (reworkOutcome == StaleBaseReworkOutcome.Routed)
+                {
+                    await RecordMergeRetryAsync(
+                        item.Id,
+                        $"work-branch push conflict on '{pushConflict.Branch}': {pushConflict.Message}",
+                        bumpLandingAttempt: false,
+                        CancellationToken.None);
+                    return;
+                }
+                await ParkMergeConflictResolutionFailedAsync(
+                    item,
+                    project,
+                    new MergeConflictResolutionFailedException(
+                        $"work-branch push conflict on '{pushConflict.Branch}' could not be reconciled ({reworkOutcome}): {pushConflict.Message}",
+                        ex),
+                    CancellationToken.None);
+                return;
+            }
             // Sandbox-to-bare publication boundary: the agent turn completed
             // and both histories are intact — only the push, reconcile, or
             // host sync did not land. Infrastructure-shaped so the Failed

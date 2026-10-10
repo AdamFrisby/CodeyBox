@@ -949,6 +949,56 @@ public sealed partial class PipelineRunner
     }
 
     /// <summary>
+    /// Parks the item at <see cref="WorkItemState.MergeConflictResolutionFailed"/>
+    /// with conflict-failure attribution and the
+    /// <c>work_item.merge_conflict_resolution_failed</c> webhook. The park is
+    /// resumable (conflict-rework retry stays available); it is the
+    /// never-terminal fallback for conflicts no automatic path could settle.
+    /// </summary>
+    private async Task ParkMergeConflictResolutionFailedAsync(
+        WorkItem item,
+        Project project,
+        MergeConflictResolutionFailedException ex,
+        CancellationToken ct)
+    {
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        var attributed = ex.Agent is { } failedAgent
+            ? current with
+            {
+                Agent = failedAgent,
+                AgentInstanceId = current.Agent == failedAgent ? current.AgentInstanceId : null,
+            }
+            : current;
+        var failed = attributed.With(
+            WorkItemState.MergeConflictResolutionFailed,
+            ex.Message,
+            failureKind: ex.FailureKind);
+        // The transition above drops turn-recovery state for this state, but
+        // the conflict park is resumable by design (the operator retries from
+        // the preserved checkpoint, like the Failed(infrastructure) retention
+        // beside it), so re-stamp the boundary the failure carried. The
+        // recovery lease is deliberately not restored: its sandbox is gone.
+        failed = failed with
+        {
+            PreemptCheckpoint = current.PreemptCheckpoint,
+            AgentTurnResumeCheckpoint = current.AgentTurnResumeCheckpoint,
+            PreemptedAt = current.PreemptedAt,
+        };
+        await _store.UpdateAsync(failed, ct);
+        await RecordMergeConflictFailureAttributionAsync(failed, ex);
+        var mergeFailedRevision = await BuildTerminalRevisionAsync(failed, ct);
+        await _webhooks.PublishAsync(new WebhookEvent
+        {
+            Event = "work_item.merge_conflict_resolution_failed",
+            WorkItem = failed,
+            Project = project,
+            PromptRevision = mergeFailedRevision?.PromptRevision,
+            RevisionAtCompletion = mergeFailedRevision?.RevisionAtCompletion,
+            RevisionMatches = mergeFailedRevision?.RevisionMatches,
+        }, ct);
+    }
+
+    /// <summary>
     /// Returns the file paths changed between <paramref name="fromTip"/> and
     /// <paramref name="toTip"/> in the host bare repo, in lexical order.
     /// Anti-abandonment uses this to detect a rework that discarded the

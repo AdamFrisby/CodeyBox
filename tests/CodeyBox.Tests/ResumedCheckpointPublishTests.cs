@@ -12,8 +12,10 @@ namespace CodeyBox.Tests;
 /// mid-turn — after pre-turn resolution but before publication — which is the
 /// only shape that reaches publication with a non-fast-forward target while
 /// keeping checkpoint ancestry valid. Proves the reconciled push, checkpoint
-/// clearing only after confirmed durability, typed conflict propagation, and
-/// checkpoint retention on failure or sync loss. Requires git on PATH.
+/// clearing only after confirmed durability, conflict routing into
+/// conflict-rework (or a resumable merge-conflict park when no router is
+/// wired — never a terminal failure), and checkpoint retention on failure or
+/// sync loss. Requires git on PATH.
 /// </summary>
 [Collection("Pipeline integration")]
 public sealed class ResumedCheckpointPublishTests : IDisposable
@@ -120,7 +122,7 @@ public sealed class ResumedCheckpointPublishTests : IDisposable
     }
 
     [Fact]
-    public async Task ResumedCheckpoint_ConflictingTarget_FailsTypedAndRetainsCheckpoint()
+    public async Task ResumedCheckpoint_ConflictingTarget_ParksResumablyWithoutRouter()
     {
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         string? rivalTip = null;
@@ -152,8 +154,11 @@ public sealed class ResumedCheckpointPublishTests : IDisposable
 
         Assert.NotNull(rivalTip);
         var final = await setup.Store.GetAsync(item.Id);
-        Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        // A genuine content conflict is never terminal: with no
+        // conflict-rework router wired the item parks resumably, keeping the
+        // checkpoint for a later retry instead of failing.
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.NotEqual(WorkItemState.Failed, final.State);
         Assert.Contains("conflict", final.LastError, StringComparison.OrdinalIgnoreCase);
 
         // The checkpoint is retained for operator retry: the ref still
