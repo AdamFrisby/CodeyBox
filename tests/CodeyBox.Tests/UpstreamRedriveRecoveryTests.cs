@@ -91,6 +91,137 @@ public sealed class UpstreamRedriveRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task RedriveAsync_MergeFromMainPlusTraileredWork_AcceptedWithoutConfirmation()
+    {
+        // Regression: branches that merged main and carry trailered work in
+        // every writer's own subset were refused because the proof demanded
+        // every configured key on every commit.
+        using var fixture = CreateFixture();
+        var item = NewItem("codeybox/legacy-item", fixture.Project.Id);
+        item = item.With(WorkItemState.Failed, "upstream push diverged", failureKind: WorkItemFailureKinds.UpstreamBlocked);
+        await fixture.Store.CreateAsync(item, CancellationToken.None);
+        await EnsureHostBranchAsync(fixture, item);
+        var baseTip = new string('1', 40);
+        var headSha = new string('e', 40);
+        fixture.Remote.BranchTips["main"] = baseTip;
+        fixture.Remote.OpenPullRequests.Add(new UpstreamPullRequest
+        {
+            Number = 612,
+            Url = "https://github.com/o/r/pull/612",
+            HeadBranch = "codeybox/legacy-item",
+            HeadSha = headSha,
+            BaseBranch = "main",
+            HasMergeConflict = true,
+        });
+        var mergeSha = new string('2', 40);
+        var agentSha = new string('3', 40);
+        var mechanicalSha = new string('4', 40);
+        fixture.Remote.BranchCommits =
+        [
+            // Orchestrator merge commit: WorkItem + Agent + Co-Authored-By.
+            new OwnedBranchCommit(
+                mergeSha,
+                "codeybox: merge codeybox/legacy-item\n\n" +
+                "CodeyBox-WorkItem: 6f2c9a1e3b4d5f6a7b8c9d0e1f2a3b4c\n" +
+                "CodeyBox-Agent: test-agent\n" +
+                "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>"),
+            // Agent work commit: Prompt-Revision + Co-Authored-By only (no WorkItem).
+            new OwnedBranchCommit(
+                agentSha,
+                "agent work\n\nDo the thing.\n\n" +
+                "CodeyBox-Prompt-Revision: 7\n" +
+                "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>"),
+            // Mechanical fixer commit: Mechanical-Fixer only.
+            new OwnedBranchCommit(
+                mechanicalSha,
+                "normalize whitespace\n\nCodeyBox-Mechanical-Fixer: whitespace"),
+        ];
+
+        var result = await fixture.Redrive.RedriveAsync(item.Id, CancellationToken.None);
+
+        Assert.True(result.Success);
+        // The range was pinned to the current base tip, not the branch name.
+        Assert.Equal(baseTip, fixture.Remote.LastBaseRevision);
+    }
+
+    [Fact]
+    public async Task RedriveAsync_UntraileredCommitOffBase_RefusedNamingSha()
+    {
+        using var fixture = CreateFixture();
+        var item = NewItem("codeybox/legacy-item", fixture.Project.Id);
+        item = item.With(WorkItemState.Failed, "upstream push diverged", failureKind: WorkItemFailureKinds.UpstreamBlocked);
+        await fixture.Store.CreateAsync(item, CancellationToken.None);
+        var baseTip = new string('1', 40);
+        var headSha = new string('f', 40);
+        fixture.Remote.BranchTips["main"] = baseTip;
+        fixture.Remote.OpenPullRequests.Add(new UpstreamPullRequest
+        {
+            Number = 612,
+            Url = "https://github.com/o/r/pull/612",
+            HeadBranch = "codeybox/legacy-item",
+            HeadSha = headSha,
+            BaseBranch = "main",
+            HasMergeConflict = true,
+        });
+        var ownedSha = new string('a', 40);
+        var foreignSha = new string('b', 40);
+        fixture.Remote.BranchCommits =
+        [
+            new OwnedBranchCommit(
+                ownedSha,
+                "agent work\n\nCodeyBox-Prompt-Revision: 7\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>"),
+            new OwnedBranchCommit(foreignSha, "operator hotfix without trailers"),
+        ];
+
+        var refused = await fixture.Redrive.RedriveAsync(item.Id, CancellationToken.None);
+
+        Assert.False(refused.Success);
+        Assert.Contains(foreignSha, refused.Error);
+        Assert.DoesNotContain(ownedSha, refused.Error);
+        Assert.Contains("confirmOwnership", refused.Error);
+    }
+
+    [Fact]
+    public async Task RedriveAsync_TrailersDisabledByConfig_RequiresConfirmOwnership()
+    {
+        using var fixture = CreateFixture(new CommitAttribution(
+            includeCoAuthoredBy: false, includeCodeyBoxTrailers: false, includePullRequestFooter: true));
+        var item = NewItem("codeybox/legacy-item", fixture.Project.Id);
+        item = item.With(WorkItemState.Failed, "upstream push diverged", failureKind: WorkItemFailureKinds.UpstreamBlocked);
+        await fixture.Store.CreateAsync(item, CancellationToken.None);
+        await EnsureHostBranchAsync(fixture, item);
+        var baseTip = new string('1', 40);
+        var headSha = new string('e', 40);
+        fixture.Remote.BranchTips["main"] = baseTip;
+        fixture.Remote.OpenPullRequests.Add(new UpstreamPullRequest
+        {
+            Number = 612,
+            Url = "https://github.com/o/r/pull/612",
+            HeadBranch = "codeybox/legacy-item",
+            HeadSha = headSha,
+            BaseBranch = "main",
+            HasMergeConflict = true,
+        });
+        fixture.Remote.BranchCommits =
+        [
+            new OwnedBranchCommit(
+                new string('a', 40),
+                "agent work\n\n" +
+                "CodeyBox-WorkItem: 6f2c9a1e3b4d5f6a7b8c9d0e1f2a3b4c\n" +
+                "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>"),
+        ];
+
+        var refused = await fixture.Redrive.RedriveAsync(item.Id, CancellationToken.None);
+
+        Assert.False(refused.Success);
+        Assert.Contains("confirmOwnership", refused.Error);
+
+        var confirmed = await fixture.Redrive.RedriveAsync(item.Id, confirmOwnership: true, CancellationToken.None);
+
+        Assert.True(confirmed.Success);
+    }
+
+    [Fact]
     public async Task RedriveAsync_NoPrAnywhere_PushesAloneWithoutRecordingPr()
     {
         using var fixture = CreateFixture();
@@ -194,7 +325,7 @@ public sealed class UpstreamRedriveRecoveryTests : IDisposable
         }
     }
 
-    private RecoveryFixture CreateFixture()
+    private RecoveryFixture CreateFixture(CommitAttribution? attribution = null)
     {
         var workspace = Path.Combine(_workspace, "fx-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(workspace);
@@ -216,9 +347,19 @@ public sealed class UpstreamRedriveRecoveryTests : IDisposable
             new StubTaskQueue(),
             git,
             NullLogger<WorkItemRetrier>.Instance);
+        CommitAttributionPolicy? policy = attribution is null
+            ? null
+            : new CommitAttributionPolicy(new CommitAttributionSnapshot(
+                new CommitAttributionOptions
+                {
+                    CoAuthoredBy = attribution.IncludeCoAuthoredBy,
+                    CodeyBoxTrailers = attribution.IncludeCodeyBoxTrailers,
+                    PullRequestFooter = attribution.IncludePullRequestFooter,
+                }));
         var service = new UpstreamRedriveService(
             store, projects, new StubRemoteFactory(remote), retrier,
-            NullLogger<UpstreamRedriveService>.Instance);
+            NullLogger<UpstreamRedriveService>.Instance,
+            attributionPolicy: policy);
         return new RecoveryFixture(workspace, store, project, remote, git, service);
     }
 
@@ -251,7 +392,10 @@ public sealed class UpstreamRedriveRecoveryTests : IDisposable
     {
         public List<UpstreamPullRequest> OpenPullRequests { get; } = new();
         public IReadOnlyList<string>? BranchCommitMessages { get; set; }
+        public IReadOnlyList<OwnedBranchCommit>? BranchCommits { get; set; }
         public string? BranchHeadSha { get; set; }
+        public Dictionary<string, string> BranchTips { get; } = new(StringComparer.Ordinal);
+        public string? LastBaseRevision { get; private set; }
         public string Name => "stub-recovery-upstream";
 
         public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
@@ -268,11 +412,21 @@ public sealed class UpstreamRedriveRecoveryTests : IDisposable
                 OpenPullRequests.Where(p => p.HeadBranch.StartsWith(branchPrefix, StringComparison.Ordinal)).ToList());
 
         public Task<string?> GetBranchHeadShaAsync(string branch, CancellationToken ct = default)
-            => Task.FromResult(BranchHeadSha);
+            => Task.FromResult(BranchTips.TryGetValue(branch, out var sha) ? sha : BranchHeadSha);
 
         public Task<IReadOnlyList<string>?> ListBranchCommitMessagesAsync(
             string baseBranch, string head, int maxCommits, CancellationToken ct = default)
             => Task.FromResult(BranchCommitMessages);
+
+        public Task<IReadOnlyList<OwnedBranchCommit>?> ListBranchCommitsAsync(
+            string baseRevision, string head, int maxCommits, CancellationToken ct = default)
+        {
+            LastBaseRevision = baseRevision;
+            if (BranchCommits is not null)
+                return Task.FromResult<IReadOnlyList<OwnedBranchCommit>?>(BranchCommits);
+            return Task.FromResult<IReadOnlyList<OwnedBranchCommit>?>(BranchCommitMessages?
+                .Select(m => new OwnedBranchCommit(string.Empty, m)).ToList());
+        }
     }
 
     private sealed class StubTaskQueue : ITaskQueue

@@ -4875,7 +4875,8 @@ builder.Services.AddSingleton<UpstreamRedriveService>(sp => new UpstreamRedriveS
     sp.GetRequiredService<IUpstreamRemoteFactory>(),
     sp.GetRequiredService<WorkItemRetrier>(),
     sp.GetRequiredService<ILogger<UpstreamRedriveService>>(),
-    sp.GetRequiredService<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>()));
+    sp.GetRequiredService<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>(),
+    sp.GetRequiredService<CodeyBox.Core.CommitAttributionPolicy>()));
 builder.Services.AddHostedService(sp => new StaleUpstreamRedriveDetector(
     sp.GetRequiredService<UpstreamRedriveService>(),
     sp.GetRequiredService<ILogger<StaleUpstreamRedriveDetector>>()));

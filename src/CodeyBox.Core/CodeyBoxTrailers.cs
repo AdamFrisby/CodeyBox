@@ -32,7 +32,13 @@ namespace CodeyBox.Core;
 /// </summary>
 public static class CodeyBoxTrailers
 {
-    public const string CoAuthoredBy = "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>";
+    /// <summary>
+    /// Canonical value of the terminal co-author trailer. Compared by exact
+    /// ordinal equality wherever ownership or attribution is decided — a
+    /// foreign <c>Co-Authored-By</c> value must never satisfy a CodeyBox check.
+    /// </summary>
+    public const string CoAuthoredByValue = "CodeyBox <noreply@codeybox.invalid>";
+    public const string CoAuthoredBy = "Co-Authored-By: " + CoAuthoredByValue;
     public const string WorkItemTrailerKey = "CodeyBox-WorkItem";
     public const string AgentTrailerKey = "CodeyBox-Agent";
     public const string MechanicalFixerTrailerKey = "CodeyBox-Mechanical-Fixer";

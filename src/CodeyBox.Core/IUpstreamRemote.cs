@@ -239,6 +239,27 @@ public interface IUpstreamRemote
         => Task.FromResult<IReadOnlyList<string>?>(null);
 
     /// <summary>
+    /// Lists the commits reachable from <paramref name="head"/> (a branch
+    /// name or commit sha) but not from <paramref name="baseRevision"/> (a
+    /// branch name or commit sha — pass the resolved current base tip sha to
+    /// pin the range to <c>&lt;base tip&gt;..&lt;remote tip&gt;</c>),
+    /// oldest first, with each commit's sha and full message. Same
+    /// ownership-proof use, bounds, and null-when-unsupported contract as
+    /// <see cref="ListBranchCommitMessagesAsync"/>, plus the shas so a
+    /// refusal can name exactly which commits blocked the proof. The default
+    /// derives from <see cref="ListBranchCommitMessagesAsync"/> with unknown
+    /// shas; forges with a real commit API override this instead.
+    /// </summary>
+    async Task<IReadOnlyList<OwnedBranchCommit>?> ListBranchCommitsAsync(
+        string baseRevision, string head, int maxCommits, CancellationToken ct = default)
+    {
+        var messages = await ListBranchCommitMessagesAsync(baseRevision, head, maxCommits, ct).ConfigureAwait(false);
+        return messages is null
+            ? null
+            : messages.Select(m => new OwnedBranchCommit(string.Empty, m)).ToList();
+    }
+
+    /// <summary>
     /// Forge capability seam for audit check-run publication. Returns whether
     /// this remote can publish structured audit findings as forge check runs.
     /// The default reports unsupported so non-GitHub forges (noop,
@@ -277,6 +298,14 @@ public sealed record UpstreamPullRequestState(
     string Url,
     PullRequestStatus Status,
     string? MergeCommitSha);
+
+/// <summary>
+/// One commit in a branch's exclusive range (<c>&lt;base&gt;..&lt;head&gt;</c>),
+/// oldest first. <see cref="Sha"/> is the full commit sha (empty when the
+/// forge did not report one); <see cref="Message"/> is the full commit
+/// message, bounded by the listing implementation.
+/// </summary>
+public sealed record OwnedBranchCommit(string Sha, string Message);
 
 /// <summary>
 /// Snapshot of an open pull request as seen by an <see cref="IUpstreamRemote"/>

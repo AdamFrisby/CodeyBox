@@ -507,7 +507,18 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     public async Task<IReadOnlyList<string>?> ListBranchCommitMessagesAsync(
         string baseBranch, string head, int maxCommits, CancellationToken ct = default)
     {
-        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        var commits = await ListBranchCommitsAsync(baseBranch, head, maxCommits, ct).ConfigureAwait(false);
+        return commits?.Select(c => c.Message).ToList();
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<OwnedBranchCommit>?> ListBranchCommitsAsync(
+        string baseRevision, string head, int maxCommits, CancellationToken ct = default)
+    {
+        if (IsCommitSha(baseRevision))
+            Validation.ValidateCommitSha(baseRevision, nameof(baseRevision));
+        else
+            Validation.ValidateBranchName(baseRevision, nameof(baseRevision));
         if (string.IsNullOrWhiteSpace(head))
             throw new ArgumentException("head must not be empty", nameof(head));
         if (IsCommitSha(head))
@@ -520,11 +531,11 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         const int perPage = 100;
         const int maxMessageBytes = 32768;
         var pageSize = Math.Min(perPage, maxCommits);
-        var messages = new List<string>();
+        var commits = new List<OwnedBranchCommit>();
         for (var page = 1; ; page++)
         {
             var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/compare/" +
-                $"{Uri.EscapeDataString(baseBranch)}...{Uri.EscapeDataString(head)}" +
+                $"{Uri.EscapeDataString(baseRevision)}...{Uri.EscapeDataString(head)}" +
                 $"?per_page={pageSize}&page={page}";
             using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
             using var resp = await SendAsync(req, ct);
@@ -533,7 +544,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 AuditLog.UpstreamApiCallFailed("GET /compare", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
                 _log.LogDebug(
                     "GitHub compare {Base}...{Head} returned {Status}; ownership unverifiable",
-                    SanitizeForLog(baseBranch), SanitizeForLog(head), (int)resp.StatusCode);
+                    SanitizeForLog(baseRevision), SanitizeForLog(head), (int)resp.StatusCode);
                 return null;
             }
             var comparison = await resp.Content.ReadFromJsonAsync<GitHubCompareResponse>(ct);
@@ -543,7 +554,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             {
                 _log.LogDebug(
                     "GitHub compare {Base}...{Head} reports {Total} exclusive commits (cap {Cap}); ownership unverifiable",
-                    SanitizeForLog(baseBranch), SanitizeForLog(head), comparison.TotalCommits, maxCommits);
+                    SanitizeForLog(baseRevision), SanitizeForLog(head), comparison.TotalCommits, maxCommits);
                 return null;
             }
             foreach (var commit in comparison.Commits ?? [])
@@ -551,38 +562,63 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 var message = commit.Commit?.Message;
                 if (string.IsNullOrWhiteSpace(message))
                     continue;
-                messages.Add(TruncateMessageTail(message.Trim(), maxMessageBytes));
+                commits.Add(new OwnedBranchCommit(
+                    NormalizeCommitSha(commit.Sha),
+                    TruncateMessageTail(message.Trim(), maxMessageBytes)));
             }
             if ((comparison.Commits?.Count ?? 0) < pageSize)
                 break;
         }
-        return messages;
+        return commits;
+    }
+
+    /// <summary>
+    /// Forge-reported commit shas are untrusted input: keep only plausible
+    /// hex shas (lowercased) so refusal messages naming offending commits
+    /// cannot carry terminal escapes or prose. Anything else becomes empty
+    /// and is omitted from the named list.
+    /// </summary>
+    private static string NormalizeCommitSha(string? sha)
+    {
+        var candidate = (sha ?? string.Empty).Trim().ToLowerInvariant();
+        if (candidate.Length is < 40 or > 64)
+            return string.Empty;
+        foreach (var c in candidate)
+        {
+            if (!Uri.IsHexDigit(c))
+                return string.Empty;
+        }
+        return candidate;
     }
 
     /// <summary>
     /// Proves a diverged remote tip is CodeyBox's own history by listing the
-    /// commits exclusive of <paramref name="baseBranch"/> through the compare
-    /// API and requiring every one to carry the configured trailers. An empty
-    /// exclusive set is safe (the tip sits at or behind the base, so nothing
-    /// foreign can be lost); any unreadable, oversized, or unmarked range is
-    /// unverified — never assumed. Never throws except on cancellation.
+    /// commits exclusive of the CURRENT base tip (<c>&lt;base tip&gt;..&lt;remote tip&gt;</c>)
+    /// through the compare API and requiring every one to carry any accepted
+    /// CodeyBox trailer. Returns the shas of commits that block the proof
+    /// (empty = owned; <c>null</c> = unverifiable). An empty exclusive set is
+    /// safe (the tip sits at or behind the base, so nothing foreign can be
+    /// lost); any unreadable, oversized, or unmarked range is unverified —
+    /// never assumed. Never throws except on cancellation.
     /// </summary>
-    private async Task<bool> TryVerifyRemoteTipOwnedAsync(
+    private async Task<IReadOnlyList<string>?> TryVerifyRemoteTipOwnedAsync(
         string baseBranch, string remoteSha, CancellationToken ct)
     {
         try
         {
             var options = _ownership.Current;
-            var keys = options.RequiredTrailerKeys ?? [];
-            if (keys.Length == 0)
-                return false;
-            var messages = await ListBranchCommitMessagesAsync(
-                baseBranch, remoteSha, Math.Max(1, options.MaxCommitsToVerify), ct).ConfigureAwait(false);
-            if (messages is null)
-                return false;
-            if (messages.Count == 0)
-                return true;
-            return BranchOwnershipPolicy.AreAllCommitsOwned(messages, keys);
+            var accepted = BranchOwnershipPolicy.EffectiveAcceptedKeys(
+                options.RequiredTrailerKeys ?? [], _attribution);
+            if (accepted.Length == 0)
+                return null;
+            var baseRevision = await ResolveBaseRevisionAsync(baseBranch, ct).ConfigureAwait(false);
+            var commits = await ListBranchCommitsAsync(
+                baseRevision, remoteSha, Math.Max(1, options.MaxCommitsToVerify), ct).ConfigureAwait(false);
+            if (commits is null)
+                return null;
+            if (commits.Count == 0)
+                return [];
+            return BranchOwnershipPolicy.FindUnownedCommitShas(commits, accepted);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -593,8 +629,42 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             _log.LogDebug(
                 "Ownership verification of remote tip {Sha} failed ({Message}); treating as unverified",
                 SanitizeForLog(remoteSha), ex.Message);
-            return false;
+            return null;
         }
+    }
+
+    /// <summary>
+    /// Pins the ownership range to the live base tip: resolves
+    /// <paramref name="baseBranch"/> to its current head sha so commits
+    /// already reachable from the base (e.g. operator commits merged into
+    /// the work branch) never count as third-party work. Falls back to the
+    /// branch name — which the compare endpoint resolves to the same tip —
+    /// when the tip cannot be read.
+    /// </summary>
+    private async Task<string> ResolveBaseRevisionAsync(string baseBranch, CancellationToken ct)
+    {
+        try
+        {
+            var tip = await GetBranchHeadShaAsync(baseBranch, ct).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(tip))
+            {
+                _log.LogDebug(
+                    "Ownership check on base {Branch} pinned to current tip {Sha}",
+                    SanitizeForLog(baseBranch), SanitizeForLog(tip));
+                return tip;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                "Could not resolve current tip of base {Branch} ({Message}); comparing against the branch name",
+                SanitizeForLog(baseBranch), ex.Message);
+        }
+        return baseBranch;
     }
 
     private static bool IsCommitSha(string value)
@@ -1102,14 +1172,15 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         {
             // No recorded prior push to lease from: accept the remote tip as
             // CodeyBox's own history only when every commit exclusive of the
-            // base carries the configured CodeyBox trailers. A single
+            // current base tip carries an accepted CodeyBox trailer. A single
             // unmarked commit keeps the refusal — a third party's history is
             // never rewritten without the operator's explicit re-drive
             // confirmation. Verification failures (unreadable commits,
             // oversized ranges, transient API errors) are unverified, never
             // assumed.
-            if (!await TryVerifyRemoteTipOwnedAsync(request.BaseBranch, remoteSha, ct).ConfigureAwait(false))
-                throw new UpstreamOwnedBranchDivergedException(request.WorkBranch, remoteSha, localTip);
+            var unowned = await TryVerifyRemoteTipOwnedAsync(request.BaseBranch, remoteSha, ct).ConfigureAwait(false);
+            if (unowned is null || unowned.Count > 0)
+                throw new UpstreamOwnedBranchDivergedException(request.WorkBranch, remoteSha, localTip, unowned);
             leaseBase = remoteSha;
             _log.LogInformation(
                 "Work branch {WorkBranch} remote tip {Sha} proven CodeyBox-owned by commit trailers; rewriting under lease",
@@ -2592,6 +2663,7 @@ internal sealed record GitHubMergeResponse(
     [property: JsonPropertyName("merged")] bool Merged = false);
 
 internal sealed record GitHubPullRequestCommitResponse(
+    [property: JsonPropertyName("sha")] string? Sha,
     [property: JsonPropertyName("commit")] GitHubPullRequestCommitDetail? Commit);
 
 internal sealed record GitHubBranchDetail(
