@@ -139,6 +139,7 @@
     <Project Path="plugins/sast/CodeyBox.BanditAuditorPlugin/CodeyBox.BanditAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.SemgrepAuditorPlugin/CodeyBox.SemgrepAuditorPlugin.csproj" />
     <Project Path="plugins/sast/CodeyBox.AstGrepAuditorPlugin/CodeyBox.AstGrepAuditorPlugin.csproj" />
+    <Project Path="plugins/sast/CodeyBox.GosecAuditorPlugin/CodeyBox.GosecAuditorPlugin.csproj" />
     <Project Path="plugins/test-runners/CodeyBox.DotnetTestRunnerPlugin/CodeyBox.DotnetTestRunnerPlugin.csproj" />
     <Project Path="plugins/quota/CodeyBox.OpencodeGoQuotaPlugin/CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <Project Path="plugins/quota/CodeyBox.QuotaResetNotifier/CodeyBox.QuotaResetNotifier.csproj" />
