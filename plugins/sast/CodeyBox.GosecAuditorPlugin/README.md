@@ -74,7 +74,8 @@ not assume the common "0 clean / 1 findings / 2 error" convention holds):
 | `1`, JSON oracle has `"Golang errors"` entries | One or more packages failed to load/type-check — partial scan (findings may also be present) | Infrastructure |
 | `1`, oracle clean, SARIF has results | Ran and found problems | Verdict (findings; `Passed = false` when any maps to `Error`) |
 | `1`, oracle clean, SARIF empty | Impossible contract state (exit reason unverifiable) | Infrastructure |
-| `1`, no/invalid JSON or SARIF | Startup failure: bad flags, unreadable `-conf`, no packages, report write failure | Infrastructure |
+| `1`, no/invalid JSON or SARIF | Startup failure: unreadable `-conf`, no packages, analyzer or report write failure | Infrastructure |
+| `2` | Flag-parse/usage error — unrecognized flags exit through Go's `flag.ExitOnError` before the main flow runs | Infrastructure |
 | `126` / `127` | Binary not executable or not found | Infrastructure |
 | anything else | Unknown convention | Infrastructure (fails loud, never a pass) |
 
@@ -87,18 +88,26 @@ naming the tool — never a passing audit.
 gosec uses Go's stdlib `flag` package, which stops parsing at the first
 positional argument. The package patterns come last in argv; operator
 `ExtraArguments` therefore land **after** them and act as additional
-package patterns — never as flags. Flag-shaped entries are rejected
-deterministically before the scan (use the scoped keys below instead).
+package patterns — never as flags. Flag-shaped entries and bare
+import-path spellings (`all`, `net/http`) are rejected deterministically
+before the scan: the former cannot parse where they land, the latter
+would resolve code outside the audited worktree (use the scoped keys
+below instead).
 
 ## Go toolchain and module graph
 
 gosec loads and type-checks packages through `go list`, so the baseline
 needs **both** `gosec` and a `go` toolchain, and the module graph must
 resolve **offline** (the auditor declares no network capability): commit
-`vendor/` or pre-seed the module cache in the sandbox image. The
-`GOSEC_AI_PROVIDER` / `GOSEC_AI_API_KEY` / `GOSEC_AI_BASE_URL` ambient
-activation path for gosec's AI-autofix feature is removed from the tool
-process environment.
+`vendor/` or pre-seed the module cache in the sandbox image. The offline
+posture is enforced on the tool process, not assumed — `GOPROXY=off` and
+`GOTOOLCHAIN=local` are pinned so a `go.mod` `require`/`toolchain`
+directive cannot drive a module or toolchain download even on a sandbox
+profile with egress, and `GOFLAGS`/`GOPACKAGESDRIVER` are unset because
+ambient values can inject flags or replace package loading with an
+arbitrary driver. The `GOSEC_AI_PROVIDER` / `GOSEC_AI_API_KEY` /
+`GOSEC_AI_BASE_URL` ambient activation path for gosec's AI-autofix
+feature is removed from the tool process environment as well.
 
 ## Version pinning
 
@@ -154,15 +163,15 @@ Scoped under `CodeyBox:Plugins:codeybox.gosec`, resolved per run
 | Key | Default | Meaning |
 |---|---|---|
 | `ExpectedVersion` | `2.29.0` | Pinned gosec release; a different installed version fails closed as infrastructure. Set this to the release you provisioned. |
-| `Targets` | `./...` | Comma-separated gosec package patterns (positional args, after all flags). Repo-relative only; narrowing below the worktree root makes findings carry target-root-relative paths. |
-| `ConfigPath` | — | Operator-owned gosec `-conf` JSON file (rule settings/globals). Canonicalized in the sandbox and rejected when it resolves inside the audited worktree — use an absolute path outside the repository. gosec reads no repo config file, so this is the only config surface. |
+| `Targets` | `./...` | Comma-separated gosec package patterns (positional args, after all flags). Must be `./`-prefixed file-tree patterns (`./...`, `./pkg/...`, `.`) — gosec positionals are go/packages patterns, so bare import-path spellings like `all` or `net/http` would resolve Go distribution/module-cache code outside the audited worktree and are rejected. Narrowing below the worktree root makes findings carry target-root-relative paths. |
+| `ConfigPath` | — | Operator-owned gosec `-conf` JSON file (rule settings/globals). Canonicalized once per run in the sandbox and the canonical path is what reaches `-conf`; the run fails when it resolves inside the audited worktree — use an absolute path outside the repository. gosec reads no repo config file, so this is the only config surface. |
 | `IncludeTests` | `false` | Pass `-tests` to also analyze `*_test.go` files. |
 | `IncludeGeneratedCode` | `false` | Omit `-exclude-generated` to also analyze `// Code generated … DO NOT EDIT` files. |
 | `BuildTags` | — | Comma-separated Go build tags (`-tags`) for files behind build constraints. |
 | `MinimumSeverity` | `info` | Drop mapped findings below this severity (`info`, `warning`, `error`). |
 | `IncludedRules` / `ExcludedRules` | — | Exact gosec rule ids to keep/drop (e.g. `G404`). Output filters; they do not change which rules run. Scan-time rule selection needs `-include`/`-exclude` inside an operator `ConfigPath` file. |
 | `ExcludePaths` | `vendor/`, `third_party/`, `node_modules/` | Repo-relative paths dropped from findings — exact path, or directory prefix when trailing `/`. Filters reported findings, not the scan (gosec's own default `-exclude-dir` already skips `vendor/` and `.git`). Setting it replaces the default list. |
-| `ExtraArguments` | — | Additional **package patterns** appended after `Targets` — never flags (see *Argument ordering*). |
+| `ExtraArguments` | — | Additional `./`-prefixed **package patterns** appended after `Targets` — never flags (see *Argument ordering*), and never bare import-path spellings, which would scan code outside the audited worktree. |
 | `TimeoutSeconds` | `300` | Per-run bound — exceeding it is infrastructure, not a pass. A full-module scan on a large tree can take minutes; raise it before assuming a hang. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/result caps; overruns are reported as truncation. Large repositories can exceed 1 MiB of SARIF — raise the former (up to 64 MiB) rather than wondering where findings went. |
 

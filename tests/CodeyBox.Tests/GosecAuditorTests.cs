@@ -19,12 +19,16 @@ namespace CodeyBox.Tests;
 /// findings, neither → a fails-closed parse failure); SARIF maps to
 /// findings with rule id and file/line; severity is recovered from the
 /// rule's native HIGH/MEDIUM/LOW tag rather than the flattened SARIF
-/// level; flag-shaped ExtraArguments die deterministically because Go's
-/// flag parser takes nothing after the positional patterns; and the
-/// plugin is inert — unloaded and absent from baseline provisioning —
-/// until an operator enables it. Every run is dispatched through <see
-/// cref="IAuditor"/> so the version pin cannot be bypassed by interface
-/// dispatch.
+/// level; flag-shaped and bare-import-path ExtraArguments/Targets die
+/// deterministically because Go's flag parser takes nothing after the
+/// positional patterns and go/packages patterns are not filesystem
+/// paths; the operator -conf lands in argv as its canonicalized value
+/// (the gated read IS the consumed read); the declared-offline tool
+/// process is pinned GOPROXY=off/GOTOOLCHAIN=local and stripped of
+/// flag/driver injection env; and the plugin is inert — unloaded and
+/// absent from baseline provisioning — until an operator enables it.
+/// Every run is dispatched through <see cref="IAuditor"/> so the version
+/// pin cannot be bypassed by interface dispatch.
 /// </summary>
 public sealed class GosecAuditorTests
 {
@@ -263,9 +267,11 @@ public sealed class GosecAuditorTests
     [Fact]
     public async Task StartupFailureExit_NoReport_IsInfrastructure()
     {
-        // gosec exits 1 on usage errors, an unreadable -conf, "No packages
-        // found", and analyzer failures — before either report is written,
-        // so the side-report read fails closed first.
+        // gosec exits 1 on an unreadable -conf, "No packages found", and
+        // analyzer failures — before either report is written, so the
+        // side-report read fails closed first. (Flag-parse/usage errors
+        // exit 2 through Go's flag.ExitOnError — covered by
+        // UndeclaredExits_AreInfrastructure.)
         IAuditor auditor = new GosecAuditor();
         var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
             () => auditor.RunAsync(
@@ -548,6 +554,179 @@ public sealed class GosecAuditorTests
     }
 
     [Fact]
+    public async Task ConfigPath_EmitsTheCanonicalPath_InArgv()
+    {
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ConfigPath"] = "/opt/links/gosec.json",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            // The configured path is a symlink whose canonical target
+            // lands outside the worktree — argv must carry the gated
+            // canonical value, not the configured spelling.
+            if (IsRealpathProbe(exec))
+                return Task.FromResult(new SandboxExecResult(
+                    0, "/etc/codeybox/gosec.json\n/work\n", ""));
+            if (IsProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsCatProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, JsonNoErrors, ""));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var result = await ((IAuditor)auditor).RunAsync(
+            sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        AssertFlagValue(scanExec!.Argv, "-conf", "/etc/codeybox/gosec.json");
+    }
+
+    [Fact]
+    public async Task BareImportPathTargets_AreRejected_BeforeAnyExec()
+    {
+        // gosec positional arguments are go/packages patterns, not
+        // filesystem paths: 'net/http' resolves into GOROOT source outside
+        // the audited worktree, so it is refused before the first probe.
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:Targets"] = "net/http",
+            }),
+            CancellationToken.None);
+
+        var execs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            execs++;
+            return Task.FromResult(
+                IsProbe(exec)
+                    ? Ok(exec)
+                    : IsCatProbe(exec)
+                        ? new SandboxExecResult(0, JsonNoErrors, "")
+                        : new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("'./'", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, execs);
+    }
+
+    [Fact]
+    public async Task FileTreeTargets_StillScan_IncludingWorktreeRootDot()
+    {
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:Targets"] = ".,./sub/...",
+            }),
+            CancellationToken.None);
+
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsCatProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, JsonNoErrors, ""));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.NotNull(scanExec);
+        Assert.Equal("./sub/...", scanExec!.Argv[^1]);
+        Assert.Equal(".", scanExec.Argv[^2]);
+    }
+
+    [Fact]
+    public async Task BareImportPathExtraArguments_AreRejected_BeforeScan()
+    {
+        var auditor = new GosecAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:ExtraArguments"] = "all",
+            }),
+            CancellationToken.None);
+
+        var scanExecs = 0;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsCatProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, JsonNoErrors, ""));
+            scanExecs++;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(
+            () => ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None));
+
+        Assert.True(ex.IsDeterministic);
+        Assert.Contains("ExtraArguments", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, scanExecs);
+    }
+
+    [Fact]
+    public async Task WrongShapeRuleMetadata_YieldsFinding_NotAParserCrash()
+    {
+        // "properties": "x" and "rule": "G404" are well-formed JSON of the
+        // wrong shape: string-indexing them throws InvalidOperationException,
+        // surfacing as an untyped 'parser failed' instead of the declared
+        // parse contract. The decorator shape-checks before indexing, so
+        // the run produces the finding with its reported level.
+        const string sarif = """
+            {
+              "version": "2.1.0",
+              "runs": [{
+                "tool": {
+                  "driver": {
+                    "name": "gosec",
+                    "version": "2.29.0",
+                    "rules": [{ "id": "G404", "properties": "x" }]
+                  }
+                },
+                "results": [{
+                  "rule": "G404",
+                  "level": "error",
+                  "message": { "text": "weak randomness" },
+                  "locations": [{
+                    "physicalLocation": {
+                      "artifactLocation": { "uri": "main.go" },
+                      "region": { "startLine": 9 }
+                    }
+                  }]
+                }]
+              }]
+            }
+            """;
+
+        IAuditor auditor = new GosecAuditor();
+        var result = await auditor.RunAsync(
+            HealthyTool(1, sarif), "/work", FakeContext(), CancellationToken.None);
+
+        var finding = Assert.Single(result.Findings);
+        Assert.Equal("main.go:9", finding.Location);
+        Assert.Equal(AuditSeverity.Error, finding.Severity);
+        Assert.False(result.Passed);
+    }
+
+    [Fact]
     public async Task ReportFile_Unreadable_IsInfrastructure()
     {
         IAuditor auditor = new GosecAuditor();
@@ -585,6 +764,38 @@ public sealed class GosecAuditorTests
         Assert.Contains("GOSEC_AI_PROVIDER", scanExec!.EnvironmentVariablesToUnset);
         Assert.Contains("GOSEC_AI_API_KEY", scanExec.EnvironmentVariablesToUnset);
         Assert.Contains("GOSEC_AI_BASE_URL", scanExec.EnvironmentVariablesToUnset);
+        // Ambient Go knobs that steer `go list` — flag injection and an
+        // arbitrary package-loading driver — are stripped too.
+        Assert.Contains("GOFLAGS", scanExec.EnvironmentVariablesToUnset);
+        Assert.Contains("GOPACKAGESDRIVER", scanExec.EnvironmentVariablesToUnset);
+    }
+
+    [Fact]
+    public async Task OfflineGoEnvironment_IsPinned_OnTheToolProcess()
+    {
+        SandboxExec? scanExec = null;
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsCatProbe(exec))
+                return Task.FromResult(new SandboxExecResult(0, JsonNoErrors, ""));
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, SarifClean, ""));
+        });
+
+        IAuditor auditor = new GosecAuditor();
+        await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        // The auditor declares no network capability, so the tool process
+        // must not inherit fetch/exec paths: GOPROXY=off keeps the module
+        // graph to cache/vendor and GOTOOLCHAIN=local blocks a repo-chosen
+        // toolchain download.
+        Assert.NotNull(scanExec);
+        var env = Assert.IsAssignableFrom<IReadOnlyDictionary<string, string>>(
+            scanExec!.ExtraEnvironment);
+        Assert.Equal("off", env["GOPROXY"]);
+        Assert.Equal("local", env["GOTOOLCHAIN"]);
     }
 
     // Fixture sources assembled at runtime so this test file does not
