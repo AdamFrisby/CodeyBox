@@ -1338,17 +1338,24 @@ public sealed partial class PipelineRunner
         string agentPhase,
         CancellationToken ct)
     {
+        // Guard AT the sink: branch names flow into sandbox git argv below
+        // (fetch refspecs, checkout, rev-parse). Validation rejects
+        // option-like values (leading dash) so git never misparses them;
+        // the argv below additionally uses explicit refspecs and `--`
+        // separators where git supports them.
+        Validation.ValidateBranchName(branch, nameof(branch));
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         if (await _gitHost.BranchExistsAsync(repoId, branch, ct))
         {
             var hostTip = await _gitHost.ResolveCommitAsync(repoId, branch, ct);
-            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", branch);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "--no-tags", "origin", "--", $"+refs/heads/{branch}:refs/remotes/origin/{branch}");
             var head = await ReadSandboxHeadShaAsync(sandbox, ct);
             if (!string.Equals(head, hostTip, StringComparison.Ordinal))
             {
                 _log.LogWarning(
                     "Staged work branch '{Branch}' at {SandboxHead} trails the bare-repo tip {HostTip}; refreshing the checkout before the agent turn",
                     branch, head, hostTip);
-                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{branch}");
+                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"refs/remotes/origin/{branch}", "--");
                 head = await ReadSandboxHeadShaAsync(sandbox, ct);
                 var freshTip = await _gitHost.ResolveCommitAsync(repoId, branch, ct);
                 if (!string.Equals(freshTip, hostTip, StringComparison.Ordinal))
@@ -1366,8 +1373,8 @@ public sealed partial class PipelineRunner
             return new WorkBranchStagingProof(hostTip, head);
         }
 
-        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", baseBranch);
-        var baseTip = await RevParseSandboxAsync(sandbox, $"origin/{baseBranch}", ct);
+        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "--no-tags", "origin", "--", $"+refs/heads/{baseBranch}:refs/remotes/origin/{baseBranch}");
+        var baseTip = await RevParseSandboxAsync(sandbox, $"refs/remotes/origin/{baseBranch}", ct);
         var newHead = await ReadSandboxHeadShaAsync(sandbox, ct);
         VerifyStagedHeadMatchesTip(baseTip, newHead, branch, agentKind, agentPhase);
         _log.LogInformation(

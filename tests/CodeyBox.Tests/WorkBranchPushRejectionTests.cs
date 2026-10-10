@@ -260,6 +260,39 @@ public sealed class WorkBranchPushRejectionTests : IDisposable
     }
 
     [Theory]
+    [InlineData("--upload-pack=evil")]
+    [InlineData("-nasty")]
+    [InlineData("feature..evil")]
+    public async Task StagingGuard_RejectsUnsafeBranchNameBeforeGit(string branch)
+    {
+        using var setup = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace));
+        var sandboxDir = Path.Combine(_workspace, "guard-reject-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(sandboxDir);
+        await using var sandbox = new LocalGitSandbox("guard-reject", sandboxDir);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            setup.Pipeline.EnsureSandboxAtCurrentWorkBranchTipAsync(
+                sandbox, "repo", branch, "main", AgentKind.Claude, "work", CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("--upload-pack=evil")]
+    [InlineData("-nasty")]
+    public async Task StagingGuard_RejectsUnsafeBaseBranchNameBeforeGit(string baseBranch)
+    {
+        using var setup = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace));
+        var sandboxDir = Path.Combine(_workspace, "guard-reject-base-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(sandboxDir);
+        await using var sandbox = new LocalGitSandbox("guard-reject-base", sandboxDir);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            setup.Pipeline.EnsureSandboxAtCurrentWorkBranchTipAsync(
+                sandbox, "repo", "feature/safe", baseBranch, AgentKind.Claude, "work", CancellationToken.None));
+    }
+
+    [Theory]
     [InlineData(null, null)]
     [InlineData("not-a-ref", null)]
     public void CheckpointSourceSha_UnknownRef_ReturnsNull(string? checkpointRef, string? expected) =>
