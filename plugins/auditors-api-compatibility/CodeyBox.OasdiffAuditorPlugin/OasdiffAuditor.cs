@@ -65,11 +65,17 @@ namespace CodeyBox.OasdiffAuditorPlugin;
 /// Ignore-file reclassification is deliberately not offered: it would let reported severities
 /// diverge from the tool's built-in standard — and, for an in-repo ignore file, let the diff
 /// author tune its own gate. Comparison tuning that cannot soften the verdict
-/// (<c>--match-path</c>, <c>--flatten-allof</c>, <c>--allow-external-refs=false</c>, …) stays
-/// available through <c>ExtraArguments</c>.</para>
+/// (<c>--match-path</c>, <c>--flatten-allof</c>, …) stays
+/// available through <c>ExtraArguments</c>. External <c>$ref</c> targets inside the
+/// documents are denied by default: the auditor-owned <c>breaking</c> and <c>validate</c>
+/// argvs carry <c>--allow-external-refs=false</c> (the tool resolves remote references over
+/// HTTP by default), so repository-controlled specs cannot make the sandbox fetch
+/// operator-unapproved hosts. An operator that needs remote references relaxes the guard
+/// explicitly with <c>--allow-external-refs=true</c> in <c>ExtraArguments</c>, which
+/// suppresses the auditor-owned default for that run.</para>
 ///
 /// <para><b>Scope and defaults.</b> The scan is
-/// <c>oasdiff breaking &lt;BaseSpec&gt; &lt;Spec&gt; --format json --fail-on &lt;FailOn&gt;</c>
+/// <c>oasdiff breaking &lt;BaseSpec&gt; &lt;Spec&gt; --format json --fail-on &lt;FailOn&gt; --allow-external-refs=false</c>
 /// (default <c>ERR</c>) over exactly the two configured documents — the tool never walks the
 /// repository, so vendored or generated trees cannot produce findings and the auditor ships no
 /// <c>ExcludePaths</c> default. Both specs are required with no guessed default: document
@@ -118,6 +124,12 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
 
     /// <summary>Default fail-on threshold: only definite breaking changes fail the command.</summary>
     internal const string DefaultFailOn = ErrFailOn;
+
+    /// <summary>Long flag denying remote <c>$ref</c> resolution in oasdiff load paths.</summary>
+    internal const string AllowExternalRefsFlag = "--allow-external-refs";
+
+    /// <summary>Auditor-owned default for <see cref="AllowExternalRefsFlag"/>: deny remote fetches.</summary>
+    internal const string DenyExternalRefsValue = "--allow-external-refs=false";
 
     private const int MaxSpecPathChars = 1024;
 
@@ -204,14 +216,20 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
         // scan argv before its presence and version checks, so a mispointed
         // spec fails deterministically before any probe or scan runs.
         var (baseSpec, spec) = ResolveScanSpecs();
-        return
-        [
+        var argv = new List<string>
+        {
             "breaking",
             baseSpec,
             spec,
             "--format", "json",
             "--fail-on", ResolveFailOn(),
-        ];
+        };
+        // Secure by default: deny remote $ref fetches unless the operator
+        // explicitly relaxes the guard via ExtraArguments (which the base
+        // appends after these entries).
+        if (!ExtraArgumentsSupplyFlag(options, AllowExternalRefsFlag))
+            argv.Add(DenyExternalRefsValue);
+        return argv;
     }
 
     /// <inheritdoc />
@@ -383,12 +401,13 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
     }
 
     /// <summary>
-    /// Runs <c>oasdiff validate --fail-on ERR</c> over one document as a bounded
-    /// precondition probe. A non-zero exit (invalid spec, unparseable document,
-    /// unresolvable reference) is coverage unavailable naming the document — the
-    /// breaking command short-circuits a non-OpenAPI document to a silent exit
-    /// <c>0</c> with an empty report, so validation must gate the scan rather than
-    /// ride along with it.
+    /// Runs <c>oasdiff validate --fail-on ERR --allow-external-refs=false</c> over one
+    /// document as a bounded precondition probe. A non-zero exit (invalid spec,
+    /// unparseable document, unresolvable reference) is coverage unavailable naming the
+    /// document — the breaking command short-circuits a non-OpenAPI document to a silent
+    /// exit <c>0</c> with an empty report, so validation must gate the scan rather than
+    /// ride along with it. The deny-external-refs default matches the scan argv; an
+    /// operator <c>ExtraArguments</c> entry for the flag relaxes this probe the same way.
     /// </summary>
     private static async Task ValidateDocumentAsync(
         ISandbox sandbox,
@@ -405,7 +424,7 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
             "spec validation",
             new SandboxExec
             {
-                Argv = [tool, "validate", "--fail-on", ErrFailOn, spec],
+                Argv = BuildValidateArgv(tool, spec, options),
                 WorkingDirectory = workingDirectory,
                 MaxStdoutBytes = ProbeMaxOutputBytes,
                 MaxStderrBytes = ProbeMaxOutputBytes,
@@ -423,6 +442,14 @@ public sealed class OasdiffAuditor : ExternalToolAuditorBase, IPluginInitializer
                 + "unavailable, never a verdict on the diff.",
                 probe.ExitCode,
                 probe.Stdout + "\n" + probe.Stderr);
+    }
+
+    private static List<string> BuildValidateArgv(string tool, string spec, ExternalToolAuditorOptions options)
+    {
+        var argv = new List<string> { tool, "validate", "--fail-on", ErrFailOn, spec };
+        if (!ExtraArgumentsSupplyFlag(options, AllowExternalRefsFlag))
+            argv.Add(DenyExternalRefsValue);
+        return argv;
     }
 
     private static bool IsContractAlteringFlag(string argument)

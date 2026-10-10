@@ -304,7 +304,7 @@ internal sealed class OasdiffBreakingJsonParser(
     {
         if (string.IsNullOrWhiteSpace(pointer))
             return null;
-        var candidate = pointer.Trim().Replace('\\', '/').TrimStart('.', '/');
+        var candidate = pointer.Trim().Replace('\\', '/').TrimStart('/');
         if (candidate.StartsWith("./", StringComparison.Ordinal))
             candidate = candidate[2..];
         return string.IsNullOrWhiteSpace(candidate) ? null : candidate;

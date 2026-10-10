@@ -41,11 +41,13 @@ so a document that is not an OpenAPI spec can never read as a clean comparison.
   audit applies to the change set carrying it. Post-hoc rule filtering through
   `IncludedRules` / `ExcludedRules` is applied by the audit host, outside the
   subject's reach.
-- **Remote references when offline.** Specs or `$ref`s naming remote URLs need
-  network egress to those hosts from the audit sandbox; without it the load or
-  the validation probe fails closed as infrastructure. Pass
-  `--allow-external-refs=false` in `ExtraArguments` when auditing untrusted specs
-  to stop the loader resolving external references.
+- **Remote references are denied by default.** The scan and validation commands
+  run with `--allow-external-refs=false`, so external `$ref`s never trigger sandbox
+  egress to repository-named hosts (oasdiff resolves them over HTTP by default).
+  Specs or `$ref`s naming remote URLs fail closed as infrastructure unless the
+  operator explicitly relaxes the guard with `--allow-external-refs=true` in
+  `ExtraArguments`. Without that relaxation, offline sandboxes fail the load or
+  validation probe as infrastructure.
 
 ## Exit codes and failure classification
 
@@ -130,7 +132,7 @@ Scoped under `CodeyBox:Plugins:codeybox.oasdiff`, hot-reloadable per run:
 | `MinimumSeverity` | `info` | Findings below this mapped severity are dropped. |
 | `IncludedRules` / `ExcludedRules` | — | Exact oasdiff check identifiers to include or drop (e.g. `response-success-status-removed`). Applied by the host after the scan. |
 | `ExcludePaths` | — (empty) | Repository-relative paths dropped from findings. Empty by default: the tool reads exactly two files, so there is no vendored tree to exclude. |
-| `ExtraArguments` | — | Extra CLI arguments appended to argv (e.g. `--match-path`, `--flatten-allof`, `--allow-external-refs=false`). Contract-altering flags (`--format`, `--fail-on`, `--composed`, ignore/severity files, `--template`, `--color`) are rejected. |
+| `ExtraArguments` | — | Extra CLI arguments appended to argv (e.g. `--match-path`, `--flatten-allof`). Contract-altering flags (`--format`, `--fail-on`, `--composed`, ignore/severity files, `--template`, `--color`) are rejected. Passing `--allow-external-refs=true` relaxes the auditor-owned `--allow-external-refs=false` default (remote `$ref` fetches); the default stays deny. |
 | `TimeoutSeconds` | `300` | Per-run execution bound. Exceeding it is an infrastructure failure. |
 | `MaxOutputBytesPerStream` / `MaxFindings` | `1 MiB` / `1000` | Output/findings bounds; excess is reported as truncated. |
 
@@ -142,7 +144,8 @@ unavailable — the scan never runs.
 ## Default scope
 
 By default, the auditor runs `oasdiff breaking <BaseSpec> <Spec> --format json
---fail-on ERR` at the repository root over exactly the two configured documents:
+--fail-on ERR --allow-external-refs=false` at the repository root over exactly the two configured documents
+(each `validate` pre-probe carries the same deny default):
 the tool never walks the repository, so vendored specs, generated clients, and
 upstream modules cannot produce findings that train operators to ignore auditor
 output — which is why no `ExcludePaths` default ships. Both specs are required

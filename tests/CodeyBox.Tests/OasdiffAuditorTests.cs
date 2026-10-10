@@ -139,7 +139,7 @@ public sealed class OasdiffAuditorTests
 
         Assert.NotNull(scanExec);
         Assert.Equal(
-            new[] { "oasdiff", "breaking", DefaultBaseSpec, DefaultSpec, "--format", "json", "--fail-on", "ERR" },
+            new[] { "oasdiff", "breaking", DefaultBaseSpec, DefaultSpec, "--format", "json", "--fail-on", "ERR", "--allow-external-refs=false" },
             scanExec!.Argv.ToArray());
     }
 
@@ -514,8 +514,82 @@ public sealed class OasdiffAuditorTests
         Assert.NotNull(scanExec);
         // Operator tuning travels as argv entries, never through a shell.
         Assert.Equal(
-            new[] { "oasdiff", "breaking", DefaultBaseSpec, DefaultSpec, "--format", "json", "--fail-on", "ERR", "--flatten-allof", "--match-path", "^/internal" },
+            new[] { "oasdiff", "breaking", DefaultBaseSpec, DefaultSpec, "--format", "json", "--fail-on", "ERR", "--allow-external-refs=false", "--flatten-allof", "--match-path", "^/internal" },
             scanExec!.Argv.ToArray());
+    }
+
+    [Fact]
+    public async Task ScanAndValidate_DenyExternalRefs_ByDefault()
+    {
+        SandboxExec? scanExec = null;
+        var validateArgvs = new List<IReadOnlyList<string>>();
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsVersionProbe(exec))
+                return Task.FromResult(VersionOk());
+            if (IsFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsValidateProbe(exec))
+            {
+                validateArgvs.Add(exec.Argv.ToArray());
+                return Task.FromResult(Ok(exec));
+            }
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, BreakingClean, ""));
+        });
+
+        var auditor = await CreateAuditorAsync();
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        Assert.Contains("--allow-external-refs=false", scanExec!.Argv);
+        Assert.Equal(2, validateArgvs.Count);
+        Assert.All(validateArgvs, argv => Assert.Contains("--allow-external-refs=false", argv));
+    }
+
+    [Fact]
+    public async Task OperatorAllowExternalRefs_RelaxesDenyDefault()
+    {
+        SandboxExec? scanExec = null;
+        var validateArgvs = new List<IReadOnlyList<string>>();
+        var sandbox = new FakeSandbox((exec, _) =>
+        {
+            if (IsPresenceProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsVersionProbe(exec))
+                return Task.FromResult(VersionOk());
+            if (IsFileProbe(exec))
+                return Task.FromResult(Ok(exec));
+            if (IsValidateProbe(exec))
+            {
+                validateArgvs.Add(exec.Argv.ToArray());
+                return Task.FromResult(Ok(exec));
+            }
+            scanExec = exec;
+            return Task.FromResult(new SandboxExecResult(0, BreakingClean, ""));
+        });
+
+        var auditor = new OasdiffAuditor();
+        await auditor.InitializeAsync(
+            BuildPluginContext(new Dictionary<string, string?>
+            {
+                ["Scoped:BaseSpec"] = DefaultBaseSpec,
+                ["Scoped:Spec"] = DefaultSpec,
+                ["Scoped:ExtraArguments"] = "--allow-external-refs=true",
+            }),
+            CancellationToken.None);
+
+        var result = await ((IAuditor)auditor).RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
+
+        Assert.True(result.Passed);
+        Assert.NotNull(scanExec);
+        // Operator relaxation wins: the auditor-owned deny default is suppressed, not duplicated.
+        Assert.DoesNotContain("--allow-external-refs=false", scanExec!.Argv);
+        Assert.Contains("--allow-external-refs=true", scanExec.Argv);
+        Assert.All(validateArgvs, argv => Assert.DoesNotContain("--allow-external-refs=false", argv));
     }
 
     [Fact]
@@ -617,8 +691,8 @@ public sealed class OasdiffAuditorTests
 
         Assert.True(result.Passed);
         Assert.Equal(2, validateArgvs.Count);
-        Assert.Contains(validateArgvs, argv => argv.SequenceEqual(new[] { "oasdiff", "validate", "--fail-on", "ERR", DefaultBaseSpec }));
-        Assert.Contains(validateArgvs, argv => argv.SequenceEqual(new[] { "oasdiff", "validate", "--fail-on", "ERR", DefaultSpec }));
+        Assert.Contains(validateArgvs, argv => argv.SequenceEqual(new[] { "oasdiff", "validate", "--fail-on", "ERR", DefaultBaseSpec, "--allow-external-refs=false" }));
+        Assert.Contains(validateArgvs, argv => argv.SequenceEqual(new[] { "oasdiff", "validate", "--fail-on", "ERR", DefaultSpec, "--allow-external-refs=false" }));
     }
 
     [Fact]
