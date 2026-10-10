@@ -128,6 +128,7 @@
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.BrakemanAuditorPlugin\CodeyBox.BrakemanAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.BanditAuditorPlugin\CodeyBox.BanditAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\sast\CodeyBox.SemgrepAuditorPlugin\CodeyBox.SemgrepAuditorPlugin.csproj" />
+    <ProjectReference Include="..\..\plugins\sast\CodeyBox.AstGrepAuditorPlugin\CodeyBox.AstGrepAuditorPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.OpencodeGoQuotaPlugin\CodeyBox.OpencodeGoQuotaPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.StatisticsPlugin\CodeyBox.StatisticsPlugin.csproj" />
     <ProjectReference Include="..\..\plugins\quota\CodeyBox.QuotaResetNotifier\CodeyBox.QuotaResetNotifier.csproj" />
