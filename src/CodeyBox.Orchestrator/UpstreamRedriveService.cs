@@ -30,6 +30,7 @@ public sealed class UpstreamRedriveService
     private readonly WorkItemRetrier _retrier;
     private readonly ILogger<UpstreamRedriveService> _log;
     private readonly UpstreamBranchOwnershipSnapshot _ownership;
+    private readonly CommitAttributionPolicy? _attributionPolicy;
 
     public UpstreamRedriveService(
         IWorkItemStore store,
@@ -37,7 +38,8 @@ public sealed class UpstreamRedriveService
         IUpstreamRemoteFactory upstreamFactory,
         WorkItemRetrier retrier,
         ILogger<UpstreamRedriveService> log,
-        UpstreamBranchOwnershipSnapshot? ownership = null)
+        UpstreamBranchOwnershipSnapshot? ownership = null,
+        CommitAttributionPolicy? attributionPolicy = null)
     {
         _store = store;
         _projects = projects;
@@ -45,6 +47,7 @@ public sealed class UpstreamRedriveService
         _retrier = retrier;
         _log = log;
         _ownership = ownership ?? new UpstreamBranchOwnershipSnapshot(new UpstreamBranchOwnershipOptions());
+        _attributionPolicy = attributionPolicy;
     }
 
     public sealed record UpstreamRedriveCandidate(
@@ -213,8 +216,8 @@ public sealed class UpstreamRedriveService
     /// tip, never a blind overwrite.
     ///
     /// Ownership proof for branches with no recorded push: the remote tip is
-    /// accepted only when every commit exclusive of the base carries the
-    /// configured CodeyBox trailers, or when <paramref name="confirmOwnership"/>
+    /// accepted only when every commit exclusive of the current base tip
+    /// carries any accepted CodeyBox trailer, or when <paramref name="confirmOwnership"/>
     /// is true (the operator asserts the tip is CodeyBox's own history; logged
     /// and audited). Otherwise the re-drive is refused.
     /// </summary>
@@ -366,10 +369,13 @@ public sealed class UpstreamRedriveService
 
     /// <summary>
     /// Ownership gate for a tip with no recorded push and no explicit
-    /// operator confirmation. Returns null when the tip is accepted (all
-    /// exclusive commits carry the configured trailers, or the range is
-    /// empty), otherwise a refusal result naming the working confirmation
-    /// flag.
+    /// operator confirmation. The range is pinned to the CURRENT base tip
+    /// (<c>&lt;base tip&gt;..&lt;remote tip&gt;</c>) so commits already
+    /// reachable from the base — e.g. operator commits merged into the work
+    /// branch — never count as third-party work. Returns null when the tip
+    /// is accepted (every exclusive commit carries any accepted CodeyBox
+    /// trailer, or the range is empty), otherwise a refusal result naming
+    /// the offending commit shas and the working confirmation flag.
     /// </summary>
     private async Task<UpstreamRedriveResult?> CheckOwnershipGateAsync(
         IUpstreamRemote upstream,
@@ -392,11 +398,25 @@ public sealed class UpstreamRedriveService
                 RedriveConfirmationHint(item.Id),
                 null, null, 0, string.Empty);
 
-        IReadOnlyList<string>? messages;
+        var attribution = _attributionPolicy?.Resolve(project) ?? CommitAttribution.Default;
+        var accepted = BranchOwnershipPolicy.EffectiveAcceptedKeys(
+            _ownership.Current.RequiredTrailerKeys ?? [], attribution);
+        if (accepted.Length == 0)
+            return new UpstreamRedriveResult(
+                false,
+                $"cannot re-drive upstream: branch '{workBranch}' has no recorded push and commit attribution is disabled, " +
+                $"so no trailer can prove tip {observedTip} is CodeyBox's own history. " +
+                RedriveConfirmationHint(item.Id),
+                null, null, 0, string.Empty);
+
+        var baseRevision = await SafeResolveBaseRevisionAsync(upstream, baseBranch, ct).ConfigureAwait(false)
+            ?? baseBranch;
+
+        IReadOnlyList<OwnedBranchCommit>? commits;
         try
         {
-            messages = await upstream.ListBranchCommitMessagesAsync(
-                baseBranch, observedTip, Math.Max(1, _ownership.Current.MaxCommitsToVerify), ct).ConfigureAwait(false);
+            commits = await upstream.ListBranchCommitsAsync(
+                baseRevision, observedTip, Math.Max(1, _ownership.Current.MaxCommitsToVerify), ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -407,22 +427,55 @@ public sealed class UpstreamRedriveService
             _log.LogDebug(
                 "Upstream re-drive ownership check for work item {Id} failed: {Message}",
                 item.Id.ToString(), ex.Message);
-            messages = null;
+            commits = null;
         }
-        if (messages is null)
+        if (commits is null)
             return new UpstreamRedriveResult(
                 false,
                 $"cannot re-drive upstream: branch '{workBranch}' has no recorded push and its tip {observedTip} cannot be proven to be CodeyBox's own history (commit history unreadable). " +
                 RedriveConfirmationHint(item.Id),
                 null, null, 0, string.Empty);
-        var keys = _ownership.Current.RequiredTrailerKeys ?? [];
-        if (messages.Count == 0 || BranchOwnershipPolicy.AreAllCommitsOwned(messages, keys))
+        if (commits.Count == 0)
+            return null;
+        var unowned = BranchOwnershipPolicy.FindUnownedCommitShas(commits, accepted);
+        if (unowned.Count == 0)
             return null;
         return new UpstreamRedriveResult(
             false,
-            $"cannot re-drive upstream: remote tip {observedTip} of '{workBranch}' contains commits without the CodeyBox trailers, so it may include third-party work. " +
+            $"cannot re-drive upstream: remote tip {observedTip} of '{workBranch}' contains {unowned.Count} commit(s) without a CodeyBox trailer " +
+            $"({BranchOwnershipPolicy.DescribeUnownedCommits(unowned)}), so it may include third-party work. " +
             RedriveConfirmationHint(item.Id),
             null, null, 0, string.Empty);
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="baseBranch"/> to its current head sha so the
+    /// ownership range excludes everything already on the base. Returns null
+    /// when the tip cannot be read; callers fall back to the branch name,
+    /// which the forge resolves to the same tip.
+    /// </summary>
+    private async Task<string?> SafeResolveBaseRevisionAsync(
+        IUpstreamRemote upstream, string baseBranch, CancellationToken ct)
+    {
+        try
+        {
+            var sha = await upstream.GetBranchHeadShaAsync(baseBranch, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(sha))
+                return null;
+            Validation.ValidateCommitSha(sha.Trim(), "base branch head sha");
+            return sha.Trim().ToLowerInvariant();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                "Upstream re-drive could not resolve current tip of base branch {Branch}: {Message}",
+                baseBranch, ex.Message);
+            return null;
+        }
     }
 
     private static string RedriveConfirmationHint(WorkItemId id) =>

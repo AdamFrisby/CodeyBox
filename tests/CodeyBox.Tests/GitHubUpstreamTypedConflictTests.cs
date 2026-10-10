@@ -219,6 +219,15 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
                 Content = new StringContent(
                     JsonSerializer.Serialize(new
                     {
+                        commit = new { sha = new string('c', 40) },
+                    }),
+                    Encoding.UTF8, "application/json"),
+            });
+            handler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
                         total_commits = 1,
                         commits = new[] { new { sha = "abc", commit = new { message = "remote work" } } },
                     }),
@@ -230,7 +239,8 @@ public sealed class GitHubUpstreamTypedConflictAdapterTests : IDisposable
             Assert.False(UpstreamPushReconcileConflictException.TryFindIn(ex, out _));
             Assert.DoesNotContain(token, ex.Message);
             Assert.DoesNotContain(token, ex.Branch);
-            var compareCall = Assert.Single(handler.Requests);
+            Assert.Equal(2, handler.Requests.Count);
+            var compareCall = handler.Requests[1];
             Assert.Contains("/compare/", compareCall.RequestUri!.ToString(), StringComparison.Ordinal);
             // The stale remote tip is untouched.
             var (_, content, _) = await TestSupport.RunGit(upstreamBare, "show", $"{workBranch}:conflict.txt");

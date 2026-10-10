@@ -92,7 +92,8 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
 
         var (owner, repo) = SplitGithubUrl(setup.GithubUrl);
         var handler = new FakeHttpMessageHandler();
-        handler.Enqueue(Json(new // GET /compare/main...old: the stale tip is CodeyBox's own
+        handler.Enqueue(Json(new { commit = new { sha = new string('c', 40) } })); // GET /branches/main: current base tip
+        handler.Enqueue(Json(new // GET /compare/<base-tip>...old: the stale tip is CodeyBox's own
         {
             total_commits = 1,
             commits = new[] { new { sha = oldHead, commit = new { message = trailerMessage } } },
@@ -178,9 +179,11 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
         // No ExpectedRemoteHeadSha: the remote tip ("old work", no CodeyBox
         // trailers) cannot be proven to be CodeyBox's own history, so the
         // push must refuse — distinctly from a merge conflict, which would
-        // route into conflict-rework. The compare API is consulted for the
-        // trailer proof; the refusal leaves the remote intact and issues no
-        // PR call.
+        // route into conflict-rework. The base tip is resolved first so the
+        // compare range excludes everything already on the base; the compare
+        // API is then consulted for the trailer proof. The refusal leaves
+        // the remote intact, issues no PR call, and names the offending sha.
+        handler.Enqueue(Json(new { commit = new { sha = new string('c', 40) } })); // GET /branches/main: current base tip
         handler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StringContent(
@@ -199,8 +202,9 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
         Assert.False(UpstreamPushReconcileConflictException.TryFindIn(ex, out _));
         var (_, tip, _) = await TestSupport.RunGit(setup.UpstreamBare, "rev-parse", workBranch);
         Assert.Equal(oldHead, tip.Trim());
-        Assert.Single(handler.Requests);
-        Assert.Contains("/compare/", handler.Requests[0].RequestUri!.ToString(), StringComparison.Ordinal);
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.Contains("/branches/", handler.Requests[0].RequestUri!.ToString(), StringComparison.Ordinal);
+        Assert.Contains("/compare/", handler.Requests[1].RequestUri!.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

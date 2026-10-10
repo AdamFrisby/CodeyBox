@@ -626,14 +626,14 @@ Proves a stale CodeyBox-owned branch tip is CodeyBox's own history when no prior
 
 ```json
 "UpstreamBranchOwnership": {
-  "RequiredTrailerKeys": ["CodeyBox-WorkItem", "Co-Authored-By"],
+  "RequiredTrailerKeys": ["Co-Authored-By", "CodeyBox-WorkItem", "CodeyBox-Agent", "CodeyBox-Prompt-Revision", "CodeyBox-Mechanical-Fixer"],
   "MaxCommitsToVerify": 100
 }
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `RequiredTrailerKeys` | `["CodeyBox-WorkItem", "Co-Authored-By"]` | Trailer keys that must each appear in the trailer block of every commit exclusive of the base. `Co-Authored-By` additionally requires its value to name CodeyBox. An empty list never proves ownership. |
+| `RequiredTrailerKeys` | `["Co-Authored-By", "CodeyBox-WorkItem", "CodeyBox-Agent", "CodeyBox-Prompt-Revision", "CodeyBox-Mechanical-Fixer"]` | Trailer keys accepted as ownership proof, any-of: each commit exclusive of the current base tip counts as CodeyBox's own history when its trailer block carries ANY one of these keys (matched exactly). Any-of because each writer stamps a different subset (agents write `CodeyBox-Prompt-Revision` + `Co-Authored-By`; the orchestrator adds `CodeyBox-WorkItem` + `CodeyBox-Agent` / `CodeyBox-Mechanical-Fixer`). `Co-Authored-By` additionally requires its value to equal the canonical CodeyBox identity exactly. Keys from a family disabled by `CodeyBox:CommitAttribution` cannot prove ownership; when attribution disables every family (or the list is empty), nothing proves ownership and the re-drive requires `{"confirmOwnership": true}`. A refusal names the offending commit SHAs. |
 | `MaxCommitsToVerify` | `100` | Upper bound on the exclusive commits examined, enforced before buffering. A larger exclusive set is unverifiable and refused unless the operator passes `{"confirmOwnership": true}` on the re-drive. |
 
 ## `WorkerPoolHealthWatchdog`

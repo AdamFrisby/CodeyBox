@@ -26,9 +26,24 @@ public sealed class UpstreamOwnedBranchDivergedException : InvalidOperationExcep
     public const string ConfirmOwnershipFlag = "confirmOwnership";
 
     public UpstreamOwnedBranchDivergedException(string branch, string remoteSha, string localSha)
+        : this(branch, remoteSha, localSha, unownedCommitShas: null)
+    {
+    }
+
+    /// <summary>
+    /// Same refusal, naming the <paramref name="unownedCommitShas"/> that
+    /// blocked the trailer proof so the operator can inspect exactly which
+    /// commits look third-party. Null (unverifiable history) keeps the base
+    /// message; an empty list is owned and should never reach this path.
+    /// </summary>
+    public UpstreamOwnedBranchDivergedException(
+        string branch, string remoteSha, string localSha, IReadOnlyList<string>? unownedCommitShas)
         : base($"work branch '{branch}' is not a fast-forward of its previous upstream push " +
             $"(remote {remoteSha}, local {localSha}); this is not a merge conflict — the work was already recomposed on a fresh base. " +
             "CodeyBox has no recorded prior push for this branch, so it cannot prove the remote tip is its own history. " +
+            (unownedCommitShas is { Count: > 0 }
+                ? $"Commit(s) without a CodeyBox trailer: {BranchOwnershipPolicy.DescribeUnownedCommits(unownedCommitShas)}. "
+                : string.Empty) +
             $"Re-drive the upstream step with {RedriveEndpointTemplate} after confirming no third party pushed to the branch. " +
             "When every commit on the remote tip carries the CodeyBox trailers the rewrite is accepted automatically; " +
             $"otherwise the re-drive must pass {{\"{ConfirmOwnershipFlag}\": true}} to assert the remote tip is CodeyBox's own history.")
