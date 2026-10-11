@@ -99,6 +99,25 @@ public sealed class StaleBaseConflictReworkRouter
         new HashSet<WorkItemState> { WorkItemState.UpstreamPushing };
 
     /// <summary>
+    /// Source states for routing a same-branch (work-branch) push conflict:
+    /// the worker-owned in-flight states an agent turn can publish from
+    /// (work/rework turns, the audit-phase mechanical-import turn, and the
+    /// delegation turn). Same atomicity contract as
+    /// <see cref="PushPathEligibleSourceStates"/>: the router re-validates
+    /// the fresh read against this set so an unexpected concurrent transition
+    /// is rejected rather than clobbered.
+    /// </summary>
+    public static readonly IReadOnlySet<WorkItemState> WorkBranchPushEligibleSourceStates =
+        new HashSet<WorkItemState>
+        {
+            WorkItemState.Working,
+            WorkItemState.Reworking,
+            WorkItemState.ReworkingForConflict,
+            WorkItemState.Auditing,
+            WorkItemState.Delegating,
+        };
+
+    /// <summary>
     /// Applies the single flooring rule for the configured attempt cap: a value
     /// below 1 is treated as 1 so the router always permits at least one rework
     /// attempt. Kept as one method so the rule has a single source of truth

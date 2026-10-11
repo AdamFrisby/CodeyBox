@@ -37,6 +37,30 @@ public sealed partial class PipelineRunner
             ct);
     }
 
+    /// <summary>
+    /// Attempts to route a same-branch push conflict discovered during
+    /// work-branch publication (a work/rework agent turn, the audit-phase
+    /// mechanical import, or self-review) into the conflict-rework state
+    /// machine. Reads the item fresh so the router's attempt-cap check and
+    /// atomic re-dispatch operate on the current persisted state. Returns
+    /// <see cref="StaleBaseReworkOutcome.NotEnabled"/> (caller parks
+    /// resumably, never terminally) when no router is wired, the state raced,
+    /// or re-dispatch did not apply.
+    /// </summary>
+    private async Task<StaleBaseReworkOutcome> TryRouteWorkBranchPushConflictAsync(
+        WorkItem item, CancellationToken ct)
+    {
+        if (_staleBaseReworkRouter is null)
+            return StaleBaseReworkOutcome.NotEnabled;
+
+        var current = await _store.GetAsync(item.Id, ct) ?? item;
+        return await _staleBaseReworkRouter.TryRouteAsync(
+            current,
+            "work-branch-push-reconcile-conflict",
+            StaleBaseConflictReworkRouter.WorkBranchPushEligibleSourceStates,
+            ct);
+    }
+
     private async Task RunUpstreamPushPhaseAsync(
         WorkItem item,
         Project project,

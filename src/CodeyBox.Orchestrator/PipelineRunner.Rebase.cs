@@ -1238,6 +1238,173 @@ public sealed partial class PipelineRunner
         }
     }
 
+    /// <summary>
+    /// Proof that a work/rework workspace was staged at the bare-repo tip:
+    /// the host tip the staging resolved and the sandbox HEAD it verified.
+    /// </summary>
+    internal sealed record WorkBranchStagingProof(string HostTip, string SandboxHead);
+
+    /// <summary>
+    /// Returns the current bare-repo tip of <paramref name="branch"/>, or
+    /// null when the branch does not exist. Best-effort probe for logging:
+    /// never throws for a missing branch.
+    /// </summary>
+    private async Task<string?> TryResolveHostBranchTipAsync(
+        string repoId, string branch, CancellationToken ct)
+    {
+        try
+        {
+            if (!await _gitHost.BranchExistsAsync(repoId, branch, ct))
+                return null;
+            return await _gitHost.ResolveCommitAsync(repoId, branch, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex,
+                "Could not resolve host tip of work branch '{Branch}' for staging log; continuing without it",
+                branch);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Resolves the base a checkpoint resume must validate against: the fork
+    /// point of the current work-branch tip and the checkpoint source commit.
+    /// Resolving the raw tip mislabels the base whenever the branch moved
+    /// after the interrupted turn staged (a same-branch advance then trips
+    /// the checkpoint-ancestry guard with a terminal failure for a resumable
+    /// situation). When the branch fast-forwarded, the fork point IS the
+    /// turn's true pre-turn commit; after a rewrite it is the nearest shared
+    /// ancestor, which keeps the validation in the safe direction. Falls back
+    /// to the raw tip when the checkpoint source is unknown (legacy refs) or
+    /// the fork point cannot be computed.
+    /// </summary>
+    private async Task<string> ResolveAgentTurnResumeBaseAsync(
+        string repoId,
+        string workBranch,
+        string baseBranch,
+        string? checkpointSourceSha,
+        CancellationToken ct)
+    {
+        var tip = await ResolveAgentTurnPreTurnCommitAsync(repoId, workBranch, baseBranch, ct);
+        if (string.IsNullOrWhiteSpace(checkpointSourceSha)
+            || string.Equals(tip, checkpointSourceSha, StringComparison.Ordinal))
+            return tip;
+        string? forkPoint = null;
+        try
+        {
+            forkPoint = await _gitHost.FindMergeBaseAsync(repoId, tip, checkpointSourceSha, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not resolve the fork point of work branch '{Branch}' tip {Tip} and checkpoint source {Source}; validating the resume against the raw tip",
+                workBranch, tip, checkpointSourceSha);
+        }
+        if (string.IsNullOrWhiteSpace(forkPoint))
+            return tip;
+        if (!string.Equals(forkPoint, tip, StringComparison.Ordinal))
+        {
+            _log.LogInformation(
+                "Work branch '{Branch}' moved since the interrupted turn staged (tip {Tip}); validating the resume against the fork point {ForkPoint}",
+                workBranch, tip, forkPoint);
+        }
+        return forkPoint;
+    }
+
+    // Internal as a test seam alongside the staging guard.
+    internal static string? CheckpointSourceSha(string? preemptCheckpoint) =>
+        AgentTurnCheckpointRef.TryParse(preemptCheckpoint, out var parsed) ? parsed?.SourceCommitSha : null;
+
+    /// <summary>
+    /// Stages the sandbox work branch at the CURRENT bare-repo tip and
+    /// asserts sandbox HEAD equals that tip before the agent runs. A fresh
+    /// clone can trail commits that landed between the clone and the
+    /// checkout, and a reused session workspace trails by construction, so a
+    /// fetch + conditional re-checkout corrects the workspace first and the
+    /// assertion trips only when the branch keeps moving underneath staging
+    /// (surfaced as infrastructure for a bounded retry, never a silent stale
+    /// base). Both SHAs are logged for push-rejection triage.
+    /// </summary>
+    // Internal (not private) as a test seam: pipeline-integration tests stage
+    // a behind-tip checkout in a local-git sandbox and assert the correction.
+    internal async Task<WorkBranchStagingProof> EnsureSandboxAtCurrentWorkBranchTipAsync(
+        ISandbox sandbox,
+        string repoId,
+        string branch,
+        string baseBranch,
+        AgentKind agentKind,
+        string agentPhase,
+        CancellationToken ct)
+    {
+        // Guard AT the sink: branch names flow into sandbox git argv below
+        // (fetch refspecs, checkout, rev-parse). Validation rejects
+        // option-like values (leading dash) so git never misparses them;
+        // the argv below additionally uses explicit refspecs and `--`
+        // separators where git supports them.
+        Validation.ValidateBranchName(branch, nameof(branch));
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        if (await _gitHost.BranchExistsAsync(repoId, branch, ct))
+        {
+            var hostTip = await _gitHost.ResolveCommitAsync(repoId, branch, ct);
+            await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "--no-tags", "origin", "--", $"+refs/heads/{branch}:refs/remotes/origin/{branch}");
+            var head = await ReadSandboxHeadShaAsync(sandbox, ct);
+            if (!string.Equals(head, hostTip, StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    "Staged work branch '{Branch}' at {SandboxHead} trails the bare-repo tip {HostTip}; refreshing the checkout before the agent turn",
+                    branch, head, hostTip);
+                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"refs/remotes/origin/{branch}", "--");
+                head = await ReadSandboxHeadShaAsync(sandbox, ct);
+                var freshTip = await _gitHost.ResolveCommitAsync(repoId, branch, ct);
+                if (!string.Equals(freshTip, hostTip, StringComparison.Ordinal))
+                {
+                    _log.LogInformation(
+                        "Work branch '{Branch}' moved during staging ({OldTip} -> {NewTip}); verifying against the fresh tip",
+                        branch, hostTip, freshTip);
+                    hostTip = freshTip;
+                }
+            }
+            VerifyStagedHeadMatchesTip(hostTip, head, branch, agentKind, agentPhase);
+            _log.LogInformation(
+                "Staged work branch '{Branch}' at current bare-repo tip {HostTip}; sandbox HEAD {SandboxHead}",
+                branch, hostTip, head);
+            return new WorkBranchStagingProof(hostTip, head);
+        }
+
+        await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "--no-tags", "origin", "--", $"+refs/heads/{baseBranch}:refs/remotes/origin/{baseBranch}");
+        var baseTip = await RevParseSandboxAsync(sandbox, $"refs/remotes/origin/{baseBranch}", ct);
+        var newHead = await ReadSandboxHeadShaAsync(sandbox, ct);
+        VerifyStagedHeadMatchesTip(baseTip, newHead, branch, agentKind, agentPhase);
+        _log.LogInformation(
+            "Staged new work branch '{Branch}' from base '{BaseBranch}' at {BaseTip}; sandbox HEAD {SandboxHead}",
+            branch, baseBranch, baseTip, newHead);
+        return new WorkBranchStagingProof(baseTip, newHead);
+    }
+
+    /// <summary>
+    /// Pure assertion that the staged sandbox HEAD is the expected tip.
+    /// Throws <see cref="AgentInfrastructureFailureException"/> on mismatch
+    /// so a workspace that will not converge retries bounded instead of
+    /// running the agent on a stale base.
+    /// </summary>
+    internal static void VerifyStagedHeadMatchesTip(
+        string? expectedTip,
+        string sandboxHead,
+        string branch,
+        AgentKind agentKind,
+        string agentPhase)
+    {
+        if (!string.Equals(expectedTip, sandboxHead, StringComparison.Ordinal))
+            throw new AgentInfrastructureFailureException(
+                agentKind,
+                agentPhase,
+                $"staged work branch '{branch}' is not at the current bare-repo tip " +
+                $"(expected {expectedTip ?? "(absent)"}, staged {sandboxHead}); " +
+                "refusing to run the agent on a stale base");
+    }
+
     // Cold-tier extraction forwarder: implementation lives on PromptComposer.
     internal static string BuildInitialWorkPrompt(
         string userPrompt,

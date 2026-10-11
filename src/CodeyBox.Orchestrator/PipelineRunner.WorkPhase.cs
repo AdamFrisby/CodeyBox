@@ -58,16 +58,23 @@ public sealed partial class PipelineRunner
         var resumingGitCheckpoint = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
         var resumingRetainedSandbox = item.AgentTurnRecoveryLease is not null;
         var resumingPreempt = resumingGitCheckpoint || resumingRetainedSandbox;
-        if (resumingGitCheckpoint && string.IsNullOrWhiteSpace(resumePreTurnCommitSha))
+        if (resumingGitCheckpoint)
         {
-            // A checkpoint may be created by the first member of an agent class
-            // and consumed by a fallback member during this same pickup. That
-            // route did not enter RunAsync with resume metadata, so resolve the
-            // still-unmoved work-branch tip here.
-            resumePreTurnCommitSha = await ResolveAgentTurnPreTurnCommitAsync(
+            // Resolve the resume baseline as the fork point of the current
+            // tip and the checkpoint source — never the raw tip. A
+            // restart/recovery retry can arrive here after the work branch
+            // moved past the interrupted turn's base (its push landed while
+            // ClearPreempt was lost, or an outside writer advanced the
+            // branch); validating the checkpoint against the raw tip would
+            // terminally fail a resumable turn. When the branch did not move,
+            // the fork point is the tip itself. This recompute also covers
+            // the fallback-member route that never entered RunAsync with
+            // resume metadata.
+            resumePreTurnCommitSha = await ResolveAgentTurnResumeBaseAsync(
                 repoId,
                 branch,
                 baseBranch,
+                CheckpointSourceSha(item.PreemptCheckpoint),
                 ct);
         }
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
@@ -368,6 +375,28 @@ public sealed partial class PipelineRunner
             var (gitName, gitEmail) = ResolveGitIdentity(project, _opts.HostGitIdentity, item.Initiator);
             await PipelineAgentExecutor.RunMasked(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.email", gitEmail);
             await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "config", "user.name", gitName);
+
+            if (resumingGitCheckpoint)
+            {
+                // The checkpoint tree intentionally differs from the branch
+                // tip (it carries the interrupted turn's partial work), so no
+                // tip assertion applies — but record both SHAs so a later
+                // push rejection can be triaged against the staged base.
+                var resumeHead = await ReadSandboxHeadShaAsync(sandbox, ct);
+                var resumeHostTip = await TryResolveHostBranchTipAsync(repoId, branch, ct);
+                _log.LogInformation(
+                    "Staging work item {WorkItemId} from agent-turn checkpoint {CheckpointRef} at {SandboxHead} (work branch '{Branch}' tip {HostTip})",
+                    item.Id, item.PreemptCheckpoint, resumeHead, branch, resumeHostTip ?? "(absent)");
+            }
+            else
+            {
+                // Stage the work branch at the CURRENT bare-repo tip and
+                // assert sandbox HEAD matches before the agent runs, closing
+                // the clone-vs-advance race where the workspace trails newer
+                // commits already on the branch.
+                await EnsureSandboxAtCurrentWorkBranchTipAsync(
+                    sandbox, repoId, branch, baseBranch, runner.Kind, agentPhase, ct);
+            }
 
             // Capture HEAD before the agent runs. The rework prompt explicitly
             // asks the agent to make new commits, so the agent may move HEAD
