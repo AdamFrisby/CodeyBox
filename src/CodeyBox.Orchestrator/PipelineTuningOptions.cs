@@ -137,13 +137,91 @@ public sealed class PipelineTuningOptions
 
     /// <summary>
     /// Upper bound for a single merge-result build verification, measured
-    /// from sandbox acquisition through build completion. Exceeding it
-    /// fails the verification (the item re-queues through rework and
-    /// re-verifies) — an unverified tree is never landed. Must be
-    /// positive. Default 15 minutes. Hot-reloaded with the rest of
+    /// from sandbox acquisition through build completion. The verification
+    /// runs the SAME required-build command as the work-phase gate, so the
+    /// effective budget is never below
+    /// <c>RequiredBuildVerificationTimeout + MergeResultBuildVerificationProvisioningAllowance</c>
+    /// (see <see cref="GetEffectiveMergeResultBuildVerificationTimeout"/>):
+    /// an explicit value below that floor is clamped up and reported via
+    /// <see cref="TryGetMergeResultBuildBudgetWarning"/>, never applied as a
+    /// silent cap. Unset (<c>null</c>, the default) means fully automatic:
+    /// the effective budget is exactly the required-build budget plus the
+    /// provisioning allowance, with no warning. Exceeding the effective
+    /// budget is infrastructure (retried up to
+    /// <see cref="MergeResultBuildVerificationInfraMaxAttempts"/>), never a
+    /// semantic conflict — an unverified tree is never landed. An explicit
+    /// value must be positive. Hot-reloaded with the rest of
     /// <c>PipelineTuning</c>.
     /// </summary>
-    public TimeSpan MergeResultBuildVerificationTimeout { get; set; } = TimeSpan.FromMinutes(15);
+    public TimeSpan? MergeResultBuildVerificationTimeout { get; set; }
+
+    /// <summary>
+    /// Sandbox-provisioning allowance added to the required-build budget to
+    /// derive the effective merge-result verification budget: the inner
+    /// required-build timeout covers clone/checkout/build AFTER the verifier
+    /// sandbox exists, while the merge-result timeout is measured from
+    /// sandbox acquisition, so provisioning must not eat the build's own
+    /// budget. Must be non-negative. Default 5 minutes. Hot-reloaded with
+    /// the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan MergeResultBuildVerificationProvisioningAllowance { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Maximum merge-result build verification attempts spent on timeout
+    /// (infrastructure) outcomes before parking. A verification that times
+    /// out is retried without consuming the
+    /// <see cref="MergeGuardReworkMaxAttempts"/> guard-rework budget, which
+    /// exists for real semantic failures; only after this infra budget is
+    /// spent does the item park at <c>MergeConflictResolutionFailed</c> with
+    /// a message naming both timeout settings. Must be ≥ 1. Default 3.
+    /// Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int MergeResultBuildVerificationInfraMaxAttempts { get; set; } = 3;
+
+    /// <summary>
+    /// Effective per-attempt merge-result build verification budget: the
+    /// single source of truth shared by the merge landing queue. Never below
+    /// the required-build budget plus the provisioning allowance, so an
+    /// operator who raised the required-build budget for a slow host cannot
+    /// be silently capped by a stale merge-result setting. Unset means
+    /// exactly the floor (required + allowance); an explicit value below the
+    /// floor is clamped up to it.
+    /// </summary>
+    public TimeSpan GetEffectiveMergeResultBuildVerificationTimeout(TimeSpan requiredBuildVerificationTimeout)
+    {
+        var floor = requiredBuildVerificationTimeout + MergeResultBuildVerificationProvisioningAllowance;
+        return MergeResultBuildVerificationTimeout is { } configured && configured > floor
+            ? configured
+            : floor;
+    }
+
+    /// <summary>
+    /// True when an explicit merge-result timeout sits below the
+    /// required-build-derived floor and will be clamped up by
+    /// <see cref="GetEffectiveMergeResultBuildVerificationTimeout"/>.
+    /// Unset never warns: automatic means the floor by definition. Callers
+    /// log <paramref name="warning"/> at config load / verification time so
+    /// the clamp is never silent.
+    /// </summary>
+    public bool TryGetMergeResultBuildBudgetWarning(
+        TimeSpan requiredBuildVerificationTimeout,
+        out string warning)
+    {
+        var floor = requiredBuildVerificationTimeout + MergeResultBuildVerificationProvisioningAllowance;
+        if (MergeResultBuildVerificationTimeout is not { } configured || configured >= floor)
+        {
+            warning = string.Empty;
+            return false;
+        }
+
+        warning =
+            $"CodeyBox:PipelineTuning:MergeResultBuildVerificationTimeout ({configured}) " +
+            $"is below RequiredBuildVerificationTimeout ({requiredBuildVerificationTimeout}) + " +
+            $"provisioning allowance ({MergeResultBuildVerificationProvisioningAllowance}); " +
+            $"clamping the effective merge-result budget up to {floor}. " +
+            "Raise MergeResultBuildVerificationTimeout (or unset it for automatic) or lower the required-build budget to silence this warning.";
+        return true;
+    }
 
     /// <summary>
     /// Maximum conflict-rework turns the merge phase runs after a resolver
@@ -527,11 +605,23 @@ public sealed class PipelineTuningOptions
                 nameof(MergeGuardReworkMaxAttempts),
                 "MergeGuardReworkMaxAttempts must be >= 1");
         }
-        if (MergeResultBuildVerificationTimeout <= TimeSpan.Zero)
+        if (MergeResultBuildVerificationTimeout is { } mergeTimeout && mergeTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(MergeResultBuildVerificationTimeout),
-                "MergeResultBuildVerificationTimeout must be positive");
+                "MergeResultBuildVerificationTimeout must be positive when set");
+        }
+        if (MergeResultBuildVerificationProvisioningAllowance < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MergeResultBuildVerificationProvisioningAllowance),
+                "MergeResultBuildVerificationProvisioningAllowance must be non-negative");
+        }
+        if (MergeResultBuildVerificationInfraMaxAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MergeResultBuildVerificationInfraMaxAttempts),
+                "MergeResultBuildVerificationInfraMaxAttempts must be >= 1");
         }
         if (EarlyEndedTurnMaxNudges < 0)
         {

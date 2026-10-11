@@ -170,6 +170,100 @@ public sealed class PipelineTuningOptionsValidationTests
     }
 
     [Fact]
+    public void EffectiveMergeBudget_DefaultsToRequiredPlusAllowance()
+    {
+        // The incident: an operator raised the required-build budget to 45
+        // minutes but the 15-minute merge-result default silently capped every
+        // merge verification. The effective budget must never sit below the
+        // required-build budget plus the provisioning allowance.
+        var opts = new PipelineTuningOptions();
+        opts.Validate();
+
+        var effective = opts.GetEffectiveMergeResultBuildVerificationTimeout(TimeSpan.FromMinutes(45));
+
+        Assert.True(
+            effective >= TimeSpan.FromMinutes(45),
+            $"effective merge budget {effective} must cover the 45-minute required-build budget");
+        Assert.Equal(
+            TimeSpan.FromMinutes(45) + opts.MergeResultBuildVerificationProvisioningAllowance,
+            effective);
+    }
+
+    [Fact]
+    public void EffectiveMergeBudget_Unset_NeverWarns()
+    {
+        var opts = new PipelineTuningOptions { MergeResultBuildVerificationTimeout = null };
+        opts.Validate();
+
+        Assert.False(
+            opts.TryGetMergeResultBuildBudgetWarning(TimeSpan.FromMinutes(45), out _),
+            "unset means automatic (exactly the floor), so there is nothing to warn about");
+    }
+
+    [Fact]
+    public void EffectiveMergeBudget_ExplicitShortValue_ClampsUpWithWarning()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            MergeResultBuildVerificationTimeout = TimeSpan.FromMinutes(5),
+        };
+        opts.Validate();
+
+        var required = TimeSpan.FromMinutes(45);
+        var effective = opts.GetEffectiveMergeResultBuildVerificationTimeout(required);
+
+        Assert.Equal(required + opts.MergeResultBuildVerificationProvisioningAllowance, effective);
+        Assert.True(
+            opts.TryGetMergeResultBuildBudgetWarning(required, out var warning),
+            "a configured merge budget below the required-build floor must produce a warning, never a silent cap");
+        Assert.Contains("MergeResultBuildVerificationTimeout", warning, StringComparison.Ordinal);
+        Assert.Contains("RequiredBuildVerificationTimeout", warning, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EffectiveMergeBudget_GenerousExplicitValue_NoWarning()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            MergeResultBuildVerificationTimeout = TimeSpan.FromHours(2),
+        };
+        opts.Validate();
+
+        var required = TimeSpan.FromMinutes(45);
+
+        Assert.Equal(TimeSpan.FromHours(2), opts.GetEffectiveMergeResultBuildVerificationTimeout(required));
+        Assert.False(opts.TryGetMergeResultBuildBudgetWarning(required, out _));
+    }
+
+    [Fact]
+    public void Validate_NegativeMergeProvisioningAllowance_Throws()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            MergeResultBuildVerificationProvisioningAllowance = TimeSpan.FromSeconds(-1),
+        };
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(opts.Validate);
+        Assert.Equal(
+            nameof(PipelineTuningOptions.MergeResultBuildVerificationProvisioningAllowance),
+            ex.ParamName);
+    }
+
+    [Fact]
+    public void Validate_ZeroMergeInfraMaxAttempts_Throws()
+    {
+        var opts = new PipelineTuningOptions
+        {
+            MergeResultBuildVerificationInfraMaxAttempts = 0,
+        };
+
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(opts.Validate);
+        Assert.Equal(
+            nameof(PipelineTuningOptions.MergeResultBuildVerificationInfraMaxAttempts),
+            ex.ParamName);
+    }
+
+    [Fact]
     public void Validate_NegativeSandboxPermitWaitWarningThreshold_Throws()
     {
         var opts = new PipelineTuningOptions

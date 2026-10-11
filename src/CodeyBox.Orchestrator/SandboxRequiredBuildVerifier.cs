@@ -33,7 +33,24 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
     private const int MaxDotnetMarkerPathsPerBranch = 8192;
     // Internal verifier sentinel for branch-controlled clone / checkout / build
     // execution exceeding the required-build budget.
-    private const int BuildTimeoutExitCode = 124;
+    internal const int BuildTimeoutExitCode = 124;
+
+    /// <summary>
+    /// True when <paramref name="result"/> is the verifier's own required-build
+    /// budget timeout (exit 124 with the timeout output): infrastructure, not a
+    /// verdict on the diff. The merge landing treats these exactly like its own
+    /// outer verification timeout — bounded infra retries, never a semantic
+    /// conflict and never guard-budget consumption.
+    /// </summary>
+    internal static bool IsBuildTimeoutResult(RequiredBuildVerificationResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        return result.Status == RequiredBuildVerificationStatus.Failed
+            && result.ExitCode == BuildTimeoutExitCode
+            && result.Output.Contains(
+                "build exceeded the required-build verification timeout",
+                StringComparison.Ordinal);
+    }
 
     // POSIX-sh prologue that guarantees the dotnet/NuGet home points at a
     // directory we can actually create NuGet's user-config folder under, BEFORE

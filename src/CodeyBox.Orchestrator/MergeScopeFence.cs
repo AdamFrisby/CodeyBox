@@ -62,6 +62,24 @@ public sealed class MergeResultBuildFailedException : MergeConflictResolutionFai
 }
 
 /// <summary>
+/// A merge-result build verification that timed out without proving the
+/// merged tree: infrastructure, never a semantic verdict on the diff. The
+/// merge landing retries these up to
+/// <see cref="PipelineTuningOptions.MergeResultBuildVerificationInfraMaxAttempts"/>
+/// without consuming the <see cref="PipelineTuningOptions.MergeGuardReworkMaxAttempts"/>
+/// guard-rework budget (which exists for real semantic failures); only after
+/// the infra budget is spent does the item park, with a message naming both
+/// timeout settings so a too-tight budget is actionable.
+/// </summary>
+public sealed class MergeResultBuildVerificationTimeoutException : MergeConflictResolutionFailedException
+{
+    public MergeResultBuildVerificationTimeoutException(string message, Exception? innerException = null)
+        : base(message, innerException, failureKind: WorkItemFailureKinds.Infrastructure, phase: "merge")
+    {
+    }
+}
+
+/// <summary>
 /// Retryable signal that the base branch moved between merge composition
 /// and landing (the conditional <c>update-ref</c> refused to advance).
 /// Unlike <see cref="MergeConflictResolutionFailedException"/> this does
@@ -113,9 +131,14 @@ internal static partial class MergeScopeFence
         {
             if (current is MergeBaseMovedException)
                 return false;
+            if (current is MergeResultBuildVerificationTimeoutException)
+                return false;
             if (current is ScopeFenceViolation)
                 return true;
         }
+
+        if (ex is MergeResultBuildVerificationTimeoutException)
+            return false;
 
         return ex.Message.Contains("outside the permitted conflict hunks", StringComparison.Ordinal)
             || ex.Message.Contains("discarded prior commits", StringComparison.Ordinal)

@@ -272,6 +272,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
         await ApplyConfiguredAgentPausesAtStartupAsync(initial, cancellationToken);
 
         _subscription = _monitor.OnChange(OnConfigChanged);
+        LogMergeResultBuildBudgetWarningIfTooTight(initial);
         _log.LogInformation(
             "AgentConfigHotReload subscribed to CodeyBoxOptions: classes={ClassesLen} concurrency={ConcurrencyLen} burn={BurnLen} pricing={PricingLen} defaults={DefaultsLen} sanitizer={SanitizerLen} tolerance={ToleranceLen}",
             _lastRouter.Length, _lastConcurrency.Length, _lastBurn.Length, _lastPricing.Length, _lastDefaults.Length, _lastSanitizer.Length, _lastNetworkTolerance.Length);
@@ -1508,7 +1509,13 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
 
         var next = SerializePipelineTuning(opts.PipelineTuning);
         if (string.Equals(_lastPipelineTuning, next, StringComparison.Ordinal))
+        {
+            // The merge-result floor also depends on the required-build budget
+            // (restart-required): re-check the clamp warning even when the
+            // tuning block itself did not change.
+            LogMergeResultBuildBudgetWarningIfTooTight(opts);
             return;
+        }
 
         var prev = _lastPipelineTuning;
         try
@@ -1519,6 +1526,7 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
             _lastPipelineTuning = next;
             AuditLog.ConfigReloaded("PipelineTuning", prev, next);
             _log.LogInformation("Hot-reloaded PipelineTuning: {OldValue} → {NewValue}", prev, next);
+            LogMergeResultBuildBudgetWarningIfTooTight(opts);
         }
         catch (Exception ex)
         {
@@ -1527,6 +1535,22 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 "Fix the configuration error and re-save to retry.",
                 prev);
         }
+    }
+
+    /// <summary>
+    /// Config-load validation warning for the merge-result build budget: the
+    /// effective per-attempt budget is never below the required-build budget
+    /// plus the provisioning allowance, so an explicit
+    /// <c>MergeResultBuildVerificationTimeout</c> below that floor is clamped
+    /// up at verification time. This warning makes the clamp visible at load
+    /// (and on every reload) instead of a silent cap.
+    /// </summary>
+    private void LogMergeResultBuildBudgetWarningIfTooTight(CodeyBoxOptions opts)
+    {
+        ArgumentNullException.ThrowIfNull(opts);
+        var required = TimeSpan.FromSeconds(Math.Max(60, opts.RequiredBuildVerificationTimeoutSeconds));
+        if (opts.PipelineTuning.TryGetMergeResultBuildBudgetWarning(required, out var warning))
+            _log.LogWarning("{Warning}", warning);
     }
 
     private void ApplyBudgetDeferralRecheckIfChanged(CodeyBoxOptions opts)
@@ -1627,7 +1651,9 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.MergeLandingMaxAttempts,
                 opts.MergeGuardReworkMaxAttempts,
                 opts.MergeResultBuildVerificationEnabled,
-                MergeResultBuildVerificationTimeoutSeconds = opts.MergeResultBuildVerificationTimeout.TotalSeconds,
+                MergeResultBuildVerificationTimeoutSeconds = opts.MergeResultBuildVerificationTimeout?.TotalSeconds,
+                MergeResultBuildVerificationProvisioningAllowanceSeconds = opts.MergeResultBuildVerificationProvisioningAllowance.TotalSeconds,
+                opts.MergeResultBuildVerificationInfraMaxAttempts,
                 opts.EnableSandboxReuse,
                 opts.MaxSandboxReuses,
                 MaxSandboxLifetimeSeconds = opts.MaxSandboxLifetime.TotalSeconds,

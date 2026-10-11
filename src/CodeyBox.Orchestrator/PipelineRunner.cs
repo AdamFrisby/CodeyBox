@@ -922,6 +922,15 @@ public sealed partial class PipelineRunner : IPipelineRunner
                     if (firstFailure.InnerException is MergeBaseMovedException)
                         throw;
 
+                    // A merge-result verification timeout already exhausted its
+                    // own bounded infra retry budget inside the landing queue:
+                    // the tree was never proven, so no agent rework turn can
+                    // repair it. Park directly without burning the
+                    // guard-rework budget, which exists for real semantic
+                    // failures.
+                    if (firstFailure is MergeResultBuildVerificationTimeoutException)
+                        throw;
+
                     // Third-line fallback: c9fd5b75 (preventive auto-rebase) and the
                     // merge-phase agent (77ce33c667 on 405 race) have both run their
                     // course. Re-engage the ORIGINAL work agent — who knows why this
@@ -983,6 +992,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                             catch (MergeConflictResolutionFailedException next)
                             {
                                 if (next.InnerException is MergeBaseMovedException)
+                                    throw;
+                                if (next is MergeResultBuildVerificationTimeoutException)
                                     throw;
                                 lastFailure = next;
                             }

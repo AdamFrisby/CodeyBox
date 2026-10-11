@@ -3,6 +3,8 @@ using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using Microsoft.Extensions.Logging;
+using MergeClock = Microsoft.Extensions.Time.Testing.FakeTimeProvider;
 
 namespace CodeyBox.Tests;
 
@@ -230,6 +232,115 @@ public sealed class MergeResultBuildVerificationTests : IDisposable
         var barePath = Path.Combine(tp.GitRoot, item.Id + ".git");
         var (_, feature, _) = await TestSupport.RunGit(barePath, "show", "main:feature.txt");
         Assert.Equal("feature\n", feature);
+    }
+
+    /// <summary>
+    /// A merge-result verification that times out is infrastructure, not a
+    /// semantic verdict: it is retried a bounded number of times without
+    /// consuming the guard-rework budget (which exists for real semantic
+    /// failures), and only parks once the infra budget is spent — with a
+    /// message naming both timeout settings and a per-attempt duration in
+    /// the structured log so a too-tight budget is visible. The timeout
+    /// budget runs on the pipeline clock, so the fake clock drives it
+    /// deterministically.
+    /// </summary>
+    [Fact]
+    public async Task VerificationTimeout_RetriesBoundedInfraAttempts_ThenParksWithoutConsumingGuardBudget()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace, "seed-merge-verify-timeout");
+        var verifier = new DelegateBuildVerifier();
+        var clock = new MergeClock(DateTimeOffset.UtcNow);
+        const int infraMaxAttempts = 2;
+        var tuning = new PipelineTuningSnapshot(new PipelineTuningOptions
+        {
+            MergeResultBuildVerificationTimeout = TimeSpan.FromMilliseconds(200),
+            MergeResultBuildVerificationProvisioningAllowance = TimeSpan.Zero,
+            MergeResultBuildVerificationInfraMaxAttempts = infraMaxAttempts,
+        });
+        var pipelineOptions = new PipelineOptions
+        {
+            SandboxImageReference = "ignored",
+            AgentAllowedHosts = [],
+            // A generous inner budget so the floor (required + allowance)
+            // cannot clamp the 200 ms merge budget under test.
+            RequiredBuildVerificationTimeout = TimeSpan.FromMilliseconds(100),
+        };
+        var logs = new ListLogger<PipelineRunner>();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            requiredBuildVerifier: verifier,
+            pipelineTuning: tuning,
+            pipelineOptions: pipelineOptions,
+            pipelineTimeProvider: clock,
+            logger: logs);
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("feature.txt", "feature\n"));
+
+        var item = NewItem("codeybox/merge-verify-timeout-" + WorkItemId.New().ToString()[..8]);
+        await tp.Store.CreateAsync(item);
+        verifier.OnVerifyAsync = async (request, ct) =>
+        {
+            if (!IsVerifyBranch(request.WorkBranch))
+                return RequiredBuildVerificationResult.Passed(0, "work-branch head builds");
+            // Hang until the merge-result budget cancels us: the attempt must
+            // end in a timeout, never in a build verdict.
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            return RequiredBuildVerificationResult.Passed(0, "unreachable");
+        };
+
+        await RunWithAdvancingClockAsync(clock, tp.Pipeline.RunAsync(item, CancellationToken.None));
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.Equal(WorkItemState.MergeConflictResolutionFailed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.Infrastructure, final.FailureKind);
+        // Bounded infra retries: exactly one verification per attempt.
+        var mergeVerifies = verifier.VerificationRequests.Where(r => IsVerifyBranch(r.WorkBranch)).ToList();
+        Assert.Equal(infraMaxAttempts, mergeVerifies.Count);
+        // The guard-rework budget is untouched: a timeout is infrastructure,
+        // so no conflict-rework turn ever ran.
+        Assert.Equal(0, final.ConflictReworkAttempts);
+        Assert.Empty(tp.Agent.ConflictReworkPrompts);
+        // The park message names both settings so the operator can act.
+        Assert.Contains("RequiredBuildVerificationTimeout", final.LastError, StringComparison.Ordinal);
+        Assert.Contains("MergeResultBuildVerificationTimeout", final.LastError, StringComparison.Ordinal);
+        // Every attempt reported its duration in the structured log.
+        var attemptLogs = logs.Lines
+            .Where(line => line.Message.Contains("Merge-result build verification attempt", StringComparison.Ordinal))
+            .ToList();
+        Assert.Equal(infraMaxAttempts, attemptLogs.Count);
+        Assert.All(attemptLogs, line => Assert.Contains("timed out after", line.Message, StringComparison.Ordinal));
+    }
+
+    private static async Task RunWithAdvancingClockAsync(MergeClock clock, Task pipelineTask)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(pipelineTask);
+        // Advance the fake clock in lockstep with real time (10 ms fake per
+        // ~10 ms real delay) — never faster, so no other pipeline budget
+        // fires spuriously early while the merge-result budget under test
+        // elapses deterministically.
+        while (!pipelineTask.IsCompleted)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(10));
+            await Task.Delay(10);
+        }
+
+        await pipelineTask;
+    }
+
+    private sealed class ListLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Lines { get; } = new();
+        IDisposable? ILogger.BeginScope<TState>(TState state) => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (Lines) Lines.Add((logLevel, formatter(state, exception)));
+        }
     }
 
     private sealed class DelegateBuildVerifier : IRequiredBuildVerifier
