@@ -305,10 +305,12 @@ public sealed partial class PipelineRunner
                     await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
             }
             var checkedOutExistingBranch = false;
+            string? preemptCheckpoint = null;
+            string? checkpointBranch = null;
             if (resumingGitCheckpoint)
             {
-                var preemptCheckpoint = item.PreemptCheckpoint!;
-                var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
+                preemptCheckpoint = item.PreemptCheckpoint!;
+                checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
                 if (await IsStaleAgentTurnCheckpointAsync(
                         sandbox, preemptCheckpoint, checkpointBranch, resumePreTurnCommitSha, ct).ConfigureAwait(false))
@@ -325,23 +327,24 @@ public sealed partial class PipelineRunner
                     item = await DiscardStaleAgentTurnCheckpointAsync(
                         item,
                         "durable agent-turn checkpoint no longer descends from its pre-turn work-branch commit",
+                        runner.Kind,
+                        agentPhase,
                         ct).ConfigureAwait(false);
                     resumingGitCheckpoint = false;
                     resumingPreempt = false;
                     durableTurnResume = null;
                     useExactCheckpointResume = false;
                     useCrossAgentFileOnlyResume = false;
+                    preemptCheckpoint = null;
+                    checkpointBranch = null;
                 }
             }
             if (resumingGitCheckpoint)
             {
-                var preemptCheckpoint = item.PreemptCheckpoint!;
-                var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
-                await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
                 if (durableTurnResume is not null)
                 {
-                    var typedRef = AgentTurnCheckpointRef.Parse(preemptCheckpoint);
+                    var typedRef = AgentTurnCheckpointRef.Parse(preemptCheckpoint!);
                     var restoredHead = await ReadSandboxHeadShaAsync(sandbox, ct);
                     if (!string.Equals(restoredHead, typedRef.SourceCommitSha, StringComparison.Ordinal))
                     {
@@ -368,7 +371,7 @@ public sealed partial class PipelineRunner
                         ct);
                 }
                 checkedOutExistingBranch = true;
-                prompt = _promptComposer.BuildResumePrompt(prompt, preemptCheckpoint);
+                prompt = _promptComposer.BuildResumePrompt(prompt, preemptCheckpoint!);
                 if (useCrossAgentFileOnlyResume)
                 {
                     // A fallback member may inherit the partial source tree but

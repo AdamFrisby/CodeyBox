@@ -1,6 +1,7 @@
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Sandbox;
+using CodeyBox.Sandbox.Process;
 
 namespace CodeyBox.Tests;
 
@@ -125,58 +126,92 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
     [Fact]
     public async Task StaleBranchMove_WithRetainedSandboxLease_RefusedWithExplicitMessage()
     {
-        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
-        using var setup = TestSupport.BuildPipeline(_workspace, seed);
-        const int promptRevision = 7;
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        var calls = 0;
+        agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            calls++;
+            if (calls == 1)
+            {
+                var write = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", "echo 'real change' > \"$0\"", $"{workingDirectory}/output.txt"],
+                }, ct);
+                if (!write.Success)
+                    throw new InvalidOperationException($"failed to write output.txt: {write.Stderr}");
+                ready.TrySetResult();
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+            else
+            {
+                var write = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", "echo 'fresh change' > \"$0\"", $"{workingDirectory}/fresh.txt"],
+                }, ct);
+                if (!write.Success)
+                    throw new InvalidOperationException($"failed to write fresh.txt: {write.Stderr}");
+            }
+        };
+        agent.WorkResults.Enqueue(new AgentResult(true, "fresh ok", "fresh ok", null));
+
+        var sandboxHook = new LeaseInjectingSandboxProvider(
+            new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance));
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var setup = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace),
+            agentOverride: agent,
+            logger: logger,
+            sandboxProvider: sandboxHook);
+        sandboxHook.Store = setup.Store;
+
+        var item = NewItem();
+        await setup.Store.CreateAsync(item);
+        await PreemptFirstTurnAsync(setup, item, ready);
+
+        // Same situation as the discard test: fresh base plus a recomposed
+        // work branch, so the durable checkpoint no longer descends from the
+        // current tip. A concurrent provider-side retain publishes a
+        // retained-sandbox recovery lease inside the stale-check window; the
+        // discard must refuse explicitly rather than silently drop
+        // provider-owned state.
+        var barePath = BarePathFor(setup, item);
+        await RecomposeBranchOnFreshBaseAsync(setup, item);
+        var staleCheckpointCommit = await CheckpointCommitOfAsync(setup, item);
+        var (staleCode, _, _) = await TestSupport.RunGitNoThrow(
+            barePath, "merge-base", "--is-ancestor", await TipOfAsync(barePath, item.WorkBranch!), staleCheckpointCommit);
+        Assert.Equal(1, staleCode);
+
         var lease = new SandboxRecoveryLease(
             "incus",
             "codeybox-retained-stale",
             "retained-stale-token");
-        var checkpoint = new AgentTurnResumeCheckpoint(
-            AgentKind.Claude,
-            "claude/acct-a",
-            modelId: null,
-            reasoningMode: null,
-            nativeSessionId: null,
-            WorkItemState.Working,
-            AgentTurnResumePhase.Work,
-            iteration: null,
-            promptRevision: promptRevision,
-            DateTimeOffset.UtcNow);
-        var item = new WorkItem
-        {
-            Id = WorkItemId.New(),
-            ProjectId = new ProjectId("test-project"),
-            Title = "stale lease",
-            Prompt = "do thing",
-            BaseBranch = "main",
-            WorkBranch = "feature/stale-lease-" + Guid.NewGuid().ToString("N")[..8],
-            Agent = AgentKind.Claude,
-            AgentInstanceId = "claude/acct-a",
-            PromptRevision = promptRevision,
-            State = WorkItemState.Working,
-            StartedAt = DateTimeOffset.UtcNow,
-            PreemptedAt = DateTimeOffset.UtcNow,
-            AgentTurnResumeCheckpoint = checkpoint,
-            AgentTurnRecoveryLease = lease,
-        };
-        await setup.Store.CreateAsync(item);
-        await setup.GitHost.EnsureRepositoryAsync(item.Id, seed);
+        sandboxHook.TargetId = item.Id;
+        sandboxHook.LeaseToInject = lease;
 
-        // Same situation as the discard test: fresh base plus a recomposed
-        // work branch. The lease must still be refused explicitly rather
-        // than silently discarded as stale bookkeeping.
-        await RecomposeBranchOnFreshBaseAsync(setup, item);
-
-        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+        var resumeEntry = await setup.Store.GetAsync(item.Id)
+            ?? throw new InvalidOperationException("work item disappeared after preempt");
+        await setup.Pipeline.RunAsync(resumeEntry, CancellationToken.None);
 
         var final = await setup.Store.GetAsync(item.Id);
         Assert.NotNull(final);
         Assert.Equal(WorkItemState.Failed, final!.State);
-        Assert.Contains("retained-sandbox", final.LastError, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            "Cannot discard a retained-sandbox recovery lease",
+            final.LastError,
+            StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("no longer descends", final.LastError, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(lease, final.AgentTurnRecoveryLease);
         Assert.NotNull(final.AgentTurnResumeCheckpoint);
+        Assert.Null(final.PreemptCheckpoint);
+
+        // The stale bookkeeping was entered but refused, not silently
+        // discarded: the branch tip still does not descend to the checkpoint
+        // commit that was stale at dispatch.
+        var (stillStaleCode, _, _) = await TestSupport.RunGitNoThrow(
+            barePath, "merge-base", "--is-ancestor", await TipOfAsync(barePath, item.WorkBranch!), staleCheckpointCommit);
+        Assert.Equal(1, stillStaleCode);
     }
 
     private static WorkItem NewItem() => new()
@@ -255,5 +290,82 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
             ?? throw new InvalidOperationException("work item disappeared");
         var checkpointRef = AgentTurnCheckpointRef.Parse(stored.PreemptCheckpoint!);
         return checkpointRef.SourceCommitSha;
+    }
+
+    /// <summary>
+    /// Simulates a concurrent provider-side retain landing inside the
+    /// stale-check window: on the first fetch of the durable preempt ref (the
+    /// stale check's fetch, after pickup validation has passed), the
+    /// lease is published to the real store via a normal update, so the
+    /// discard's re-read observes provider-owned state and must refuse.
+    /// Capability resolution unwraps through <see cref="ISandboxDecorator"/>,
+    /// so the inner process sandbox's capabilities stay intact.
+    /// </summary>
+    private sealed class LeaseInjectingSandboxProvider(ISandboxProvider inner) : ISandboxProvider
+    {
+        public CodeyBox.Orchestrator.SqliteWorkItemStore? Store { get; set; }
+
+        public WorkItemId TargetId { get; set; }
+
+        public SandboxRecoveryLease? LeaseToInject { get; set; }
+
+        private int _injected;
+
+        public string Name => inner.Name;
+
+        public async Task<ISandbox> CreateAsync(SandboxSpec spec, CancellationToken ct = default)
+        {
+            var sandbox = await inner.CreateAsync(spec, ct).ConfigureAwait(false);
+            return new LeaseInjectingSandbox(sandbox, this);
+        }
+
+        public Task<IReadOnlyList<ManagedSandboxInfo>> ListAllManagedAsync(CancellationToken ct) =>
+            inner.ListAllManagedAsync(ct);
+
+        public Task DisposeLeakedAsync(string name, CancellationToken ct) =>
+            inner.DisposeLeakedAsync(name, ct);
+
+        internal async Task MaybeInjectAsync(IReadOnlyList<string> argv)
+        {
+            if (LeaseToInject is null || Store is null)
+                return;
+            if (!argv.Contains("fetch"))
+                return;
+            if (!argv.Any(a => a.Contains("codeybox/preempt", StringComparison.Ordinal)))
+                return;
+            if (Interlocked.Exchange(ref _injected, 1) == 1)
+                return;
+            var current = await Store.GetAsync(TargetId).ConfigureAwait(false);
+            if (current is null || current.AgentTurnRecoveryLease is not null)
+                return;
+            await Store.UpdateAsync(
+                current with
+                {
+                    AgentTurnRecoveryLease = LeaseToInject,
+                    UpdatedAt = DateTimeOffset.UtcNow,
+                }).ConfigureAwait(false);
+        }
+    }
+
+    private sealed class LeaseInjectingSandbox(ISandbox inner, LeaseInjectingSandboxProvider owner) : ISandboxDecorator
+    {
+        public ISandbox InnerSandbox => inner;
+
+        public string Id => inner.Id;
+
+        public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv is not null)
+                await owner.MaybeInjectAsync(exec.Argv).ConfigureAwait(false);
+            return await inner.ExecAsync(exec, ct).ConfigureAwait(false);
+        }
+
+        public Task SyncStateToHostAsync(CancellationToken ct = default) =>
+            inner.SyncStateToHostAsync(ct);
+
+        public Task KillActiveExecsAsync(CancellationToken ct = default) =>
+            inner.KillActiveExecsAsync(ct);
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 }

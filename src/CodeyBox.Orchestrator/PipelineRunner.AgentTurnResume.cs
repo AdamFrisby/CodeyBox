@@ -1262,6 +1262,9 @@ public sealed partial class PipelineRunner
             ct).ConfigureAwait(false);
     }
 
+    private const string StaleCheckpointLeaseRefusalMessage =
+        "Cannot discard a retained-sandbox recovery lease for a stale durable agent-turn checkpoint; retry the retained agent turn or cancel the item so provider cleanup remains authoritative.";
+
     /// <summary>
     /// Atomically discards a stale durable agent-turn checkpoint lineage. The
     /// work branch is untouched, so the caller restarts the turn fresh from
@@ -1272,19 +1275,17 @@ public sealed partial class PipelineRunner
     private async Task<WorkItem> DiscardStaleAgentTurnCheckpointAsync(
         WorkItem item,
         string reason,
+        AgentKind agentKind,
+        string agentPhase,
         CancellationToken ct)
     {
-        if (item.AgentTurnRecoveryLease is not null)
-        {
-            throw new InvalidOperationException(
-                "Cannot discard a retained-sandbox recovery lease for a stale durable agent-turn checkpoint; retry the retained agent turn or cancel the item so provider cleanup remains authoritative.");
-        }
-
         var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
-        if (current.AgentTurnRecoveryLease is not null)
+        if (item.AgentTurnRecoveryLease is not null || current.AgentTurnRecoveryLease is not null)
         {
-            throw new InvalidOperationException(
-                "Cannot discard a retained-sandbox recovery lease for a stale durable agent-turn checkpoint; retry the retained agent turn or cancel the item so provider cleanup remains authoritative.");
+            throw new AgentInfrastructureFailureException(
+                agentKind,
+                agentPhase,
+                StaleCheckpointLeaseRefusalMessage);
         }
 
         var discarded = current with
