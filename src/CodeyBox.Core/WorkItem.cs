@@ -948,7 +948,22 @@ public sealed record WorkItem
             || (state == WorkItemState.Failed
                 && string.Equals(nextFailureKind, "transient-exhausted", StringComparison.OrdinalIgnoreCase));
         var preservesTransientHistory = carriesTransientHistory || ShouldPreserveTransientRetryHistory(state);
-        var carriesTypedAgentTurnRecoveryBoundary = HasTypedAgentTurnRecoveryBoundary
+        // A stale-check race can publish a retained-sandbox lease after a
+        // durable Git checkpoint was already recorded, leaving both backings
+        // present (incoherent per HasTypedAgentTurnRecoveryBoundary). For an
+        // infrastructure terminal failure the provider lease is authoritative:
+        // heal to a coherent lease-only boundary by dropping the stale Git
+        // ref while keeping the checkpoint metadata and lease, so operator
+        // retry/cancel stays on the retained path instead of silently
+        // dropping provider-owned state. Non-infrastructure failures keep the
+        // existing fail-closed clear.
+        var hasBothRecoveryBackings = AgentTurnResumeCheckpoint is not null
+            && !string.IsNullOrWhiteSpace(PreemptCheckpoint)
+            && AgentTurnRecoveryLease is not null;
+        var healsToLeaseOnlyBoundary = hasBothRecoveryBackings
+            && state == WorkItemState.Failed
+            && CodeyBox.Core.WorkItemFailureKinds.IsInfraShaped(nextFailureKind);
+        var carriesTypedAgentTurnRecoveryBoundary = (HasTypedAgentTurnRecoveryBoundary || healsToLeaseOnlyBoundary)
             && CodeyBox.Core.AgentTurnResumeCheckpoint.CanPersistThrough(state, nextFailureKind);
         var carriesLegacyPreemptCheckpoint = AgentTurnResumeCheckpoint is null
             && AgentTurnRecoveryLease is null
@@ -1014,9 +1029,11 @@ public sealed record WorkItem
             WorkBranch = state == WorkItemState.Queued && !preserveQueuedPickup ? null : WorkBranch,
             PreserveWorkBranchOnQueuedPickup = preserveQueuedPickup,
             PreemptedAt = carriesAgentTurnRecoveryBoundary ? PreemptedAt : null,
-            PreemptCheckpoint = carriesAgentTurnRecoveryBoundary && !string.IsNullOrWhiteSpace(PreemptCheckpoint)
-                ? PreemptCheckpoint
-                : null,
+            PreemptCheckpoint = healsToLeaseOnlyBoundary
+                ? null
+                : carriesAgentTurnRecoveryBoundary && !string.IsNullOrWhiteSpace(PreemptCheckpoint)
+                    ? PreemptCheckpoint
+                    : null,
             AgentTurnResumeCheckpoint = carriesAgentTurnRecoveryBoundary ? AgentTurnResumeCheckpoint : null,
             AgentTurnRecoveryLease = carriesAgentTurnRecoveryBoundary ? AgentTurnRecoveryLease : null,
         };

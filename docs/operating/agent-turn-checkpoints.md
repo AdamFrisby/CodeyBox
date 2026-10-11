@@ -99,6 +99,17 @@ accepts it only when the checkpoint already contains meaningful source changes
 relative to the pre-turn work-branch tip. An allow-empty checkpoint followed by
 a no-op resume uses the normal initial-work/rework no-diff failure path.
 
+When the work branch legitimately moves after the checkpoint was written — a
+pickup-time rebase onto a fresh base or a restart-recovery recomposition — the
+checkpoint commit no longer descends from the current pre-turn tip and is
+unusable, but that says nothing about the work. The turn preparation discards
+the stale checkpoint (logged as `Discarding durable agent-turn resume
+checkpoint`, the same record as a phase-boundary discard) and runs a normal
+fresh turn from the current branch tip with the branch preserved. This is not a
+failure and does not count toward terminal failures. A checkpoint backed by a
+retained-sandbox recovery lease is never discarded this way: provider-owned
+state stays authoritative and the resume is refused explicitly.
+
 Durable re-dispatches are bounded by
 `CodeyBox:PipelineTuning:AgentSessionResumeMaxAttempts`. The attempt is claimed
 atomically immediately before the resume hook rather than at enqueue time, so

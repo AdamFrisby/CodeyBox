@@ -312,15 +312,46 @@ public sealed partial class PipelineRunner
                     await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "remote", "set-url", "--push", "origin", access.CloneUrlInsideSandbox);
             }
             var checkedOutExistingBranch = false;
+            string? preemptCheckpoint = null;
+            string? checkpointBranch = null;
             if (resumingGitCheckpoint)
             {
-                var preemptCheckpoint = item.PreemptCheckpoint!;
-                var checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
+                preemptCheckpoint = item.PreemptCheckpoint!;
+                checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
+                if (await IsStaleAgentTurnCheckpointAsync(
+                        sandbox, preemptCheckpoint, checkpointBranch, resumePreTurnCommitSha, ct).ConfigureAwait(false))
+                {
+                    // The work branch legitimately moved after the checkpoint
+                    // was written (a pickup-time rebase onto a fresh base or a
+                    // restart-recovery recomposition). The checkpoint tree is
+                    // unusable, but that says nothing about the work: discard
+                    // the bookkeeping and run a normal fresh turn from the
+                    // current branch tip, preserving the branch — never a
+                    // terminal failure. A retained-sandbox lease still refuses
+                    // inside the discard: provider-owned state is never
+                    // silently dropped.
+                    item = await DiscardStaleAgentTurnCheckpointAsync(
+                        item,
+                        "durable agent-turn checkpoint no longer descends from its pre-turn work-branch commit",
+                        runner.Kind,
+                        agentPhase,
+                        ct).ConfigureAwait(false);
+                    resumingGitCheckpoint = false;
+                    resumingPreempt = false;
+                    durableTurnResume = null;
+                    useExactCheckpointResume = false;
+                    useCrossAgentFileOnlyResume = false;
+                    preemptCheckpoint = null;
+                    checkpointBranch = null;
+                }
+            }
+            if (resumingGitCheckpoint)
+            {
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "checkout", "-B", branch, $"origin/{checkpointBranch}");
                 if (durableTurnResume is not null)
                 {
-                    var typedRef = AgentTurnCheckpointRef.Parse(preemptCheckpoint);
+                    var typedRef = AgentTurnCheckpointRef.Parse(preemptCheckpoint!);
                     var restoredHead = await ReadSandboxHeadShaAsync(sandbox, ct);
                     if (!string.Equals(restoredHead, typedRef.SourceCommitSha, StringComparison.Ordinal))
                     {
@@ -347,7 +378,7 @@ public sealed partial class PipelineRunner
                         ct);
                 }
                 checkedOutExistingBranch = true;
-                prompt = _promptComposer.BuildResumePrompt(prompt, preemptCheckpoint);
+                prompt = _promptComposer.BuildResumePrompt(prompt, preemptCheckpoint!);
                 if (useCrossAgentFileOnlyResume)
                 {
                     // A fallback member may inherit the partial source tree but
