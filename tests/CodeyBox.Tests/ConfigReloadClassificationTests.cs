@@ -599,7 +599,14 @@ public sealed class ConfigReloadClassificationTests : IDisposable
                 opts.MergeResultBuildVerificationEnabled = !opts.MergeResultBuildVerificationEnabled;
                 break;
             case nameof(PipelineTuningOptions.MergeResultBuildVerificationTimeout):
-                opts.MergeResultBuildVerificationTimeout += TimeSpan.FromHours(1);
+                opts.MergeResultBuildVerificationTimeout =
+                    (opts.MergeResultBuildVerificationTimeout ?? TimeSpan.FromMinutes(15)) + TimeSpan.FromHours(1);
+                break;
+            case nameof(PipelineTuningOptions.MergeResultBuildVerificationProvisioningAllowance):
+                opts.MergeResultBuildVerificationProvisioningAllowance += TimeSpan.FromMinutes(1);
+                break;
+            case nameof(PipelineTuningOptions.MergeResultBuildVerificationInfraMaxAttempts):
+                opts.MergeResultBuildVerificationInfraMaxAttempts += 10;
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(field), field, "No mutator for this PipelineTuning field.");

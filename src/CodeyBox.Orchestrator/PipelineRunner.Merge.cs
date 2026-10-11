@@ -714,6 +714,20 @@ public sealed partial class PipelineRunner
     /// base. Verifier infrastructure failures propagate untouched (parked
     /// as infrastructure, never landed, never misattributed to the diff).
     /// </para>
+    ///
+    /// <para>
+    /// A verification that times out is infrastructure, not a verdict on the
+    /// diff: it is retried up to
+    /// <see cref="PipelineTuningOptions.MergeResultBuildVerificationInfraMaxAttempts"/>
+    /// without consuming the guard-rework budget, and only parks (as
+    /// <see cref="MergeResultBuildVerificationTimeoutException"/>) once the
+    /// infra budget is spent. The per-attempt budget is the single source of
+    /// truth in
+    /// <see cref="PipelineTuningOptions.GetEffectiveMergeResultBuildVerificationTimeout"/>,
+    /// never below the required-build budget plus the provisioning
+    /// allowance. Every attempt reports its duration in the structured log
+    /// so a too-tight budget is visible.
+    /// </para>
     /// </summary>
     private async Task VerifyMergeBuildAndLandAsync(
         WorkItem item,
@@ -753,28 +767,95 @@ public sealed partial class PipelineRunner
             await _gitHost.SetBranchToCommitAsync(repoId, verifyBranch, mergeSha, ct);
             try
             {
-                var timeout = _pipelineTuning.Current.MergeResultBuildVerificationTimeout;
-                using var timeoutCts = new CancellationTokenSource(timeout);
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
-                RequiredBuildVerificationResult result;
-                try
+                // Snapshot the budgets once: an in-flight verification keeps a
+                // stable per-attempt budget while the next landing observes a
+                // configuration edit.
+                var tuning = _pipelineTuning.Current;
+                var requiredBuildTimeout = _opts.RequiredBuildVerificationTimeout;
+                var configuredMergeTimeout = tuning.MergeResultBuildVerificationTimeout;
+                var effectiveTimeout = tuning.GetEffectiveMergeResultBuildVerificationTimeout(requiredBuildTimeout);
+                var maxAttempts = Math.Max(1, tuning.MergeResultBuildVerificationInfraMaxAttempts);
+                if (tuning.TryGetMergeResultBuildBudgetWarning(requiredBuildTimeout, out var budgetWarning))
                 {
-                    result = await _requiredBuildGate.VerifyMergeResultAsync(
-                        item, project, repoId, baseBranch, verifyBranch, linkedCts.Token);
-                }
-                catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
-                {
-                    throw new MergeConflictResolutionFailedException(
-                        $"merge-result build verification timed out after {timeout} without proving the merged tree; refusing to land an unverified tree",
-                        ex);
+                    _log.LogWarning(
+                        "Merge-result build verification budget clamped for work item {WorkItemId}: {Warning} " +
+                        "(configured MergeResultBuildVerificationTimeout={Configured}, " +
+                        "RequiredBuildVerificationTimeout={Required}, effective={Effective})",
+                        item.Id, budgetWarning, configuredMergeTimeout, requiredBuildTimeout, effectiveTimeout);
                 }
 
-                if (result.Status == RequiredBuildVerificationStatus.Failed)
+                for (var attempt = 1; ; attempt++)
                 {
-                    var summary = RequiredBuildGate.BuildFailureSummary(result);
-                    throw new MergeResultBuildFailedException(
-                        $"merge result failed required build (semantic conflict against '{baseBranch}'): {summary}",
-                        result.Output);
+                    var attemptStart = _opts.TimeProvider.GetUtcNow();
+                    // TimeProvider-backed so tests drive the budget with a
+                    // FakeTimeProvider instead of racing wall-clock scheduling.
+                    using var timeoutCts = new CancellationTokenSource(effectiveTimeout, _opts.TimeProvider);
+                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+                    RequiredBuildVerificationResult result;
+                    try
+                    {
+                        result = await _requiredBuildGate.VerifyMergeResultAsync(
+                            item, project, repoId, baseBranch, verifyBranch, linkedCts.Token);
+                    }
+                    catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+                    {
+                        var timedOutElapsed = _opts.TimeProvider.GetUtcNow() - attemptStart;
+                        var retryAction = attempt < maxAttempts
+                            ? "retrying as infrastructure without consuming the guard-rework budget"
+                            : "infra retry budget spent; parking without landing the unverified tree";
+                        _log.LogWarning(
+                            ex,
+                            "Merge-result build verification attempt {Attempt}/{MaxAttempts} for work item {WorkItemId} " +
+                            "timed out after {Elapsed} (budget {Budget}); {Action}",
+                            attempt, maxAttempts, item.Id, timedOutElapsed, effectiveTimeout, retryAction);
+                        if (attempt < maxAttempts)
+                            continue;
+
+                        throw new MergeResultBuildVerificationTimeoutException(
+                            FormatMergeVerificationTimeoutMessage(
+                                maxAttempts, effectiveTimeout, timedOutElapsed,
+                                requiredBuildTimeout, configuredMergeTimeout),
+                            ex);
+                    }
+
+                    // The inner verifier's own required-build budget firing is
+                    // the same infrastructure outcome as the outer budget
+                    // firing: the build never proved the tree, so this is not
+                    // a semantic conflict and must not route to rework.
+                    if (SandboxRequiredBuildVerifier.IsBuildTimeoutResult(result))
+                    {
+                        var innerElapsed = _opts.TimeProvider.GetUtcNow() - attemptStart;
+                        var innerRetryAction = attempt < maxAttempts
+                            ? "retrying as infrastructure without consuming the guard-rework budget"
+                            : "infra retry budget spent; parking without landing the unverified tree";
+                        _log.LogWarning(
+                            "Merge-result build verification attempt {Attempt}/{MaxAttempts} for work item {WorkItemId} " +
+                            "hit the inner required-build timeout after {Elapsed} (budget {Budget}); {Action}",
+                            attempt, maxAttempts, item.Id, innerElapsed, effectiveTimeout, innerRetryAction);
+                        if (attempt < maxAttempts)
+                            continue;
+
+                        throw new MergeResultBuildVerificationTimeoutException(
+                            FormatMergeVerificationTimeoutMessage(
+                                maxAttempts, effectiveTimeout, innerElapsed,
+                                requiredBuildTimeout, configuredMergeTimeout));
+                    }
+
+                    var elapsed = _opts.TimeProvider.GetUtcNow() - attemptStart;
+                    _log.LogInformation(
+                        "Merge-result build verification attempt {Attempt}/{MaxAttempts} for work item {WorkItemId} " +
+                        "finished in {Elapsed} with status {Status} (budget {Budget})",
+                        attempt, maxAttempts, item.Id, elapsed, result.Status, effectiveTimeout);
+
+                    if (result.Status == RequiredBuildVerificationStatus.Failed)
+                    {
+                        var summary = RequiredBuildGate.BuildFailureSummary(result);
+                        throw new MergeResultBuildFailedException(
+                            $"merge result failed required build (semantic conflict against '{baseBranch}'): {summary}",
+                            result.Output);
+                    }
+
+                    break;
                 }
             }
             finally
@@ -789,6 +870,20 @@ public sealed partial class PipelineRunner
             _mergeLandingGate.Release(landingKey, landingSlot, landingAcquired);
         }
     }
+
+    private static string FormatMergeVerificationTimeoutMessage(
+        int maxAttempts,
+        TimeSpan effectiveTimeout,
+        TimeSpan lastAttemptElapsed,
+        TimeSpan requiredBuildTimeout,
+        TimeSpan? configuredMergeTimeout)
+        => "merge-result build verification timed out after "
+            + $"{maxAttempts} attempt(s) of {effectiveTimeout} (last attempt ran {lastAttemptElapsed}) "
+            + "without proving the merged tree; refusing to land an unverified tree "
+            + $"(RequiredBuildVerificationTimeout={requiredBuildTimeout}, "
+            + $"PipelineTuning:MergeResultBuildVerificationTimeout={configuredMergeTimeout?.ToString() ?? "unset (automatic)"}). "
+            + "Raise MergeResultBuildVerificationTimeout (it must cover RequiredBuildVerificationTimeout "
+            + "plus sandbox provisioning) and re-dispatch the item.";
 
     /// <summary>
     /// Best-effort removal of the short-lived merge-verification branch.

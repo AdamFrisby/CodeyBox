@@ -44,6 +44,8 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.MergeLandingMaxAttempts),
         nameof(PipelineTuningOptions.MergeResultBuildVerificationEnabled),
         nameof(PipelineTuningOptions.MergeResultBuildVerificationTimeout),
+        nameof(PipelineTuningOptions.MergeResultBuildVerificationProvisioningAllowance),
+        nameof(PipelineTuningOptions.MergeResultBuildVerificationInfraMaxAttempts),
         nameof(PipelineTuningOptions.MergeGuardReworkMaxAttempts),
         nameof(PipelineTuningOptions.EnableSandboxReuse),
         nameof(PipelineTuningOptions.MaxSandboxReuses),
