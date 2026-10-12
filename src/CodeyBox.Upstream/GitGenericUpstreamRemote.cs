@@ -21,6 +21,14 @@ public sealed class GitGenericUpstreamRemote : IUpstreamRemote
 
     public string Name => "git-generic";
 
+    /// <summary>
+    /// Generic completion pushes the base branch (it has no work-branch PR
+    /// concept), never the item's work branch — so its push is not recorded
+    /// as a work-branch tip. Recording the base tip as a work-branch push
+    /// would poison the lease decision with false evidence.
+    /// </summary>
+    public bool PushesWorkBranch => false;
+
     public async Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
     {
         try

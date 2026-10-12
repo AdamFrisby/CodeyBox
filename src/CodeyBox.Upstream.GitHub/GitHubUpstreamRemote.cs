@@ -592,6 +592,31 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     }
 
     /// <summary>
+    /// True when <paramref name="remoteSha"/> equals any recorded CodeyBox
+    /// push in <paramref name="knownShas"/> (ordinal, ignoring case and
+    /// surrounding whitespace). The scan is bounded: at most the first
+    /// <c>MaxKnownShaScan</c> entries are compared, so a hostile or
+    /// misconfigured caller cannot turn the lease decision into an
+    /// unbounded loop. Recorded history is already bounded at record time
+    /// (see <see cref="WorkItemPushHistory"/>); this is defense in depth.
+    /// </summary>
+    private static bool IsKnownPushedSha(IReadOnlyList<string>? knownShas, string remoteSha)
+    {
+        const int MaxKnownShaScan = 128;
+        if (knownShas is null || knownShas.Count == 0)
+            return false;
+        var count = 0;
+        foreach (var known in knownShas)
+        {
+            if (count++ >= MaxKnownShaScan)
+                break;
+            if (string.Equals(known?.Trim(), remoteSha, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Proves a diverged remote tip is CodeyBox's own history by listing the
     /// commits exclusive of the CURRENT base tip (<c>&lt;base tip&gt;..&lt;remote tip&gt;</c>)
     /// through the compare API and requiring every one to carry any accepted
@@ -1168,7 +1193,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         var expected = request.ExpectedRemoteHeadSha?.Trim();
         string leaseBase;
-        if (string.IsNullOrWhiteSpace(expected))
+        if (IsKnownPushedSha(request.KnownWorkBranchShas, remoteSha))
+        {
+            // Bounded-history fallback: the remote tip equals a sha CodeyBox
+            // recorded pushing for this item. The latest record may have gone
+            // stale (a later push landed but its completion failed before the
+            // record was persisted), yet this tip is provably CodeyBox's own —
+            // no trailer proof needed, and none is possible when trailers are
+            // disabled by configuration.
+            leaseBase = remoteSha;
+            _log.LogInformation(
+                "Work branch {WorkBranch} remote tip {Sha} matches a recorded CodeyBox push; rewriting under lease",
+                SanitizeForLog(request.WorkBranch), leaseBase);
+        }
+        else if (string.IsNullOrWhiteSpace(expected))
         {
             // No recorded prior push to lease from: accept the remote tip as
             // CodeyBox's own history only when every commit exclusive of the
@@ -1189,9 +1227,31 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         else
         {
             if (!string.Equals(expected, remoteSha, StringComparison.OrdinalIgnoreCase))
-                throw await BuildLeaseMismatchWithActualAsync(
-                    request, expected, remoteSha, upstreamEnv, ct).ConfigureAwait(false);
-            leaseBase = remoteSha;
+            {
+                // The remote moved past the last recorded push. It is still
+                // CodeyBox's own history when every commit exclusive of the
+                // current base tip carries this instance's trailers (the same
+                // ownership proof the no-record path uses) — e.g. a re-drive
+                // push that landed but was never recorded. Only a tip with
+                // foreign or unverifiable commits refuses as third-party work.
+                var unowned = await TryVerifyRemoteTipOwnedAsync(request.BaseBranch, remoteSha, ct).ConfigureAwait(false);
+                if (unowned is not null && unowned.Count == 0)
+                {
+                    leaseBase = remoteSha;
+                    _log.LogInformation(
+                        "Work branch {WorkBranch} remote tip {Sha} moved past the last recorded push but every exclusive commit carries CodeyBox trailers; rewriting under lease",
+                        SanitizeForLog(request.WorkBranch), leaseBase);
+                }
+                else
+                {
+                    throw await BuildLeaseMismatchWithActualAsync(
+                        request, expected, remoteSha, upstreamEnv, ct).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                leaseBase = remoteSha;
+            }
         }
 
         try

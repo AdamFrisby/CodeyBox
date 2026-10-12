@@ -136,6 +136,91 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
     }
 
     [Fact]
+    public async Task StaleLease_KnownHistoryTip_ProceedsUnderLeaseWithoutTrailerProof()
+    {
+        // The remote tip is an older CodeyBox push still in the bounded
+        // history while the latest record points elsewhere (a later push
+        // landed without being persisted): the recorded tip is accepted as
+        // CodeyBox's own without consulting commit trailers — the only
+        // proof available when trailers are disabled by configuration.
+        var workBranch = NewBranch();
+        using var setup = await SetupAsync();
+        var oldHead = await CommitBranchFileAsync(setup.UpstreamBare, workBranch, "old.txt", "old\n", "old work");
+        var newHead = await RecomposeHostBranchOnFreshBaseAsync(setup.HostPath, workBranch);
+
+        var (owner, repo) = SplitGithubUrl(setup.GithubUrl);
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(Json(new // POST /pulls → fresh PR (AutoMerge off: no merge call)
+        {
+            number = 612,
+            html_url = $"https://github.com/{owner}/{repo}/pull/612",
+        }));
+        var remote = BuildRemote(setup.Host, handler, owner, repo, setup.Token, AutoMerge: false);
+
+        var staleExpected = new string('7', 40);
+        var outcome = await remote.CompleteAsync(
+            SampleRequest(setup.RepoId, workBranch, "squash", ExpectedRemoteHeadSha: staleExpected, knownWorkBranchShas: [oldHead]),
+            CancellationToken.None);
+
+        Assert.Equal(newHead, outcome.PushedWorkBranchSha);
+        Assert.Equal(612, outcome.PullRequestNumber);
+        var (_, tip, _) = await TestSupport.RunGit(setup.UpstreamBare, "rev-parse", workBranch);
+        Assert.Equal(newHead, tip.Trim());
+        Assert.Contains(setup.Shim.Invocations, i => i.Contains("--force-with-lease="));
+        // History short-circuits the trailer proof: no branch/compare call.
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.ToString().Contains("/compare/", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.ToString().Contains("/branches/", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task StaleLease_UnrecordedTrailerTip_ProceedsUnderLeaseAfterTrailerProof()
+    {
+        // Replay of the d9951691 incident shape: a re-drive push landed on
+        // the remote but was never recorded, so the latest record is stale
+        // and the remote tip is in no history — yet every exclusive commit
+        // carries CodeyBox trailers. The push must proceed under lease
+        // instead of misreporting CodeyBox's own push as third-party work.
+        var workBranch = NewBranch();
+        using var setup = await SetupAsync();
+        const string trailerMessage =
+            "codeybox: merge codeybox/work\n\n" +
+            "CodeyBox-WorkItem: 6f2c9a1e3b4d5f6a7b8c9d0e1f2a3b4c\n" +
+            "Co-Authored-By: CodeyBox <noreply@codeybox.invalid>";
+        var remoteTip = await CommitBranchFileAsync(setup.UpstreamBare, workBranch, "merge.txt", "merge\n", trailerMessage);
+        var newHead = await RecomposeHostBranchOnFreshBaseAsync(setup.HostPath, workBranch);
+
+        var (owner, repo) = SplitGithubUrl(setup.GithubUrl);
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(Json(new { commit = new { sha = new string('c', 40) } })); // GET /branches/main: current base tip
+        handler.Enqueue(Json(new // GET /compare/<base-tip>...remote: the stale tip is CodeyBox's own
+        {
+            total_commits = 1,
+            commits = new[] { new { sha = remoteTip, commit = new { message = trailerMessage } } },
+        }));
+        handler.Enqueue(Json(new // POST /pulls → fresh PR (AutoMerge off: no merge call)
+        {
+            number = 612,
+            html_url = $"https://github.com/{owner}/{repo}/pull/612",
+        }));
+        var remote = BuildRemote(setup.Host, handler, owner, repo, setup.Token, AutoMerge: false);
+
+        var staleExpected = new string('8', 40);
+        var outcome = await remote.CompleteAsync(
+            SampleRequest(setup.RepoId, workBranch, "squash", ExpectedRemoteHeadSha: staleExpected, knownWorkBranchShas: [staleExpected]),
+            CancellationToken.None);
+
+        Assert.Equal(newHead, outcome.PushedWorkBranchSha);
+        Assert.Equal(612, outcome.PullRequestNumber);
+        var (_, tip, _) = await TestSupport.RunGit(setup.UpstreamBare, "rev-parse", workBranch);
+        Assert.Equal(newHead, tip.Trim());
+        Assert.Contains(setup.Shim.Invocations, i => i.Contains("--force-with-lease="));
+        Assert.Contains(handler.Requests, r =>
+            r.RequestUri!.ToString().Contains("/compare/", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ThirdPartyPush_LeaseMismatchParksWithoutClobber()
     {
         var workBranch = NewBranch();
@@ -147,6 +232,15 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
 
         var (owner, repo) = SplitGithubUrl(setup.GithubUrl);
         var handler = new FakeHttpMessageHandler();
+        // A moved remote is trailer-proven before it is refused: the proof
+        // consults the branch + compare APIs and finds the unmarked
+        // third-party commit, so the lease still refuses.
+        handler.Enqueue(Json(new { commit = new { sha = new string('c', 40) } })); // GET /branches/main: current base tip
+        handler.Enqueue(Json(new // GET /compare/<base-tip>...remote: foreign commit, no trailers
+        {
+            total_commits = 1,
+            commits = new[] { new { sha = thirdPartyHead, commit = new { message = "third party change" } } },
+        }));
         var remote = BuildRemote(setup.Host, handler, owner, repo, setup.Token, AutoMerge: true);
 
         var ex = await Assert.ThrowsAsync<UpstreamLeaseMismatchException>(() =>
@@ -156,12 +250,16 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
 
         Assert.Equal(workBranch, ex.Branch);
         Assert.Equal(oldHead, ex.ExpectedSha);
-        // Nothing clobbered: the third-party tip is intact and no PR API call
-        // was ever issued (the push guard fired first).
+        // Nothing clobbered: the third-party tip is intact and no PR-mutating
+        // API call was ever issued (only the read-only ownership proof ran
+        // before the push guard fired).
         var (_, tip, _) = await TestSupport.RunGit(setup.UpstreamBare, "rev-parse", workBranch);
         Assert.Equal(thirdPartyHead, tip.Trim());
         Assert.NotEqual(newHead, tip.Trim());
-        Assert.Empty(handler.Requests);
+        Assert.Contains(handler.Requests, r =>
+            r.RequestUri!.ToString().Contains("/compare/", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.Method != HttpMethod.Get);
     }
 
     [Fact]
@@ -325,7 +423,7 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
     }
 
     private static UpstreamCompletionRequest SampleRequest(
-        string repoId, string workBranch, string mergeMethod, string? ExpectedRemoteHeadSha) => new()
+        string repoId, string workBranch, string mergeMethod, string? ExpectedRemoteHeadSha, IReadOnlyList<string>? knownWorkBranchShas = null) => new()
         {
             RepositoryId = repoId,
             WorkItemId = WorkItemId.New(),
@@ -337,6 +435,7 @@ public sealed class GitHubOwnedBranchPushTests : IDisposable
             Description = "desc",
             MergeMethod = mergeMethod,
             ExpectedRemoteHeadSha = ExpectedRemoteHeadSha,
+            KnownWorkBranchShas = knownWorkBranchShas,
         };
 
     private static GitHubUpstreamRemote BuildRemote(

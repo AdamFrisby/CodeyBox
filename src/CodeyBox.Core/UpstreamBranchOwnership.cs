@@ -37,10 +37,23 @@ public sealed class UpstreamBranchOwnershipOptions
     /// </summary>
     public int MaxCommitsToVerify { get; set; } = 100;
 
+    /// <summary>
+    /// Upper bound on the per-item pushed-sha history retained for the lease
+    /// fallback (see <see cref="WorkItemPushHistory"/>). A diverged remote
+    /// tip matching any retained entry is accepted as CodeyBox's own history
+    /// without consulting commit trailers — the only proof available when
+    /// trailers are disabled by configuration or the exclusive range is
+    /// unverifiable. Enforced at record time (oldest entries drop first), so
+    /// the stored history never grows without bound. Default 20; must be at
+    /// least 1 (smaller values behave as 1).
+    /// </summary>
+    public int MaxPushHistoryEntries { get; set; } = 20;
+
     public UpstreamBranchOwnershipOptions Clone() => new()
     {
         RequiredTrailerKeys = (string[])RequiredTrailerKeys.Clone(),
         MaxCommitsToVerify = MaxCommitsToVerify,
+        MaxPushHistoryEntries = MaxPushHistoryEntries,
     };
 }
 

@@ -10,6 +10,12 @@ public sealed class NoopUpstreamRemote : IUpstreamRemote
 {
     public string Name => "noop";
 
+    /// <summary>
+    /// The noop completion pushes nothing: there is no work-branch tip to
+    /// record, so push-history tracking stays empty for noop items.
+    /// </summary>
+    public bool PushesWorkBranch => false;
+
     public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
         => Task.FromResult(new UpstreamPushResult(true, null));
 

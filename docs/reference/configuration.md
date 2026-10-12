@@ -629,7 +629,8 @@ Proves a stale CodeyBox-owned branch tip is CodeyBox's own history when no prior
 ```json
 "UpstreamBranchOwnership": {
   "RequiredTrailerKeys": ["Co-Authored-By", "CodeyBox-WorkItem", "CodeyBox-Agent", "CodeyBox-Prompt-Revision", "CodeyBox-Mechanical-Fixer"],
-  "MaxCommitsToVerify": 100
+  "MaxCommitsToVerify": 100,
+  "MaxPushHistoryEntries": 20
 }
 ```
 
@@ -637,6 +638,7 @@ Proves a stale CodeyBox-owned branch tip is CodeyBox's own history when no prior
 |-----|---------|-------------|
 | `RequiredTrailerKeys` | `["Co-Authored-By", "CodeyBox-WorkItem", "CodeyBox-Agent", "CodeyBox-Prompt-Revision", "CodeyBox-Mechanical-Fixer"]` | Trailer keys accepted as ownership proof, any-of: each commit exclusive of the current base tip counts as CodeyBox's own history when its trailer block carries ANY one of these keys (matched exactly). Any-of because each writer stamps a different subset (agents write `CodeyBox-Prompt-Revision` + `Co-Authored-By`; the orchestrator adds `CodeyBox-WorkItem` + `CodeyBox-Agent` / `CodeyBox-Mechanical-Fixer`). `Co-Authored-By` additionally requires its value to equal the canonical CodeyBox identity exactly. Keys from a family disabled by `CodeyBox:CommitAttribution` cannot prove ownership; when attribution disables every family (or the list is empty), nothing proves ownership and the re-drive requires `{"confirmOwnership": true}`. A refusal names the offending commit SHAs. |
 | `MaxCommitsToVerify` | `100` | Upper bound on the exclusive commits examined, enforced before buffering. A larger exclusive set is unverifiable and refused unless the operator passes `{"confirmOwnership": true}` on the re-drive. |
+| `MaxPushHistoryEntries` | `20` | Upper bound on the per-item history of pushed work-branch tips. Every successful push is recorded (latest sha plus this bounded history); a diverged remote tip matching ANY retained entry is accepted as CodeyBox's own history without consulting commit trailers — the only proof available when trailers are disabled or the exclusive range is unverifiable. Oldest entries drop first; values below 1 behave as 1. |
 
 ## `WorkerPoolHealthWatchdog`
 

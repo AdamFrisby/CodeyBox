@@ -1,3 +1,4 @@
+using System.Net.Http;
 using CodeyBox.Core;
 using CodeyBox.Git;
 using CodeyBox.Orchestrator;
@@ -167,6 +168,155 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
         Assert.Equal(headSha, stored.LastPushedWorkBranchSha);
     }
 
+    [Fact]
+    public async Task UpstreamPush_Success_RecordsPushedShaAndHistory()
+    {
+        // Every successful work-branch push is recorded immediately: the
+        // item's last-pushed sha becomes the pushed tip and the bounded
+        // history carries it, so the next attempt proves the remote tip is
+        // CodeyBox's own.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var pushedSha = new string('a', 40);
+        var remote = new RecordingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            OutcomeForCall = _ => new UpstreamCompletionOutcome
+            {
+                BranchPushed = true,
+                PushedWorkBranchSha = pushedSha,
+                PullRequestNumber = 7,
+                PullRequestUrl = "https://example.invalid/o/r/pull/7",
+            },
+        };
+        var factory = new RecordingRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "recording-upstream",
+                AutoMerge = false,
+                MergeMethod = "squash",
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge]);
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("recorded.txt", "recorded\n"));
+
+        var item = NewItem("codeybox/record-push-test");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = (await tp.Store.GetAsync(item.Id))!;
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Equal(1, remote.CompleteCalls);
+        Assert.Equal(pushedSha, final.LastPushedWorkBranchSha);
+        Assert.Equal([pushedSha], final.PushedWorkBranchShaHistory);
+        Assert.Null(remote.Requests[0].ExpectedRemoteHeadSha);
+    }
+
+    [Fact]
+    public async Task UpstreamPush_TransientFailure_RetriesWithRefreshedLeaseAndRecordsPush()
+    {
+        // A completion that fails AFTER its push landed must not lose the
+        // push: the tip is confirmed (remote tip equals the attempted local
+        // tip) and recorded before classification, and the retry carries it
+        // as the lease base instead of re-hitting a stale record.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var secondPushSha = new string('b', 40);
+        var remote = new RecordingUpstreamRemote
+        {
+            SeedRepoPath = seed,
+            ThrowForCall = index => index == 0
+                ? new HttpRequestException("connection reset after push")
+                : null,
+            OutcomeForCall = _ => new UpstreamCompletionOutcome
+            {
+                BranchPushed = true,
+                PushedWorkBranchSha = secondPushSha,
+                PullRequestNumber = 8,
+                PullRequestUrl = "https://example.invalid/o/r/pull/8",
+            },
+        };
+        var factory = new RecordingRemoteFactory(remote);
+
+        using var tp = TestSupport.BuildPipeline(
+            _workspace, seed,
+            upstream: new ProjectUpstream
+            {
+                Kind = "recording-upstream",
+                AutoMerge = false,
+                MergeMethod = "squash",
+            },
+            upstreamFactory: factory,
+            mergeStrategy: [MergeStrategy.RealMerge],
+            pipelineOptions: new PipelineOptions
+            {
+                SandboxImageReference = "ignored",
+                UpstreamPushMaxAttempts = 2,
+                UpstreamPushBackoff = TimeSpan.Zero,
+            });
+        remote.BareRepoRoot = tp.GitRoot;
+        tp.Agent.WorkPlan.Enqueue(new FileWrite("retry-record.txt", "retry\n"));
+
+        var item = NewItem("codeybox/retry-record-test");
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = (await tp.Store.GetAsync(item.Id))!;
+        Assert.Equal(WorkItemState.Done, final.State);
+        Assert.Equal(2, remote.CompleteCalls);
+        // The retry succeeded with a new tip: it becomes the latest record,
+        // while the confirmed first-attempt tip stays in the history.
+        Assert.Equal(secondPushSha, final.LastPushedWorkBranchSha);
+        Assert.Equal(2, final.PushedWorkBranchShaHistory.Count);
+        Assert.Equal(secondPushSha, final.PushedWorkBranchShaHistory[1]);
+        // The first attempt carried no lease base; the retry carried the
+        // confirmed tip recorded from the failed attempt.
+        Assert.Null(remote.Requests[0].ExpectedRemoteHeadSha);
+        Assert.Equal(final.PushedWorkBranchShaHistory[0], remote.Requests[1].ExpectedRemoteHeadSha);
+        Assert.Equal([final.PushedWorkBranchShaHistory[0]], remote.Requests[1].KnownWorkBranchShas);
+    }
+
+    [Fact]
+    public async Task RedriveAsync_WithOpenPr_AppendsLeaseBaseToPushHistory()
+    {
+        // The operator-authorized tip joins the bounded push history (not
+        // just the latest record): the retried run's push receipt extends
+        // this history, and the lease fallback accepts any entry — so the
+        // record survives even if a later push lands without being
+        // persisted.
+        using var fixture = CreateRedriveFixture();
+        var oldPush = new string('a', 40);
+        var item = WorkItemPushHistory.RecordPush(
+            NewItem("codeybox/history-item", fixture.Project.Id)
+                .With(WorkItemState.Failed, "refusing to overwrite", failureKind: WorkItemFailureKinds.UpstreamBlocked),
+            oldPush);
+        item = item with { MergedPrNumber = 612 };
+        await fixture.Store.CreateAsync(item);
+        var headSha = new string('d', 40);
+        fixture.Remote.OpenPullRequests.Add(new UpstreamPullRequest
+        {
+            Number = 612,
+            Url = "https://github.com/o/r/pull/612",
+            HeadBranch = "codeybox/history-item",
+            HeadSha = headSha,
+            BaseBranch = "main",
+            HasMergeConflict = false,
+        });
+        fixture.Remote.BranchCommitMessages =
+        [
+            "agent work\n\nCodeyBox-WorkItem: x\nCo-Authored-By: CodeyBox <noreply@codeybox.invalid>",
+        ];
+
+        var result = await fixture.Redrive.RedriveAsync(item.Id, CancellationToken.None);
+
+        Assert.False(result.Success);
+        var stored = (await fixture.Store.GetAsync(item.Id))!;
+        Assert.Equal(headSha, stored.LastPushedWorkBranchSha);
+        Assert.Equal([oldPush, headSha], stored.PushedWorkBranchShaHistory);
+    }
+
     private static WorkItem NewItem(string branch, ProjectId? projectId = null) => new()
     {
         Id = WorkItemId.New(),
@@ -301,6 +451,55 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
     }
 
     private sealed class LeaseMismatchRemoteFactory(LeaseMismatchUpstreamRemote remote) : IUpstreamRemoteFactory
+    {
+        public IUpstreamRemote Create(Project project) => remote;
+    }
+
+    private sealed class RecordingUpstreamRemote : IUpstreamRemote
+    {
+        public required string SeedRepoPath { get; init; }
+        public string? BareRepoRoot { get; set; }
+        public List<UpstreamCompletionRequest> Requests { get; } = new();
+        public int CompleteCalls { get; private set; }
+        public string? LastRepositoryId { get; private set; }
+        public string Name => "recording-upstream";
+
+        public Func<int, UpstreamCompletionOutcome>? OutcomeForCall { get; set; }
+        public Func<int, Exception?>? ThrowForCall { get; set; }
+
+        public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
+            => Task.FromResult(new UpstreamPushResult(true, null));
+
+        public Task<UpstreamCompletionOutcome> CompleteAsync(UpstreamCompletionRequest request, CancellationToken ct = default)
+        {
+            Requests.Add(request);
+            LastRepositoryId = request.RepositoryId;
+            var index = CompleteCalls;
+            CompleteCalls++;
+            if (ThrowForCall?.Invoke(index) is { } ex)
+                throw ex;
+            return Task.FromResult(OutcomeForCall?.Invoke(index)
+                ?? new UpstreamCompletionOutcome { BranchPushed = true });
+        }
+
+        public Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)
+            => Task.FromResult(true);
+
+        public async Task<string?> GetBranchHeadShaAsync(string branch, CancellationToken ct = default)
+        {
+            // Reads the host bare repo — the same repo the pipeline resolves
+            // the local tip from — so a failure after a real push observes
+            // remote == local and the tip is confirmed, while a diverged
+            // remote would observe a mismatch and record nothing.
+            if (BareRepoRoot is null || LastRepositoryId is null)
+                return null;
+            var barePath = Path.Combine(BareRepoRoot, LastRepositoryId + ".git");
+            var (_, sha, _) = await TestSupport.RunGit(barePath, "rev-parse", "--verify", $"{branch}^{{commit}}");
+            return sha.Trim();
+        }
+    }
+
+    private sealed class RecordingRemoteFactory(RecordingUpstreamRemote remote) : IUpstreamRemoteFactory
     {
         public IUpstreamRemote Create(Project project) => remote;
     }

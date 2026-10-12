@@ -221,6 +221,10 @@ public sealed class SqliteWorkItemStore :
             // tip is its own previous push before rewriting the owned branch
             // under --force-with-lease.
             RunMigration("ALTER TABLE work_items ADD COLUMN last_pushed_work_branch_sha TEXT;");
+            // Additive migration: bounded history of work-branch tips CodeyBox
+            // pushed, so the lease guard can accept any recorded tip (not just
+            // the latest) before treating a moved remote as third-party work.
+            RunMigration("ALTER TABLE work_items ADD COLUMN pushed_work_branch_sha_history TEXT;");
             // Additive migration: minimum quality-score floor for routing.
             // Default 95 preserves existing semantics (frontier-adjacent fallback allowed).
             RunMigration("ALTER TABLE work_items ADD COLUMN min_model_score INTEGER NOT NULL DEFAULT 95;");
@@ -1451,7 +1455,7 @@ public sealed class SqliteWorkItemStore :
                         work_timeout_ticks, work_timeout_override_ticks, merge_timeout_ticks, push_upstream, state, created_at, updated_at,
                         last_error, upstream_push_attempts, depends_on_json, agent_class_id, queue_position,
                         stuck_retries, started_at, external_id, replay_of_work_item_id, merge_sha,
-                        local_squash_sha, merged_pr_number, merged_pr_url, last_pushed_work_branch_sha,
+                        local_squash_sha, merged_pr_number, merged_pr_url, last_pushed_work_branch_sha, pushed_work_branch_sha_history,
                         min_model_score, cancellation_reason, recovery_attempts, recovery_attempt_source_state, consecutive_infra_recoveries, release_id, preempted_at, preempt_checkpoint,
                         agent_turn_resume_checkpoint_json, agent_turn_recovery_lease_json,
                         suspended_vm_name, suspended_at, agent_log_path,
@@ -1472,7 +1476,7 @@ public sealed class SqliteWorkItemStore :
                         initiator_json)
                     VALUES ($id, $project_id, $title, $prompt, $base, $work, $agent, $agent_instance_id, $wt, $wto, $mt, $pu, $state, $ca, $ua, $err, $att, $deps, $class_id, $qpos,
                         $sretries, $started_at, $external_id, $replay_of, $merge_sha,
-                        $local_squash_sha, $merged_pr_number, $merged_pr_url, $last_pushed_work_branch_sha,
+                        $local_squash_sha, $merged_pr_number, $merged_pr_url, $last_pushed_work_branch_sha, $pushed_work_branch_sha_history,
                         $min_model_score, $cancellation_reason, $recovery_attempts, $recovery_attempt_source_state, $consecutive_infra_recoveries, $release_id, $preempted_at, $preempt_checkpoint,
                         $agent_turn_resume_checkpoint, $agent_turn_recovery_lease,
                         $suspended_vm_name, $suspended_at, $agent_log_path,
@@ -1802,6 +1806,7 @@ public sealed class SqliteWorkItemStore :
                     merged_pr_number = $merged_pr_number,
                     merged_pr_url = $merged_pr_url,
                     last_pushed_work_branch_sha = $last_pushed_work_branch_sha,
+                    pushed_work_branch_sha_history = $pushed_work_branch_sha_history,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -1909,6 +1914,7 @@ public sealed class SqliteWorkItemStore :
                     merged_pr_number = $merged_pr_number,
                     merged_pr_url = $merged_pr_url,
                     last_pushed_work_branch_sha = $last_pushed_work_branch_sha,
+                    pushed_work_branch_sha_history = $pushed_work_branch_sha_history,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -2018,6 +2024,7 @@ public sealed class SqliteWorkItemStore :
                     merged_pr_number = $merged_pr_number,
                     merged_pr_url = $merged_pr_url,
                     last_pushed_work_branch_sha = $last_pushed_work_branch_sha,
+                    pushed_work_branch_sha_history = $pushed_work_branch_sha_history,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -2497,6 +2504,7 @@ public sealed class SqliteWorkItemStore :
                     merged_pr_number = $merged_pr_number,
                     merged_pr_url = $merged_pr_url,
                     last_pushed_work_branch_sha = $last_pushed_work_branch_sha,
+                    pushed_work_branch_sha_history = $pushed_work_branch_sha_history,
                     min_model_score = $min_model_score,
                     cancellation_reason = $cancellation_reason,
                     recovery_attempts = $recovery_attempts,
@@ -2941,6 +2949,7 @@ public sealed class SqliteWorkItemStore :
                         merged_pr_number = $merged_pr_number,
                         merged_pr_url = $merged_pr_url,
                     last_pushed_work_branch_sha = $last_pushed_work_branch_sha,
+                    pushed_work_branch_sha_history = $pushed_work_branch_sha_history,
                         min_model_score = $min_model_score,
                         cancellation_reason = $cancellation_reason,
                         recovery_attempts = $recovery_attempts,
@@ -4609,6 +4618,8 @@ public sealed class SqliteWorkItemStore :
             item.MergedPrNumber.HasValue ? (object)item.MergedPrNumber.Value : DBNull.Value);
         cmd.Parameters.AddWithValue("$merged_pr_url", (object?)item.MergedPrUrl ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$last_pushed_work_branch_sha", (object?)item.LastPushedWorkBranchSha ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$pushed_work_branch_sha_history",
+            JsonSerializer.Serialize(item.PushedWorkBranchShaHistory));
         cmd.Parameters.AddWithValue("$min_model_score", item.MinModelScore);
         cmd.Parameters.AddWithValue("$cancellation_reason",
             item.CancellationReason.HasValue ? (object)item.CancellationReason.Value.ToString() : DBNull.Value);
@@ -4765,6 +4776,7 @@ public sealed class SqliteWorkItemStore :
         MergedPrNumber = ReadNullableInt32(r, "merged_pr_number"),
         MergedPrUrl = ReadNullableString(r, "merged_pr_url"),
         LastPushedWorkBranchSha = ReadNullableString(r, "last_pushed_work_branch_sha"),
+        PushedWorkBranchShaHistory = ReadPushHistory(r),
         MinModelScore = ReadInt32OrDefault(r, "min_model_score", defaultValue: 95),
         CancellationReason = ReadCancellationReason(r),
         RecoveryAttempts = ReadInt32OrDefault(r, "recovery_attempts", defaultValue: 0),
@@ -5044,6 +5056,21 @@ public sealed class SqliteWorkItemStore :
     {
         var ord = r.GetOrdinal(column);
         return r.IsDBNull(ord) ? null : r.GetString(ord);
+    }
+
+    /// <summary>
+    /// Reads the bounded pushed-sha history. Legacy rows carry NULL and
+    /// corrupt JSON degrades to empty — either way the lease guard falls
+    /// back to the latest sha and the trailer proof instead of failing the
+    /// read. The column itself always exists: the additive migration adds it
+    /// when the store opens.
+    /// </summary>
+    private static IReadOnlyList<string> ReadPushHistory(SqliteDataReader r)
+    {
+        var raw = ReadNullableString(r, "pushed_work_branch_sha_history");
+        if (string.IsNullOrWhiteSpace(raw))
+            return [];
+        return DeserializeStringList(raw);
     }
 
     private static AgentKind? ReadNullableAgentKind(SqliteDataReader r, string column)
