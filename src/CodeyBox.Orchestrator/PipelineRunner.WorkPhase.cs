@@ -329,8 +329,12 @@ public sealed partial class PipelineRunner
                 preemptCheckpoint = item.PreemptCheckpoint!;
                 checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
-                if (await IsStaleAgentTurnCheckpointAsync(
-                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, resumeTipSha, resumeBaseSha, ct).ConfigureAwait(false))
+                var staleCheckpoint = await IsStaleAgentTurnCheckpointAsync(
+                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, resumeTipSha, resumeBaseSha, ct).ConfigureAwait(false);
+                _log.LogDebug(
+                    "Durable agent-turn checkpoint staleness for work item {Id}: stale={Stale} (work tip {WorkTip}, base tip {BaseTip}, base tip before refresh {BaseTipBeforeRefresh}, checkpoint ref {CheckpointRef})",
+                    item.Id, staleCheckpoint, resumeTipSha, resumeBaseSha, preRefreshBaseTipSha, preemptCheckpoint);
+                if (staleCheckpoint)
                 {
                     // The base moved under the checkpoint after it was
                     // written (a pickup-time rebase onto a fresh base or a

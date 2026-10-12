@@ -116,8 +116,11 @@ failure and does not count toward terminal failures. A same-base advance of
 the work branch (an outside writer landing commits without moving the base)
 is not stale: the base ref is unchanged across the refresh, so the checkpoint
 still applies and resumes against the fork-point baseline. A checkpoint backed by a
-retained-sandbox recovery lease is never discarded this way: provider-owned
-state stays authoritative and the resume is refused explicitly.
+retained-sandbox recovery lease is never silently dropped: the stale Git
+preempt ref is cleared so the lease stays the single authoritative backing,
+the lease and its checkpoint metadata are preserved, and the resume is
+refused explicitly with the retry/cancel path instead of running a fresh
+turn over provider-owned state.
 
 Durable re-dispatches are bounded by
 `CodeyBox:PipelineTuning:AgentSessionResumeMaxAttempts`. The attempt is claimed
