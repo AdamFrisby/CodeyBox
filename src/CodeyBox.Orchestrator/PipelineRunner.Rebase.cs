@@ -1462,4 +1462,25 @@ public sealed partial class PipelineRunner
         return commitSha.ToLowerInvariant();
     }
 
+    /// <summary>
+    /// Resolves the current base-branch tip. Used alongside the work-branch
+    /// tip to decide whether a durable agent-turn checkpoint is stale: a
+    /// checkpoint still reachable from the base (a plain branch advance) is
+    /// resumed, while one reachable from neither tip (a rebase onto a fresh
+    /// base or a restart-recovery recomposition) is discarded for a fresh turn.
+    /// </summary>
+    private async Task<string> ResolveAgentTurnBaseTipAsync(
+        string repoId,
+        string baseBranch,
+        CancellationToken ct)
+    {
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
+        var commitSha = await _gitHost.ResolveCommitAsync(
+            repoId,
+            $"refs/heads/{baseBranch}",
+            ct);
+        Validation.ValidateCommitSha(commitSha, nameof(commitSha));
+        return commitSha.ToLowerInvariant();
+    }
+
 }

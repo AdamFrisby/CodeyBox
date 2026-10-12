@@ -102,7 +102,13 @@ a no-op resume uses the normal initial-work/rework no-diff failure path.
 When the base moves under the checkpoint after it was written — a
 pickup-time rebase onto a fresh base or a restart-recovery recomposition — the
 base ref changes across the pickup's upstream refresh and the checkpoint tree
-no longer applies, but that says nothing about the work. The turn preparation
+no longer applies, but that says nothing about the work. A checkpoint that
+descends from neither the current branch tip nor the current base tip is
+stale even when the base ref is unchanged across the refresh (the branch was
+recomposed at an already-staged fresh base). When no pre-refresh base
+snapshot exists, the same reachability test alone decides; a
+checkpoint still reachable from the base tip (a plain branch advance past the
+interrupted turn's base) is resumed, not discarded. The turn preparation
 discards the stale checkpoint (logged as `Discarding durable agent-turn resume
 checkpoint`, the same record as a phase-boundary discard) and runs a normal
 fresh turn from the current branch tip with the branch preserved. This is not a
