@@ -4145,8 +4145,22 @@ builder.Services.AddSingleton<BaseBrokenMonitorService>(sp => new BaseBrokenMoni
     sp.GetRequiredService<IWorkItemStore>(),
     sp.GetRequiredService<PipelineTuningSnapshot>(),
     sp.GetService<TimeProvider>(),
-    sp.GetRequiredService<ILogger<BaseBrokenMonitorService>>()));
+    sp.GetRequiredService<ILogger<BaseBrokenMonitorService>>(),
+    sp.GetService<IUpstreamRemoteFactory>()));
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BaseBrokenMonitorService>());
+// Post-merge CI watch: polls the forge CI status of landed merge commits
+// and records a test-kind base-broken condition (plus the top-priority fix
+// item) the moment a red main is detected. Wired into the pipeline for
+// scheduling; runs as a hosted service for polling.
+builder.Services.AddSingleton<PostMergeCiWatchService>(sp => new PostMergeCiWatchService(
+    sp.GetRequiredService<IProjectRepository>(),
+    sp.GetRequiredService<IUpstreamRemoteFactory>(),
+    sp.GetRequiredService<BaseBrokenConditionTracker>(),
+    sp.GetRequiredService<IWorkItemStore>(),
+    sp.GetRequiredService<PipelineTuningSnapshot>(),
+    sp.GetService<TimeProvider>(),
+    sp.GetRequiredService<ILogger<PostMergeCiWatchService>>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PostMergeCiWatchService>());
 
 builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     sp.GetRequiredService<ISandboxProvider>(),
@@ -4260,6 +4274,7 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     providerTransientCorrelation: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
     baseBuildVerifier: sp.GetRequiredService<BaseBuildVerifier>(),
     baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>(),
+    postMergeCiWatch: sp.GetService<PostMergeCiWatchService>(),
     attributionPolicy: sp.GetRequiredService<CodeyBox.Core.CommitAttributionPolicy>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test

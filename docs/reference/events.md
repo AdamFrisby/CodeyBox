@@ -100,8 +100,8 @@ subscribe to.
 | `project.budget_warning` | 1.0 | Project crossed the cost warning threshold. |
 | `project.budget_exceeded` | 1.0 | Project crossed the cost hard cap. |
 | `project.budget_recovered` | 1.0 | Project spend dropped below the warning threshold. |
-| `project.base_broken_detected` | 1.7 | The project's base branch tip reproduces the required-build failure; build-dependent dispatch is held. Details include `projectId`, `baseBranch`, `baseSha`. |
-| `project.base_broken_cleared` | 1.7 | The base tip builds again; held items resume. |
+| `project.base_broken_detected` | 1.7 | The project's base branch tip is broken (build-kind: reproduces the required-build failure; test-kind: builds but its tests fail — forge CI red for the merge commit, or audit test failures reproducing on the base). Build-dependent dispatch is held. Details include `projectId`, `baseBranch`, `baseSha`. |
+| `project.base_broken_cleared` | 1.7 | The base is healthy again (build-kind: tip builds; test-kind: tip CI passes); held items resume. |
 | `work_item.planning` | 1.5 | Planning-only agent turn started. |
 | `work_item.plan_review` | 1.5 | Planning artifact entered review. |
 | `work_item.plan_approved` | 1.5 | Planning artifact was approved; implementation may start. |
@@ -126,7 +126,7 @@ subscribe to.
 | `work_item.waiting_for_quota_reset` | 1.0 | Work item parked until quota reset window. |
 | `work_item.waiting_for_agent_resume` | 1.3 | Work item parked because its only eligible agent is paused. |
 | `work_item.waiting_for_transient_retry` | 1.4 | Work item parked until the transient transport/network retry backoff expires. |
-| `work_item.base_broken_parked` | 1.7 | A required-build failure was attributed to the broken base branch rather than the item's diff; the item returned to a resumable state (branch preserved, no failure charge). Details include `baseBranch`, `baseSha`, `resumeState`, `fixWorkItemId`, `phase`. |
+| `work_item.base_broken_parked` | 1.7 | A required-build failure (or test-only audit failures) was attributed to the broken base branch rather than the item's diff; the item returned to a resumable state (branch preserved, no failure charge). Details include `baseBranch`, `baseSha`, `failureKind`, `resumeState`, `fixWorkItemId`, `phase`. |
 | `work_item.agent_stuck` | 1.0 | Stuck-agent probe killed a hung agent. |
 | `work_item.auto_retry` | 1.0 | Quota/transient auto-retry re-queued a failed item. |
 | `work_item.agent_restore_requeued` | 1.5 | Agent-restore infra sweep re-queued a failed item. |

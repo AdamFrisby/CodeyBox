@@ -622,6 +622,14 @@ public sealed partial class PipelineRunner
                     }, ct);
                 }
                 await Transition(item, WorkItemState.Done, ct, project);
+                // The forge minted the authoritative merge commit (or the
+                // local merge stands for non-PR forges): watch its CI so a
+                // red main is detected, held, and repaired immediately.
+                SchedulePostMergeCiWatch(
+                    project, baseBranch,
+                    completed.MergedSha ?? mergeSha,
+                    item.Id,
+                    suspects: [completed.MergedSha, mergeSha]);
             }
         }
         catch (OperationCanceledException oce) when (oce is not PhaseCancellationException)

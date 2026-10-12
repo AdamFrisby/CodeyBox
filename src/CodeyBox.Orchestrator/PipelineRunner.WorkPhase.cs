@@ -1629,7 +1629,9 @@ public sealed partial class PipelineRunner
             // checkpoint-conversion failure: it must reach the outer
             // BaseBuildBrokenException catch unwrapped so the item parks
             // (branch preserved) instead of failing as infrastructure.
-            && ex is not BaseBuildBrokenException)
+            // Test-red parks identically.
+            && ex is not BaseBuildBrokenException
+            && ex is not BaseTestBrokenException)
         {
             throw new AgentInfrastructureFailureException(
                 runner.Kind,

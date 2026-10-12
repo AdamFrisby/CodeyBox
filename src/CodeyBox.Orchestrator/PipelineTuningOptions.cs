@@ -520,6 +520,38 @@ public sealed class PipelineTuningOptions
     /// </summary>
     public TimeSpan BaseBrokenRecheckInterval { get; set; } = TimeSpan.FromMinutes(2);
 
+    /// <summary>
+    /// Master switch for post-merge CI red detection. When true (default),
+    /// every landed merge schedules a bounded watch of the merge commit's
+    /// forge CI status; a red tip records a test-kind base-broken condition
+    /// (holding build-dependent dispatch) and files one top-priority fix
+    /// item naming the failing checks and the suspect commits. Hot-reloaded
+    /// with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public bool PostMergeCiWatchEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Interval between post-merge CI status polls. Default 1 minute; must
+    /// be positive. Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan PostMergeCiWatchInterval { get; set; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Maximum polls per watched merge commit before the watch is dropped
+    /// (CI finished, went green, or never reported). Bounds the per-merge
+    /// forge traffic. Must be positive. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>.
+    /// </summary>
+    public int PostMergeCiWatchMaxAttempts { get; set; } = 30;
+
+    /// <summary>
+    /// Maximum concurrently watched merge commits. A schedule past the cap
+    /// drops the oldest watch (newest merge wins — the tip that matters).
+    /// Bounds memory and forge traffic under merge bursts. Must be
+    /// positive. Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public int PostMergeCiWatchMaxWatches { get; set; } = 64;
+
     public void Validate()
     {
         _ = PlanReviewIterationLimit.Create(MaxPlanReviewIterations);
@@ -673,6 +705,25 @@ public sealed class PipelineTuningOptions
                 nameof(BaseBrokenRecheckInterval),
                 BaseBrokenRecheckInterval,
                 "BaseBrokenRecheckInterval must be a positive TimeSpan");
+        }
+        if (PostMergeCiWatchInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(PostMergeCiWatchInterval),
+                PostMergeCiWatchInterval,
+                "PostMergeCiWatchInterval must be a positive TimeSpan");
+        }
+        if (PostMergeCiWatchMaxAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(PostMergeCiWatchMaxAttempts),
+                "PostMergeCiWatchMaxAttempts must be >= 1");
+        }
+        if (PostMergeCiWatchMaxWatches < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(PostMergeCiWatchMaxWatches),
+                "PostMergeCiWatchMaxWatches must be >= 1");
         }
         new Core.SuggestionDedupePolicy
         {

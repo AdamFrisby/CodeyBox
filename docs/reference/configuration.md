@@ -588,7 +588,11 @@ Hot-reloadable retry and recovery bounds used by pipeline execution.
 | `SuggestionDedupeMaxRecordedSources` | `25` | Cap on the source work-item id list recorded on a merged suggestion. Once full, repeats still bump the occurrence count but stop appending ids. Must be ≥ 1. Hot-reloadable. |
 | `BaseBrokenDetectionEnabled` | `true` | When a required-build failure's compiler errors point at files outside the item's diff, the orchestrator sandbox-builds the base tip (verdict cached per base SHA). A reproducing failure parks the item without a failure charge and records a project-level base-broken condition that holds build-dependent dispatch; `false` keeps every required-build failure item-attributed. Hot-reloadable. |
 | `BaseBrokenFixItemPriority` | `1000` | Dispatch priority for the auto-filed base-fix work item (one per broken base SHA). Must be within [-1000, 1000]. Hot-reloadable. |
-| `BaseBrokenRecheckInterval` | `00:02:00` (2 min) | Interval between base-tip re-checks for active base-broken conditions: the same SHA skips the rebuild, a moved tip is built once and the condition clears when it passes. Must be positive. Hot-reloadable. |
+| `BaseBrokenRecheckInterval` | `00:02:00` (2 min) | Interval between base-tip re-checks for active base-broken conditions: the same SHA skips the rebuild, a moved tip is built once and the condition clears when it passes. For test-kind conditions a passing build alone never clears — the new tip's forge CI must also pass. Must be positive. Hot-reloadable. |
+| `PostMergeCiWatchEnabled` | `true` | After every landed merge, watch the merge commit's forge CI status: a red tip records a test-kind base-broken condition (holding build-dependent dispatch) and files one top-priority fix item naming the failing checks and the suspect commits. Hot-reloadable. |
+| `PostMergeCiWatchInterval` | `00:01:00` (1 min) | Interval between post-merge CI status polls. Must be positive. Hot-reloadable. |
+| `PostMergeCiWatchMaxAttempts` | `30` | Maximum polls per watched merge commit before the watch is dropped (CI finished, went green, or never reported). Must be ≥ 1. Hot-reloadable. |
+| `PostMergeCiWatchMaxWatches` | `64` | Maximum concurrently watched merge commits; past the cap the oldest watch is evicted (newest merge wins). Must be ≥ 1. Hot-reloadable. |
 
 Durable agent-turn scratchpad archives have a non-configurable 32 MiB safety
 cap. They are stored as content-verified, host-private SQLite BLOBs and are

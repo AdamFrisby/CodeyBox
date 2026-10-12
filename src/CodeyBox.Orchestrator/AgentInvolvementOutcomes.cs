@@ -40,7 +40,10 @@ internal static class AgentInvolvementOutcomes
         NoActionRequiredException => Success,
         // The build failure traces to the base branch, not to anything the
         // agent produced — the attempt is infrastructure, not agent fault.
+        // A test-red base parks the same way (the tests fail on the base
+        // tip, not because of the diff).
         BaseBuildBrokenException => FailureInfrastructure,
+        BaseTestBrokenException => FailureInfrastructure,
         OperationCanceledException => FailureCancelled,
         _ => FailureAgent,
     };

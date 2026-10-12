@@ -1390,10 +1390,12 @@ public static class AuditLog
             .Information("Project {ProjectId} queue resumed", projectId.Value);
 
     /// <summary>
-    /// A required-build failure was attributed to the project's base branch
-    /// (the base tip reproduces it with no contributing error file inside the
-    /// item diff). While the condition is active the dispatcher holds
-    /// build-dependent phases for the project.
+    /// A failure was attributed to the project's base branch: a
+    /// required-build failure the base tip reproduces with no contributing
+    /// error file inside the item diff, or a test-red tip (forge CI red for
+    /// the merge commit, or audit test failures reproducing on the base).
+    /// While the condition is active the dispatcher holds build-dependent
+    /// phases for the project.
     /// </summary>
     public static void BaseBrokenDetected(
         ProjectId projectId,
@@ -1402,7 +1404,7 @@ public static class AuditLog
         string? errorSummary = null) =>
         Audit("project.base_broken_detected")
             .Warning(
-                "Project {ProjectId} base branch {BaseBranch} tip {BaseSha} fails the required build; build-dependent phases held: {ErrorSummary}",
+                "Project {ProjectId} base branch {BaseBranch} tip {BaseSha} is broken (build or test red); build-dependent phases held: {ErrorSummary}",
                 projectId.Value.Replace("\r", "").Replace("\n", ""),
                 AuditSingleLine(baseBranch, 128),
                 AuditSingleLine(baseSha, 64),
