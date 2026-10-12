@@ -52,7 +52,12 @@ public sealed partial class PipelineRunner
         // timings, streams, supervision, and prompt preprocessing instead of
         // "rework". Null keeps the legacy isInitial-derived labels.
         string? phaseLabelOverride = null,
-        AgentPromptPhase? promptPhaseOverride = null)
+        AgentPromptPhase? promptPhaseOverride = null,
+        // Base-branch tip snapshotted before the pickup's upstream refresh.
+        // Compared against the base tip at turn-preparation time: any move
+        // means the checkpoint's base was superseded and the checkpoint is
+        // stale. Null skips the comparison (fresh pickup without a resume).
+        string? preRefreshBaseTipSha = null)
     {
         item = await RefreshAgentTurnResumeCheckpointAsync(item, isInitial, iteration, ct);
         var resumingGitCheckpoint = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
@@ -320,20 +325,23 @@ public sealed partial class PipelineRunner
                 checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
                 if (await IsStaleAgentTurnCheckpointAsync(
-                        sandbox, preemptCheckpoint, checkpointBranch, resumePreTurnCommitSha, ct).ConfigureAwait(false))
+                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, ct).ConfigureAwait(false))
                 {
-                    // The work branch legitimately moved after the checkpoint
-                    // was written (a pickup-time rebase onto a fresh base or a
-                    // restart-recovery recomposition). The checkpoint tree is
+                    // The base moved under the checkpoint after it was
+                    // written (a pickup-time rebase onto a fresh base or a
+                    // restart-recovery recomposition moved the base ref across
+                    // this pickup's upstream refresh). The checkpoint tree is
                     // unusable, but that says nothing about the work: discard
                     // the bookkeeping and run a normal fresh turn from the
                     // current branch tip, preserving the branch — never a
-                    // terminal failure. A retained-sandbox lease still refuses
-                    // inside the discard: provider-owned state is never
-                    // silently dropped.
+                    // terminal failure. A same-base branch advance leaves the
+                    // base untouched, so it still resumes below against the
+                    // fork-point baseline. A retained-sandbox lease still
+                    // refuses inside the discard: provider-owned state is
+                    // never silently dropped.
                     item = await DiscardStaleAgentTurnCheckpointAsync(
                         item,
-                        "durable agent-turn checkpoint no longer descends from its pre-turn work-branch commit",
+                        "durable agent-turn checkpoint base moved across the pickup upstream refresh",
                         runner.Kind,
                         agentPhase,
                         ct).ConfigureAwait(false);
