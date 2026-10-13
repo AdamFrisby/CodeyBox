@@ -316,6 +316,18 @@ public sealed partial class PipelineRunner : IPipelineRunner
         {
             await using var sandboxContext = new WorkSandboxContext(_sandboxes, _pipelineTuning, _log);
             var configuredBaseBranch = item.BaseBranch ?? project.DefaultBaseBranch;
+            // Snapshot the base-branch tip BEFORE the ensure below can
+            // refresh it from upstream. A durable agent-turn checkpoint is
+            // captured against the base it staged on: when the refresh moves
+            // the base, the checkpoint tree no longer applies and the work
+            // phase must discard it for a fresh turn. The branch tip alone
+            // cannot prove this — a same-base branch advance must keep
+            // resuming — so the pre/post-refresh comparison is the stale
+            // signal. Best-effort: a missing repo/branch yields null and the
+            // work phase falls back to base ancestry.
+            var baseTipBeforeRefresh = resumingPreempt && !string.IsNullOrWhiteSpace(configuredBaseBranch)
+                ? await TryResolveHostBranchTipAsync(item.Id.ToString(), configuredBaseBranch, ct, scope: "base branch")
+                : null;
             var (repoId, baseBranch) = await EnsurePipelineRepositoryAsync(item, project, configuredBaseBranch, ct);
             var hadRecordedWorkBranchAtEntry = !string.IsNullOrWhiteSpace(item.WorkBranch);
             var workBranch = item.WorkBranch ?? DefaultWorkBranchFor(item.Id);
@@ -590,7 +602,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                         hostShutdownToken,
                                         buildFailurePolicy: RequiredBuildPolicy.Terminal,
                                         auditorsForPreemptiveSelfReview: auditors,
-                                        resumePreTurnCommitSha: resumePreTurnCommitSha),
+                                        resumePreTurnCommitSha: resumePreTurnCommitSha,
+                                        preRefreshBaseTipSha: baseTipBeforeRefresh),
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: workPhase,
@@ -658,7 +671,8 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                         // build gate and folded into the iteration's findings.
                                         buildFailurePolicy: RequiredBuildPolicy.DeferToAuditLoop,
                                         iteration: resumeIteration,
-                                        resumePreTurnCommitSha: resumePreTurnCommitSha),
+                                        resumePreTurnCommitSha: resumePreTurnCommitSha,
+                                        preRefreshBaseTipSha: baseTipBeforeRefresh),
                                     workToken: attemptCt),
                             ct,
                             phaseCancellation: reworkPhase,

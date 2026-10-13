@@ -124,6 +124,104 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
     }
 
     [Fact]
+    public async Task StaleCheckpoint_WithAdvancedTipAfterRecompose_DiscardedAndFreshTurnStagesAtCurrentTip()
+    {
+        // Combination of a stale checkout tip (an outside writer lands a
+        // commit on the recomposed branch, as in the same-branch-advance
+        // recovery) plus a stale checkpoint (the base moved under it): the
+        // tip advance must not resurrect the stale resume. The checkpoint is
+        // still discarded and the fresh turn stages at the CURRENT tip,
+        // preserving the recomposed base, the landed commit, and the fresh
+        // turn's output — never the discarded checkpoint's tree.
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Claude };
+        agent.BeforeWorkAsync = async (sandbox, workingDirectory, ct) =>
+        {
+            calls++;
+            if (calls == 1)
+            {
+                var write = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", "echo 'real change' > \"$0\"", $"{workingDirectory}/output.txt"],
+                }, ct);
+                if (!write.Success)
+                    throw new InvalidOperationException($"failed to write output.txt: {write.Stderr}");
+                ready.TrySetResult();
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+            else
+            {
+                var write = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["sh", "-c", "echo 'fresh change' > \"$0\"", $"{workingDirectory}/fresh.txt"],
+                }, ct);
+                if (!write.Success)
+                    throw new InvalidOperationException($"failed to write fresh.txt: {write.Stderr}");
+            }
+        };
+        agent.WorkResults.Enqueue(new AgentResult(true, "fresh ok", "fresh ok", null));
+
+        var logger = new CapturingLogger<PipelineRunner>();
+        using var setup = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace),
+            agentOverride: agent,
+            logger: logger);
+
+        var item = NewItem();
+        await setup.Store.CreateAsync(item);
+        await PreemptFirstTurnAsync(setup, item, ready);
+
+        var freshBaseTip = await RecomposeBranchOnFreshBaseAsync(setup, item);
+        var rivalTip = await AdvanceBranchAsync(setup, item, "rival.txt", "rival change\n", "rival advance");
+        var barePath = BarePathFor(setup, item);
+        var (staleCode, _, _) = await TestSupport.RunGitNoThrow(
+            barePath, "merge-base", "--is-ancestor", await TipOfAsync(barePath, item.WorkBranch!), await CheckpointCommitOfAsync(setup, item));
+        Assert.Equal(1, staleCode);
+
+        var resumeEntry = await setup.Store.GetAsync(item.Id)
+            ?? throw new InvalidOperationException("work item disappeared after preempt");
+        await setup.Pipeline.RunAsync(resumeEntry, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Done, final!.State);
+        Assert.Null(final.FailureKind);
+        Assert.Equal(0, final.TerminalFailureCount);
+
+        Assert.Null(final.PreemptCheckpoint);
+        Assert.Null(final.AgentTurnResumeCheckpoint);
+        Assert.Null(final.AgentTurnRecoveryLease);
+        Assert.Equal(2, agent.WorkPrompts.Count);
+        Assert.DoesNotContain("codeybox/preempt", agent.WorkPrompts[1], StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            logger.Entries,
+            e => e.Message.Contains(
+                "Discarding durable agent-turn resume checkpoint",
+                StringComparison.OrdinalIgnoreCase));
+
+        // The fresh turn staged at the moved tip (not at the recomposed base
+        // alone): the tip advance survived the discard alongside the base.
+        Assert.Contains(
+            logger.Entries,
+            e => e.Message.Contains(
+                "at current bare-repo tip",
+                StringComparison.OrdinalIgnoreCase));
+        var (baseAncestorCode, _, _) = await TestSupport.RunGitNoThrow(
+            barePath, "merge-base", "--is-ancestor", freshBaseTip, item.WorkBranch!);
+        Assert.Equal(0, baseAncestorCode);
+        var (rivalAncestorCode, _, _) = await TestSupport.RunGitNoThrow(
+            barePath, "merge-base", "--is-ancestor", rivalTip, item.WorkBranch!);
+        Assert.Equal(0, rivalAncestorCode);
+        var (_, tree, _) = await TestSupport.RunGit(barePath, "ls-tree", "-r", item.WorkBranch!, "--name-only");
+        Assert.Contains("fresh.txt", tree);
+        Assert.Contains("base2.txt", tree);
+        Assert.Contains("rival.txt", tree);
+        Assert.DoesNotContain("output.txt", tree);
+    }
+
+    [Fact]
     public async Task StaleBranchMove_WithRetainedSandboxLease_RefusedWithExplicitMessage()
     {
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -276,6 +374,28 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         await TestSupport.RunGit(clone, "checkout", "-q", "-B", item.WorkBranch!, "main");
         await TestSupport.RunGit(clone, "push", "-q", "origin", $"HEAD:{item.WorkBranch}");
         return freshBaseTip.Trim();
+    }
+
+    /// <summary>
+    /// Lands one outside-writer commit on top of the existing work branch,
+    /// returning the new tip SHA.
+    /// </summary>
+    private async Task<string> AdvanceBranchAsync(
+        TestPipeline setup, WorkItem item, string file, string content, string message)
+    {
+        var barePath = BarePathFor(setup, item);
+        var clone = Path.Combine(_workspace, "advance-" + Guid.NewGuid().ToString("N")[..8]);
+        await TestSupport.RunGit(_workspace, "clone", "-q", barePath, clone);
+        await TestSupport.RunGit(clone, "config", "user.email", "advance@example.invalid");
+        await TestSupport.RunGit(clone, "config", "user.name", "Advance Writer");
+        await TestSupport.RunGit(clone, "fetch", "-q", "origin");
+        await TestSupport.RunGit(clone, "checkout", "-q", "-B", item.WorkBranch!, $"origin/{item.WorkBranch}");
+        await File.WriteAllTextAsync(Path.Combine(clone, file), content);
+        await TestSupport.RunGit(clone, "add", file);
+        await TestSupport.RunGit(clone, "commit", "-q", "-m", message);
+        await TestSupport.RunGit(clone, "push", "-q", "origin", $"HEAD:{item.WorkBranch}");
+        var (_, tip, _) = await TestSupport.RunGit(clone, "rev-parse", "HEAD");
+        return tip.Trim();
     }
 
     private static async Task<string> TipOfAsync(string barePath, string branch)

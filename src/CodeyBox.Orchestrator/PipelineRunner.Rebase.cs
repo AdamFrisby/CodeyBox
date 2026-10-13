@@ -1250,7 +1250,7 @@ public sealed partial class PipelineRunner
     /// never throws for a missing branch.
     /// </summary>
     private async Task<string?> TryResolveHostBranchTipAsync(
-        string repoId, string branch, CancellationToken ct)
+        string repoId, string branch, CancellationToken ct, string scope = "work branch")
     {
         try
         {
@@ -1261,8 +1261,8 @@ public sealed partial class PipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogDebug(ex,
-                "Could not resolve host tip of work branch '{Branch}' for staging log; continuing without it",
-                branch);
+                "Could not resolve host tip of {Scope} '{Branch}' for staging log; continuing without it",
+                scope, branch);
             return null;
         }
     }
@@ -1278,6 +1278,11 @@ public sealed partial class PipelineRunner
     /// ancestor, which keeps the validation in the safe direction. Falls back
     /// to the raw tip when the checkpoint source is unknown (legacy refs) or
     /// the fork point cannot be computed.
+    /// This baseline is only for the resumed no-op/meaningful-changes
+    /// validation. Whether the checkpoint is usable at all (stale discard) is
+    /// decided separately against the current base-branch tip — a fork point
+    /// is an ancestor of the checkpoint by construction and can never detect
+    /// a base move.
     /// </summary>
     private async Task<string> ResolveAgentTurnResumeBaseAsync(
         string repoId,

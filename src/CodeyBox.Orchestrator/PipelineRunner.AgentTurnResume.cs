@@ -1209,24 +1209,34 @@ public sealed partial class PipelineRunner
     }
 
     /// <summary>
-    /// True when the published checkpoint commit no longer descends from the
-    /// pre-turn work-branch tip, e.g. the branch was rebased onto a fresh base
-    /// or recomposed by restart recovery after the checkpoint was written. The
-    /// checkpoint tree is then unusable, but that says nothing about the work.
+    /// True when the published checkpoint is stale: the base-branch tip moved
+    /// between the pickup's upstream refresh and turn preparation, so the
+    /// base the checkpoint was captured against was superseded (a pickup-time
+    /// rebase onto a fresh base or a restart-recovery recomposition). The
+    /// resume path checks the checkpoint tree out as-is and reconciles onto
+    /// the branch tip, which cannot span a base move — so the checkpoint tree
+    /// is unusable, but that says nothing about the work and the caller
+    /// discards the bookkeeping for a fresh turn. The move is detected as a
+    /// pre/post-refresh tip difference (<paramref name="baseTipBeforeRefresh"/>
+    /// was snapshotted before the pickup refresh ran): a same-base branch
+    /// advance leaves the base untouched and is NOT stale — it keeps resuming
+    /// against the fork-point baseline downstream. Neither the branch tip nor
+    /// the fork point can prove staleness (a fork point is an ancestor of the
+    /// checkpoint by construction, and the branch tip diverges on every
+    /// ordinary advance). Both resolutions below are host-side against the
+    /// authoritative bare repo, never the possibly trailing sandbox clone.
     /// The checkpoint commit resolves from its content binding for typed refs,
-    /// or from the published ref for legacy preempt checkpoints. Both shapes
-    /// are canonical hex after this resolution, so the merge-base argv below
-    /// carries no untrusted flag characters.
+    /// or from the published ref for legacy preempt checkpoints; both shapes
+    /// are validated canonical hex before the ancestry probe.
     /// </summary>
-    private static async Task<bool> IsStaleAgentTurnCheckpointAsync(
-        ISandbox sandbox,
+    private async Task<bool> IsStaleAgentTurnCheckpointAsync(
+        string repoId,
+        string baseBranch,
         string preemptCheckpointRef,
-        string checkpointBranch,
-        string? preTurnCommitSha,
+        string? baseTipBeforeRefresh,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(preTurnCommitSha))
-            throw new InvalidOperationException("Durable agent-turn resume has no pre-turn source commit.");
+        Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
         string checkpointCommitSha;
         if (AgentTurnCheckpointRef.TryParse(preemptCheckpointRef, out var typedRef)
             && typedRef is not null)
@@ -1235,31 +1245,29 @@ public sealed partial class PipelineRunner
         }
         else
         {
-            var resolved = await sandbox.ExecAsync(new SandboxExec
-            {
-                Argv =
-                [
-                    "git", "-C", SandboxConventions.WorkDir,
-                    "rev-parse", "--verify", $"origin/{checkpointBranch}",
-                ],
-                MaxStdoutBytes = 4096,
-                MaxStderrBytes = 4096,
-                KillOnOutputLimit = true,
-            }, ct);
-            PipelineAgentExecutor.ThrowIfExecutionUnavailable(resolved);
-            if (!resolved.Success)
-            {
-                throw new InvalidOperationException(
-                    "Failed to resolve the durable agent-turn checkpoint ref.");
-            }
-            checkpointCommitSha = resolved.Stdout.Trim();
+            checkpointCommitSha = await _gitHost.ResolveCommitAsync(
+                repoId, preemptCheckpointRef, ct).ConfigureAwait(false);
         }
-
-        return !await IsPreTurnCommitAncestorOfCheckpointAsync(
-            sandbox,
-            preTurnCommitSha,
-            checkpointCommitSha,
-            ct).ConfigureAwait(false);
+        Validation.ValidateCommitSha(checkpointCommitSha, nameof(checkpointCommitSha));
+        var baseTip = await _gitHost.ResolveCommitAsync(
+            repoId, $"refs/heads/{baseBranch}", ct).ConfigureAwait(false);
+        Validation.ValidateCommitSha(baseTip, nameof(baseTip));
+        if (string.IsNullOrWhiteSpace(baseTipBeforeRefresh))
+        {
+            // No pre-refresh snapshot (the repo or base was absent at pickup):
+            // fall back to base ancestry — a checkpoint that does not descend
+            // from the current base cannot resume.
+            return !await _gitHost.IsAncestorAsync(
+                repoId,
+                baseTip.ToLowerInvariant(),
+                checkpointCommitSha.ToLowerInvariant(),
+                ct).ConfigureAwait(false);
+        }
+        Validation.ValidateCommitSha(baseTipBeforeRefresh, nameof(baseTipBeforeRefresh));
+        return !string.Equals(
+            baseTipBeforeRefresh.ToLowerInvariant(),
+            baseTip.ToLowerInvariant(),
+            StringComparison.Ordinal);
     }
 
     private const string StaleCheckpointLeaseRefusalMessage =
