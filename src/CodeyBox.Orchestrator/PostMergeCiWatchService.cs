@@ -80,7 +80,7 @@ public sealed class PostMergeCiWatchService : BackgroundService
         try
         {
             var sha = mergeSha?.Trim() ?? string.Empty;
-            if (sha.Length == 0 || !IsHexSha(sha))
+            if (sha.Length == 0 || !BaseBrokenTestSupport.IsHexSha(sha))
             {
                 _log.LogWarning(
                     "Post-merge CI watch not scheduled for project {ProjectId}: merge sha is not a commit sha",
@@ -307,20 +307,5 @@ public sealed class PostMergeCiWatchService : BackgroundService
     {
         lock (_gate)
             _watches.Remove($"{watch.ProjectId.Value}\0{watch.MergeSha}");
-    }
-
-    private static bool IsHexSha(string value)
-    {
-        if (value.Length < 7 || value.Length > 128)
-            return false;
-        foreach (var c in value)
-        {
-            var isHex = (c >= '0' && c <= '9')
-                || (c >= 'a' && c <= 'f')
-                || (c >= 'A' && c <= 'F');
-            if (!isHex)
-                return false;
-        }
-        return true;
     }
 }

@@ -110,7 +110,7 @@ internal static class BaseBrokenTestSupport
         return result;
     }
 
-    private static bool IsHexSha(string value)
+    internal static bool IsHexSha(string value)
     {
         if (value.Length < 7 || value.Length > 64)
             return false;
