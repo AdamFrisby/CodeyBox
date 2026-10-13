@@ -1041,6 +1041,12 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 await Transition(item, WorkItemState.Merged, ct, project);
                 await PublishMergeCompletedAsync(item, project, baseBranch, workBranch, mergeSha, ct);
                 ScheduleBaselineProduction(project, repoId, baseBranch, mergeSha);
+                // Watch the landed commit's forge CI: two green branches can
+                // still combine into a test-red tree, and the merge-result
+                // gate only builds. The local SHA is unwatched on PR forges
+                // (the forge never saw it — the watch drops as unknown);
+                // the authoritative SHA is watched after the upstream push.
+                SchedulePostMergeCiWatch(project, baseBranch, mergeSha, item.Id, suspects: [mergeSha]);
             }
 
             // -------- Phase 3: Upstream push (separate atomic unit) --------
@@ -1356,6 +1362,16 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 "Work item {Id} required-build failure attributed to broken base '{Base}' tip {Sha}; parking at {ResumeState}",
                 item.Id, ex.BaseBranch, ex.BaseSha, ex.ResumeState);
             await ParkForBaseBrokenBaseAsync(item, project, ex);
+        }
+        catch (BaseTestBrokenException ex)
+        {
+            // The base tip builds but its tests fail — same containment as
+            // the build path (park, record, hold, file), with the tip's CI
+            // as the clear signal instead of its build.
+            _log.LogWarning(
+                "Work item {Id} test failure attributed to test-red base '{Base}' tip {Sha}; parking at {ResumeState}",
+                item.Id, ex.BaseBranch, ex.BaseSha, ex.ResumeState);
+            await ParkForBaseBrokenTestAsync(item, project, ex);
         }
         catch (RequiredBuildFailedException ex)
         {

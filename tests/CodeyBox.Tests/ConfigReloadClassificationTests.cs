@@ -595,6 +595,18 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.BaseBrokenRecheckInterval):
                 opts.BaseBrokenRecheckInterval += TimeSpan.FromMinutes(1);
                 break;
+            case nameof(PipelineTuningOptions.PostMergeCiWatchEnabled):
+                opts.PostMergeCiWatchEnabled = !opts.PostMergeCiWatchEnabled;
+                break;
+            case nameof(PipelineTuningOptions.PostMergeCiWatchInterval):
+                opts.PostMergeCiWatchInterval += TimeSpan.FromMinutes(1);
+                break;
+            case nameof(PipelineTuningOptions.PostMergeCiWatchMaxAttempts):
+                opts.PostMergeCiWatchMaxAttempts += 10;
+                break;
+            case nameof(PipelineTuningOptions.PostMergeCiWatchMaxWatches):
+                opts.PostMergeCiWatchMaxWatches += 10;
+                break;
             case nameof(PipelineTuningOptions.MergeResultBuildVerificationEnabled):
                 opts.MergeResultBuildVerificationEnabled = !opts.MergeResultBuildVerificationEnabled;
                 break;

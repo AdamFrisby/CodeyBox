@@ -1681,6 +1681,10 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.BaseBrokenDetectionEnabled,
                 opts.BaseBrokenFixItemPriority,
                 BaseBrokenRecheckIntervalSeconds = opts.BaseBrokenRecheckInterval.TotalSeconds,
+                opts.PostMergeCiWatchEnabled,
+                PostMergeCiWatchIntervalSeconds = opts.PostMergeCiWatchInterval.TotalSeconds,
+                opts.PostMergeCiWatchMaxAttempts,
+                opts.PostMergeCiWatchMaxWatches,
             },
             JsonOpts);
 

@@ -9,16 +9,21 @@ namespace CodeyBox.Orchestrator;
 
 /// <summary>
 /// Periodic sweeper that clears recorded base-broken conditions once the
-/// base tip builds again. For each active condition it refreshes the repo
+/// base is healthy again. For each active condition it refreshes the repo
 /// tracking the broken base (the fix item's repo when one was filed —
 /// upstream fetches land there first), re-resolves the base tip, and:
 /// <list type="bullet">
-///   <item>same SHA → the verdict is immutable; no rebuild, still held.</item>
-///   <item>new SHA that builds → the condition clears and held items
-///   resume (dispatch wake).</item>
+///   <item>same SHA, build-kind → the verdict is immutable; no rebuild, still held.</item>
+///   <item>same SHA, test-kind → the forge CI status for that SHA is
+///   re-polled (pending can turn green); a passing tip clears, anything
+///   else keeps the hold.</item>
+///   <item>new SHA that builds → a build-kind condition clears; a test-kind
+///   condition clears only when the new tip's CI also passes (a green build
+///   alone must never clear a test-red hold — that is exactly the gap this
+///   work closes).</item>
 ///   <item>new SHA that also fails → the old condition clears and a new
 ///   condition (keyed by the new SHA, with its own deduped fix item)
-///   replaces it.</item>
+///   replaces it, preserving the failure kind.</item>
 /// </list>
 /// Interval is the hot-reloadable
 /// <see cref="PipelineTuningOptions.BaseBrokenRecheckInterval"/>.
@@ -31,6 +36,7 @@ public sealed class BaseBrokenMonitorService : BackgroundService
     private readonly IProjectRepository _projects;
     private readonly IWorkItemStore _items;
     private readonly PipelineTuningSnapshot _tuning;
+    private readonly IUpstreamRemoteFactory? _upstreamFactory;
     private readonly TimeProvider _time;
     private readonly ILogger<BaseBrokenMonitorService> _log;
 
@@ -42,7 +48,8 @@ public sealed class BaseBrokenMonitorService : BackgroundService
         IWorkItemStore items,
         PipelineTuningSnapshot tuning,
         TimeProvider? timeProvider = null,
-        ILogger<BaseBrokenMonitorService>? log = null)
+        ILogger<BaseBrokenMonitorService>? log = null,
+        IUpstreamRemoteFactory? upstreamFactory = null)
     {
         _tracker = tracker ?? throw new ArgumentNullException(nameof(tracker));
         _baseBuilds = baseBuilds ?? throw new ArgumentNullException(nameof(baseBuilds));
@@ -52,6 +59,7 @@ public sealed class BaseBrokenMonitorService : BackgroundService
         _tuning = tuning ?? throw new ArgumentNullException(nameof(tuning));
         _time = timeProvider ?? TimeProvider.System;
         _log = log ?? NullLogger<BaseBrokenMonitorService>.Instance;
+        _upstreamFactory = upstreamFactory;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -141,8 +149,17 @@ public sealed class BaseBrokenMonitorService : BackgroundService
 
         if (string.Equals(tipSha, condition.BaseSha, StringComparison.OrdinalIgnoreCase))
         {
-            // The tip is still the recorded-broken commit: its build verdict
-            // is immutable — no rebuild needed, the hold stays.
+            // Same SHA. A build-kind verdict is immutable — no rebuild
+            // needed, the hold stays. A test-kind verdict can still resolve
+            // (CI pending → green), so re-poll the forge when wired.
+            if (condition.FailureKind == BaseBrokenFailureKind.Test
+                && await IsTipCiPassingAsync(project, tipSha, ct).ConfigureAwait(false))
+            {
+                _log.LogWarning(
+                    "Base-broken monitor: CI now passes for test-red base tip {Sha}; clearing condition for project {ProjectId}",
+                    condition.BaseSha, condition.ProjectId.Value);
+                await _tracker.ClearAsync(condition.ProjectId, condition.BaseSha, ct).ConfigureAwait(false);
+            }
             return;
         }
 
@@ -164,9 +181,30 @@ public sealed class BaseBrokenMonitorService : BackgroundService
 
         switch (verdict.Outcome)
         {
-            case BaseBuildOutcome.Passed:
+            case BaseBuildOutcome.Passed when condition.FailureKind == BaseBrokenFailureKind.Build:
                 await _tracker.ClearAsync(condition.ProjectId, condition.BaseSha, ct).ConfigureAwait(false);
                 return;
+
+            case BaseBuildOutcome.Passed:
+            {
+                // A green build never clears a test-red hold by itself. The
+                // new tip clears only when its CI passes; a red tip
+                // supersedes (new SHA, new failing checks); an unknown CI
+                // verdict keeps the hold so a moved-but-unproven tip cannot
+                // silently release parked items.
+                var failing = await TryGetFailingChecksAsync(project, tipSha, ct).ConfigureAwait(false);
+                if (failing is not null && failing.Count == 0)
+                {
+                    await _tracker.ClearAsync(condition.ProjectId, condition.BaseSha, ct).ConfigureAwait(false);
+                    return;
+                }
+                if (failing is { Count: > 0 })
+                {
+                    await SupersedeWithTestAsync(
+                        condition, repoId, repoItemId, tipSha, failing, ct).ConfigureAwait(false);
+                }
+                return;
+            }
 
             case BaseBuildOutcome.Failed:
             {
@@ -201,6 +239,92 @@ public sealed class BaseBrokenMonitorService : BackgroundService
                 // Inconclusive (transient sandbox/toolchain fault): keep the
                 // hold; the next sweep re-attempts the build.
                 return;
+        }
+    }
+
+    /// <summary>
+    /// Supersedes a test-kind condition with a fresh one for a moved,
+    /// still-red tip: new SHA, the tip's current failing checks, the tip as
+    /// the prime suspect — plus its own deduped fix item.
+    /// </summary>
+    private async Task SupersedeWithTestAsync(
+        BaseBrokenCondition condition,
+        string repoId,
+        WorkItemId repoItemId,
+        string tipSha,
+        IReadOnlyList<string> failingChecks,
+        CancellationToken ct)
+    {
+        await _tracker.ClearAsync(condition.ProjectId, condition.BaseSha, ct).ConfigureAwait(false);
+        var suspects = BaseBrokenTestSupport.SanitizeShas([tipSha]);
+        var next = new BaseBrokenCondition
+        {
+            ProjectId = condition.ProjectId,
+            BaseBranch = condition.BaseBranch,
+            BaseSha = tipSha,
+            RepositoryId = repoId,
+            ErrorSummary = BaseBrokenTestSupport.BuildSummary(failingChecks, suspects),
+            FailureKind = BaseBrokenFailureKind.Test,
+            FailingNames = BaseBrokenTestSupport.SanitizeNameListForRecord(failingChecks),
+            DetectedAt = _time.GetUtcNow(),
+        };
+        var recorded = await _tracker.RecordDetectedAsync(next, ct).ConfigureAwait(false);
+        var sourceItem = await _items.GetAsync(repoItemId, ct).ConfigureAwait(false);
+        if (sourceItem is not null)
+        {
+            await _tracker.EnsureFixItemAsync(
+                recorded,
+                sourceItem,
+                _tuning.Current.BaseBrokenFixItemPriority,
+                ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// True only when the forge proves the tip's required checks green.
+    /// Unknown (unwired/unsupported forge, transport fault, pending) is
+    /// false — never a clear signal.
+    /// </summary>
+    private async Task<bool> IsTipCiPassingAsync(Project project, string tipSha, CancellationToken ct)
+    {
+        var failing = await TryGetFailingChecksAsync(project, tipSha, ct).ConfigureAwait(false);
+        return failing is not null && failing.Count == 0;
+    }
+
+    /// <summary>
+    /// Forge verdict for a tip: failing check names (red), empty (green),
+    /// or null (unknown — unwired/unsupported forge, fault, or pending).
+    /// Null never clears and never records.
+    /// </summary>
+    private async Task<IReadOnlyList<string>?> TryGetFailingChecksAsync(
+        Project project,
+        string tipSha,
+        CancellationToken ct)
+    {
+        if (_upstreamFactory is null)
+            return null;
+        try
+        {
+            var remote = _upstreamFactory.Create(project);
+            var summary = await remote.GetCheckResultsAsync(tipSha, ct).ConfigureAwait(false);
+            if (summary is null)
+                return null;
+            if (summary.RequiredChecksPassed)
+                return [];
+            var failing = summary.Checks
+                .Where(c => c.State == UpstreamCheckState.Failing)
+                .Select(c => c.Name)
+                .ToList();
+            // Required checks unsatisfied but none individually failing
+            // (e.g. still running): unknown, not red.
+            return failing.Count == 0 ? null : failing;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Base-broken monitor: could not read CI status for base tip {Sha}; keeping condition",
+                BaseBrokenTestSupport.ShortSha(tipSha));
+            return null;
         }
     }
 

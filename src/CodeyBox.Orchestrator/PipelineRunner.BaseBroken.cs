@@ -37,6 +37,61 @@ public sealed partial class PipelineRunner
             DetectedAt = _opts.TimeProvider.GetUtcNow(),
         };
 
+        var parkReason =
+            $"required build failed on base branch '{ex.BaseBranch}' tip " +
+            $"{BaseBrokenTestSupport.ShortSha(ex.BaseSha)} (base broken, not this diff); " +
+            "item held until the base builds again";
+        await ParkForBaseBrokenCoreAsync(
+            item, project, condition, ex.ResumeState, ex.Phase, parkReason,
+            healthyAgain: "fails the required build",
+            ct: CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Handles a <see cref="BaseTestBrokenException"/>: the item's tests
+    /// fail, but so do the same tests on the base tip — the base is
+    /// test-red, not the work. Same containment as the build path (record,
+    /// file, park, hold); only the condition kind and the clear signal
+    /// (tip CI green instead of tip build green) differ.
+    /// </summary>
+    private async Task ParkForBaseBrokenTestAsync(
+        WorkItem item,
+        Project project,
+        BaseTestBrokenException ex)
+    {
+        var condition = new BaseBrokenCondition
+        {
+            ProjectId = project.Id,
+            BaseBranch = ex.BaseBranch,
+            BaseSha = ex.BaseSha,
+            RepositoryId = item.Id.ToString(),
+            ErrorSummary = ex.FailureSummary
+                ?? BaseBrokenTestSupport.BuildSummary(ex.FailingTests, ex.SuspectCommits),
+            FailureKind = BaseBrokenFailureKind.Test,
+            FailingNames = BaseBrokenTestSupport.SanitizeNameListForRecord(ex.FailingTests),
+            DetectedAt = _opts.TimeProvider.GetUtcNow(),
+        };
+
+        var parkReason =
+            $"tests failed on base branch '{ex.BaseBranch}' tip " +
+            $"{BaseBrokenTestSupport.ShortSha(ex.BaseSha)} (base test-red, not this diff); " +
+            "item held until the base tip passes CI again";
+        await ParkForBaseBrokenCoreAsync(
+            item, project, condition, ex.ResumeState, ex.Phase, parkReason,
+            healthyAgain: "is test-red",
+            ct: CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task ParkForBaseBrokenCoreAsync(
+        WorkItem item,
+        Project project,
+        BaseBrokenCondition condition,
+        WorkItemState resumeState,
+        string? phase,
+        string parkReason,
+        string healthyAgain,
+        CancellationToken ct)
+    {
         WorkItemId? fixItemId = null;
         if (_baseBrokenConditions is not null)
         {
@@ -58,7 +113,7 @@ public sealed partial class PipelineRunner
                 _log.LogWarning(
                     conditionEx,
                     "Work item {Id}: failed to record/file base-broken condition for base tip {Sha}; parking item regardless",
-                    item.Id, ex.BaseSha);
+                    item.Id, condition.BaseSha);
             }
         }
 
@@ -66,10 +121,6 @@ public sealed partial class PipelineRunner
         //    preserved. Built via a record initializer (not With()) because
         //    With(Queued) intentionally clears WorkBranch for the
         //    failed-retry path — here the whole point is keeping it.
-        var parkReason =
-            $"required build failed on base branch '{ex.BaseBranch}' tip " +
-            $"{ex.BaseSha[..Math.Min(12, ex.BaseSha.Length)]} (base broken, not this diff); " +
-            "item held until the base builds again";
         await RunBoundedPostAgentAsync(
             item.Id,
             "transition-base-broken-park",
@@ -87,14 +138,14 @@ public sealed partial class PipelineRunner
 
                 var parked = WorkItemRecoveryPolicy.ReleaseAgentTurnDispatchClaim(current) with
                 {
-                    State = ex.ResumeState,
+                    State = resumeState,
                     LastError = parkReason,
                     UpdatedAt = _opts.TimeProvider.GetUtcNow(),
-                    StartedAt = ex.ResumeState == WorkItemState.Queued
+                    StartedAt = resumeState == WorkItemState.Queued
                         ? null
                         : current.StartedAt,
                     PreserveWorkBranchOnQueuedPickup =
-                        ex.ResumeState == WorkItemState.Queued
+                        resumeState == WorkItemState.Queued
                         && !string.IsNullOrWhiteSpace(current.WorkBranch),
                     // One-shot authorization and parked-retry metadata from
                     // the interrupted phase must not leak into the resumable
@@ -124,14 +175,15 @@ public sealed partial class PipelineRunner
             }).ConfigureAwait(false);
 
         _log.LogWarning(
-            "Work item {Id} parked at {ResumeState}: base branch '{Base}' tip {Sha} fails the required build{FixNote}",
+            "Work item {Id} parked at {ResumeState}: base branch '{Base}' tip {Sha} {HealthyAgain}{FixNote}",
             item.Id,
-            ex.ResumeState,
-            ex.BaseBranch,
-            ex.BaseSha,
+            resumeState,
+            condition.BaseBranch,
+            condition.BaseSha,
+            healthyAgain,
             fixItemId is { } fix ? $" (fix item {fix})" : string.Empty);
 
-        AuditLog.WorkItemTransitioned(item.Id, ex.ResumeState.ToString());
+        AuditLog.WorkItemTransitioned(item.Id, resumeState.ToString());
         await _webhooks.PublishAsync(new WebhookEvent
         {
             Event = "work_item.base_broken_parked",
@@ -140,11 +192,12 @@ public sealed partial class PipelineRunner
             Details = new
             {
                 workItemId = item.Id.ToString(),
-                baseBranch = ex.BaseBranch,
-                baseSha = ex.BaseSha,
-                resumeState = ex.ResumeState.ToString(),
+                baseBranch = condition.BaseBranch,
+                baseSha = condition.BaseSha,
+                failureKind = condition.FailureKind.ToString(),
+                resumeState = resumeState.ToString(),
                 fixWorkItemId = fixItemId?.ToString(),
-                phase = ex.Phase,
+                phase,
             },
         }, CancellationToken.None).ConfigureAwait(false);
     }

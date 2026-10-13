@@ -74,6 +74,10 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.BaseBrokenDetectionEnabled),
         nameof(PipelineTuningOptions.BaseBrokenFixItemPriority),
         nameof(PipelineTuningOptions.BaseBrokenRecheckInterval),
+        nameof(PipelineTuningOptions.PostMergeCiWatchEnabled),
+        nameof(PipelineTuningOptions.PostMergeCiWatchInterval),
+        nameof(PipelineTuningOptions.PostMergeCiWatchMaxAttempts),
+        nameof(PipelineTuningOptions.PostMergeCiWatchMaxWatches),
     ];
 
     /// <summary>
