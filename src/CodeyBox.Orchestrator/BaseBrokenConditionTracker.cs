@@ -236,15 +236,33 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
             }
 
             var now = _time.GetUtcNow();
+            // Test-kind conditions name the failing tests/checks and the
+            // suspect commits; build-kind conditions carry the build excerpt.
+            // Suspects for test-kind rows are parsed back out of the stored
+            // summary line when present (see BaseBrokenTestSupport), so the
+            // filed item names the same commits the detector saw.
+            var isTestKind = condition.FailureKind == BaseBrokenFailureKind.Test;
+            var suspectCommits = isTestKind
+                ? BaseBrokenTestSupport.ParseSuspects(condition.ErrorSummary)
+                : [];
             var fix = new WorkItem
             {
                 Id = WorkItemId.New(),
                 ProjectId = condition.ProjectId,
-                Title = BaseBrokenFixItemPolicy.BuildTitle(condition.BaseBranch, condition.BaseSha),
-                Prompt = BaseBrokenFixItemPolicy.BuildPrompt(
-                    condition.BaseBranch,
-                    condition.BaseSha,
-                    sourceItem.Id),
+                Title = isTestKind
+                    ? BaseBrokenFixItemPolicy.BuildTestTitle(condition.BaseBranch, condition.BaseSha, condition.FailingNames)
+                    : BaseBrokenFixItemPolicy.BuildTitle(condition.BaseBranch, condition.BaseSha),
+                Prompt = isTestKind
+                    ? BaseBrokenFixItemPolicy.BuildTestPrompt(
+                        condition.BaseBranch,
+                        condition.BaseSha,
+                        condition.FailingNames,
+                        suspectCommits,
+                        sourceItem.Id)
+                    : BaseBrokenFixItemPolicy.BuildPrompt(
+                        condition.BaseBranch,
+                        condition.BaseSha,
+                        sourceItem.Id),
                 BaseBranch = condition.BaseBranch,
                 DependsOn = [],
                 QueuePosition = now.Ticks,
@@ -258,10 +276,16 @@ public sealed class BaseBrokenConditionTracker : IBaseBrokenConditionStatusProvi
                 // after reviewing the excerpt. The excerpt lives on LastError
                 // (operator surface, never composed into an agent prompt).
                 State = WorkItemState.NeedsOperatorInput,
-                LastError = BaseBrokenFixItemPolicy.BuildOperatorNote(
-                    condition.BaseBranch,
-                    condition.BaseSha,
-                    condition.ErrorSummary),
+                LastError = isTestKind
+                    ? BaseBrokenFixItemPolicy.BuildTestOperatorNote(
+                        condition.BaseBranch,
+                        condition.BaseSha,
+                        condition.FailingNames,
+                        suspectCommits)
+                    : BaseBrokenFixItemPolicy.BuildOperatorNote(
+                        condition.BaseBranch,
+                        condition.BaseSha,
+                        condition.ErrorSummary),
                 // System provenance: caller-facing creation always stamps a
                 // non-null initiator (server-resolved from auth), so a null
                 // initiator marks this row as orchestrator-filed. IsOpenFixItem

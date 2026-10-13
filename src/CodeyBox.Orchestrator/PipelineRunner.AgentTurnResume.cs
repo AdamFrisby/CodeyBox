@@ -1212,28 +1212,37 @@ public sealed partial class PipelineRunner
     /// True when the published checkpoint is stale: the base-branch tip moved
     /// between the pickup's upstream refresh and turn preparation, so the
     /// base the checkpoint was captured against was superseded (a pickup-time
-    /// rebase onto a fresh base or a restart-recovery recomposition). The
+    /// rebase onto a fresh base or a restart-recovery recomposition) — or the
+    /// checkpoint descends from neither the current work-branch tip nor the
+    /// current base tip, which catches a recomposition at an already-staged
+    /// fresh base that leaves the base ref unchanged across the refresh. The
     /// resume path checks the checkpoint tree out as-is and reconciles onto
     /// the branch tip, which cannot span a base move — so the checkpoint tree
     /// is unusable, but that says nothing about the work and the caller
     /// discards the bookkeeping for a fresh turn. The move is detected as a
     /// pre/post-refresh tip difference (<paramref name="baseTipBeforeRefresh"/>
     /// was snapshotted before the pickup refresh ran): a same-base branch
-    /// advance leaves the base untouched and is NOT stale — it keeps resuming
-    /// against the fork-point baseline downstream. Neither the branch tip nor
-    /// the fork point can prove staleness (a fork point is an ancestor of the
-    /// checkpoint by construction, and the branch tip diverges on every
-    /// ordinary advance). Both resolutions below are host-side against the
-    /// authoritative bare repo, never the possibly trailing sandbox clone.
+    /// advance leaves the base untouched and reachable, so it is NOT stale —
+    /// it keeps resuming against the fork-point baseline downstream. Neither
+    /// the branch tip nor the fork point can prove staleness on its own (a
+    /// fork point is an ancestor of the checkpoint by construction, and the
+    /// branch tip diverges on every ordinary advance). When no pre-refresh
+    /// snapshot exists (the repo or base was absent at pickup), the same
+    /// reachability test alone decides: a checkpoint still reachable from the
+    /// base tip (a plain branch advance past the interrupted turn's base)
+    /// still resumes. All resolutions are host-side against the authoritative
+    /// bare repo, never the possibly trailing sandbox clone.
     /// The checkpoint commit resolves from its content binding for typed refs,
     /// or from the published ref for legacy preempt checkpoints; both shapes
-    /// are validated canonical hex before the ancestry probe.
+    /// are validated canonical hex before the ancestry probes.
     /// </summary>
     private async Task<bool> IsStaleAgentTurnCheckpointAsync(
         string repoId,
         string baseBranch,
         string preemptCheckpointRef,
         string? baseTipBeforeRefresh,
+        string? workBranchTipSha,
+        string? baseTipSha,
         CancellationToken ct)
     {
         Validation.ValidateBranchName(baseBranch, nameof(baseBranch));
@@ -1252,22 +1261,39 @@ public sealed partial class PipelineRunner
         var baseTip = await _gitHost.ResolveCommitAsync(
             repoId, $"refs/heads/{baseBranch}", ct).ConfigureAwait(false);
         Validation.ValidateCommitSha(baseTip, nameof(baseTip));
-        if (string.IsNullOrWhiteSpace(baseTipBeforeRefresh))
+        if (!string.IsNullOrWhiteSpace(baseTipBeforeRefresh))
         {
-            // No pre-refresh snapshot (the repo or base was absent at pickup):
-            // fall back to base ancestry — a checkpoint that does not descend
-            // from the current base cannot resume.
-            return !await _gitHost.IsAncestorAsync(
-                repoId,
+            Validation.ValidateCommitSha(baseTipBeforeRefresh, nameof(baseTipBeforeRefresh));
+            if (!string.Equals(
+                baseTipBeforeRefresh.ToLowerInvariant(),
                 baseTip.ToLowerInvariant(),
-                checkpointCommitSha.ToLowerInvariant(),
-                ct).ConfigureAwait(false);
+                StringComparison.Ordinal))
+            {
+                return true;
+            }
+            // Base untouched across the refresh: a same-base branch advance
+            // keeps resuming below — unless the checkpoint descends from
+            // neither tip (the branch was recomposed at an already-staged
+            // fresh base, so the refresh was a no-op). Fall through to the
+            // reachability probes.
         }
-        Validation.ValidateCommitSha(baseTipBeforeRefresh, nameof(baseTipBeforeRefresh));
-        return !string.Equals(
-            baseTipBeforeRefresh.ToLowerInvariant(),
+        // A checkpoint that still descends from either the work-branch tip
+        // (untouched branch) or the base tip (a plain branch advance past the
+        // interrupted turn's base) can resume; anything else is stale.
+        if (!string.IsNullOrWhiteSpace(workBranchTipSha)
+            && await _gitHost.IsAncestorAsync(
+                repoId,
+                workBranchTipSha.ToLowerInvariant(),
+                checkpointCommitSha.ToLowerInvariant(),
+                ct).ConfigureAwait(false))
+        {
+            return false;
+        }
+        return !await _gitHost.IsAncestorAsync(
+            repoId,
             baseTip.ToLowerInvariant(),
-            StringComparison.Ordinal);
+            checkpointCommitSha.ToLowerInvariant(),
+            ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1319,8 +1345,10 @@ public sealed partial class PipelineRunner
     /// Atomically discards a stale durable agent-turn checkpoint lineage. The
     /// work branch is untouched, so the caller restarts the turn fresh from
     /// the current branch tip. Refuses — never silently drops — a
-    /// retained-sandbox recovery lease: provider-owned state stays
-    /// authoritative with the operator retry/cancel path.
+    /// retained-sandbox recovery lease: the stale Git half (preempt ref) is
+    /// cleared so the row keeps exactly one recovery backing, the
+    /// provider-owned lease and its checkpoint metadata stay authoritative,
+    /// and the operator retry/cancel path is surfaced via the refusal.
     /// </summary>
     private async Task<WorkItem> DiscardStaleAgentTurnCheckpointAsync(
         WorkItem item,
@@ -1332,6 +1360,19 @@ public sealed partial class PipelineRunner
         var current = await _store.GetAsync(item.Id, ct).ConfigureAwait(false) ?? item;
         if (item.AgentTurnRecoveryLease is not null || current.AgentTurnRecoveryLease is not null)
         {
+            var refused = current with
+            {
+                PreemptedAt = null,
+                PreemptCheckpoint = null,
+                AgentTurnRecoveryLease = current.AgentTurnRecoveryLease ?? item.AgentTurnRecoveryLease,
+                UpdatedAt = DateTimeOffset.UtcNow,
+            };
+            if (!await _store.TryUpdateIfStateAndUpdatedAtAsync(
+                    refused, current.State, current.UpdatedAt, ct).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException(
+                    "Work item changed while its stale durable agent-turn checkpoint was being discarded.");
+            }
             throw new AgentInfrastructureFailureException(
                 agentKind,
                 agentPhase,

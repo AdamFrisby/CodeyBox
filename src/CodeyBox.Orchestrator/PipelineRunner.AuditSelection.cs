@@ -1252,8 +1252,8 @@ public sealed partial class PipelineRunner
             return null;
         // A broken base attribution is repository state, not agent
         // performance: the item parks and the project holds rather than the
-        // attempt counting toward the breaker.
-        if (error is BaseBuildBrokenException)
+        // attempt counting toward the breaker. Test-red parks identically.
+        if (error is BaseBuildBrokenException or BaseTestBrokenException)
             return null;
         // Every other terminal exception is a real dispatch failure.
         return false;

@@ -607,6 +607,17 @@ public sealed partial class PipelineRunner
             _log.LogInformation("Audit iteration {Iter} of {Max} found {Count} blocking findings for {Id}",
                 iteration, maxIterations, blocking.Count, item.Id);
 
+            // Test-red base containment runs BEFORE flake escalation: when the
+            // iteration's failures are test-only and every one reproduces on
+            // the base, an already-recorded red main (or a forge-red tip)
+            // means the item must park under the project hold — not spawn a
+            // per-test flake child, and never fail. Throws
+            // BaseTestBrokenException on a verdict; the outer catch parks,
+            // records, holds, and files the one fix item for the SHA.
+            await ThrowIfBaseTestBrokenAsync(
+                item, project, repoId, baseBranch, blocking, iterationAttributions,
+                scheduledAuditors, ct);
+
             // NotDiffAttributable flake escalation: a test failure that
             // reproduces on the base branch is not caused by the diff, so it
             // must NOT be fed back to the rework agent. Spawn (or reuse) an
@@ -691,6 +702,85 @@ public sealed partial class PipelineRunner
             if (parked) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Test-red base containment for one audit iteration. When the
+    /// iteration's blocking findings are test-only and every observed test
+    /// failure carries a genuine base-branch verdict, asks
+    /// <see cref="BaseBrokenTestClassifier"/> for a verdict: an active
+    /// project condition adopts the failure (main is recorded red), or a
+    /// forge-red current tip records a new one. On a verdict throws
+    /// <see cref="BaseTestBrokenException"/> so the outer catch parks the
+    /// item (no failure charge), records the condition, holds
+    /// build-dependent dispatch, and files the one top-priority fix item
+    /// naming the failing tests and suspect commits. Returns silently when
+    /// the failure is item-attributed — the normal rework/flake paths own
+    /// it. Never throws for infrastructure faults: a classifier fault
+    /// returns null (fail-closed) rather than parking the item.
+    /// </summary>
+    private async Task ThrowIfBaseTestBrokenAsync(
+        WorkItem item,
+        Project project,
+        string repoId,
+        string baseBranch,
+        IReadOnlyList<AuditFinding> blocking,
+        IReadOnlyList<TestFailureAttributionResult> attributions,
+        IReadOnlyList<IAuditor> scheduledAuditors,
+        CancellationToken ct)
+    {
+        if (_baseBrokenConditions is null)
+            return;
+        if (blocking is null || blocking.Count == 0)
+            return;
+        if (attributions is null || attributions.Count == 0)
+            return;
+        if (!NonDeterministicTestEscalationPolicy.HasActionableTests(attributions))
+            return;
+
+        BaseTestBrokenVerdict? verdict;
+        try
+        {
+            var classifier = new BaseBrokenTestClassifier(
+                _baseBrokenConditions,
+                _gitHost,
+                _pipelineTuning,
+                _upstreamFactory,
+                _log);
+            verdict = await classifier.TryClassifyAsync(
+                item,
+                project,
+                repoId,
+                baseBranch,
+                blocking,
+                attributions,
+                BaseBrokenTestClassifier.TestRunnerAuditorNames(scheduledAuditors),
+                ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "Test-red classification for work item {Id} threw; falling back to normal rework",
+                item.Id);
+            return;
+        }
+
+        if (verdict is null)
+            return;
+
+        throw new BaseTestBrokenException(
+            $"Audit test failures reproduce on base branch '{baseBranch}' tip {verdict.BaseSha} ({verdict.FailingTests.Count} test(s)); base is test-red, not this diff",
+            baseBranch,
+            verdict.BaseSha,
+            verdict.FailingTests,
+            verdict.SuspectCommits,
+            verdict.Summary,
+            WorkItemState.WorkComplete,
+            phase: "audit");
     }
 
     /// <summary>
