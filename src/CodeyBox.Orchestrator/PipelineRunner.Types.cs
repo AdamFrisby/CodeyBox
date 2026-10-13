@@ -96,6 +96,65 @@ internal sealed class BaseBuildBrokenException : Exception
 }
 
 /// <summary>
+/// The base branch builds but its tests fail at the recorded tip — the red
+/// is in the base, not the work. Thrown by the audit-loop test-red check
+/// (and the post-merge CI watch path records the same condition shape
+/// directly) instead of <see cref="AuditFailedException"/>; the outer catch
+/// parks the item at <see cref="ResumeState"/> (branch preserved, no failure
+/// charge), records the project-level test-kind base-broken condition, and
+/// holds build-dependent dispatch until the tip's CI passes again. Every
+/// <see cref="BaseBuildBrokenException"/> handling site also handles this
+/// type: same containment, different clear signal.
+/// </summary>
+internal sealed class BaseTestBrokenException : Exception
+{
+    public BaseTestBrokenException(
+        string message,
+        string baseBranch,
+        string baseSha,
+        IReadOnlyList<string> failingTests,
+        IReadOnlyList<string> suspectCommits,
+        string? failureSummary,
+        WorkItemState resumeState,
+        string? phase = null)
+        : base(message)
+    {
+        BaseBranch = baseBranch;
+        BaseSha = baseSha;
+        FailingTests = failingTests;
+        SuspectCommits = suspectCommits;
+        FailureSummary = failureSummary;
+        ResumeState = resumeState;
+        Phase = phase;
+    }
+
+    /// <summary>The base branch whose tip tests fail.</summary>
+    public string BaseBranch { get; }
+
+    /// <summary>The base branch tip SHA that reproduced the test failures.</summary>
+    public string BaseSha { get; }
+
+    /// <summary>Failing test or CI-check names (sanitized at the throw site).</summary>
+    public IReadOnlyList<string> FailingTests { get; }
+
+    /// <summary>Suspect landed commits (hex SHAs) the detector named.</summary>
+    public IReadOnlyList<string> SuspectCommits { get; }
+
+    /// <summary>Bounded summary text (names + suspects) for the condition record.</summary>
+    public string? FailureSummary { get; }
+
+    /// <summary>
+    /// The resumable state the item returns to while the hold is active:
+    /// WorkComplete for an audit-gate detection (re-audited on resume),
+    /// Queued for a work-phase detection.
+    /// </summary>
+    public WorkItemState ResumeState { get; }
+
+    /// <summary>Pipeline phase string that detected the failure (for logging).</summary>
+    public string? Phase { get; }
+}
+
+/// <summary>
 /// A declared e2e-replay capability could not be made green by the
 /// post-implementation replay gate (missing/broken replay that authoring +
 /// verification could not resolve). Like <see cref="RequiredBuildFailedException"/>

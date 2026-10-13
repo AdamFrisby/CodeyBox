@@ -63,6 +63,8 @@ public sealed partial class PipelineRunner
         var resumingGitCheckpoint = !string.IsNullOrWhiteSpace(item.PreemptCheckpoint);
         var resumingRetainedSandbox = item.AgentTurnRecoveryLease is not null;
         var resumingPreempt = resumingGitCheckpoint || resumingRetainedSandbox;
+        string? resumeTipSha = null;
+        string? resumeBaseSha = null;
         if (resumingGitCheckpoint)
         {
             // Resolve the resume baseline as the fork point of the current
@@ -74,13 +76,16 @@ public sealed partial class PipelineRunner
             // terminally fail a resumable turn. When the branch did not move,
             // the fork point is the tip itself. This recompute also covers
             // the fallback-member route that never entered RunAsync with
-            // resume metadata.
+            // resume metadata. The raw tips are resolved alongside for the
+            // stale check below, which needs them — not the fork point.
             resumePreTurnCommitSha = await ResolveAgentTurnResumeBaseAsync(
                 repoId,
                 branch,
                 baseBranch,
                 CheckpointSourceSha(item.PreemptCheckpoint),
                 ct);
+            resumeTipSha = await ResolveAgentTurnPreTurnCommitAsync(repoId, branch, baseBranch, ct);
+            resumeBaseSha = await ResolveAgentTurnBaseTipAsync(repoId, baseBranch, ct);
         }
         var credential = await ResolveAgentCredentialAsync(runner.Kind, project, item, ct);
         var selectedMemberForSession = TryResolveSelectedMember(runner.Kind, project, item);
@@ -325,9 +330,11 @@ public sealed partial class PipelineRunner
                 checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
                 // Two independent signals detect a base move under the
-                // checkpoint: the pickup pre/post-refresh tip difference (the
-                // base ref moved across this pickup's upstream refresh) and
-                // the source-lineage probe (the current base tip is no longer
+                // checkpoint: the pickup pre/post-refresh tip difference plus
+                // the work/base-tip reachability probes (the base ref moved
+                // across this pickup's upstream refresh or the checkpoint no
+                // longer descends from the work-branch or base tip) and the
+                // source-lineage probe (the current base tip is no longer
                 // contained in the checkpoint source's history, so the tree
                 // was staged on an abandoned base after a recompose/rebase).
                 // Either firing discards for a fresh turn. A same-base branch
@@ -339,9 +346,12 @@ public sealed partial class PipelineRunner
                 var checkpointSourceSha = CheckpointSourceSha(preemptCheckpoint);
                 var baseMovedPastCheckpoint = checkpointSourceSha is not null
                     && await IsCheckpointBaseMovedAsync(repoId, baseBranch, checkpointSourceSha, ct).ConfigureAwait(false);
-                var refreshMovedBase = await IsStaleAgentTurnCheckpointAsync(
-                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, ct).ConfigureAwait(false);
-                if (refreshMovedBase || baseMovedPastCheckpoint)
+                var staleCheckpoint = await IsStaleAgentTurnCheckpointAsync(
+                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, resumeTipSha, resumeBaseSha, ct).ConfigureAwait(false);
+                _log.LogDebug(
+                    "Durable agent-turn checkpoint staleness for work item {Id}: stale={Stale} (work tip {WorkTip}, base tip {BaseTip}, base tip before refresh {BaseTipBeforeRefresh}, checkpoint ref {CheckpointRef})",
+                    item.Id, staleCheckpoint || baseMovedPastCheckpoint, resumeTipSha, resumeBaseSha, preRefreshBaseTipSha, preemptCheckpoint);
+                if (staleCheckpoint || baseMovedPastCheckpoint)
                 {
                     // The base moved under the checkpoint after it was
                     // written (a pickup-time rebase onto a fresh base or a
@@ -357,8 +367,8 @@ public sealed partial class PipelineRunner
                     // never silently dropped.
                     item = await DiscardStaleAgentTurnCheckpointAsync(
                         item,
-                        refreshMovedBase
-                            ? "durable agent-turn checkpoint base moved across the pickup upstream refresh"
+                        staleCheckpoint
+                            ? "durable agent-turn checkpoint base moved across the pickup upstream refresh or no longer descends from the work-branch or base tip"
                             : "durable agent-turn checkpoint source predates the current base tip after the work branch was recomposed",
                         runner.Kind,
                         agentPhase,
@@ -1647,7 +1657,9 @@ public sealed partial class PipelineRunner
             // checkpoint-conversion failure: it must reach the outer
             // BaseBuildBrokenException catch unwrapped so the item parks
             // (branch preserved) instead of failing as infrastructure.
-            && ex is not BaseBuildBrokenException)
+            // Test-red parks identically.
+            && ex is not BaseBuildBrokenException
+            && ex is not BaseTestBrokenException)
         {
             throw new AgentInfrastructureFailureException(
                 runner.Kind,

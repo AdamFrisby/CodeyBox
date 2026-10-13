@@ -76,6 +76,42 @@ public sealed partial class PipelineRunner
             && SandboxTestSelectionBaselineRunner.IsHexSha(mergeSha.Trim());
 
     /// <summary>
+    /// Schedules a post-merge CI watch after a successful landing. Resolves
+    /// the configured enablement live (hot-reloadable); the service itself
+    /// re-checks at poll time, so a disable between schedule and poll still
+    /// drops the watch. Best-effort — any fault is logged and swallowed so
+    /// the merge outcome (already persisted) is never affected.
+    /// </summary>
+    private void SchedulePostMergeCiWatch(
+        Project project,
+        string baseBranch,
+        string? mergeSha,
+        WorkItemId sourceItemId,
+        IReadOnlyList<string?>? suspects = null)
+    {
+        if (_postMergeCiWatch is null)
+            return;
+        try
+        {
+            if (!_pipelineTuning.Current.PostMergeCiWatchEnabled)
+                return;
+            _postMergeCiWatch.Schedule(
+                project.Id,
+                baseBranch,
+                mergeSha,
+                sourceItemId,
+                suspects?.Where(s => s is not null).Cast<string>().ToList());
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(
+                ex,
+                "Post-merge CI watch scheduling failed for project {ProjectId}; merge is unaffected",
+                project.Id.Value);
+        }
+    }
+
+    /// <summary>
     /// Stages the newest stored baseline whose commit is an ancestor of the
     /// item's base tip into the audit sandbox at
     /// <c>BaselineSandboxPath</c> (read-only). Stages nothing when no stored

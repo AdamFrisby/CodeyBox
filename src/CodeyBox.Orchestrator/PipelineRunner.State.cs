@@ -189,6 +189,10 @@ public sealed partial class PipelineRunner
     private readonly TestSelectionBaselineScheduler? _baselineScheduler;
     private readonly Func<TestSelectionBaselineProductionOptions>? _baselineProductionOptions;
     private readonly TestSelectionBaselineAuditStager? _baselineStager;
+    // Post-merge CI watch (null keeps the pre-feature behaviour: landed
+    // merges schedule no CI watch and test-red detection relies on the
+    // audit-time check alone).
+    private readonly PostMergeCiWatchService? _postMergeCiWatch;
     // Leased workload secrets (null keeps the static host-environment path).
     // When wired, grant-authorised secrets are issued as time-bound or
     // brokered leases and revoked on terminal transitions.
@@ -618,6 +622,7 @@ public sealed partial class PipelineRunner
         // condition, the fix-item dedupe, and the dispatcher hold.
         BaseBuildVerifier? baseBuildVerifier = null,
         BaseBrokenConditionTracker? baseBrokenConditions = null,
+        PostMergeCiWatchService? postMergeCiWatch = null,
         CommitAttributionPolicy? attributionPolicy = null,
         // Hot-reloadable work-branch ownership knobs (trailer proof, push
         // history bound). Optional: when null the shipped defaults apply, so
@@ -791,6 +796,7 @@ public sealed partial class PipelineRunner
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _mergeLandingGate = mergeLandingGate ?? MergeLandingGate.Shared;
         _baseBrokenConditions = baseBrokenConditions;
+        _postMergeCiWatch = postMergeCiWatch;
         var effectiveToolchainFaultClassifier =
             toolchainFaultClassifier ?? new ToolchainFaultClassifier(snapshot: null);
         _requiredBuildGate = new RequiredBuildGate(
