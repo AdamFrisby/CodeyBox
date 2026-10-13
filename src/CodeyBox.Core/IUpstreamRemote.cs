@@ -12,6 +12,16 @@ public interface IUpstreamRemote
     string Name { get; }
 
     /// <summary>
+    /// True when <see cref="CompleteAsync"/> pushes the item's work branch to
+    /// the upstream (the common case). False for upstreams whose completion
+    /// pushes a different ref (git-generic lands the base branch) or nothing
+    /// at all (noop). The orchestrator records a pushed work-branch tip only
+    /// when this is true, so a recorded sha is always evidence of a real
+    /// work-branch push — never a guess.
+    /// </summary>
+    bool PushesWorkBranch => true;
+
+    /// <summary>
     /// Pushes the named ref from the host bare repo to the upstream. The
     /// repository identifier is opaque and must be understood by the host
     /// git module that materialises it.
@@ -757,12 +767,27 @@ public sealed record UpstreamCompletionRequest
     /// as <c>LastPushedWorkBranchSha</c>), or an operator-authorized sha
     /// observed on the remote during a re-drive. When the remote tip has
     /// diverged from the new head, the implementation rewrites the owned
-    /// branch only under a <c>--force-with-lease</c> bound to this sha; a
-    /// mismatch means a third party pushed and the rewrite is refused.
+    /// branch only under a <c>--force-with-lease</c> bound to this sha. A
+    /// moved remote is first checked against <see cref="KnownWorkBranchShas"/>
+    /// and the commit-trailer ownership proof before it is refused as
+    /// third-party work; only a foreign or unverifiable tip is refused.
     /// Null when CodeyBox has no record (first push, or legacy rows): a
     /// diverged remote is then reported distinctly rather than rewritten.
     /// </summary>
     public string? ExpectedRemoteHeadSha { get; init; }
+
+    /// <summary>
+    /// Every work-branch tip sha CodeyBox has recorded pushing for this item
+    /// (bounded history, newest last; see
+    /// <c>WorkItem.PushedWorkBranchShaHistory</c>). When the remote tip
+    /// matches <see cref="ExpectedRemoteHeadSha"/> the lease proceeds as
+    /// usual; when it has moved, a tip equal to ANY entry here is still
+    /// accepted as CodeyBox's own history before the implementation falls
+    /// back to the commit-trailer ownership proof. Null or empty when no
+    /// history was recorded (first push, legacy rows): only the trailer
+    /// proof can then authorize a rewrite.
+    /// </summary>
+    public IReadOnlyList<string>? KnownWorkBranchShas { get; init; }
 }
 
 /// <summary>Result of <see cref="IUpstreamRemote.CompleteAsync"/>.</summary>

@@ -67,9 +67,10 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         agent.WorkResults.Enqueue(new AgentResult(true, "fresh ok", "fresh ok", null));
 
         var logger = new CapturingLogger<PipelineRunner>();
+        var seedRepoPath = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var setup = TestSupport.BuildPipeline(
             _workspace,
-            await TestSupport.CreateSeedRepoAsync(_workspace),
+            seedRepoPath,
             agentOverride: agent,
             logger: logger);
 
@@ -81,7 +82,7 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         // restart-recovery recomposition: the base advances and the work
         // branch is recomposed at the fresh tip. The checkpoint still
         // descends from the old base, not from this tip.
-        var freshBaseTip = await RecomposeBranchOnFreshBaseAsync(setup, item);
+        var freshBaseTip = await RecomposeBranchOnFreshBaseAsync(setup, item, seedRepoPath);
         var barePath = BarePathFor(setup, item);
         var (staleCode, _, _) = await TestSupport.RunGitNoThrow(
             barePath, "merge-base", "--is-ancestor", await TipOfAsync(barePath, item.WorkBranch!), await CheckpointCommitOfAsync(setup, item));
@@ -163,9 +164,10 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         agent.WorkResults.Enqueue(new AgentResult(true, "fresh ok", "fresh ok", null));
 
         var logger = new CapturingLogger<PipelineRunner>();
+        var seedRepoPath = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var setup = TestSupport.BuildPipeline(
             _workspace,
-            await TestSupport.CreateSeedRepoAsync(_workspace),
+            seedRepoPath,
             agentOverride: agent,
             logger: logger);
 
@@ -173,7 +175,7 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         await setup.Store.CreateAsync(item);
         await PreemptFirstTurnAsync(setup, item, ready);
 
-        var freshBaseTip = await RecomposeBranchOnFreshBaseAsync(setup, item);
+        var freshBaseTip = await RecomposeBranchOnFreshBaseAsync(setup, item, seedRepoPath);
         var rivalTip = await AdvanceBranchAsync(setup, item, "rival.txt", "rival change\n", "rival advance");
         var barePath = BarePathFor(setup, item);
         var (staleCode, _, _) = await TestSupport.RunGitNoThrow(
@@ -256,9 +258,10 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         var sandboxHook = new LeaseInjectingSandboxProvider(
             new ProcessSandboxProvider(Microsoft.Extensions.Logging.Abstractions.NullLogger<ProcessSandboxProvider>.Instance));
         var logger = new CapturingLogger<PipelineRunner>();
+        var seedRepoPath = await TestSupport.CreateSeedRepoAsync(_workspace);
         using var setup = TestSupport.BuildPipeline(
             _workspace,
-            await TestSupport.CreateSeedRepoAsync(_workspace),
+            seedRepoPath,
             agentOverride: agent,
             logger: logger,
             sandboxProvider: sandboxHook);
@@ -275,7 +278,7 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
         // discard must refuse explicitly rather than silently drop
         // provider-owned state.
         var barePath = BarePathFor(setup, item);
-        await RecomposeBranchOnFreshBaseAsync(setup, item);
+        await RecomposeBranchOnFreshBaseAsync(setup, item, seedRepoPath);
         var staleCheckpointCommit = await CheckpointCommitOfAsync(setup, item);
         var (staleCode, _, _) = await TestSupport.RunGitNoThrow(
             barePath, "merge-base", "--is-ancestor", await TipOfAsync(barePath, item.WorkBranch!), staleCheckpointCommit);
@@ -356,23 +359,25 @@ public sealed class StaleCheckpointFreshTurnTests : IDisposable
 
     /// <summary>
     /// Advances the base branch with a fresh commit and recomposes the work
-    /// branch at the fresh tip, returning the fresh base tip SHA.
+    /// branch at the fresh tip, returning the fresh base tip SHA. The base
+    /// advance lands in the upstream seed repo — never straight in the host
+    /// bare repo, whose main is force-refreshed from the seed on every
+    /// pickup (canonical base refresh) and would clobber a direct push. The
+    /// work branch is repointed at the fresh tip in the host bare repo, the
+    /// same end state a pickup-time rebase or restart-recovery recomposition
+    /// leaves behind.
     /// </summary>
-    private async Task<string> RecomposeBranchOnFreshBaseAsync(TestPipeline setup, WorkItem item)
+    private async Task<string> RecomposeBranchOnFreshBaseAsync(TestPipeline setup, WorkItem item, string seedRepoPath)
     {
+        await File.WriteAllTextAsync(Path.Combine(seedRepoPath, "base2.txt"), "fresh base\n");
+        await TestSupport.RunGit(seedRepoPath, "add", "base2.txt");
+        await TestSupport.RunGit(seedRepoPath, "commit", "-q", "-m", "fresh base commit");
+        var (_, freshBaseTip, _) = await TestSupport.RunGit(seedRepoPath, "rev-parse", "HEAD");
         var barePath = BarePathFor(setup, item);
-        var clone = Path.Combine(_workspace, "rebase-" + Guid.NewGuid().ToString("N")[..8]);
-        await TestSupport.RunGit(_workspace, "clone", "-q", barePath, clone);
-        await TestSupport.RunGit(clone, "config", "user.email", "rebase@example.invalid");
-        await TestSupport.RunGit(clone, "config", "user.name", "Rebase Writer");
-        await TestSupport.RunGit(clone, "checkout", "-q", "main");
-        await File.WriteAllTextAsync(Path.Combine(clone, "base2.txt"), "fresh base\n");
-        await TestSupport.RunGit(clone, "add", "base2.txt");
-        await TestSupport.RunGit(clone, "commit", "-q", "-m", "fresh base commit");
-        await TestSupport.RunGit(clone, "push", "-q", "origin", "HEAD:main");
-        var (_, freshBaseTip, _) = await TestSupport.RunGit(clone, "rev-parse", "HEAD");
-        await TestSupport.RunGit(clone, "checkout", "-q", "-B", item.WorkBranch!, "main");
-        await TestSupport.RunGit(clone, "push", "-q", "origin", $"HEAD:{item.WorkBranch}");
+        // Fetch the fresh base into the host bare repo and recompose the work
+        // branch at it (forced: recomposition rewrites the branch). The next
+        // pickup's canonical base refresh fetches the same tip for main.
+        await TestSupport.RunGit(barePath, "fetch", "-q", seedRepoPath, $"+main:refs/heads/{item.WorkBranch}");
         return freshBaseTip.Trim();
     }
 

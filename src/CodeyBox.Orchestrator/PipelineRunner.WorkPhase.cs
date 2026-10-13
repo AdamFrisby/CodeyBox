@@ -324,8 +324,24 @@ public sealed partial class PipelineRunner
                 preemptCheckpoint = item.PreemptCheckpoint!;
                 checkpointBranch = ValidatePreemptCheckpoint(item, preemptCheckpoint);
                 await PipelineAgentExecutor.Run(sandbox, "git", "-C", SandboxConventions.WorkDir, "fetch", "origin", preemptCheckpoint);
-                if (await IsStaleAgentTurnCheckpointAsync(
-                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, ct).ConfigureAwait(false))
+                // Two independent signals detect a base move under the
+                // checkpoint: the pickup pre/post-refresh tip difference (the
+                // base ref moved across this pickup's upstream refresh) and
+                // the source-lineage probe (the current base tip is no longer
+                // contained in the checkpoint source's history, so the tree
+                // was staged on an abandoned base after a recompose/rebase).
+                // Either firing discards for a fresh turn. A same-base branch
+                // advance fires neither and still resumes below against the
+                // fork-point baseline. The fork-point ancestry check alone
+                // stays vacuous for typed refs (the pre-turn commit is the
+                // fork point of the tip and the source, always an ancestor
+                // of the source itself), so it cannot be the signal.
+                var checkpointSourceSha = CheckpointSourceSha(preemptCheckpoint);
+                var baseMovedPastCheckpoint = checkpointSourceSha is not null
+                    && await IsCheckpointBaseMovedAsync(repoId, baseBranch, checkpointSourceSha, ct).ConfigureAwait(false);
+                var refreshMovedBase = await IsStaleAgentTurnCheckpointAsync(
+                        repoId, baseBranch, preemptCheckpoint, preRefreshBaseTipSha, ct).ConfigureAwait(false);
+                if (refreshMovedBase || baseMovedPastCheckpoint)
                 {
                     // The base moved under the checkpoint after it was
                     // written (a pickup-time rebase onto a fresh base or a
@@ -341,7 +357,9 @@ public sealed partial class PipelineRunner
                     // never silently dropped.
                     item = await DiscardStaleAgentTurnCheckpointAsync(
                         item,
-                        "durable agent-turn checkpoint base moved across the pickup upstream refresh",
+                        refreshMovedBase
+                            ? "durable agent-turn checkpoint base moved across the pickup upstream refresh"
+                            : "durable agent-turn checkpoint source predates the current base tip after the work branch was recomposed",
                         runner.Kind,
                         agentPhase,
                         ct).ConfigureAwait(false);

@@ -4260,7 +4260,8 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     providerTransientCorrelation: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
     baseBuildVerifier: sp.GetRequiredService<BaseBuildVerifier>(),
     baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>(),
-    attributionPolicy: sp.GetRequiredService<CodeyBox.Core.CommitAttributionPolicy>()));
+    attributionPolicy: sp.GetRequiredService<CodeyBox.Core.CommitAttributionPolicy>(),
+    branchOwnership: sp.GetRequiredService<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>()));
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable

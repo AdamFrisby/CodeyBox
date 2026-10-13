@@ -168,6 +168,11 @@ public sealed partial class PipelineRunner
                 // the operator instead of being rewritten blind.
                 if (request.ExpectedRemoteHeadSha is null && !string.IsNullOrWhiteSpace(stored?.LastPushedWorkBranchSha))
                     request = request with { ExpectedRemoteHeadSha = stored.LastPushedWorkBranchSha };
+                // Bounded recorded-push history for the same lease decision:
+                // a remote tip matching ANY entry is still CodeyBox's own
+                // even when the latest record went stale.
+                if (stored is not null && stored.PushedWorkBranchShaHistory.Count > 0)
+                    request = request with { KnownWorkBranchShas = stored.PushedWorkBranchShaHistory };
             }
 
             // Pre-merge CI gate. The forge's textual `mergeable` flag does not
@@ -321,6 +326,19 @@ public sealed partial class PipelineRunner
                     if (outcome.Notes is not null)
                         _log.LogInformation("Upstream notes: {Notes}", outcome.Notes);
 
+                    // Record every successful work-branch push immediately —
+                    // before race recovery (which recomposes the branch and
+                    // may itself fail), PR handling, or the next loop
+                    // iteration. A push whose completion later fails must
+                    // already be on record, or the next attempt sees the
+                    // remote at this sha, compares it with the stale record,
+                    // and misreports CodeyBox's own push as third-party work.
+                    // The refreshed request also carries the new tip as the
+                    // lease base for any further attempt in this run.
+                    request = await RecordUpstreamPushAsync(
+                        item.Id, upstream, repoId, workBranch, outcome.PushedWorkBranchSha,
+                        outcome.BranchPushed && !outcome.Skipped, request, ct);
+
                     lastIterationRaced = outcome.AutoMergeRaced;
                     if (outcome.AutoMergeRaced)
                     {
@@ -428,12 +446,14 @@ public sealed partial class PipelineRunner
                         if (outcome.PullRequestNumber is not null || outcome.PullRequestUrl is not null)
                         {
                             var racedPersist = await _store.GetAsync(item.Id, ct) ?? item;
-                            await _store.UpdateAsync(racedPersist with
-                            {
-                                MergedPrNumber = outcome.PullRequestNumber ?? racedPersist.MergedPrNumber,
-                                MergedPrUrl = outcome.PullRequestUrl ?? racedPersist.MergedPrUrl,
-                                LastPushedWorkBranchSha = outcome.PushedWorkBranchSha ?? racedPersist.LastPushedWorkBranchSha,
-                            }, ct);
+                            await _store.UpdateAsync(WorkItemPushHistory.RecordPush(
+                                racedPersist with
+                                {
+                                    MergedPrNumber = outcome.PullRequestNumber ?? racedPersist.MergedPrNumber,
+                                    MergedPrUrl = outcome.PullRequestUrl ?? racedPersist.MergedPrUrl,
+                                },
+                                outcome.PushedWorkBranchSha,
+                                PushHistoryBound), ct);
                         }
                         continue;
                     }
@@ -497,6 +517,18 @@ public sealed partial class PipelineRunner
                     }
 
                     _log.LogWarning("Upstream complete attempt {Attempt} failed: {Error}", attempt, ex.Message);
+                    // The push may still have landed even though the
+                    // completion failed (a PR/merge step threw after the
+                    // branch push, or the push result was ambiguous).
+                    // Confirm and record it BEFORE retrying/parking:
+                    // otherwise the next attempt sees the remote at that sha,
+                    // compares it with the stale record, and misreports
+                    // CodeyBox's own push as third-party work. This runs only
+                    // on the generic path: the typed terminals above
+                    // (lease mismatch, diverged history, reconcile conflict)
+                    // are thrown INSTEAD of pushing, so their contracts
+                    // guarantee nothing landed and no confirm read is needed.
+                    request = await ConfirmUpstreamPushAsync(item.Id, upstream, repoId, workBranch, request, ct);
                     if (attempt < _opts.UpstreamPushMaxAttempts)
                         await Task.Delay(_opts.UpstreamPushBackoff, ct);
                     else
@@ -569,13 +601,15 @@ public sealed partial class PipelineRunner
                     completed.PushedWorkBranchSha is not null)
                 {
                     var preMergePersist = await _store.GetAsync(item.Id, ct) ?? item;
-                    await _store.UpdateAsync(preMergePersist with
-                    {
-                        MergeSha = completed.MergedSha ?? preMergePersist.MergeSha,
-                        MergedPrNumber = completed.PullRequestNumber ?? preMergePersist.MergedPrNumber,
-                        MergedPrUrl = completed.PullRequestUrl ?? preMergePersist.MergedPrUrl,
-                        LastPushedWorkBranchSha = completed.PushedWorkBranchSha ?? preMergePersist.LastPushedWorkBranchSha,
-                    }, ct);
+                    await _store.UpdateAsync(WorkItemPushHistory.RecordPush(
+                        preMergePersist with
+                        {
+                            MergeSha = completed.MergedSha ?? preMergePersist.MergeSha,
+                            MergedPrNumber = completed.PullRequestNumber ?? preMergePersist.MergedPrNumber,
+                            MergedPrUrl = completed.PullRequestUrl ?? preMergePersist.MergedPrUrl,
+                        },
+                        completed.PushedWorkBranchSha,
+                        PushHistoryBound), ct);
                 }
 
                 // Verified-delivery gate (sig-pr422-delivery-reconciliation):
@@ -829,5 +863,129 @@ public sealed partial class PipelineRunner
         string? ParkReason,
         string? FailureKind = null,
         AgentKind? Agent = null);
+
+    /// <summary>
+    /// Configured bound on retained pushed-sha history entries, read live so
+    /// hot-reload edits apply to the next push without a restart. Falls back
+    /// to the shipped default when no ownership snapshot is wired.
+    /// </summary>
+    private int PushHistoryBound =>
+        _branchOwnership?.Current.MaxPushHistoryEntries ?? WorkItemPushHistory.DefaultMaxEntries;
+
+    /// <summary>
+    /// Records a successful work-branch push on the item (latest sha plus
+    /// bounded history) and refreshes the in-flight request's lease base, so
+    /// a later attempt in this run — or the next run — proves the remote tip
+    /// is CodeyBox's own instead of misreporting it as third-party work.
+    /// <paramref name="reportedSha"/> is the tip the remote reports pushing;
+    /// when it is blank but <paramref name="branchPushed"/> confirms a
+    /// work-branch push landed, the local tip is resolved best-effort
+    /// (covers legacy hosts and forge remotes that track no tip). The sha
+    /// must look like a real commit id (hex, 40–64 chars) — anything else is
+    /// untrusted forge output and stays unrecorded. Never throws except on
+    /// cancellation: every I/O failure keeps the previous record and request.
+    /// </summary>
+    private async Task<UpstreamCompletionRequest> RecordUpstreamPushAsync(
+        WorkItemId itemId,
+        IUpstreamRemote upstream,
+        string repoId,
+        string workBranch,
+        string? reportedSha,
+        bool branchPushed,
+        UpstreamCompletionRequest request,
+        CancellationToken ct)
+    {
+        var sha = reportedSha?.Trim();
+        if (string.IsNullOrWhiteSpace(sha) && branchPushed && upstream.PushesWorkBranch)
+        {
+            try
+            {
+                sha = (await _gitHost.ResolveCommitAsync(repoId, workBranch, ct).ConfigureAwait(false)).Trim();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogDebug(ex, "Could not resolve pushed tip of {WorkBranch}; push stays unrecorded", workBranch);
+                return request;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(sha) || !WorkItemPushHistory.IsPlausibleSha(sha))
+        {
+            _log.LogDebug("Refusing to record implausible pushed sha for {WorkBranch}; push stays unrecorded", workBranch);
+            return request;
+        }
+        WorkItem? stored;
+        try
+        {
+            stored = await _store.GetAsync(itemId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogDebug(ex, "Could not read work item {WorkItemId} to record pushed sha", itemId);
+            return request;
+        }
+        if (stored is null)
+            return request;
+        var updated = WorkItemPushHistory.RecordPush(stored, sha, PushHistoryBound);
+        try
+        {
+            await _store.UpdateAsync(updated, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogDebug(ex, "Could not persist pushed sha for work item {WorkItemId}", itemId);
+            return request;
+        }
+        _log.LogInformation("Recorded pushed work-branch tip {Sha} for work item {WorkItemId}", sha, itemId);
+        return request with
+        {
+            ExpectedRemoteHeadSha = updated.LastPushedWorkBranchSha,
+            KnownWorkBranchShas = updated.PushedWorkBranchShaHistory,
+        };
+    }
+
+    /// <summary>
+    /// Best-effort confirmation for a completion that FAILED after its push
+    /// step: when the upstream tip now equals the local tip CodeyBox
+    /// attempted to push, that tip demonstrably reached the remote (either
+    /// by this attempt or an identical earlier one — both CodeyBox's own) and
+    /// is recorded before the failure is classified. Anything unresolvable
+    /// or unequal records nothing: a guess is never persisted.
+    /// </summary>
+    private async Task<UpstreamCompletionRequest> ConfirmUpstreamPushAsync(
+        WorkItemId itemId,
+        IUpstreamRemote upstream,
+        string repoId,
+        string workBranch,
+        UpstreamCompletionRequest request,
+        CancellationToken ct)
+    {
+        if (!upstream.PushesWorkBranch)
+            return request;
+        string? remoteTip;
+        string? localTip;
+        try
+        {
+            remoteTip = await upstream.GetBranchHeadShaAsync(workBranch, ct).ConfigureAwait(false);
+            localTip = await _gitHost.ResolveCommitAsync(repoId, workBranch, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            // A timeout here (TaskCanceledException without a requested
+            // shutdown) must not surface as a cancellation: swallowing it
+            // lets the in-loop retry classify the ORIGINAL failure instead
+            // of parking the item as interrupted.
+            _log.LogDebug(ex, "Could not confirm pushed tip of {WorkBranch} after failed completion", workBranch);
+            return request;
+        }
+        if (string.IsNullOrWhiteSpace(remoteTip) || string.IsNullOrWhiteSpace(localTip))
+            return request;
+        if (!string.Equals(remoteTip.Trim(), localTip.Trim(), StringComparison.OrdinalIgnoreCase))
+            return request;
+        _log.LogInformation(
+            "Upstream tip of {WorkBranch} equals the attempted local tip after a failed completion; recording {Sha}",
+            workBranch, remoteTip.Trim());
+        return await RecordUpstreamPushAsync(
+            itemId, upstream, repoId, workBranch, remoteTip.Trim(), branchPushed: true, request, ct).ConfigureAwait(false);
+    }
 
 }

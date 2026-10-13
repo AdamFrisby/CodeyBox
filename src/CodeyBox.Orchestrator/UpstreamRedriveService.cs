@@ -352,9 +352,18 @@ public sealed class UpstreamRedriveService
             };
         }
         if (leaseBase is not null
-            && !string.Equals(updated.LastPushedWorkBranchSha, leaseBase, StringComparison.OrdinalIgnoreCase))
+            && !string.Equals(updated.LastPushedWorkBranchSha, leaseBase, StringComparison.OrdinalIgnoreCase)
+            && !WorkItemPushHistory.Contains(updated, leaseBase))
         {
-            updated = updated with { LastPushedWorkBranchSha = leaseBase };
+            // Record the operator-authorized tip as the lease base AND in the
+            // bounded push history: the retried run's push receipt extends
+            // this history, and the lease fallback accepts any entry — so
+            // the record survives even if a later push lands without being
+            // persisted. Implausible tips stay unrecorded (see
+            // WorkItemPushHistory); the retry then proceeds without a lease
+            // base rather than on poisoned evidence.
+            updated = WorkItemPushHistory.RecordPush(
+                updated, leaseBase, _ownership.Current.MaxPushHistoryEntries);
         }
         if (!ReferenceEquals(updated, fresh))
             await _store.UpdateAsync(updated, ct);

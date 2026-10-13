@@ -96,6 +96,9 @@ public sealed partial class PipelineRunner
     // a private snapshot (unchanging defaults) when DI does not supply one.
     private readonly PipelineTuningSnapshot _pipelineTuning;
     private readonly CommitAttributionPolicy _attribution;
+    // Hot-reloadable work-branch ownership knobs. Null when unwired (tests /
+    // legacy embedders): readers fall back to shipped defaults.
+    private readonly UpstreamBranchOwnershipSnapshot? _branchOwnership;
     // Optional stale-base remediation router. When wired AND enabled, a
     // stale-base conflict discovered at upstream-push time re-dispatches the
     // item into conflict-rework instead of parking. Null preserves the
@@ -615,7 +618,12 @@ public sealed partial class PipelineRunner
         // condition, the fix-item dedupe, and the dispatcher hold.
         BaseBuildVerifier? baseBuildVerifier = null,
         BaseBrokenConditionTracker? baseBrokenConditions = null,
-        CommitAttributionPolicy? attributionPolicy = null)
+        CommitAttributionPolicy? attributionPolicy = null,
+        // Hot-reloadable work-branch ownership knobs (trailer proof, push
+        // history bound). Optional: when null the shipped defaults apply, so
+        // tests and embeddings that don't wire the snapshot keep the
+        // previous behaviour.
+        UpstreamBranchOwnershipSnapshot? branchOwnership = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -740,6 +748,7 @@ public sealed partial class PipelineRunner
         _incrementalRebase = incrementalRebase;
         _pipelineTuning = pipelineTuning ?? new PipelineTuningSnapshot(new PipelineTuningOptions());
         _attribution = attributionPolicy ?? new CommitAttributionPolicy(new CommitAttributionSnapshot(new CommitAttributionOptions()));
+        _branchOwnership = branchOwnership;
         _staleBaseReworkRouter = staleBaseReworkRouter;
         _flakeEscalation = flakeEscalation;
         _flakeEscalationOptions = flakeEscalationOptions;
