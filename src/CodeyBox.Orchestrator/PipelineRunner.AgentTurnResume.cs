@@ -1270,6 +1270,48 @@ public sealed partial class PipelineRunner
             StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// True when the base branch moved past the checkpoint's source commit:
+    /// the current base tip is no longer contained in the checkpoint's
+    /// history, so the checkpoint tree was staged on an abandoned base and a
+    /// fresh turn from the current tip must replace it. This covers the
+    /// recompose/rebase case that the fork-point ancestry check above cannot
+    /// see: the pre-turn commit is the fork point of the tip and the source,
+    /// which is always an ancestor of the source itself, so that check alone
+    /// never reports a typed checkpoint stale. Applies only to typed refs
+    /// (the only shape carrying a source commit); anything unresolvable
+    /// answers false so an uncertain lineage resumes rather than discards.
+    /// </summary>
+    private async Task<bool> IsCheckpointBaseMovedAsync(
+        string repoId,
+        string baseBranch,
+        string checkpointSourceSha,
+        CancellationToken ct)
+    {
+        var source = checkpointSourceSha.Trim();
+        string baseTip;
+        try
+        {
+            baseTip = (await _gitHost.ResolveCommitAsync(repoId, baseBranch, ct).ConfigureAwait(false)).Trim();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Could not resolve base branch '{BaseBranch}' tip for checkpoint lineage check; assuming unmoved", baseBranch);
+            return false;
+        }
+        if (string.Equals(baseTip, source, StringComparison.OrdinalIgnoreCase))
+            return false;
+        try
+        {
+            return !await _gitHost.IsAncestorAsync(repoId, baseTip, source, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Could not check checkpoint lineage against base branch '{BaseBranch}'; assuming unmoved", baseBranch);
+            return false;
+        }
+    }
+
     private const string StaleCheckpointLeaseRefusalMessage =
         "Cannot discard a retained-sandbox recovery lease for a stale durable agent-turn checkpoint; retry the retained agent turn or cancel the item so provider cleanup remains authoritative.";
 
