@@ -482,4 +482,208 @@ public sealed class BuildScriptNuGetHealTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    private static string MigrationMarkerPath(string home)
+        => Path.Combine(home, ".local", "share", "NuGet", "Migrations", "1");
+
+    private static async Task<string> CurrentUidAsync()
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("id", "-u")
+        {
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+        };
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var uid = (await process.StandardOutput.ReadToEndAsync()).Trim();
+        await process.WaitForExitAsync();
+        return uid;
+    }
+
+    // Since runtime 10.0.13, NuGet's first-use/restore "NuGet-Migrations"
+    // user-scoped mutex resolves under $XDG_RUNTIME_DIR (else
+    // $HOME/.dotnet/corefx/Runtime/SharedMemory); a gate exec whose launch env
+    // resolves neither aborts before MSBuild. NuGet only takes that mutex while
+    // its applied-migration marker is absent, so the heal seeds the empty
+    // `Migrations/1` marker under every home a later exec could resolve.
+    [Fact]
+    public async Task HealScript_DirectDotSource_SeedsMigrationMarkers_UnderResolvedHomes()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var cliHome = Path.Combine(root, "cli");
+        var workdir = Path.Combine(root, "work");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(cliHome);
+        Directory.CreateDirectory(workdir);
+        // The script only seeds the stamped repo-local home when its cwd is the
+        // repository root — recognized by the script's own presence there.
+        Directory.CreateDirectory(Path.Combine(workdir, "scripts"));
+        await File.WriteAllTextAsync(Path.Combine(workdir, "scripts", "nuget-home-heal.sh"), "#\n");
+
+        // An already-applied marker is real migration state — never clobber it.
+        var existingMarker = MigrationMarkerPath(home);
+        Directory.CreateDirectory(Path.GetDirectoryName(existingMarker)!);
+        await File.WriteAllTextAsync(existingMarker, "preexisting");
+        try
+        {
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["DOTNET_CLI_HOME"] = cliHome,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                    "sh", workdir, HealScriptRepoRoot(),
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var uid = await CurrentUidAsync();
+            var seededHomes = new[]
+            {
+                home,
+                cliHome,
+                // The stamped repo-local home auditor execs get for dotnet.
+                Path.Combine(workdir, ".dotnet-cli-home"),
+                // The shared per-user fallback the preamble generations redirect to.
+                Path.Combine(root, "codeybox-nuget-home-" + uid),
+            };
+            foreach (var candidate in seededHomes)
+            {
+                var marker = MigrationMarkerPath(candidate);
+                Assert.True(File.Exists(marker), $"expected migration marker under {candidate}");
+            }
+
+            Assert.Equal("preexisting", await File.ReadAllTextAsync(existingMarker));
+            // Seeded markers are the empty file NuGet itself writes after a
+            // no-op migration run.
+            Assert.Equal(string.Empty, await File.ReadAllTextAsync(MigrationMarkerPath(cliHome)));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // End-to-end: a gate exec whose env gives no usable runtime dir — here a
+    // non-writable $XDG_RUNTIME_DIR, which takes precedence over a healthy
+    // $HOME — crashed in dotnet first-use creating "NuGet-Migrations" before
+    // MSBuild ran. After the heal seeds the migration marker under the stamped
+    // repo-local home, the same wrapped `dotnet build` skips the mutex and
+    // completes. Uses a stub-free real `dotnet` so the NuGet migration gate is
+    // exercised, not simulated.
+    [Fact]
+    public async Task HealScript_SeededMigrationMarker_LetsDotnetBuildRun_WhenRuntimeDirUnusable()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process ignores the permission bits that make the
+        // runtime dir unusable, so the pre-heal failure is unobservable.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var workdir = Path.Combine(root, "work");
+        var gateHome = Path.Combine(workdir, ".dotnet-cli-home");
+        var cliHome = Path.Combine(root, "cli");
+        var brokenRuntimeDir = Path.Combine(root, "xdg-broken");
+        Directory.CreateDirectory(workdir);
+        Directory.CreateDirectory(cliHome);
+        Directory.CreateDirectory(brokenRuntimeDir);
+        // Marks the fixture as the repository root so the heal seeds the
+        // stamped repo-local home under it.
+        Directory.CreateDirectory(Path.Combine(workdir, "scripts"));
+        await File.WriteAllTextAsync(Path.Combine(workdir, "scripts", "nuget-home-heal.sh"), "#\n");
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(workdir, "lib.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(Path.Combine(workdir, "C.cs"), "public class C { }\n");
+            await ChmodAsync("000", brokenRuntimeDir);
+
+            var gateEnv = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                // Mirrors a raw dotnet auditor exec: the stamped repo-local
+                // home, a fresh CLI home, and a runtime dir the user cannot use.
+                ["HOME"] = gateHome,
+                ["DOTNET_CLI_HOME"] = cliHome,
+                ["XDG_RUNTIME_DIR"] = brokenRuntimeDir,
+                ["PATH"] = Environment.GetEnvironmentVariable("PATH")
+                    ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["LANG"] = "C.UTF-8",
+            };
+            var buildArgv = new List<string> { "dotnet", "build", Path.Combine(workdir, "lib.csproj") };
+
+            var preHeal = await new DefaultProcessRunner().RunAsync(
+                buildArgv,
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: gateEnv,
+                workingDirectory: workdir);
+            Assert.False(preHeal.Success, "the fixture must reproduce the NuGet-Migrations abort");
+            Assert.Contains("NuGet-Migrations", preHeal.Stdout + preHeal.Stderr, StringComparison.Ordinal);
+
+            var healEnv = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = Path.Combine(root, "home"),
+                ["DOTNET_CLI_HOME"] = Path.Combine(root, "cli-setup"),
+                ["PATH"] = gateEnv["PATH"],
+                ["TMPDIR"] = root,
+            };
+            Directory.CreateDirectory(healEnv["HOME"]);
+            var heal = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                    "sh", workdir, HealScriptRepoRoot(),
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: healEnv);
+            Assert.True(heal.Success, heal.Stdout + heal.Stderr);
+            Assert.True(
+                File.Exists(MigrationMarkerPath(gateHome)),
+                "the heal must seed the migration marker under the stamped gate home");
+
+            var postHeal = await new DefaultProcessRunner().RunAsync(
+                buildArgv,
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: gateEnv,
+                workingDirectory: workdir);
+            Assert.True(postHeal.Success, postHeal.Stdout + postHeal.Stderr);
+            Assert.True(
+                File.Exists(Path.Combine(workdir, "obj", "project.assets.json")),
+                "restore must have run to completion");
+        }
+        finally
+        {
+            await ChmodAsync("755", brokenRuntimeDir);
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }

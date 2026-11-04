@@ -174,7 +174,81 @@ codeybox_ensure_dotnet_runtime_dir() {
     return 0
 }
 
+# The runtime-dir pinning above only fixes THIS process tree: exported values
+# die with the exec that sourced this file. Audit gates run as separate execs
+# whose environment we do not control — the `sh -c` preamble wrapping them is
+# baked into the orchestrator binary and can predate the HOME/XDG pinning —
+# and the named-mutex directory is resolved from the launch environment, so an
+# MSBuild-time `Environment.SetEnvironmentVariable` cannot help either. What a
+# broken runtime dir actually breaks is narrower than dotnet in general: the
+# "NuGet-Migrations" mutex is created only while NuGet's applied-migration
+# marker is ABSENT. MigrationRunner checks
+# File.Exists(<user-profile>/.local/share/NuGet/Migrations/1) — or
+# $XDG_DATA_HOME/NuGet/Migrations/1 — BEFORE creating the mutex
+# (NuGet.Common.Migrations.MigrationRunner), so when the marker is present,
+# first-use and restore skip the mutex outright and the launch env's runtime
+# dir is never consulted.
+#
+# Seed that marker under every home a later exec in this sandbox could resolve:
+# the stamped repo-local CLI home (DotnetCliHomeConventions pins HOME/
+# DOTNET_CLI_HOME to <workdir>/.dotnet-cli-home for raw dotnet execs), the
+# ambient $HOME/$DOTNET_CLI_HOME, the shared per-user fallback both preamble
+# versions redirect to, the passwd-entry home (the UserProfile fallback when
+# $HOME is unset), and $XDG_DATA_HOME's marker layout when that is set. The
+# marker is the exact state NuGet leaves after a no-op migration run — an empty
+# file — and File.Exists only needs the path to be readable, which is precisely
+# what distinguishes it from the SharedMemory dir the mutex would have needed
+# to CREATE. Seeding is strictly best-effort: homes that cannot be written are
+# skipped (a marker cannot be planted there either), and an existing marker is
+# never touched so real migration state is preserved.
+_codeybox_seed_migration_marker() {
+    _codeybox_marker_home="$1"
+    [ -n "$_codeybox_marker_home" ] || return 0
+    case " ${_codeybox_seen_marker_homes:-} " in
+        *" $_codeybox_marker_home "*) return 0 ;;
+    esac
+    _codeybox_seen_marker_homes="${_codeybox_seen_marker_homes:-}$_codeybox_marker_home "
+    _codeybox_marker_dir="$_codeybox_marker_home/.local/share/NuGet/Migrations"
+    _codeybox_marker="$_codeybox_marker_dir/1"
+    # An existing marker (or a symlink placeholder) is real migration state —
+    # never overwrite it and never write through a symlink.
+    { [ -e "$_codeybox_marker" ] || [ -L "$_codeybox_marker" ]; } && return 0
+    mkdir -p "$_codeybox_marker_dir" 2>/dev/null || return 0
+    : > "$_codeybox_marker" 2>/dev/null || true
+    return 0
+}
+
+codeybox_seed_nuget_migration_state() {
+    _codeybox_seen_marker_homes=" "
+    _codeybox_seed_migration_marker "${HOME:-}"
+    _codeybox_seed_migration_marker "${DOTNET_CLI_HOME:-}"
+    # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
+    # home the orchestrator stamps onto raw dotnet auditor execs. Only the
+    # repository root can be that working directory — an MSBuild-Exec'd run has
+    # a project directory as its cwd and must not grow a stray home there.
+    if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then
+        _codeybox_seed_migration_marker "$(pwd -P)/.dotnet-cli-home"
+    fi
+    # The shared per-user fallback both preamble generations redirect to.
+    _codeybox_seed_migration_marker "${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
+    # Environment.GetFolderPath(UserProfile) falls back to the passwd entry
+    # when $HOME is unset — cover a gate exec that resolves no HOME at all.
+    _codeybox_seed_migration_marker "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    # $XDG_DATA_HOME relocates the whole Migrations tree (no .local/share).
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        _codeybox_xdg_marker_dir="$XDG_DATA_HOME/NuGet/Migrations"
+        if [ ! -e "$_codeybox_xdg_marker_dir/1" ]; then
+            mkdir -p "$_codeybox_xdg_marker_dir" 2>/dev/null \
+                && : > "$_codeybox_xdg_marker_dir/1" 2>/dev/null || true
+        fi
+    fi
+    return 0
+}
+
 codeybox_heal_nuget_home
 # Run AFTER the home heal so a just-redirected DOTNET_CLI_HOME is reused as the
 # runtime dir rather than spending a second scratch dir.
 codeybox_ensure_dotnet_runtime_dir
+# Run LAST so the resolved (possibly just-healed) home values are among the
+# seeded candidates.
+codeybox_seed_nuget_migration_state

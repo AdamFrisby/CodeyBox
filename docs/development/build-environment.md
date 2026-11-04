@@ -47,6 +47,33 @@ can a props file re-point the home in process — MSBuild rejects
 `[System.Environment]::SetEnvironmentVariable` with `MSB4185`, since env
 mutation is not on the property-function allowlist.
 
+### The `NuGet-Migrations` named mutex needs a usable runtime dir at launch
+
+Since runtime 10.0.13, user-scoped named mutexes resolve under
+`$XDG_RUNTIME_DIR`, falling back to
+`$HOME/.dotnet/corefx/Runtime/SharedMemory` — and the runtime caches that answer
+at process start, so no in-process env change can help. NuGet creates that mutex
+in two places before/inside `dotnet build`: first-use configuration and restore
+(`MigrationRunner`). When the launch environment resolves neither variable to a
+usable directory the CLI aborts with
+`System.IO.IOException: The system cannot open the device or file specified. : 'NuGet-Migrations'`
+(dotnet/runtime#135726, #136802) — before MSBuild starts, so no `InitialTargets`
+hook can observe the failure itself.
+
+`scripts/nuget-home-heal.sh` answers this on two axes. Dot-sourced, it pins an
+unusable `HOME`/`XDG_RUNTIME_DIR` to a writable dir — which only helps the
+current process tree, since exports die with the exec. The durable part is
+`codeybox_seed_nuget_migration_state`: `MigrationRunner` checks
+`File.Exists(<user-profile>/.local/share/NuGet/Migrations/1)` (or
+`$XDG_DATA_HOME/NuGet/Migrations/1`) *before* creating the mutex, so seeding
+that empty marker — the exact state NuGet leaves after a no-op migration run —
+under every home a later exec could resolve (`$HOME`, `$DOTNET_CLI_HOME`, the
+stamped `<workdir>/.dotnet-cli-home`, the shared `codeybox-nuget-home-<uid>`
+fallback, the passwd-entry home, `$XDG_DATA_HOME`) keeps first-use and restore
+off the mutex with no env cooperation at all. A home that cannot even be
+traversed/written remains unfixable from the repository; that is image damage
+the preamble redirect, not this heal, is designed to outlive.
+
 This is the operative remediation for auditors that invoke `dotnet` **raw**
 (`process:required-build`, `csharp:build-WaE`) against a misprovisioned image:
 those auditors do not go through `build.sh`, and the work branch's MSBuild
