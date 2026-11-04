@@ -59,7 +59,7 @@ public sealed class NuGetHomeSelfHealTests
         var uid = await TestSupport.CurrentUidAsync();
         Assert.Equal(
             Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
-            ParseVar(stdout, "HOME"));
+            ParseVar(stdout, "CLI_HOME"));
         // Original arguments reached dotnet unchanged.
         Assert.Contains("ARGS=build --no-incremental /warnaserror", stdout);
     }
@@ -84,7 +84,7 @@ public sealed class NuGetHomeSelfHealTests
         var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
 
         Assert.Equal(0, exitCode);
-        var redirected = ParseVar(stdout, "HOME");
+        var redirected = ParseVar(stdout, "CLI_HOME");
         Assert.NotEqual(squatted, redirected);
         // A private mktemp dir under tmp, named from the same leaf, and a real dir.
         Assert.StartsWith(
@@ -121,6 +121,61 @@ public sealed class NuGetHomeSelfHealTests
         Assert.Equal(fallback, ParseVar(stdout, "XDG"));
         Assert.True(Directory.Exists(fallback));
         Assert.Contains("ARGS=build", stdout);
+    }
+
+    // The runtime-dir pin must not trust the env-provided DOTNET_CLI_HOME
+    // verbatim: it is canonicalized first, so a legitimately symlinked cli home
+    // resolves and is exported as the real directory — reused rather than
+    // refused.
+    [Fact]
+    public async Task WrapDotnetInvocation_PinsWritableUserDirs_ResolvesSymlinkedCliHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process can write anywhere, so the unusable-home
+        // branch is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        using var fixture = SelfHealFixture.WithUnwritableHome();
+        var real = Path.Combine(fixture.Tmp, "cli-real");
+        Directory.CreateDirectory(real);
+        var link = Path.Combine(fixture.Tmp, "cli-link");
+        File.CreateSymbolicLink(link, real);
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string> { ["DOTNET_CLI_HOME"] = link });
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(real, ParseVar(stdout, "HOME"));
+        Assert.Equal(real, ParseVar(stdout, "XDG"));
+    }
+
+    // Regression: the runtime-dir pin once admitted a merely writable
+    // DOTNET_CLI_HOME, so a foreign-owned but writable directory (/tmp is
+    // root-owned and world-writable for an unprivileged user) was pinned as
+    // HOME / XDG_RUNTIME_DIR — putting dotnet's user-scoped mutex storage and
+    // the NuGet user-config read under foreign-controlled storage. A candidate
+    // not owned by this uid must be refused for the owned per-user fallback.
+    [Fact]
+    public async Task WrapDotnetInvocation_PinsWritableUserDirs_RefusesForeignOwnedCliHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        // /tmp is euid-owned for a privileged process, so the refusal is
+        // unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        using var fixture = SelfHealFixture.WithUnwritableHome();
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string> { ["DOTNET_CLI_HOME"] = "/tmp" });
+
+        Assert.Equal(0, exitCode);
+        var uid = await TestSupport.CurrentUidAsync();
+        var fallback = Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+        Assert.Equal(fallback, ParseVar(stdout, "HOME"));
+        Assert.Equal(fallback, ParseVar(stdout, "XDG"));
     }
 
     private static string ParseVar(string stdout, string name)
@@ -183,7 +238,7 @@ public sealed class NuGetHomeSelfHealTests
                     File.SetUnixFileMode(config, UnixFileMode.None);
             },
             fakeDotnetBody:
-                "#!/bin/sh\nprintf 'HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
+                "#!/bin/sh\nprintf 'CLI_HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
             extraEnvRemovals: [],
             restorePermissions: static fixture =>
             {
@@ -219,7 +274,8 @@ public sealed class NuGetHomeSelfHealTests
                 }
             });
 
-        public async Task<(string Stdout, int ExitCode)> RunWrappedDotnetAsync()
+        public async Task<(string Stdout, int ExitCode)> RunWrappedDotnetAsync(
+            IReadOnlyDictionary<string, string>? extraEnv = null)
         {
             var wrapped = NuGetHomeSelfHeal.WrapDotnetInvocation(
                 ["dotnet", "build", "--no-incremental", "/warnaserror"]);
@@ -239,6 +295,9 @@ public sealed class NuGetHomeSelfHealTests
             psi.Environment.Remove("NUGET_PACKAGES");
             foreach (var name in _extraEnvRemovals)
                 psi.Environment.Remove(name);
+            if (extraEnv is not null)
+                foreach (var kv in extraEnv)
+                    psi.Environment[kv.Key] = kv.Value;
 
             using var process = Process.Start(psi)!;
             var stdout = await process.StandardOutput.ReadToEndAsync();

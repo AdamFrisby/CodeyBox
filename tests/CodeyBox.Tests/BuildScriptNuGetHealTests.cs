@@ -1,3 +1,4 @@
+using CodeyBox.Core;
 using CodeyBox.HostProcess;
 
 namespace CodeyBox.Tests;
@@ -449,6 +450,151 @@ public sealed class BuildScriptNuGetHealTests
         finally
         {
             await ChmodAsync("755", home);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The heal script mirrors two C# constants as shell variables (shell cannot
+    // read them): DotnetCliHomeConventions.DirectoryName for the stamped
+    // repo-local home and NuGetHomeSelfHeal.WritableHomeLeaf for the shared
+    // per-user fallback. Pin the mirror so renaming either constant without
+    // updating the script fails here instead of silently desyncing the
+    // fallback selection and the migration-marker seeding.
+    [Fact]
+    public async Task HealScript_MirrorsCliHomeLeafConstants()
+    {
+        var script = await File.ReadAllTextAsync(
+            Path.Combine(HealScriptRepoRoot(), "scripts", "nuget-home-heal.sh"));
+
+        Assert.Contains(
+            $"_codeybox_repo_home_leaf=\"{DotnetCliHomeConventions.DirectoryName}\"",
+            script, StringComparison.Ordinal);
+        Assert.Contains(
+            $"_codeybox_home_leaf=\"{NuGetHomeSelfHeal.WritableHomeLeaf}\"",
+            script, StringComparison.Ordinal);
+    }
+
+    // The seeded user-config staging file must come from mktemp's unpredictable
+    // O_EXCL create — never a PID-predictable `>` target a co-tenant-planted
+    // symlink could redirect into an arbitrary-path write as the gate user.
+    // Pins the guard so a future edit cannot quietly regress to `tmp.$$`.
+    [Fact]
+    public async Task HealScript_SeedsUserConfig_ThroughUnpredictableMktempStaging()
+    {
+        var script = await File.ReadAllTextAsync(
+            Path.Combine(HealScriptRepoRoot(), "scripts", "nuget-home-heal.sh"));
+
+        Assert.DoesNotContain("tmp.$$", script, StringComparison.Ordinal);
+        Assert.Contains(".NuGet.Config.tmp.XXXXXX", script, StringComparison.Ordinal);
+    }
+
+    // The runtime-dir pin must not trust the env-provided DOTNET_CLI_HOME
+    // verbatim: it is canonicalized first, so a legitimately symlinked cli home
+    // resolves and the pin exports the real directory — reused rather than
+    // refused.
+    [Fact]
+    public async Task HealScript_PinsWritableUserDirs_ResolvesSymlinkedCliHome()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var cliReal = Path.Combine(root, "cli-real");
+        var cliLink = Path.Combine(root, "cli-link");
+        Directory.CreateDirectory(cliReal);
+        File.CreateSymbolicLink(cliLink, cliReal);
+        var sentinel = Path.Combine(root, "vars");
+        try
+        {
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                // No usable HOME at all forces the runtime-dir pin.
+                ["HOME"] = Path.Combine(root, "no-such-home"),
+                ["DOTNET_CLI_HOME"] = cliLink,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" > \"$3\"",
+                    "sh", root, HealScriptRepoRoot(), sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = await File.ReadAllLinesAsync(sentinel);
+            Assert.Equal(2, lines.Length);
+            // Both variables land on the canonical directory, not the link path.
+            Assert.Equal(cliReal, lines[0]);
+            Assert.Equal(cliReal, lines[1]);
+            Assert.True(
+                File.Exists(Path.Combine(cliReal, ".nuget", "NuGet", "NuGet.Config")),
+                "the pinned home must carry the seeded readable user config");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Regression for the runtime-dir pin admitting a foreign-owned
+    // DOTNET_CLI_HOME: the env value is untrusted, so after canonicalization
+    // the resolved dir must be owned by this uid — a foreign-owned but
+    // writable directory (/tmp is exactly that for an unprivileged user) must
+    // be refused in favour of the owned per-user fallback, or the seeding and
+    // dotnet's user-scoped mutex storage would land in foreign-controlled
+    // storage.
+    [Fact]
+    public async Task HealScript_PinsWritableUserDirs_RefusesForeignOwnedCliHome()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // /tmp is euid-owned for a privileged process, so the refusal is
+        // unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var sentinel = Path.Combine(root, "vars");
+        Directory.CreateDirectory(root);
+        try
+        {
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = Path.Combine(root, "no-such-home"),
+                ["DOTNET_CLI_HOME"] = "/tmp",
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" > \"$3\"",
+                    "sh", root, HealScriptRepoRoot(), sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = await File.ReadAllLinesAsync(sentinel);
+            Assert.Equal(2, lines.Length);
+            Assert.Equal(lines[0], lines[1]);
+            Assert.NotEqual("/tmp", lines[0]);
+            var uid = await TestSupport.CurrentUidAsync();
+            Assert.Equal(
+                Path.Combine(root, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
+                lines[0]);
+        }
+        finally
+        {
             Directory.Delete(root, recursive: true);
         }
     }

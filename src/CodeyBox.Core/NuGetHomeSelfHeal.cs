@@ -38,6 +38,10 @@ public static class NuGetHomeSelfHeal
     /// back to a private <c>mktemp</c> dir (<c>{leaf}.XXXXXX</c>) so a squatted or
     /// root-left directory in a world-writable temp cannot make the healed home
     /// itself unusable. NuGet manages its own settings-dir creation within it.
+    /// Mirrored as <c>_codeybox_home_leaf</c> in <c>scripts/nuget-home-heal.sh</c>
+    /// (shell cannot read this constant); renaming it without updating that
+    /// mirror desyncs the fallback selection and migration-marker seeding —
+    /// pinned by <c>BuildScriptNuGetHealTests</c>.
     /// </summary>
     public const string WritableHomeLeaf = "codeybox-nuget-home";
 
@@ -60,6 +64,35 @@ public static class NuGetHomeSelfHeal
         nuget_root="${nuget_home}/.nuget"
         nuget_settings_dir="${nuget_root}/NuGet"
         nuget_settings_file="${nuget_settings_dir}/NuGet.Config"
+        # The two helpers below are spelled exactly like the ones in
+        # scripts/nuget-home-heal.sh (which mirrors this whole preamble) so a
+        # guard change lands identically in both copies: a dir is usable only
+        # when it exists and is writable by this user.
+        _codeybox_dir_usable() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
+        # Print a writable per-user home dir. $1 (the possibly just-redirected
+        # DOTNET_CLI_HOME) is canonicalized so a legitimately symlinked home
+        # resolves, then admitted only when the RESOLVED directory is owned by
+        # this uid and writable — DOTNET_CLI_HOME is environment input, and a
+        # planted symlink or foreign-owned dir must not redirect the healed
+        # home or the user-scoped mutex dir into foreign-controlled storage.
+        # Otherwise the shared per-user dir on the same ownership terms (kept
+        # shared so the healed home and mutex location are stable across
+        # execs), else a private mktemp dir.
+        _codeybox_pick_user_dir() {
+          pick_dir="${1:-}"
+          if [ -n "$pick_dir" ]; then
+            mkdir -p "$pick_dir" 2>/dev/null || true
+            pick_dir="$(cd "$pick_dir" 2>/dev/null && pwd -P)" || pick_dir=
+          fi
+          if [ -z "$pick_dir" ] || [ ! -O "$pick_dir" ] || [ ! -w "$pick_dir" ]; then
+            pick_dir="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}-$(id -u)"
+            mkdir -p "$pick_dir" 2>/dev/null || true
+            if [ ! -d "$pick_dir" ] || [ ! -O "$pick_dir" ] || [ ! -w "$pick_dir" ]; then
+              pick_dir="$(mktemp -d "${TMPDIR:-/tmp}/{{WritableHomeLeaf}}.XXXXXX")"
+            fi
+          fi
+          printf '%s\n' "$pick_dir"
+        }
         nuget_home_broken=0
         if [ -d "$nuget_settings_dir" ]; then
           { [ ! -w "$nuget_settings_dir" ]; } && nuget_home_broken=1
@@ -68,11 +101,7 @@ public static class NuGetHomeSelfHeal
           nuget_home_broken=1
         fi
         if [ "$nuget_home_broken" -eq 1 ]; then
-          writable_home="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}-$(id -u)"
-          mkdir -p "$writable_home" 2>/dev/null || true
-          if [ ! -d "$writable_home" ] || [ ! -O "$writable_home" ] || [ ! -w "$writable_home" ]; then
-            writable_home="$(mktemp -d "${TMPDIR:-/tmp}/{{WritableHomeLeaf}}.XXXXXX")"
-          fi
+          writable_home="$(_codeybox_pick_user_dir)"
           export DOTNET_CLI_HOME="$writable_home"
           existing_packages="${nuget_root}/packages"
           if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$existing_packages" ] && [ -w "$existing_packages" ]; then
@@ -91,19 +120,11 @@ public static class NuGetHomeSelfHeal
         # writable dir: preferring the (possibly just-healed) DOTNET_CLI_HOME,
         # else the shared per-user fallback.
         need_user_dir=0
-        { [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; } && need_user_dir=1
-        { [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; } && need_user_dir=1
+        _codeybox_dir_usable "${HOME:-}" || need_user_dir=1
+        _codeybox_dir_usable "${XDG_RUNTIME_DIR:-}" || need_user_dir=1
         if [ "$need_user_dir" -eq 1 ]; then
-          user_dir="${DOTNET_CLI_HOME:-}"
-          { [ -n "$user_dir" ]; } && mkdir -p "$user_dir" 2>/dev/null || true
-          if [ ! -d "$user_dir" ] || [ ! -w "$user_dir" ]; then
-            user_dir="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}-$(id -u)"
-            mkdir -p "$user_dir" 2>/dev/null || true
-            if [ ! -d "$user_dir" ] || [ ! -O "$user_dir" ] || [ ! -w "$user_dir" ]; then
-              user_dir="$(mktemp -d "${TMPDIR:-/tmp}/{{WritableHomeLeaf}}.XXXXXX")"
-            fi
-          fi
-          if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+          user_dir="$(_codeybox_pick_user_dir "${DOTNET_CLI_HOME:-}")"
+          if ! _codeybox_dir_usable "${HOME:-}"; then
             # Redirecting HOME would orphan a pre-baked package cache under the
             # original $HOME/.nuget — preserve it for restore like the
             # broken-home branch does. scripts/nuget-home-heal.sh mirrors this
@@ -117,7 +138,7 @@ public static class NuGetHomeSelfHeal
             fi
             export HOME="$user_dir"
           fi
-          { [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; } && export XDG_RUNTIME_DIR="$user_dir"
+          _codeybox_dir_usable "${XDG_RUNTIME_DIR:-}" || export XDG_RUNTIME_DIR="$user_dir"
         fi
         """;
 

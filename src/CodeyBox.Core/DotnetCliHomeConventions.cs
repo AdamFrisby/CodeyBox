@@ -9,6 +9,13 @@ namespace CodeyBox.Core;
 /// </summary>
 public static class DotnetCliHomeConventions
 {
+    /// <summary>
+    /// Mirrored as <c>_codeybox_repo_home_leaf</c> in
+    /// <c>scripts/nuget-home-heal.sh</c> (shell cannot read this constant);
+    /// renaming it without updating that mirror desyncs the migration-marker
+    /// seeding for the stamped repo-local home — pinned by
+    /// <c>BuildScriptNuGetHealTests</c>.
+    /// </summary>
     public const string DirectoryName = ".dotnet-cli-home";
 
     public static string ResolvePath(string workingDirectory)

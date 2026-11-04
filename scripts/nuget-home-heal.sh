@@ -32,6 +32,15 @@
 # exported DOTNET_CLI_HOME would not survive back to the parent `dotnet`), which
 # the in-place quarantine below performs whenever the cli-home is writable.
 
+# Single shell-side definition of the two path leaves whose C# constants this
+# script must mirror: NuGetHomeSelfHeal.WritableHomeLeaf (the per-user fallback
+# home under ${TMPDIR:-/tmp}) and DotnetCliHomeConventions.DirectoryName (the
+# stamped repo-local CLI home). Shell cannot read the C# constants, so renaming
+# one without updating its mirror silently desyncs the fallback selection and
+# the migration-marker seeding — BuildScriptNuGetHealTests pins both pairs.
+_codeybox_home_leaf="codeybox-nuget-home"
+_codeybox_repo_home_leaf=".dotnet-cli-home"
+
 # Writability is necessary but not sufficient: an inherited NuGet.Config that is
 # present but unreadable (e.g. baked mode 0600 under another account, inside a
 # directory we can still write) reproduces the same fatal read, so treat that as
@@ -75,10 +84,15 @@ _codeybox_seed_nuget_home() {
     # per-user fallback home and race this write, so render to a sibling temp
     # and install with `ln` — an atomic no-clobber create that can never leave
     # a half-written config behind or overwrite one a peer (or NuGet) wrote
-    # first.
+    # first. The staging file comes from mktemp (an unpredictable O_EXCL
+    # create): a PID-predictable `>` write would follow a co-tenant-planted
+    # symlink at the temp path, turning the seed into an arbitrary-path file
+    # create/truncate as this user.
     if [ ! -e "$_codeybox_seed_user_dir/NuGet.Config" ]; then
-        _codeybox_seed_tmp="$_codeybox_seed_user_dir/.NuGet.Config.tmp.$$"
-        if printf '%s\n' \
+        _codeybox_seed_tmp="$(mktemp \
+            "$_codeybox_seed_user_dir/.NuGet.Config.tmp.XXXXXX" 2>/dev/null)" \
+            || _codeybox_seed_tmp=
+        if [ -n "$_codeybox_seed_tmp" ] && printf '%s\n' \
             '<?xml version="1.0" encoding="utf-8"?>' \
             '<configuration />' \
             > "$_codeybox_seed_tmp" 2>/dev/null; then
@@ -125,21 +139,14 @@ codeybox_heal_nuget_home() {
 
     # The cli-home itself is not writable (e.g. an inherited read-only mount that
     # cannot be relocated aside): keep the build hermetic by redirecting the .NET
-    # CLI home to a writable per-user directory for this process tree. Same
-    # fallback chain as the C# preamble (NuGetHomeSelfHeal.Preamble): the shared
-    # per-user dir — so one healed home, and its seeded cache, is reused across
-    # execs — unless it is missing pieces, squatted, or foreign-owned in the
-    # world-writable temp, in which case a private mktemp dir. Seed the chosen
-    # home the same way as the in-place path — a readable user config so the
-    # fatal read succeeds, and a symlink to the inherited (still readable but
-    # unwritable) package cache so restore stays offline-safe there too.
-    _codeybox_scratch_home="${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
-    mkdir -p "$_codeybox_scratch_home" 2>/dev/null || true
-    if [ ! -d "$_codeybox_scratch_home" ] || [ ! -O "$_codeybox_scratch_home" ] \
-        || [ ! -w "$_codeybox_scratch_home" ]; then
-        _codeybox_scratch_home="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-nuget-home.XXXXXX")" \
-            || return 0
-    fi
+    # CLI home to a writable per-user directory for this process tree, chosen by
+    # the shared _codeybox_pick_user_dir chain — the shared per-user dir, else a
+    # private mktemp dir; same chain as the C# preamble
+    # (NuGetHomeSelfHeal.Preamble). Seed the chosen home the same way as the
+    # in-place path — a readable user config so the fatal read succeeds, and a
+    # symlink to the inherited (still readable but unwritable) package cache so
+    # restore stays offline-safe there too.
+    _codeybox_scratch_home="$(_codeybox_pick_user_dir)" || return 0
     DOTNET_CLI_HOME="$_codeybox_scratch_home"
     export DOTNET_CLI_HOME
     _codeybox_seed_nuget_home "$_codeybox_scratch_home/.nuget/NuGet" \
@@ -148,9 +155,45 @@ codeybox_heal_nuget_home() {
 }
 
 # True when $1 names an existing directory the current user can write — the
-# probe applied to HOME / XDG_RUNTIME_DIR / DOTNET_CLI_HOME below.
+# probe applied to HOME / XDG_RUNTIME_DIR below.
 _codeybox_dir_usable() {
     [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]
+}
+
+# Print a writable per-user home dir for the heal's redirected-home and
+# runtime-dir fallbacks; returns nonzero when no candidate could be obtained.
+# $1, when non-empty, is the preferred candidate (the possibly just-redirected
+# DOTNET_CLI_HOME). It is canonicalized so a legitimately symlinked home
+# resolves, then admitted only when the RESOLVED directory is owned by this
+# uid and writable — DOTNET_CLI_HOME is environment input, and a co-tenant- or
+# work-branch-planted symlink (or a foreign-owned dir) must not redirect the
+# seeding below and dotnet's user-scoped mutex/runtime storage into
+# foreign-controlled directories. Otherwise the shared per-user dir — kept
+# shared so one healed home, its seeded cache, and the mutex location are
+# stable across execs — under the same ownership requirements (a squatted or
+# root-left directory in the world-writable temp is refused), else a private
+# mktemp dir. Same chain as the C# preamble's _codeybox_pick_user_dir.
+_codeybox_pick_user_dir() {
+    _codeybox_pick="${1:-}"
+    if [ -n "$_codeybox_pick" ]; then
+        mkdir -p "$_codeybox_pick" 2>/dev/null || true
+        # The `||` fallback keeps the assignment's status at zero: a bare
+        # `var=$(cd ...)` would propagate the failed substitution's status and
+        # abort a `set -e` caller merely because the candidate is absent.
+        _codeybox_pick="$(cd "$_codeybox_pick" 2>/dev/null && pwd -P)" \
+            || _codeybox_pick=
+    fi
+    if [ -z "$_codeybox_pick" ] || [ ! -O "$_codeybox_pick" ] \
+        || [ ! -w "$_codeybox_pick" ]; then
+        _codeybox_pick="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-$(id -u)"
+        mkdir -p "$_codeybox_pick" 2>/dev/null || true
+        if [ ! -d "$_codeybox_pick" ] || [ ! -O "$_codeybox_pick" ] \
+            || [ ! -w "$_codeybox_pick" ]; then
+            _codeybox_pick="$(mktemp -d \
+                "${TMPDIR:-/tmp}/${_codeybox_home_leaf}.XXXXXX")" || return 1
+        fi
+    fi
+    printf '%s\n' "$_codeybox_pick"
 }
 
 # The NuGet-settings heal above does not cover dotnet's OTHER per-user runtime
@@ -172,19 +215,11 @@ codeybox_ensure_dotnet_runtime_dir() {
         return 0
     fi
 
-    _codeybox_user_dir="${DOTNET_CLI_HOME:-}"
-    if [ -n "$_codeybox_user_dir" ]; then
-        mkdir -p "$_codeybox_user_dir" 2>/dev/null || true
-    fi
-    if ! _codeybox_dir_usable "$_codeybox_user_dir"; then
-        _codeybox_user_dir="${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
-        mkdir -p "$_codeybox_user_dir" 2>/dev/null || true
-        if [ ! -d "$_codeybox_user_dir" ] || [ ! -O "$_codeybox_user_dir" ] \
-            || [ ! -w "$_codeybox_user_dir" ]; then
-            _codeybox_user_dir="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-nuget-home.XXXXXX")" \
-                || return 0
-        fi
-    fi
+    # The env-provided DOTNET_CLI_HOME is only the preferred candidate — the
+    # helper canonicalizes it and refuses anything not owned by this uid before
+    # falling through to the shared per-user dir, else a private mktemp dir.
+    _codeybox_user_dir="$(_codeybox_pick_user_dir "${DOTNET_CLI_HOME:-}")" \
+        || return 0
     if ! _codeybox_dir_usable "${HOME:-}"; then
         # Redirecting HOME would orphan a pre-baked package cache under the
         # original $HOME/.nuget — seed the replacement home (readable user
@@ -246,8 +281,10 @@ codeybox_ensure_dotnet_runtime_dir() {
 # written through.
 #
 # Materialize the missing leaf of a heal-controlled candidate home. Single
-# `mkdir`, never `-p`: the parent (${TMPDIR:-/tmp} or the checkout root)
-# already exists, and a squatted or planted path at that leaf fails the mkdir
+# `mkdir`, never `-p`: the usual parent (${TMPDIR:-/tmp} or the checkout root)
+# already exists; a missing one (an env-provided DOTNET_CLI_HOME can point
+# anywhere) simply fails the mkdir and the seeder's checks then skip the
+# candidate. A squatted or planted path at that leaf likewise fails the mkdir
 # and the seeder's -O re-check alike. Owner-only mode so no co-tenant can
 # plant symlinks inside between creation and use.
 _codeybox_ensure_owned_home() {
@@ -326,18 +363,18 @@ codeybox_seed_nuget_migration_state() {
     _codeybox_ensure_owned_home "${DOTNET_CLI_HOME:-}"
     _codeybox_seed_home_migration_marker "${DOTNET_CLI_HOME:-}"
     # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
-    # home the orchestrator stamps onto raw dotnet auditor execs
-    # (DotnetCliHomeConventions.DirectoryName; the literal is mirrored because
-    # shell cannot read the C# constant). Only the repository root can be that
-    # working directory — an MSBuild-Exec'd run has a project directory as its
-    # cwd and must not grow a stray home there.
+    # home the orchestrator stamps onto raw dotnet auditor execs;
+    # _codeybox_repo_home_leaf mirrors DotnetCliHomeConventions.DirectoryName
+    # (see the constants block at the top of this file). Only the repository
+    # root can be that working directory — an MSBuild-Exec'd run has a project
+    # directory as its cwd and must not grow a stray home there.
     if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then
-        _codeybox_repo_cli_home="$(pwd -P)/.dotnet-cli-home"
+        _codeybox_repo_cli_home="$(pwd -P)/${_codeybox_repo_home_leaf}"
         _codeybox_ensure_owned_home "$_codeybox_repo_cli_home"
         _codeybox_seed_home_migration_marker "$_codeybox_repo_cli_home"
     fi
     # The shared per-user fallback both preamble generations redirect to.
-    _codeybox_fallback_home="${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
+    _codeybox_fallback_home="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-$(id -u)"
     _codeybox_ensure_owned_home "$_codeybox_fallback_home"
     _codeybox_seed_home_migration_marker "$_codeybox_fallback_home"
     # Environment.GetFolderPath(UserProfile) falls back to the passwd entry
