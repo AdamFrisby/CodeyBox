@@ -54,91 +54,207 @@ public static class NuGetHomeSelfHeal
     /// A no-op when the NuGet home, <c>$HOME</c>, and <c>$XDG_RUNTIME_DIR</c>
     /// are all usable.
     ///
-    /// <para>Assumes the enclosing script already ran <c>set -eu</c>; the
-    /// <c>[ ... ] &amp;&amp; flag</c> idioms are <c>set -e</c>-safe because a
-    /// failing test is a non-final AND-OR member. Every variable expansion uses a
-    /// <c>:-</c> default so it is also <c>set -u</c>-safe.</para>
+    /// <para>"Usable" is deliberately stronger than "-d &amp;&amp; -w": the env
+    /// values are untrusted input, so every admitted directory is canonicalized
+    /// (cd/pwd -P) and required to be owned by this uid and never
+    /// group/other-writable, under an ancestor chain a co-tenant cannot swap —
+    /// a merely-writable foreign dir must never hold the NuGet.Config every
+    /// restore reads or dotnet's user-scoped mutex storage.</para>
+    ///
+    /// <para>Assumes the enclosing script already ran <c>set -eu</c>; every
+    /// helper invocation is a command substitution guarded by
+    /// <c>|| var=</c> (or an <c>if</c>/<c>||</c>/<c>&amp;&amp;</c> member) so a
+    /// degraded step — including a total <c>mktemp</c> failure — cannot abort
+    /// the script before <c>exec "$@"</c>; the caller-side
+    /// <c>[ -n "$var" ]</c> gates then simply skip the pin. Every variable
+    /// expansion uses a <c>:-</c> default so it is also <c>set -u</c>-safe.</para>
     /// </summary>
-    public const string Preamble = $$"""
-        nuget_home="${DOTNET_CLI_HOME:-$HOME}"
+    public const string Preamble = $$$"""
+        _codeybox_euid="$(id -u)"
+        _codeybox_home_leaf="{{{WritableHomeLeaf}}}"
+        nuget_home="${DOTNET_CLI_HOME:-${HOME:-}}"
         nuget_root="${nuget_home}/.nuget"
         nuget_settings_dir="${nuget_root}/NuGet"
         nuget_settings_file="${nuget_settings_dir}/NuGet.Config"
-        # The two helpers below are spelled exactly like the ones in
+        # The helpers below are spelled exactly like the ones in
         # scripts/nuget-home-heal.sh (which mirrors this whole preamble) so a
-        # guard change lands identically in both copies: a dir is usable only
-        # when it exists and is writable by this user.
-        _codeybox_dir_usable() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
-        # Print a writable per-user home dir. $1 (the possibly just-redirected
-        # DOTNET_CLI_HOME) is canonicalized so a legitimately symlinked home
-        # resolves, then admitted only when the RESOLVED directory is owned by
-        # this uid and writable — DOTNET_CLI_HOME is environment input, and a
-        # planted symlink or foreign-owned dir must not redirect the healed
-        # home or the user-scoped mutex dir into foreign-controlled storage.
-        # Otherwise the shared per-user dir on the same ownership terms (kept
-        # shared so the healed home and mutex location are stable across
-        # execs), else a private mktemp dir.
-        _codeybox_pick_user_dir() {
-          pick_dir="${1:-}"
-          if [ -n "$pick_dir" ]; then
-            mkdir -p "$pick_dir" 2>/dev/null || true
-            pick_dir="$(cd "$pick_dir" 2>/dev/null && pwd -P)" || pick_dir=
-          fi
-          if [ -z "$pick_dir" ] || [ ! -O "$pick_dir" ] || [ ! -w "$pick_dir" ]; then
-            pick_dir="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}-$(id -u)"
-            mkdir -p "$pick_dir" 2>/dev/null || true
-            if [ ! -d "$pick_dir" ] || [ ! -O "$pick_dir" ] || [ ! -w "$pick_dir" ]; then
-              pick_dir="$(mktemp -d "${TMPDIR:-/tmp}/{{WritableHomeLeaf}}.XXXXXX")"
+        # guard change lands identically in both copies.
+        _codeybox_lstat_dir() {
+            set -- $(ls -ldn "$1" 2>/dev/null)
+            case ${1:-} in
+                d*) ;;
+                *) return 1 ;;
+            esac
+            _codeybox_stat_mode=$1
+            _codeybox_stat_uid=${3:-}
+            [ -n "$_codeybox_stat_uid" ]
+        }
+        _codeybox_secure_dir() {
+            # Empty input must fail before the cd: `cd ""` silently stays in the
+            # current directory in several shells, which would "verify" the cwd.
+            [ -n "${1:-}" ] || return 1
+            _codeybox_sec="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+            if [ "${3:-}" = "writable" ] && [ ! -w "$_codeybox_sec" ]; then
+                return 1
             fi
-          fi
-          printf '%s\n' "$pick_dir"
+            _codeybox_sec_rule=${2:-private}
+            _codeybox_sec_walk=$_codeybox_sec
+            _codeybox_sec_leaf=1
+            while :; do
+                _codeybox_lstat_dir "$_codeybox_sec_walk" || return 1
+                if [ "$_codeybox_sec_leaf" -eq 1 ] && [ "$_codeybox_sec_rule" = private ]; then
+                    [ "$_codeybox_stat_uid" = "$_codeybox_euid" ] || return 1
+                else
+                    { [ "$_codeybox_stat_uid" = "$_codeybox_euid" ] \
+                        || [ "$_codeybox_stat_uid" = "0" ]; } || return 1
+                fi
+                case $_codeybox_stat_mode in
+                    ?????w*|????????w*)
+                        # Leaf rules stricter than anchor never tolerate
+                        # group/other write bits; an anchor tolerates them only
+                        # under the sticky bit.
+                        if [ "$_codeybox_sec_leaf" -eq 1 ] \
+                            && [ "$_codeybox_sec_rule" != anchor ]; then
+                            return 1
+                        fi
+                        case $_codeybox_stat_mode in
+                            ?????????[tT]*) ;;
+                            *) return 1 ;;
+                        esac ;;
+                esac
+                _codeybox_sec_leaf=0
+                [ "$_codeybox_sec_walk" = "/" ] && break
+                _codeybox_sec_walk=${_codeybox_sec_walk%/*}
+                [ -n "$_codeybox_sec_walk" ] || _codeybox_sec_walk=/
+            done
+            printf '%s\n' "$_codeybox_sec"
+        }
+        _codeybox_adopt_dir() {
+            [ -n "${1:-}" ] || return 1
+            if [ -e "$1" ] || [ -L "$1" ]; then
+                _codeybox_secure_dir "$1" private "${2:-}"
+                return
+            fi
+            _codeybox_adopt_parent="$(dirname "$1" 2>/dev/null)" || return 1
+            _codeybox_adopt_parent="$(_codeybox_secure_dir \
+                "$_codeybox_adopt_parent" anchor writable)" || return 1
+            mkdir -m 700 "$1" 2>/dev/null || return 1
+            _codeybox_secure_dir "$1" private "${2:-}"
+        }
+        _codeybox_pick_user_dir() {
+            _codeybox_pick="${1:-}"
+            if [ -n "$_codeybox_pick" ]; then
+                _codeybox_pick="$(_codeybox_adopt_dir "$_codeybox_pick" writable)" \
+                    || _codeybox_pick=
+            fi
+            if [ -z "$_codeybox_pick" ]; then
+                _codeybox_pick="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-${_codeybox_euid}"
+                _codeybox_pick="$(_codeybox_adopt_dir "$_codeybox_pick" writable)" \
+                    || _codeybox_pick=
+            fi
+            if [ -z "$_codeybox_pick" ]; then
+                _codeybox_pick="$(mktemp -d \
+                    "${TMPDIR:-/tmp}/${_codeybox_home_leaf}.XXXXXX")" || return 1
+                _codeybox_pick="$(_codeybox_secure_dir "$_codeybox_pick" private writable)" \
+                    || return 1
+            fi
+            printf '%s\n' "$_codeybox_pick"
         }
         nuget_home_broken=0
-        if [ -d "$nuget_settings_dir" ]; then
-          { [ ! -w "$nuget_settings_dir" ]; } && nuget_home_broken=1
-          { [ -e "$nuget_settings_file" ] && [ ! -r "$nuget_settings_file" ]; } && nuget_home_broken=1
-        elif [ -d "$nuget_root" ] && [ ! -w "$nuget_root" ]; then
+        nuget_home_resolved="$(_codeybox_adopt_dir "$nuget_home" writable)" \
+            || nuget_home_resolved=
+        nuget_settings_resolved="$(_codeybox_secure_dir \
+            "$nuget_settings_dir" private writable)" || nuget_settings_resolved=
+        if [ -z "$nuget_home_resolved" ]; then
+          # The cli home itself is not private per-user storage — foreign-owned,
+          # unwritable, or resolving through a planted symlink — so nothing
+          # beneath it can keep a NuGet.Config NuGet trusts.
           nuget_home_broken=1
+        elif [ -n "$nuget_settings_resolved" ]; then
+          { [ -e "$nuget_settings_file" ] && [ ! -r "$nuget_settings_file" ]; } && nuget_home_broken=1
+        elif [ -e "$nuget_settings_dir" ] || [ -L "$nuget_settings_dir" ]; then
+          # A settings dir that is not private per-user storage — foreign-owned,
+          # co-tenant-writable, or a planted symlink — cannot keep a
+          # NuGet.Config NuGet trusts either.
+          nuget_home_broken=1
+        elif [ -d "$nuget_root" ]; then
+          # The settings dir is absent: .nuget must be a dir this user (or root)
+          # owns with no co-tenant write access for NuGet to create settings in.
+          _codeybox_secure_dir "$nuget_root" trusted writable >/dev/null 2>&1 \
+            || nuget_home_broken=1
+        fi
+        if [ "$nuget_home_broken" -eq 0 ] && [ -n "${DOTNET_CLI_HOME:-}" ]; then
+          # Re-export the canonical path so a symlinked env value cannot be
+          # retargeted between these checks and the dotnet resolution.
+          export DOTNET_CLI_HOME="$nuget_home_resolved"
         fi
         if [ "$nuget_home_broken" -eq 1 ]; then
-          writable_home="$(_codeybox_pick_user_dir)"
-          export DOTNET_CLI_HOME="$writable_home"
-          existing_packages="${nuget_root}/packages"
-          if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$existing_packages" ] && [ -w "$existing_packages" ]; then
-            export NUGET_PACKAGES="$existing_packages"
+          writable_home="$(_codeybox_pick_user_dir)" || writable_home=
+          if [ -n "$writable_home" ]; then
+            export DOTNET_CLI_HOME="$writable_home"
+            existing_packages="${nuget_root}/packages"
+            # Only an owned cache is consumable — a co-tenant-controlled cache
+            # would satisfy package installs with planted or tampered extracted
+            # entries, running attacker code in the wrapped build.
+            _codeybox_existing_packages="$(_codeybox_secure_dir \
+              "$existing_packages" trusted)" || _codeybox_existing_packages=
+            if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_existing_packages" ]; then
+              export NUGET_PACKAGES="$_codeybox_existing_packages"
+            fi
+            echo "nuget-home self-heal: '${nuget_root}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${NUGET_PACKAGES})}" >&2
           fi
-          echo "nuget-home self-heal: '${nuget_root}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${NUGET_PACKAGES})}" >&2
         fi
         # A usable NuGet settings home is not enough by itself: since runtime
         # 10.0.13, dotnet first-use creates the user-scoped "NuGet-Migrations"
         # named mutex under $XDG_RUNTIME_DIR, falling back to
         # $HOME/.dotnet/corefx/Runtime/SharedMemory — and NuGet builds that key
         # user paths off $HOME hit the same broken home. When neither variable
-        # points somewhere usable the CLI aborts before MSBuild with
-        # "The system cannot open the device or file specified: 'NuGet-Migrations'"
-        # (dotnet/runtime#135726, #136802). Pin each unusable variable to a
-        # writable dir: preferring the (possibly just-healed) DOTNET_CLI_HOME,
-        # else the shared per-user fallback.
-        need_user_dir=0
-        _codeybox_dir_usable "${HOME:-}" || need_user_dir=1
-        _codeybox_dir_usable "${XDG_RUNTIME_DIR:-}" || need_user_dir=1
-        if [ "$need_user_dir" -eq 1 ]; then
-          user_dir="$(_codeybox_pick_user_dir "${DOTNET_CLI_HOME:-}")"
-          if ! _codeybox_dir_usable "${HOME:-}"; then
-            # Redirecting HOME would orphan a pre-baked package cache under the
-            # original $HOME/.nuget — preserve it for restore like the
-            # broken-home branch does. scripts/nuget-home-heal.sh mirrors this
-            # whole block (same DOTNET_CLI_HOME -> shared per-user -> mktemp
-            # chain) with one intentional difference: it links the cache into
-            # the redirected home's .nuget instead of exporting NUGET_PACKAGES,
-            # materializing the cache on disk for children that resolve
-            # packages off $HOME without inheriting the variable.
-            if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$nuget_root/packages" ] && [ -w "$nuget_root/packages" ]; then
-              export NUGET_PACKAGES="$nuget_root/packages"
+        # resolves to verified private storage the CLI aborts before MSBuild
+        # with "The system cannot open the device or file specified:
+        # 'NuGet-Migrations'" (dotnet/runtime#135726, #136802). Pin each
+        # unusable variable to a writable dir: preferring the (possibly
+        # just-healed) DOTNET_CLI_HOME, else the shared per-user fallback.
+        # Usable values are re-exported under their canonical path so a
+        # symlinked env value cannot be retargeted after the check.
+        home_resolved="$(_codeybox_secure_dir "${HOME:-}" private writable)" \
+          || home_resolved=
+        xdg_resolved="$(_codeybox_secure_dir "${XDG_RUNTIME_DIR:-}" private writable)" \
+          || xdg_resolved=
+        if [ -z "$home_resolved" ] || [ -z "$xdg_resolved" ]; then
+          user_dir="$(_codeybox_pick_user_dir "${DOTNET_CLI_HOME:-}")" || user_dir=
+          if [ -n "$user_dir" ]; then
+            if [ -n "$home_resolved" ]; then
+              export HOME="$home_resolved"
+            else
+              # Redirecting HOME would orphan a pre-baked package cache under
+              # the original $HOME/.nuget — preserve it for restore like the
+              # broken-home branch does. scripts/nuget-home-heal.sh mirrors
+              # this whole block (same DOTNET_CLI_HOME -> shared per-user ->
+              # mktemp chain, same private-dir admission) with two intentional
+              # differences: it links the cache into the redirected home's
+              # .nuget instead of exporting NUGET_PACKAGES, and it seeds a
+              # readable user config under the redirected home — both
+              # materialize on disk for children that resolve packages or the
+              # settings path off $HOME without inheriting the exports, while
+              # this preamble only has to keep the single wrapped `dotnet`
+              # working (NuGet creates the config itself in a writable home).
+              _codeybox_old_packages="${nuget_root}/packages"
+              _codeybox_old_resolved="$(_codeybox_secure_dir \
+                "$_codeybox_old_packages" trusted)" || _codeybox_old_resolved=
+              if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_old_resolved" ]; then
+                export NUGET_PACKAGES="$_codeybox_old_resolved"
+              fi
+              export HOME="$user_dir"
             fi
-            export HOME="$user_dir"
+            if [ -n "$xdg_resolved" ]; then
+              export XDG_RUNTIME_DIR="$xdg_resolved"
+            else
+              export XDG_RUNTIME_DIR="$user_dir"
+            fi
           fi
-          _codeybox_dir_usable "${XDG_RUNTIME_DIR:-}" || export XDG_RUNTIME_DIR="$user_dir"
+        else
+          export HOME="$home_resolved"
+          export XDG_RUNTIME_DIR="$xdg_resolved"
         fi
         """;
 

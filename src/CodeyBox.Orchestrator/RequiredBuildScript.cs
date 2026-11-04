@@ -62,13 +62,15 @@ internal static class RequiredBuildScript
         # "Failed to read NuGet.Config ... Permission denied" and produces no
         # assemblies. Redirect the CLI/NuGet per-user home to a directory this
         # script owns so the gate no longer depends on $HOME being writable.
-        dotnet_home="$tmp_root/codeybox-dotnet-home-$$"
+        # mktemp -d (an unpredictable O_EXCL, mode-700 create): a PID-predictable
+        # name in the world-writable temp could be squatted by a co-tenant,
+        # which would put the exported per-user home inside storage the gate
+        # does not control.
+        dotnet_home="$(mktemp -d "$tmp_root/codeybox-dotnet-home.XXXXXX")"
         original_home="${HOME:-}"
 
         cleanup() { rm -rf "$targets_file" "$dotnet_home"; }
         trap cleanup EXIT INT TERM
-
-        mkdir -p "$dotnet_home"
         export DOTNET_CLI_HOME="$dotnet_home"
         export DOTNET_NOLOGO=1
         export DOTNET_CLI_TELEMETRY_OPTOUT=1

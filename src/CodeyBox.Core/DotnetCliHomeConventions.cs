@@ -44,24 +44,28 @@ public static class DotnetCliHomeConventions
 
     /// <summary>
     /// Stamps a writable CLI home on the environment of a single
-    /// <c>dotnet</c> invocation. Pins BOTH <c>DOTNET_CLI_HOME</c> and
-    /// <c>HOME</c> to the repo-local home: some NuGet builds derive the
-    /// user-level config directory (<c>~/.nuget/NuGet</c>) from <c>$HOME</c>
+    /// <c>dotnet</c> invocation. Pins <c>DOTNET_CLI_HOME</c>, <c>HOME</c>, and
+    /// <c>XDG_RUNTIME_DIR</c> to the repo-local home: some NuGet builds derive
+    /// the user-level config directory (<c>~/.nuget/NuGet</c>) from <c>$HOME</c>
     /// and IGNORE <c>DOTNET_CLI_HOME</c>, so pinning only the latter still lets
     /// restore probe a root-owned <c>~/.nuget</c> and abort with "Failed to read
-    /// NuGet.Config ... denied" even though <c>DOTNET_CLI_HOME</c> is writable.
-    /// Matching <c>HOME</c> to the same directory lands every NuGet resolution
-    /// strategy on one writable home. This mirrors
+    /// NuGet.Config ... denied" even though <c>DOTNET_CLI_HOME</c> is writable;
+    /// and since runtime 10.0.13 dotnet's user-scoped named mutexes (NuGet's
+    /// first-use "NuGet-Migrations") resolve under <c>$XDG_RUNTIME_DIR</c>
+    /// before the <c>$HOME</c> fallback, so an unusable ambient value would
+    /// abort first-use before MSBuild. Matching all three to the same
+    /// directory lands every NuGet resolution strategy on one writable home.
+    /// This mirrors
     /// <c>SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript</c>, which
-    /// pins both for the same reason. <c>build.sh</c> instead inherits this
-    /// stamped <c>HOME</c>/<c>DOTNET_CLI_HOME</c> and repairs whichever it
+    /// pins all three for the same reason. <c>build.sh</c> instead inherits
+    /// this stamped <c>HOME</c>/<c>DOTNET_CLI_HOME</c> and repairs whichever it
     /// resolves via the shared <c>scripts/nuget-home-heal.sh</c> recovery.
     /// <para>Unlike <see cref="ApplyIfAbsent"/> (used at sandbox creation, where
     /// overriding <c>HOME</c> would disturb sibling git/tool steps that need the
     /// caller's home), this is safe to override <c>HOME</c> because callers apply
     /// it to the per-command environment of the dotnet exec ONLY — see
-    /// <c>ShellCommandAuditor</c>. Existing <c>HOME</c>/<c>DOTNET_CLI_HOME</c>
-    /// values the caller set are respected.</para>
+    /// <c>ShellCommandAuditor</c>. Existing <c>HOME</c>/<c>DOTNET_CLI_HOME</c>/
+    /// <c>XDG_RUNTIME_DIR</c> values the caller set are respected.</para>
     /// </summary>
     public static void ApplyIfDotnetInvocation(
         IReadOnlyList<string> argv,
@@ -75,13 +79,17 @@ public static class DotnetCliHomeConventions
 
         ApplyIfAbsent(environment, workingDirectory);
 
-        // Point HOME at the same CLI home resolved above so a $HOME-derived
-        // NuGet user-config directory cannot fall back to a root-owned ~/.nuget.
-        if (!environment.ContainsKey("HOME")
-            && environment.TryGetValue("DOTNET_CLI_HOME", out var cliHome)
+        // Point HOME and XDG_RUNTIME_DIR at the same CLI home resolved above so
+        // a $HOME-derived NuGet user-config directory cannot fall back to a
+        // root-owned ~/.nuget and the user-scoped mutex location cannot fall
+        // back to an unusable ambient runtime dir.
+        if (environment.TryGetValue("DOTNET_CLI_HOME", out var cliHome)
             && !string.IsNullOrEmpty(cliHome))
         {
-            environment["HOME"] = cliHome;
+            if (!environment.ContainsKey("HOME"))
+                environment["HOME"] = cliHome;
+            if (!environment.ContainsKey("XDG_RUNTIME_DIR"))
+                environment["XDG_RUNTIME_DIR"] = cliHome;
         }
     }
 

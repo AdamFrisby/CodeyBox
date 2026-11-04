@@ -99,12 +99,13 @@ complementary, branch-controlled path.)
 
 ### The `build.sh` entry point handles this itself
 
-`build.sh` — the repository's canonical build entry point — applies the same
-redirect as the gate: it points `DOTNET_CLI_HOME` at a script-owned, writable
-directory (cleaned up on exit) and preserves any pre-baked `$HOME/.nuget/packages`
-cache via `NUGET_PACKAGES` before running `dotnet build CodeyBox.slnx`. Running
-`sh build.sh` therefore succeeds even when the image's `$HOME/.nuget` is owned by
-another user.
+`build.sh` — the repository's canonical build entry point — dot-sources the
+same `scripts/nuget-home-heal.sh` recovery before running `dotnet` (or any
+forwarded gate command): it repairs a foreign-owned `$HOME/.nuget` in place
+when `$HOME` is writable, and otherwise redirects `DOTNET_CLI_HOME` (and the
+runtime-dir variables) to a verified per-user fallback, reusing the inherited
+package cache when its owner is trusted. Running `sh build.sh` therefore
+succeeds even when the image's `$HOME/.nuget` is owned by another user.
 
 ### Baseline seeding must guest-own `$HOME/.nuget`
 

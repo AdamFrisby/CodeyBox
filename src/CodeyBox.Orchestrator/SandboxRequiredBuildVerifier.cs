@@ -84,6 +84,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         cli_home="${DOTNET_CLI_HOME:-}"
         if [ -n "$cli_home" ] \
           && mkdir -p "$cli_home/.nuget/NuGet" 2>/dev/null \
+          && [ -O "$cli_home/.nuget/NuGet" ] \
           && [ -w "$cli_home/.nuget/NuGet" ] \
           && { [ ! -e "$cli_home/.nuget/NuGet/NuGet.Config" ] || [ -r "$cli_home/.nuget/NuGet/NuGet.Config" ]; }; then
           :

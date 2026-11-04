@@ -599,6 +599,269 @@ public sealed class BuildScriptNuGetHealTests
         }
     }
 
+    // Same admission class as the foreign-owned case, one permission axis
+    // over: a HOME that is group/world-writable — even one owned by this uid —
+    // lets a co-tenant plant the NuGet.Config, swap the seeded entries, or
+    // hold the user-scoped mutex storage, so "usable" must refuse it for the
+    // owned per-user fallback rather than keeping the writable dir.
+    [Fact]
+    public async Task HealScript_PinsWritableUserDirs_RefusesCoTenantWritableHome()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var sentinel = Path.Combine(root, "vars");
+        Directory.CreateDirectory(home);
+        try
+        {
+            await ChmodAsync("777", home); // writable by every co-tenant
+
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$3\"",
+                    "sh", root, HealScriptRepoRoot(), sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = await File.ReadAllLinesAsync(sentinel);
+            Assert.Equal(3, lines.Length);
+            Assert.NotEqual(home, lines[0]);
+            var uid = await TestSupport.CurrentUidAsync();
+            var fallback = Path.Combine(root, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+            Assert.Equal(fallback, lines[0]);
+            Assert.Equal(fallback, lines[1]);
+            Assert.Equal(fallback, lines[2]);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The same merely-writable-is-not-ownership rule on the env-provided
+    // DOTNET_CLI_HOME: a group/world-writable cli home would keep the
+    // NuGet.Config every restore reads inside co-tenant-controlled storage,
+    // so the heal redirects to the owned fallback instead.
+    [Fact]
+    public async Task HealScript_RefusesCoTenantWritableCliHome()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var cliHome = Path.Combine(root, "cli");
+        var sentinel = Path.Combine(root, "vars");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(cliHome);
+        try
+        {
+            await ChmodAsync("777", cliHome); // writable by every co-tenant
+
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["DOTNET_CLI_HOME"] = cliHome,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$3\"",
+                    "sh", root, HealScriptRepoRoot(), sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = await File.ReadAllLinesAsync(sentinel);
+            Assert.Equal(3, lines.Length);
+            var uid = await TestSupport.CurrentUidAsync();
+            var fallback = Path.Combine(root, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+            Assert.Equal(home, lines[0]);       // healthy HOME is kept
+            Assert.Equal(fallback, lines[2]);   // the 777 cli home is refused
+            Assert.Equal(fallback, lines[1]);   // runtime dir lands on the fallback
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Regression for the mkdir -p descent: adopting the env-provided cli home
+    // must never create directories through a symlinked intermediate — a path
+    // like <planted-link>/deep/deeper used to materialize the whole chain
+    // under the link's target (an attacker-chosen dir-create as this user).
+    // A missing intermediate simply refuses the candidate now.
+    [Fact]
+    public async Task HealScript_NeverCreatesCliHomeThroughSymlinkedIntermediate()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var outside = Path.Combine(root, "outside");
+        var link = Path.Combine(root, "link");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(outside);
+        File.CreateSymbolicLink(link, outside);
+        try
+        {
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["DOTNET_CLI_HOME"] = Path.Combine(link, "deep", "deeper"),
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                    "sh", root, HealScriptRepoRoot(),
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.Empty(Directory.GetFileSystemEntries(outside));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // A .nuget planted as a symlink must be quarantined aside — never probed
+    // or created through — and the heal must leave a real, seeded settings
+    // directory behind. `mkdir -p` descending the link would otherwise plant
+    // the NuGet settings tree inside the link's foreign target.
+    [Fact]
+    public async Task HealScript_QuarantinesSymlinkedNuGetDir()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(outside);
+        File.CreateSymbolicLink(Path.Combine(home, ".nuget"), outside);
+        try
+        {
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            // The planted link was moved aside (preserved), not followed.
+            var quarantines = Directory.GetFileSystemEntries(home, ".nuget.codeybox-unwritable.*");
+            Assert.Single(quarantines);
+            Assert.True(
+                File.GetAttributes(quarantines[0]).HasFlag(FileAttributes.ReparsePoint),
+                "the quarantined entry must be the symlink itself");
+            Assert.Empty(Directory.GetFileSystemEntries(outside));
+
+            // A real settings dir with a readable seeded config replaced it.
+            var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+            Assert.True(Directory.Exists(nugetDir));
+            Assert.Contains(
+                "<configuration",
+                await File.ReadAllTextAsync(Path.Combine(nugetDir, "NuGet.Config")),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The redirected-home path must not link a co-tenant-writable package
+    // cache into the healed home: NuGet consumes extracted entries with a
+    // valid .nupkg.metadata without re-extracting, so a cache a co-tenant can
+    // write would satisfy package installs with planted content.
+    [Fact]
+    public async Task HealScript_Redirect_DoesNotLinkCoTenantWritableCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process can write anywhere; the unwritable-home
+        // redirect this test needs is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var sentinel = Path.Combine(root, "cli-home");
+        try
+        {
+            var packages = Path.Combine(home, ".nuget", "packages", "pkg");
+            Directory.CreateDirectory(packages);
+            await File.WriteAllTextAsync(Path.Combine(packages, "marker.txt"), "planted");
+            await ChmodAsync("777", Path.Combine(home, ".nuget", "packages"));
+            await ChmodAsync("555", Path.Combine(home, ".nuget"));
+            await ChmodAsync("555", home);
+
+            var repoRoot = HealScriptRepoRoot();
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s' \"$DOTNET_CLI_HOME\" > \"$3\"",
+                    "sh", root, repoRoot, sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var scratchHome = await File.ReadAllTextAsync(sentinel);
+            Assert.False(string.IsNullOrEmpty(scratchHome), "fallback must export a scratch DOTNET_CLI_HOME");
+            // The seeded home carries the readable config but NOT the foreign
+            // cache: no packages entry (link or dir) may appear under .nuget.
+            Assert.True(File.Exists(Path.Combine(scratchHome, ".nuget", "NuGet", "NuGet.Config")));
+            Assert.False(
+                File.Exists(Path.Combine(scratchHome, ".nuget", "packages"))
+                || Directory.Exists(Path.Combine(scratchHome, ".nuget", "packages")),
+                "a co-tenant-writable cache must not be linked into the healed home");
+        }
+        finally
+        {
+            await ChmodAsync("755", home);
+            await ChmodAsync("755", Path.Combine(home, ".nuget"));
+            await ChmodAsync("755", Path.Combine(home, ".nuget", "packages"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task HealScript_DirectDotSource_LeavesWritableHomeIntact()
     {

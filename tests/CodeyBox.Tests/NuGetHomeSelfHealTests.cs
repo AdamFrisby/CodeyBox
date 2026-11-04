@@ -178,6 +178,83 @@ public sealed class NuGetHomeSelfHealTests
         Assert.Equal(fallback, ParseVar(stdout, "XDG"));
     }
 
+    // Merely-writable is not ownership: a group/world-writable $HOME — even
+    // one owned by this uid — lets a co-tenant plant the NuGet.Config or hold
+    // dotnet's user-scoped mutex storage inside it, so the usable check must
+    // refuse it and pin the owned per-user fallback instead.
+    [Fact]
+    public async Task WrapDotnetInvocation_PinsWritableUserDirs_RefusesCoTenantWritableHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithCoTenantWritableHome();
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        var uid = await TestSupport.CurrentUidAsync();
+        var fallback = Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+        Assert.Equal(fallback, ParseVar(stdout, "HOME"));
+        Assert.Equal(fallback, ParseVar(stdout, "XDG"));
+    }
+
+    // Same rule on the env-provided DOTNET_CLI_HOME: a group/world-writable
+    // cli home cannot keep the NuGet.Config restore reads, so the heal
+    // redirects to the owned fallback even though the env dir is writable.
+    [Fact]
+    public async Task WrapDotnetInvocation_RefusesCoTenantWritableCliHome()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithHealthyHome();
+        var foreign = Path.Combine(fixture.Tmp, "co-tenant-writable");
+        Directory.CreateDirectory(foreign);
+        File.SetUnixFileMode(
+            foreign,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string> { ["DOTNET_CLI_HOME"] = foreign });
+
+        Assert.Equal(0, exitCode);
+        var uid = await TestSupport.CurrentUidAsync();
+        var fallback = Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+        Assert.Equal(fallback, ParseVar(stdout, "CLI_HOME"));
+        Assert.Equal(fixture.Home, ParseVar(stdout, "HOME"));
+        Assert.Equal(fallback, ParseVar(stdout, "XDG"));
+    }
+
+    // Regression for the mkdir -p descent on the env-provided cli home: a
+    // candidate under a symlinked intermediate must never materialize the
+    // chain under the link's target — a missing component simply refuses the
+    // candidate now.
+    [Fact]
+    public async Task WrapDotnetInvocation_NeverCreatesCliHomeThroughSymlinkedIntermediate()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithHealthyHome();
+        var outside = Path.Combine(fixture.Tmp, "outside");
+        Directory.CreateDirectory(outside);
+        var link = Path.Combine(fixture.Tmp, "link");
+        File.CreateSymbolicLink(link, outside);
+        var cli = Path.Combine(link, "deep", "deeper");
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string> { ["DOTNET_CLI_HOME"] = cli });
+
+        Assert.Equal(0, exitCode);
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+        var uid = await TestSupport.CurrentUidAsync();
+        Assert.Equal(
+            Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
+            ParseVar(stdout, "CLI_HOME"));
+    }
+
     private static string ParseVar(string stdout, string name)
     {
         var line = stdout.Split('\n').Single(l => l.StartsWith(name + "=", StringComparison.Ordinal));
@@ -245,6 +322,43 @@ public sealed class NuGetHomeSelfHealTests
                 var config = Path.Combine(fixture.Home, ".nuget", "NuGet", "NuGet.Config");
                 if (File.Exists(config) && !OperatingSystem.IsWindows())
                     File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            });
+
+        // A perfectly healthy NuGet home — the preamble takes no redirect;
+        // fake `dotnet` echoes every variable the preamble may pin.
+        public static SelfHealFixture WithHealthyHome() => new(
+            prepareHome: static home => { },
+            fakeDotnetBody:
+                "#!/bin/sh\nprintf 'CLI_HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'HOME=%s\\n' \"${HOME:-}\"\nprintf 'XDG=%s\\n' \"${XDG_RUNTIME_DIR:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
+            extraEnvRemovals: ["XDG_RUNTIME_DIR"],
+            restorePermissions: static fixture => { });
+
+        // A $HOME that IS writable — but by every co-tenant (mode 777). The
+        // writable bit alone must not admit it: anything planted inside by a
+        // co-tenant would be consumed by restore.
+        public static SelfHealFixture WithCoTenantWritableHome() => new(
+            prepareHome: static home =>
+            {
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(
+                        home,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+                }
+            },
+            fakeDotnetBody:
+                "#!/bin/sh\nprintf 'HOME=%s\\n' \"${HOME:-}\"\nprintf 'XDG=%s\\n' \"${XDG_RUNTIME_DIR:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
+            extraEnvRemovals: ["XDG_RUNTIME_DIR"],
+            restorePermissions: static fixture =>
+            {
+                if (!OperatingSystem.IsWindows() && Directory.Exists(fixture.Home))
+                {
+                    File.SetUnixFileMode(
+                        fixture.Home,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
             });
 
         // A $HOME the current user cannot write at all — the runtime-10.0.13+

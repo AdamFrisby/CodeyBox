@@ -37,12 +37,18 @@ home="${HOME:-}"
 
 nuget_home="$home/.nuget"
 
-# Fast path: absent or already writable — ensure the settings dir exists.
-if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
+# Absent or writable .nuget only needs the settings dir to exist; every
+# failure defers to the redirect the same way (see defer_to_redirect).
+ensure_settings_dir() {
   if mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
     exit 0
   fi
   defer_to_redirect "cannot create $nuget_home/NuGet under $home"
+}
+
+# Fast path: absent or already writable — ensure the settings dir exists.
+if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
+  ensure_settings_dir
 fi
 
 # $HOME/.nuget exists but is not writable: repairing it means renaming it
@@ -58,10 +64,7 @@ while ! mkdir "$lock_dir" 2>/dev/null; do
   tries=$((tries + 1))
   # Another node already finished the repair.
   if [ -d "$nuget_home" ] && [ -w "$nuget_home" ]; then
-    if mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
-      exit 0
-    fi
-    defer_to_redirect "cannot create $nuget_home/NuGet under $home"
+    ensure_settings_dir
   fi
   if [ "$tries" -ge 200 ]; then
     echo "error : timed out waiting to repair non-writable NuGet home at $nuget_home" >&2
@@ -78,10 +81,7 @@ trap cleanup_lock EXIT INT TERM
 
 # Re-check under the lock — a peer may have repaired while we waited.
 if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
-  if mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
-    exit 0
-  fi
-  defer_to_redirect "cannot create $nuget_home/NuGet under $home"
+  ensure_settings_dir
 fi
 
 baked="$home/.nuget.rootbaked"
