@@ -80,6 +80,63 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     }
 
     [Fact]
+    public async Task Script_DefersToRedirect_WhenHomeUnwritable()
+    {
+        // An unwritable $HOME makes every in-place repair impossible — both the
+        // fast-path mkdir and the quarantine mv need a writable parent. The
+        // script must not turn that into a build failure (MSB3073): the
+        // DOTNET_CLI_HOME redirect is the designed fallback, so it exits 0 and
+        // leaves the broken tree untouched.
+        if (Environment.IsPrivilegedProcess)
+            return; // root can write anywhere; the unwritable branch is unobservable
+
+        var home = Path.Combine(_workspace, "home-unwritable");
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(nugetHome);
+        File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var (exit, output) = await RunScriptAsync(home);
+
+            Assert.Equal(0, exit);
+            Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(home, ".nuget.rootbaked")));
+        }
+        finally
+        {
+            File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public async Task Script_DefersToRedirect_WhenNuGetHomeCannotBeCreated()
+    {
+        // $HOME unwritable with no .nuget at all: the mkdir fast path cannot
+        // succeed, so the script defers to the redirect instead of dying under
+        // `set -e`.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var home = Path.Combine(_workspace, "home-no-create");
+        Directory.CreateDirectory(home);
+        File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var (exit, output) = await RunScriptAsync(home);
+
+            Assert.Equal(0, exit);
+            Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(home, ".nuget")));
+        }
+        finally
+        {
+            File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
     public async Task DirectoryBuildTargets_LetsRawDotnetRestore_WhenNuGetHomeIsNotWritable()
     {
         // End-to-end: the same fault the auditors hit (root-owned $HOME/.nuget)

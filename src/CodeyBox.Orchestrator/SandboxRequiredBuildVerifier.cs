@@ -92,6 +92,10 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         fi
         export DOTNET_CLI_HOME="$cli_home"
         export HOME="$cli_home"
+        # Since runtime 10.0.13, user-scoped named mutexes (NuGet's first-use
+        # "NuGet-Migrations") resolve under $XDG_RUNTIME_DIR before the $HOME
+        # fallback; pin it too so first-use cannot abort creating that mutex.
+        export XDG_RUNTIME_DIR="$cli_home"
         """;
 
     // Exposed to tests so the actual gate script — the exact artifact the

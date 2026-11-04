@@ -14,7 +14,12 @@ namespace CodeyBox.Core;
 /// <para>The remedy is environmental, not source-level: when any level of the
 /// <c>~/.nuget</c> settings hierarchy is unusable by the current user, redirect
 /// <c>DOTNET_CLI_HOME</c> to a writable temp dir (reusing the existing package
-/// cache when present) so restore can create its own settings. This is the single
+/// cache when present) so restore can create its own settings. The preamble also
+/// guarantees a usable per-user runtime location (<c>HOME</c> /
+/// <c>XDG_RUNTIME_DIR</c>) for dotnet's user-scoped named mutexes — since
+/// runtime 10.0.13 an unusable <c>$HOME</c> aborts first-use before MSBuild with
+/// an IOException creating <c>NuGet-Migrations</c>, which a DOTNET_CLI_HOME
+/// redirect alone does not cover. This is the single
 /// source of truth for that shell preamble; the required-build gate and the
 /// C# build/test/format shell auditors both consume it, and the standalone
 /// <c>./build.sh</c> entrypoint mirrors it (it cannot share a constant across the
@@ -39,7 +44,11 @@ public static class NuGetHomeSelfHeal
     /// <summary>
     /// POSIX shell preamble that exports a redirected <c>DOTNET_CLI_HOME</c> (and,
     /// when reusable, <c>NUGET_PACKAGES</c>) iff the current user cannot use its
-    /// <c>~/.nuget</c> settings home. A no-op on a healthy home.
+    /// <c>~/.nuget</c> settings home, and pins <c>HOME</c>/<c>XDG_RUNTIME_DIR</c>
+    /// to a writable per-user dir when either is unusable (required by .NET
+    /// 10.0.13+ user-scoped named mutexes such as <c>NuGet-Migrations</c>).
+    /// A no-op when the NuGet home, <c>$HOME</c>, and <c>$XDG_RUNTIME_DIR</c>
+    /// are all usable.
     ///
     /// <para>Assumes the enclosing script already ran <c>set -eu</c>; the
     /// <c>[ ... ] &amp;&amp; flag</c> idioms are <c>set -e</c>-safe because a
@@ -70,6 +79,40 @@ public static class NuGetHomeSelfHeal
             export NUGET_PACKAGES="$existing_packages"
           fi
           echo "nuget-home self-heal: '${nuget_root}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${NUGET_PACKAGES})}" >&2
+        fi
+        # A usable NuGet settings home is not enough by itself: since runtime
+        # 10.0.13, dotnet first-use creates the user-scoped "NuGet-Migrations"
+        # named mutex under $XDG_RUNTIME_DIR, falling back to
+        # $HOME/.dotnet/corefx/Runtime/SharedMemory — and NuGet builds that key
+        # user paths off $HOME hit the same broken home. When neither variable
+        # points somewhere usable the CLI aborts before MSBuild with
+        # "The system cannot open the device or file specified: 'NuGet-Migrations'"
+        # (dotnet/runtime#135726, #136802). Pin each unusable variable to a
+        # writable dir: preferring the (possibly just-healed) DOTNET_CLI_HOME,
+        # else the shared per-user fallback.
+        need_user_dir=0
+        { [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; } && need_user_dir=1
+        { [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; } && need_user_dir=1
+        if [ "$need_user_dir" -eq 1 ]; then
+          user_dir="${DOTNET_CLI_HOME:-}"
+          { [ -n "$user_dir" ]; } && mkdir -p "$user_dir" 2>/dev/null || true
+          if [ ! -d "$user_dir" ] || [ ! -w "$user_dir" ]; then
+            user_dir="${TMPDIR:-/tmp}/{{WritableHomeLeaf}}-$(id -u)"
+            mkdir -p "$user_dir" 2>/dev/null || true
+            if [ ! -d "$user_dir" ] || [ ! -O "$user_dir" ] || [ ! -w "$user_dir" ]; then
+              user_dir="$(mktemp -d "${TMPDIR:-/tmp}/{{WritableHomeLeaf}}.XXXXXX")"
+            fi
+          fi
+          if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+            # Redirecting HOME would orphan a pre-baked package cache under the
+            # original $HOME/.nuget — preserve it for restore like the
+            # broken-home branch does.
+            if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$nuget_root/packages" ] && [ -w "$nuget_root/packages" ]; then
+              export NUGET_PACKAGES="$nuget_root/packages"
+            fi
+            export HOME="$user_dir"
+          fi
+          { [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; } && export XDG_RUNTIME_DIR="$user_dir"
         fi
         """;
 

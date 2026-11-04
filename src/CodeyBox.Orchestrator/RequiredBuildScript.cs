@@ -87,6 +87,12 @@ internal static class RequiredBuildScript
         # DOTNET_CLI_HOME is set. Point both variables at the isolated writable
         # directory, after preserving the original package-cache path above.
         export HOME="$dotnet_home"
+
+        # Since runtime 10.0.13, user-scoped named mutexes (NuGet's first-use
+        # "NuGet-Migrations") resolve under $XDG_RUNTIME_DIR before the $HOME
+        # fallback; pin it too so first-use cannot abort the CLI creating that
+        # mutex when the ambient runtime dir is unset or unusable.
+        export XDG_RUNTIME_DIR="$dotnet_home"
         """;
 
     /// <summary>

@@ -387,6 +387,73 @@ public sealed class BuildScriptNuGetHealTests
     }
 
     [Fact]
+    public async Task HealScript_PinsWritableUserDirs_WhenHomeUnusable()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process can write anywhere; the unusable-home branch is
+        // unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            // An unusable $HOME does not only break NuGet's settings dir:
+            // runtime 10.0.13+ creates user-scoped named mutexes (NuGet's
+            // first-use "NuGet-Migrations") under $XDG_RUNTIME_DIR or $HOME,
+            // so a raw `dotnet` aborts before MSBuild. The dot-sourced
+            // recovery must pin both to a writable dir for the caller's
+            // process tree.
+            await ChmodAsync("555", home);
+
+            var sentinel = Path.Combine(root, "vars");
+            var repoRoot = HealScriptRepoRoot();
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . ./scripts/nuget-home-heal.sh && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$2\"",
+                    "sh", repoRoot, sentinel,
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = await File.ReadAllLinesAsync(sentinel);
+            Assert.Equal(3, lines.Length);
+            var exportedHome = lines[0];
+            var xdgRuntimeDir = lines[1];
+            var dotnetCliHome = lines[2];
+
+            // HOME and XDG_RUNTIME_DIR were both unusable/absent and must now
+            // point at a writable dir — the just-redirected CLI home — never
+            // the unusable $HOME.
+            Assert.NotEqual(home, exportedHome);
+            Assert.Equal(dotnetCliHome, exportedHome);
+            Assert.Equal(dotnetCliHome, xdgRuntimeDir);
+            Assert.True(Directory.Exists(xdgRuntimeDir));
+            var probe = Path.Combine(exportedHome, "writable-probe");
+            await File.WriteAllTextAsync(probe, "ok"); // throws if not writable
+        }
+        finally
+        {
+            await ChmodAsync("755", home);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task HealScript_DirectDotSource_LeavesWritableHomeIntact()
     {
         if (!OperatingSystem.IsLinux())

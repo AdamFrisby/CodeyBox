@@ -93,10 +93,46 @@ public sealed class NuGetHomeSelfHealTests
         Assert.True(Directory.Exists(redirected));
     }
 
+    // An unusable $HOME is a different fault than an unreadable NuGet.Config:
+    // since runtime 10.0.13 the dotnet CLI creates the user-scoped
+    // "NuGet-Migrations" named mutex under $XDG_RUNTIME_DIR, falling back to
+    // $HOME — an unusable HOME aborts first-use before MSBuild runs. The wrap
+    // must pin HOME and XDG_RUNTIME_DIR to a writable dir so dotnet first-use
+    // can run at all.
+    [Fact]
+    public async Task WrapDotnetInvocation_PinsWritableUserDirs_WhenHomeUnusable()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process can write anywhere, so the unusable-home
+        // branch is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        using var fixture = new UnusableHomeFixture();
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        var uid = await CurrentUidAsync();
+        // Both variables land on the shared writable fallback under TMPDIR —
+        // never the unusable home.
+        var fallback = Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid);
+        Assert.Equal(fallback, ParseVar(stdout, "HOME"));
+        Assert.Equal(fallback, ParseVar(stdout, "XDG"));
+        Assert.True(Directory.Exists(fallback));
+        Assert.Contains("ARGS=build", stdout);
+    }
+
     private static string ParseRedirectedHome(string stdout)
     {
         var line = stdout.Split('\n').Single(l => l.StartsWith("HOME=", StringComparison.Ordinal));
         return line["HOME=".Length..].Trim();
+    }
+
+    private static string ParseVar(string stdout, string name)
+    {
+        var line = stdout.Split('\n').Single(l => l.StartsWith(name + "=", StringComparison.Ordinal));
+        return line[(name.Length + 1)..].Trim();
     }
 
     private static async Task<string> CurrentUidAsync()
@@ -174,6 +210,82 @@ public sealed class NuGetHomeSelfHealTests
             var config = Path.Combine(Home, ".nuget", "NuGet", "NuGet.Config");
             if (File.Exists(config) && !OperatingSystem.IsWindows())
                 File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            try { Directory.Delete(_root, recursive: true); } catch { }
+        }
+    }
+
+    // A $HOME the current user cannot write at all — the runtime-10.0.13+
+    // named-mutex failure mode — plus a fake `dotnet` echoing HOME,
+    // XDG_RUNTIME_DIR, and its args, in an isolated temp tree that is cleaned
+    // up (restoring perms) on Dispose.
+    private sealed class UnusableHomeFixture : IDisposable
+    {
+        private readonly string _root;
+        public string Home { get; }
+        public string Tmp { get; }
+        private readonly string _binDir;
+
+        public UnusableHomeFixture()
+        {
+            _root = Directory.CreateTempSubdirectory("codeybox-selfheal-").FullName;
+            Home = Path.Combine(_root, "home");
+            Directory.CreateDirectory(Home);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    Home,
+                    UnixFileMode.UserRead | UnixFileMode.UserExecute);
+            }
+
+            Tmp = Path.Combine(_root, "tmp");
+            Directory.CreateDirectory(Tmp);
+
+            _binDir = Path.Combine(_root, "bin");
+            Directory.CreateDirectory(_binDir);
+            var fakeDotnet = Path.Combine(_binDir, "dotnet");
+            File.WriteAllText(
+                fakeDotnet,
+                "#!/bin/sh\nprintf 'HOME=%s\\n' \"${HOME:-}\"\nprintf 'XDG=%s\\n' \"${XDG_RUNTIME_DIR:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n");
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(
+                    fakeDotnet,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        public async Task<(string Stdout, int ExitCode)> RunWrappedDotnetAsync()
+        {
+            var wrapped = NuGetHomeSelfHeal.WrapDotnetInvocation(
+                ["dotnet", "build", "--no-incremental", "/warnaserror"]);
+
+            var psi = new ProcessStartInfo(wrapped[0])
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var arg in wrapped.Skip(1))
+                psi.ArgumentList.Add(arg);
+            psi.Environment["HOME"] = Home;
+            psi.Environment["TMPDIR"] = Tmp;
+            psi.Environment["PATH"] = _binDir + ":" + Environment.GetEnvironmentVariable("PATH");
+            psi.Environment.Remove("DOTNET_CLI_HOME");
+            psi.Environment.Remove("NUGET_PACKAGES");
+            psi.Environment.Remove("XDG_RUNTIME_DIR");
+
+            using var process = Process.Start(psi)!;
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            return (stdout, process.ExitCode);
+        }
+
+        public void Dispose()
+        {
+            if (!OperatingSystem.IsWindows() && Directory.Exists(Home))
+            {
+                File.SetUnixFileMode(
+                    Home,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
             try { Directory.Delete(_root, recursive: true); } catch { }
         }
     }

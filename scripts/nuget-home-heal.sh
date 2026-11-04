@@ -128,4 +128,53 @@ codeybox_heal_nuget_home() {
     return 0
 }
 
+# The NuGet-settings heal above does not cover dotnet's OTHER per-user runtime
+# needs. Since runtime 10.0.13, user-scoped named mutexes — NuGet's first-use
+# "NuGet-Migrations" among them — resolve under $XDG_RUNTIME_DIR, falling back
+# to $HOME/.dotnet/corefx/Runtime/SharedMemory, and NuGet builds that key user
+# paths off $HOME ignore DOTNET_CLI_HOME and hit the same broken home. On
+# images whose $HOME is unavailable (the same broken-home images this file
+# heals), the CLI then aborts before MSBuild with "The system cannot open the
+# device or file specified: 'NuGet-Migrations'" (dotnet/runtime#135726,
+# #136802). Pin each unusable variable to a writable dir — preferring the
+# (possibly just-redirected) DOTNET_CLI_HOME, else a private mktemp dir — for
+# this dot-sourced process tree. Strict no-op when both are usable.
+codeybox_ensure_dotnet_runtime_dir() {
+    _codeybox_need_user_dir=0
+    if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+        _codeybox_need_user_dir=1
+    fi
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
+        _codeybox_need_user_dir=1
+    fi
+    [ "$_codeybox_need_user_dir" -eq 1 ] || return 0
+
+    _codeybox_user_dir="${DOTNET_CLI_HOME:-}"
+    if [ -n "$_codeybox_user_dir" ]; then
+        mkdir -p "$_codeybox_user_dir" 2>/dev/null || true
+    fi
+    if [ -z "$_codeybox_user_dir" ] || [ ! -d "$_codeybox_user_dir" ] || [ ! -w "$_codeybox_user_dir" ]; then
+        _codeybox_user_dir="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-dotnet-runtime.XXXXXX")" \
+            || return 0
+    fi
+    if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+        # Redirecting HOME would orphan a pre-baked package cache under the
+        # original $HOME/.nuget — seed the replacement home (readable user
+        # config + linked cache) before the redirect, exactly like the
+        # scratch-home path above.
+        _codeybox_seed_nuget_home "$_codeybox_user_dir/.nuget/NuGet" \
+            "$HOME/.nuget/packages"
+        HOME="$_codeybox_user_dir"
+        export HOME
+    fi
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
+        XDG_RUNTIME_DIR="$_codeybox_user_dir"
+        export XDG_RUNTIME_DIR
+    fi
+    return 0
+}
+
 codeybox_heal_nuget_home
+# Run AFTER the home heal so a just-redirected DOTNET_CLI_HOME is reused as the
+# runtime dir rather than spending a second scratch dir.
+codeybox_ensure_dotnet_runtime_dir
