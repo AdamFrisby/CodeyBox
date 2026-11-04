@@ -486,19 +486,6 @@ public sealed class BuildScriptNuGetHealTests
     private static string MigrationMarkerPath(string home)
         => Path.Combine(home, ".local", "share", "NuGet", "Migrations", "1");
 
-    private static async Task<string> CurrentUidAsync()
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo("id", "-u")
-        {
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-        };
-        using var process = System.Diagnostics.Process.Start(psi)!;
-        var uid = (await process.StandardOutput.ReadToEndAsync()).Trim();
-        await process.WaitForExitAsync();
-        return uid;
-    }
-
     // Since runtime 10.0.13, NuGet's first-use/restore "NuGet-Migrations"
     // user-scoped mutex resolves under $XDG_RUNTIME_DIR (else
     // $HOME/.dotnet/corefx/Runtime/SharedMemory); a gate exec whose launch env
@@ -549,7 +536,7 @@ public sealed class BuildScriptNuGetHealTests
                 environment: env);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
-            var uid = await CurrentUidAsync();
+            var uid = await TestSupport.CurrentUidAsync();
             var seededHomes = new[]
             {
                 home,
@@ -569,6 +556,116 @@ public sealed class BuildScriptNuGetHealTests
             // Seeded markers are the empty file NuGet itself writes after a
             // no-op migration run.
             Assert.Equal(string.Empty, await File.ReadAllTextAsync(MigrationMarkerPath(cliHome)));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Regression for the confused-deputy write the seeder could perform: the
+    // marker leaf is created with `: >`, which writes THROUGH a symlink, so a
+    // dangling symlink planted at $XDG_DATA_HOME/NuGet/Migrations/1 — where
+    // `-e` is false and a `-e`-only guard would open it for writing — must be
+    // left alone, never turned into an empty file at the link's target.
+    [Fact]
+    public async Task HealScript_DirectDotSource_NeverWritesMarkerThroughSymlinkLeaf()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var xdgData = Path.Combine(root, "xdg-data");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(xdgData);
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var markerDir = Path.Combine(xdgData, "NuGet", "Migrations");
+            Directory.CreateDirectory(markerDir);
+            var markerLink = Path.Combine(markerDir, "1");
+            var linkTarget = Path.Combine(outside, "planted-target");
+            File.CreateSymbolicLink(markerLink, linkTarget);
+
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["XDG_DATA_HOME"] = xdgData,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                    "sh", root, HealScriptRepoRoot(),
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            // The link's target must not exist — nothing was written through
+            // the planted symlink — and the placeholder itself is still a link.
+            Assert.False(File.Exists(linkTarget), "marker write must not follow the planted symlink");
+            Assert.True(
+                File.GetAttributes(markerLink).HasFlag(FileAttributes.ReparsePoint),
+                "the existing symlink leaf is migration state and must be left untouched");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Same confused-deputy class one level up: `mkdir -p` descends through a
+    // symlinked intermediate component, so a planted $HOME/.local link would
+    // have planted the whole marker tree under the link's target directory.
+    // The seeder must refuse to descend and leave the target untouched.
+    [Fact]
+    public async Task HealScript_DirectDotSource_NeverDescendsThroughSymlinkedComponent()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(outside);
+        try
+        {
+            File.CreateSymbolicLink(Path.Combine(home, ".local"), outside);
+
+            var env = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["HOME"] = home,
+                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                ["TMPDIR"] = root,
+            };
+            var result = await new DefaultProcessRunner().RunAsync(
+                [
+                    "/bin/sh", "-c",
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                    "sh", root, HealScriptRepoRoot(),
+                ],
+                null,
+                CancellationToken.None,
+                maxStdoutBytes: 65536,
+                maxStderrBytes: 65536,
+                environment: env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.False(
+                File.Exists(Path.Combine(outside, "share", "NuGet", "Migrations", "1")),
+                "no marker may be created under the symlink's target");
+            Assert.False(
+                Directory.Exists(Path.Combine(outside, "share")),
+                "no part of the marker tree may be created under the symlink's target");
         }
         finally
         {

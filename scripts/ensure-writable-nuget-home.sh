@@ -24,6 +24,14 @@
 # csharp:build-WaE — self-heals on a misprovisioned image.
 set -eu
 
+# Every degraded path below ends the same way: report why the in-place repair
+# is impossible, then exit 0 so the DOTNET_CLI_HOME redirect (see header)
+# picks the build up instead of surfacing a misleading MSB3073.
+defer_to_redirect() {
+  echo "ensure-writable-nuget-home: $1; relying on the DOTNET_CLI_HOME redirect" >&2
+  exit 0
+}
+
 home="${HOME:-}"
 [ -n "$home" ] || exit 0
 
@@ -34,16 +42,14 @@ if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
   if mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
     exit 0
   fi
-  echo "ensure-writable-nuget-home: cannot create $nuget_home/NuGet under $home; relying on the DOTNET_CLI_HOME redirect" >&2
-  exit 0
+  defer_to_redirect "cannot create $nuget_home/NuGet under $home"
 fi
 
 # $HOME/.nuget exists but is not writable: repairing it means renaming it
 # aside, which requires a writable $HOME. When $HOME is unwritable too there
 # is no in-place repair — defer to the DOTNET_CLI_HOME redirect.
 if [ ! -w "$home" ]; then
-  echo "ensure-writable-nuget-home: $home is not writable; cannot repair $nuget_home in place — relying on the DOTNET_CLI_HOME redirect" >&2
-  exit 0
+  defer_to_redirect "$home is not writable; cannot repair $nuget_home in place"
 fi
 
 lock_dir="${TMPDIR:-/tmp}/codeybox-ensure-writable-nuget-home.lock"
@@ -55,8 +61,7 @@ while ! mkdir "$lock_dir" 2>/dev/null; do
     if mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
       exit 0
     fi
-    echo "ensure-writable-nuget-home: cannot create $nuget_home/NuGet under $home; relying on the DOTNET_CLI_HOME redirect" >&2
-    exit 0
+    defer_to_redirect "cannot create $nuget_home/NuGet under $home"
   fi
   if [ "$tries" -ge 200 ]; then
     echo "error : timed out waiting to repair non-writable NuGet home at $nuget_home" >&2
@@ -76,8 +81,7 @@ if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
   if mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
     exit 0
   fi
-  echo "ensure-writable-nuget-home: cannot create $nuget_home/NuGet under $home; relying on the DOTNET_CLI_HOME redirect" >&2
-  exit 0
+  defer_to_redirect "cannot create $nuget_home/NuGet under $home"
 fi
 
 baked="$home/.nuget.rootbaked"
@@ -86,13 +90,15 @@ if [ -e "$baked" ]; then
 fi
 
 if ! mv "$nuget_home" "$baked" 2>/dev/null; then
-  echo "ensure-writable-nuget-home: cannot relocate $nuget_home aside; relying on the DOTNET_CLI_HOME redirect" >&2
-  exit 0
+  defer_to_redirect "cannot relocate $nuget_home aside"
 fi
 if ! mkdir -p "$nuget_home/NuGet" 2>/dev/null; then
-  echo "ensure-writable-nuget-home: relocated $nuget_home but cannot recreate it; relying on the DOTNET_CLI_HOME redirect" >&2
-  exit 0
+  defer_to_redirect "relocated $nuget_home but cannot recreate it"
 fi
 if [ -d "$baked/packages" ]; then
-  ln -s "$baked/packages" "$nuget_home/packages" 2>/dev/null || true
+  # A lost link only means restore re-downloads instead of reusing the baked
+  # cache — degraded, not fatal — but leave a trace like every other degraded
+  # path above.
+  ln -s "$baked/packages" "$nuget_home/packages" 2>/dev/null \
+    || echo "ensure-writable-nuget-home: cannot link $baked/packages into $nuget_home; restore may re-download" >&2
 fi

@@ -106,7 +106,12 @@ public static class NuGetHomeSelfHeal
           if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
             # Redirecting HOME would orphan a pre-baked package cache under the
             # original $HOME/.nuget — preserve it for restore like the
-            # broken-home branch does.
+            # broken-home branch does. scripts/nuget-home-heal.sh mirrors this
+            # whole block (same DOTNET_CLI_HOME -> shared per-user -> mktemp
+            # chain) with one intentional difference: it links the cache into
+            # the redirected home's .nuget instead of exporting NUGET_PACKAGES,
+            # materializing the cache on disk for children that resolve
+            # packages off $HOME without inheriting the variable.
             if [ -z "${NUGET_PACKAGES:-}" ] && [ -d "$nuget_root/packages" ] && [ -w "$nuget_root/packages" ]; then
               export NUGET_PACKAGES="$nuget_root/packages"
             fi

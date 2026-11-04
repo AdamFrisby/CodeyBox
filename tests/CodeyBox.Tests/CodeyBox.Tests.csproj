@@ -8,11 +8,6 @@
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
 
-  <!-- Suppress vulnerability advisories for OTel transitive dependencies that have no patched
-       version in the local NuGet cache. Mirrored from CodeyBox.Api.csproj. -->
-  <ItemGroup>
-  </ItemGroup>
-
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />

@@ -15,10 +15,12 @@
 # home, none merely reconfigures sources.
 #
 # DOT-SOURCE this file (`. scripts/nuget-home-heal.sh`) BEFORE invoking dotnet.
-# It is a strict no-op when the home is already usable, never fails the caller
-# (safe under `set -e`), and — because it is dot-sourced — can export a fallback
-# DOTNET_CLI_HOME into the caller's environment. build.sh and the audit
-# build/test gates all source this rather than re-implementing the recovery.
+# It never fails the caller (safe under `set -e`), and — because it is
+# dot-sourced — can export a fallback DOTNET_CLI_HOME into the caller's
+# environment. The settings heal and runtime-dir pinning are strict no-ops on
+# an already-usable home; the only write in that case is the idempotent
+# migration-marker seeding described below. build.sh and the audit build/test
+# gates all source this rather than re-implementing the recovery.
 #
 # It is ALSO run from MSBuild via an InitialTargets hook (see
 # Directory.NuGetHomeHeal.targets, wired into Directory.Build.props and
@@ -69,12 +71,20 @@ _codeybox_seed_nuget_home() {
         ln -s "$_codeybox_seed_cache_src" "$_codeybox_seed_root/packages" 2>/dev/null || true
     fi
     # Repository package sources come from RestoreConfigFile, so an empty user
-    # config adds no overrides and clears no sources.
+    # config adds no overrides and clears no sources. Two execs can share the
+    # per-user fallback home and race this write, so render to a sibling temp
+    # and install with `ln` — an atomic no-clobber create that can never leave
+    # a half-written config behind or overwrite one a peer (or NuGet) wrote
+    # first.
     if [ ! -e "$_codeybox_seed_user_dir/NuGet.Config" ]; then
-        printf '%s\n' \
+        _codeybox_seed_tmp="$_codeybox_seed_user_dir/.NuGet.Config.tmp.$$"
+        if printf '%s\n' \
             '<?xml version="1.0" encoding="utf-8"?>' \
             '<configuration />' \
-            > "$_codeybox_seed_user_dir/NuGet.Config" 2>/dev/null || true
+            > "$_codeybox_seed_tmp" 2>/dev/null; then
+            ln "$_codeybox_seed_tmp" "$_codeybox_seed_user_dir/NuGet.Config" 2>/dev/null || true
+        fi
+        rm -f "$_codeybox_seed_tmp" 2>/dev/null || true
     fi
 }
 
@@ -115,17 +125,32 @@ codeybox_heal_nuget_home() {
 
     # The cli-home itself is not writable (e.g. an inherited read-only mount that
     # cannot be relocated aside): keep the build hermetic by redirecting the .NET
-    # CLI home to a writable scratch directory for this process tree. Seed that
-    # scratch home the same way as the in-place path — a readable user config so
-    # the fatal read succeeds, and a symlink to the inherited (still readable but
+    # CLI home to a writable per-user directory for this process tree. Same
+    # fallback chain as the C# preamble (NuGetHomeSelfHeal.Preamble): the shared
+    # per-user dir — so one healed home, and its seeded cache, is reused across
+    # execs — unless it is missing pieces, squatted, or foreign-owned in the
+    # world-writable temp, in which case a private mktemp dir. Seed the chosen
+    # home the same way as the in-place path — a readable user config so the
+    # fatal read succeeds, and a symlink to the inherited (still readable but
     # unwritable) package cache so restore stays offline-safe there too.
-    _codeybox_scratch_home="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-dotnet-home.XXXXXX")" \
-        || return 0
+    _codeybox_scratch_home="${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
+    mkdir -p "$_codeybox_scratch_home" 2>/dev/null || true
+    if [ ! -d "$_codeybox_scratch_home" ] || [ ! -O "$_codeybox_scratch_home" ] \
+        || [ ! -w "$_codeybox_scratch_home" ]; then
+        _codeybox_scratch_home="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-nuget-home.XXXXXX")" \
+            || return 0
+    fi
     DOTNET_CLI_HOME="$_codeybox_scratch_home"
     export DOTNET_CLI_HOME
     _codeybox_seed_nuget_home "$_codeybox_scratch_home/.nuget/NuGet" \
         "$_codeybox_cli_home/.nuget/packages"
     return 0
+}
+
+# True when $1 names an existing directory the current user can write — the
+# probe applied to HOME / XDG_RUNTIME_DIR / DOTNET_CLI_HOME below.
+_codeybox_dir_usable() {
+    [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]
 }
 
 # The NuGet-settings heal above does not cover dotnet's OTHER per-user runtime
@@ -136,38 +161,45 @@ codeybox_heal_nuget_home() {
 # images whose $HOME is unavailable (the same broken-home images this file
 # heals), the CLI then aborts before MSBuild with "The system cannot open the
 # device or file specified: 'NuGet-Migrations'" (dotnet/runtime#135726,
-# #136802). Pin each unusable variable to a writable dir — preferring the
-# (possibly just-redirected) DOTNET_CLI_HOME, else a private mktemp dir — for
-# this dot-sourced process tree. Strict no-op when both are usable.
+# #136802). Pin each unusable variable to a writable dir for this dot-sourced
+# process tree. The fallback chain matches the C# preamble so both copies pick
+# the same dir: the (possibly just-redirected) DOTNET_CLI_HOME, else the shared
+# per-user dir — kept shared so the user-scoped mutex location is stable across
+# execs — else a private mktemp dir. Strict no-op when both are usable.
 codeybox_ensure_dotnet_runtime_dir() {
-    _codeybox_need_user_dir=0
-    if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
-        _codeybox_need_user_dir=1
+    if _codeybox_dir_usable "${HOME:-}" \
+        && _codeybox_dir_usable "${XDG_RUNTIME_DIR:-}"; then
+        return 0
     fi
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
-        _codeybox_need_user_dir=1
-    fi
-    [ "$_codeybox_need_user_dir" -eq 1 ] || return 0
 
     _codeybox_user_dir="${DOTNET_CLI_HOME:-}"
     if [ -n "$_codeybox_user_dir" ]; then
         mkdir -p "$_codeybox_user_dir" 2>/dev/null || true
     fi
-    if [ -z "$_codeybox_user_dir" ] || [ ! -d "$_codeybox_user_dir" ] || [ ! -w "$_codeybox_user_dir" ]; then
-        _codeybox_user_dir="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-dotnet-runtime.XXXXXX")" \
-            || return 0
+    if ! _codeybox_dir_usable "$_codeybox_user_dir"; then
+        _codeybox_user_dir="${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
+        mkdir -p "$_codeybox_user_dir" 2>/dev/null || true
+        if [ ! -d "$_codeybox_user_dir" ] || [ ! -O "$_codeybox_user_dir" ] \
+            || [ ! -w "$_codeybox_user_dir" ]; then
+            _codeybox_user_dir="$(mktemp -d "${TMPDIR:-/tmp}/codeybox-nuget-home.XXXXXX")" \
+                || return 0
+        fi
     fi
-    if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+    if ! _codeybox_dir_usable "${HOME:-}"; then
         # Redirecting HOME would orphan a pre-baked package cache under the
         # original $HOME/.nuget — seed the replacement home (readable user
         # config + linked cache) before the redirect, exactly like the
-        # scratch-home path above.
+        # scratch-home path above. The C# preamble exports NUGET_PACKAGES
+        # instead: equivalent for the single process it wraps, while this
+        # script materializes the cache inside the home so a child that
+        # resolves packages off $HOME without inheriting NUGET_PACKAGES is
+        # covered too.
         _codeybox_seed_nuget_home "$_codeybox_user_dir/.nuget/NuGet" \
-            "$HOME/.nuget/packages"
+            "${HOME:-}/.nuget/packages"
         HOME="$_codeybox_user_dir"
         export HOME
     fi
-    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
+    if ! _codeybox_dir_usable "${XDG_RUNTIME_DIR:-}"; then
         XDG_RUNTIME_DIR="$_codeybox_user_dir"
         export XDG_RUNTIME_DIR
     fi
@@ -201,46 +233,122 @@ codeybox_ensure_dotnet_runtime_dir() {
 # to CREATE. Seeding is strictly best-effort: homes that cannot be written are
 # skipped (a marker cannot be planted there either), and an existing marker is
 # never touched so real migration state is preserved.
+#
+# The candidates are less-trusted-influenceable paths — a predictable name in
+# the world-writable ${TMPDIR:-/tmp} can be squatted by a co-tenant, and any of
+# them can contain a planted symlink — so seeding must never become a
+# confused-deputy write into an attacker-chosen directory: `mkdir -p` descends
+# through symlinked intermediate components and `: >` writes through a symlink
+# leaf. Every candidate is therefore canonicalized and required to be a real
+# directory owned by this uid before anything is written under it, each
+# Migrations-tree component is created level by level while refusing to
+# descend through a symlink, and a symlink at the marker leaf is never
+# written through.
+#
+# Materialize the missing leaf of a heal-controlled candidate home. Single
+# `mkdir`, never `-p`: the parent (${TMPDIR:-/tmp} or the checkout root)
+# already exists, and a squatted or planted path at that leaf fails the mkdir
+# and the seeder's -O re-check alike. Owner-only mode so no co-tenant can
+# plant symlinks inside between creation and use.
+_codeybox_ensure_owned_home() {
+    [ -n "${1:-}" ] || return 0
+    if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+        mkdir -m 700 "$1" 2>/dev/null || true
+    fi
+}
+
+# Seed NuGet's applied-migration marker under candidate home $1, at relative
+# path $2 (".local/share/NuGet/Migrations" for a home, "NuGet/Migrations" for
+# $XDG_DATA_HOME). Safe to call with anything: a missing, non-directory,
+# foreign-owned, or foreign-owned-resolving candidate is skipped, as is any
+# symlink found while descending.
 _codeybox_seed_migration_marker() {
-    _codeybox_marker_home="$1"
-    [ -n "$_codeybox_marker_home" ] || return 0
-    case " ${_codeybox_seen_marker_homes:-} " in
-        *" $_codeybox_marker_home "*) return 0 ;;
+    [ -n "${1:-}" ] || return 0
+    # Canonicalize so a legitimately symlinked home still resolves; then
+    # require the resolved directory be owned by this uid — the guard the
+    # preamble's WritableHomeLeaf comment already promises for a squatted or
+    # root-left directory in a world-writable temp.
+    # The `||` fallback keeps the assignment's status at zero: a bare
+    # `var=$(cd ...)` would propagate the failed substitution's status and
+    # abort a `set -e` caller merely because a candidate is absent.
+    _codeybox_marker_base="$(cd "$1" 2>/dev/null && pwd -P)" \
+        || _codeybox_marker_base=
+    if [ -z "$_codeybox_marker_base" ] || [ ! -O "$_codeybox_marker_base" ]; then
+        return 0
+    fi
+    _codeybox_marker_dir="$_codeybox_marker_base/$2"
+    case " ${_codeybox_seen_marker_dirs:-} " in
+        *" $_codeybox_marker_dir "*) return 0 ;;
     esac
-    _codeybox_seen_marker_homes="${_codeybox_seen_marker_homes:-}$_codeybox_marker_home "
-    _codeybox_marker_dir="$_codeybox_marker_home/.local/share/NuGet/Migrations"
-    _codeybox_marker="$_codeybox_marker_dir/1"
-    # An existing marker (or a symlink placeholder) is real migration state —
-    # never overwrite it and never write through a symlink.
+    _codeybox_seen_marker_dirs="${_codeybox_seen_marker_dirs:-}$_codeybox_marker_dir "
+
+    # Descend one component at a time rather than `mkdir -p`: a planted
+    # symlink at any intermediate level would otherwise be followed, planting
+    # the marker tree under a directory the candidate's owner never chose.
+    _codeybox_marker_walk="$_codeybox_marker_base"
+    _codeybox_marker_rel="$2"
+    while [ -n "$_codeybox_marker_rel" ]; do
+        case $_codeybox_marker_rel in
+            */*)
+                _codeybox_marker_part=${_codeybox_marker_rel%%/*}
+                _codeybox_marker_rel=${_codeybox_marker_rel#*/}
+                ;;
+            *)
+                _codeybox_marker_part=$_codeybox_marker_rel
+                _codeybox_marker_rel=
+                ;;
+        esac
+        _codeybox_marker_walk="$_codeybox_marker_walk/$_codeybox_marker_part"
+        [ -L "$_codeybox_marker_walk" ] && return 0
+        if [ ! -d "$_codeybox_marker_walk" ]; then
+            mkdir "$_codeybox_marker_walk" 2>/dev/null || return 0
+        fi
+    done
+
+    _codeybox_marker="$_codeybox_marker_walk/1"
+    # An existing marker (or a symlink placeholder, which `-e` alone cannot
+    # see when dangling) is real migration state — never overwrite it and
+    # never write through a symlink.
     { [ -e "$_codeybox_marker" ] || [ -L "$_codeybox_marker" ]; } && return 0
-    mkdir -p "$_codeybox_marker_dir" 2>/dev/null || return 0
     : > "$_codeybox_marker" 2>/dev/null || true
     return 0
 }
 
+_codeybox_seed_home_migration_marker() {
+    _codeybox_seed_migration_marker "$1" ".local/share/NuGet/Migrations"
+}
+
 codeybox_seed_nuget_migration_state() {
-    _codeybox_seen_marker_homes=" "
-    _codeybox_seed_migration_marker "${HOME:-}"
-    _codeybox_seed_migration_marker "${DOTNET_CLI_HOME:-}"
+    _codeybox_seen_marker_dirs=" "
+    _codeybox_seed_home_migration_marker "${HOME:-}"
+    # Stamped/redirected homes the heal itself materializes may not exist yet;
+    # create just the leaf, then let the seeder's ownership checks re-verify.
+    _codeybox_ensure_owned_home "${DOTNET_CLI_HOME:-}"
+    _codeybox_seed_home_migration_marker "${DOTNET_CLI_HOME:-}"
     # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
-    # home the orchestrator stamps onto raw dotnet auditor execs. Only the
-    # repository root can be that working directory — an MSBuild-Exec'd run has
-    # a project directory as its cwd and must not grow a stray home there.
+    # home the orchestrator stamps onto raw dotnet auditor execs
+    # (DotnetCliHomeConventions.DirectoryName; the literal is mirrored because
+    # shell cannot read the C# constant). Only the repository root can be that
+    # working directory — an MSBuild-Exec'd run has a project directory as its
+    # cwd and must not grow a stray home there.
     if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then
-        _codeybox_seed_migration_marker "$(pwd -P)/.dotnet-cli-home"
+        _codeybox_repo_cli_home="$(pwd -P)/.dotnet-cli-home"
+        _codeybox_ensure_owned_home "$_codeybox_repo_cli_home"
+        _codeybox_seed_home_migration_marker "$_codeybox_repo_cli_home"
     fi
     # The shared per-user fallback both preamble generations redirect to.
-    _codeybox_seed_migration_marker "${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
+    _codeybox_fallback_home="${TMPDIR:-/tmp}/codeybox-nuget-home-$(id -u)"
+    _codeybox_ensure_owned_home "$_codeybox_fallback_home"
+    _codeybox_seed_home_migration_marker "$_codeybox_fallback_home"
     # Environment.GetFolderPath(UserProfile) falls back to the passwd entry
     # when $HOME is unset — cover a gate exec that resolves no HOME at all.
-    _codeybox_seed_migration_marker "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
-    # $XDG_DATA_HOME relocates the whole Migrations tree (no .local/share).
+    # `getent` does not exist on macOS, where this candidate silently skips.
+    _codeybox_seed_home_migration_marker \
+        "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    # $XDG_DATA_HOME relocates the whole Migrations tree (no .local/share) —
+    # same owned-dir and no-symlink rules via the shared helper.
     if [ -n "${XDG_DATA_HOME:-}" ]; then
-        _codeybox_xdg_marker_dir="$XDG_DATA_HOME/NuGet/Migrations"
-        if [ ! -e "$_codeybox_xdg_marker_dir/1" ]; then
-            mkdir -p "$_codeybox_xdg_marker_dir" 2>/dev/null \
-                && : > "$_codeybox_xdg_marker_dir/1" 2>/dev/null || true
-        fi
+        _codeybox_seed_migration_marker "$XDG_DATA_HOME" "NuGet/Migrations"
     fi
     return 0
 }

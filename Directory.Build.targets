@@ -11,7 +11,7 @@
     that invoke `dotnet` directly (process:required-build, csharp:build-WaE)
     succeed without depending on DOTNET_CLI_HOME redirects in the host
     orchestrator binary. See scripts/ensure-writable-nuget-home.sh and
-    docs/build-environment.md.
+    docs/development/build-environment.md.
 
     NuGetHomeGuard.targets (imported above) supplies an in-process backstop:
     when the user config is present-but-unreadable, its initial target
