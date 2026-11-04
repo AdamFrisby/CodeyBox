@@ -20,13 +20,21 @@ namespace CodeyBox.Orchestrator;
 /// </summary>
 internal static class MSBuildDiagnosticsEnrichment
 {
-    internal const string BinlogDirectoryName = RequiredBuildScript.BinlogDirectoryName;
+    internal const string BinlogDirectoryPrefix = RequiredBuildScript.BinlogDirectoryPrefix;
     internal const string BinlogConfigVariable = RequiredBuildScript.BinlogConfigVariable;
 
     private const int BinlogFileNameMaxIndex = 9999;
 
     private static readonly Regex BinlogFileNamePattern = new(
         "^target-([0-9]{1,4})\\.binlog$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    // The listing echoes the discovered binlog directory's LEAF name on a
+    // `DIR=` line; before it is trusted as a fetch path component it must
+    // match the mktemp naming the build script produces (fixed prefix plus
+    // its suffix characters only — no separators, no traversal).
+    private static readonly Regex BinlogDirectoryLeafPattern = new(
+        "^" + Regex.Escape(RequiredBuildScript.BinlogDirectoryPrefix) + "\\.[A-Za-z0-9._-]{1,64}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex CommitShaPattern = new(
@@ -37,7 +45,8 @@ internal static class MSBuildDiagnosticsEnrichment
     // RequiredBuildScript from the same discovery and isolation fragments
     // as the default path, with least-data `-bl` logging added to each
     // `dotnet build` (ProjectImports=None: no embedded imported-project
-    // content) into the fixed directory this file's fetch step knows. The
+    // content) into the per-exec directory this file's fetch step
+    // rediscovers by owner-filtered glob. The
     // build configuration arrives via CODEYBOX_MSBUILD_CONFIG (validated
     // operator config, re-checked by the case guard); binlog file names are
     // index-derived, never taken from branch-controlled paths.
@@ -130,7 +139,8 @@ internal static class MSBuildDiagnosticsEnrichment
                 dropped.Add($"listing capped at {options.MaxBinlogsPerBuild} log(s): further logs were not examined");
             foreach (var name in listing.Names)
             {
-                var fetch = await FetchAndProduceAsync(sandbox, name, binding, options, producer, ct)
+                var fetch = await FetchAndProduceAsync(
+                        sandbox, listing.DirectoryLeaf!, name, binding, options, producer, ct)
                     .ConfigureAwait(false);
                 if (fetch.Evidence is null)
                 {
@@ -204,42 +214,73 @@ internal static class MSBuildDiagnosticsEnrichment
 
     /// <summary>
     /// The outcome of listing the attempt's binlog directory: the
-    /// allowlisted file names, whether the listing itself succeeded, and
-    /// whether the listing was cut short (transfer cap or per-build file
-    /// cap), in which case the caller must not present the collected subset
-    /// as the whole attempt.
+    /// allowlisted file names, the discovered directory leaf (validated
+    /// against the mktemp naming pattern), whether the listing itself
+    /// succeeded, and whether the listing was cut short (transfer cap or
+    /// per-build file cap), in which case the caller must not present the
+    /// collected subset as the whole attempt.
     /// </summary>
-    private sealed record BinlogListing(IReadOnlyList<string> Names, bool Available, bool Truncated);
+    private sealed record BinlogListing(
+        string? DirectoryLeaf,
+        IReadOnlyList<string> Names,
+        bool Available,
+        bool Truncated);
 
     private static async Task<BinlogListing> ListBinlogNamesAsync(
         ISandbox sandbox,
         MSBuildDiagnosticsOptions options,
         CancellationToken ct)
     {
-        // Fixed directory (no PID interpolation: each exec is a fresh shell
-        // with its own $$). Structured argv only; the listing is filtered by
-        // an exact file-name allowlist below.
+        // The build script writes binlogs into a per-exec `mktemp -d`
+        // directory (an unpredictable name: a fixed one in the world-writable
+        // temp could be squatted by a co-tenant with planted target-N.binlog
+        // symlinks). Rediscover it by globbing the name prefix and keeping
+        // the newest directory owned by this exec's uid — a co-tenant's
+        // planted match is foreign-owned and excluded by -O. The leaf is
+        // echoed as DIR=<leaf> so the fetch step builds its path from a
+        // validated prefix-only name, never a raw sandbox path. Structured
+        // argv only; the listing is filtered by an exact file-name allowlist
+        // below.
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = [
                 "sh", "-c",
-                "ls -1 -- \"$1\" 2>/dev/null",
+                $$"""
+                latest=
+                for dir in "$1/{{BinlogDirectoryPrefix}}."*; do
+                  [ -d "$dir" ] || continue
+                  [ -O "$dir" ] || continue
+                  if [ -z "$latest" ] || [ "$dir" -nt "$latest" ]; then
+                    latest=$dir
+                  fi
+                done
+                [ -n "$latest" ] || exit 3
+                printf 'DIR=%s\n' "${latest##*/}"
+                ls -1 -- "$latest"
+                """,
                 "codeybox-binlog-list",
-                "${TMPDIR:-/tmp}/" + BinlogDirectoryName,
+                "${TMPDIR:-/tmp}",
             ],
             WorkingDirectory = SandboxConventions.WorkDir,
             MaxStdoutBytes = 4096,
             MaxStderrBytes = 1024,
         }, ct).ConfigureAwait(false);
         if (!result.Success || result.ExecutionUnavailable)
-            return new BinlogListing([], Available: false, Truncated: false);
+            return new BinlogListing(null, [], Available: false, Truncated: false);
 
+        string? directoryLeaf = null;
         var names = new List<string>();
         var capped = false;
         foreach (var line in result.Stdout.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
         {
-            var name = line.Trim();
-            var match = BinlogFileNamePattern.Match(name);
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("DIR=", StringComparison.Ordinal))
+            {
+                var leaf = trimmed[4..];
+                directoryLeaf = BinlogDirectoryLeafPattern.IsMatch(leaf) ? leaf : null;
+                continue;
+            }
+            var match = BinlogFileNamePattern.Match(trimmed);
             if (!match.Success) continue;
             if (!int.TryParse(match.Groups[1].Value, out var index)
                 || index < 1
@@ -250,10 +291,12 @@ internal static class MSBuildDiagnosticsEnrichment
                 capped = true;
                 continue;
             }
-            names.Add(name);
+            names.Add(trimmed);
         }
         names.Sort(StringComparer.Ordinal);
-        return new BinlogListing(names, Available: true, Truncated: capped || result.StdoutLimitExceeded);
+        if (directoryLeaf is null)
+            return new BinlogListing(null, [], Available: false, Truncated: false);
+        return new BinlogListing(directoryLeaf, names, Available: true, Truncated: capped || result.StdoutLimitExceeded);
     }
 
     /// <summary>
@@ -266,14 +309,16 @@ internal static class MSBuildDiagnosticsEnrichment
 
     private static async Task<BinlogFetch> FetchAndProduceAsync(
         ISandbox sandbox,
+        string directoryLeaf,
         string fileName,
         BuildDiagnosticsSourceBinding binding,
         MSBuildDiagnosticsOptions options,
         IBuildDiagnosticsProducer producer,
         CancellationToken ct)
     {
-        // One bounded exec prints "<byte-size>\n<base64>". The file name was
-        // allowlisted by ListBinlogNamesAsync and travels as "$1" (never
+        // One bounded exec prints "<byte-size>\n<base64>". The directory leaf
+        // was validated against the mktemp naming pattern and the file name
+        // was allowlisted by ListBinlogNamesAsync; both travel as "$1" (never
         // interpolated), so branch-controlled content cannot reach a shell.
         var fetchCap = checked((int)Math.Min(
             options.MaxBinlogBytes / 3 * 4 + 128,
@@ -284,7 +329,7 @@ internal static class MSBuildDiagnosticsEnrichment
                 "sh", "-c",
                 "size=$(stat -c %s -- \"$1\" 2>/dev/null) || exit 3; printf '%s\\n' \"$size\"; base64 -w0 -- \"$1\"",
                 "codeybox-binlog-fetch",
-                "${TMPDIR:-/tmp}/" + BinlogDirectoryName + "/" + fileName,
+                "${TMPDIR:-/tmp}/" + directoryLeaf + "/" + fileName,
             ],
             WorkingDirectory = SandboxConventions.WorkDir,
             MaxStdoutBytes = fetchCap,

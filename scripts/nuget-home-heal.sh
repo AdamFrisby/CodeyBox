@@ -42,12 +42,18 @@
 # through to an owned fallback instead of being trusted because it was
 # writable.
 
-# Single shell-side definition of the two path leaves whose C# constants this
-# script must mirror: NuGetHomeSelfHeal.WritableHomeLeaf (the per-user fallback
-# home under ${TMPDIR:-/tmp}) and DotnetCliHomeConventions.DirectoryName (the
-# stamped repo-local CLI home). Shell cannot read the C# constants, so renaming
-# one without updating its mirror silently desyncs the fallback selection and
-# the migration-marker seeding — BuildScriptNuGetHealTests pins both pairs.
+# === codeybox-shared-helpers: begin ===
+# Everything between the "codeybox-shared-helpers" sentinels is the head of
+# NuGetHomeSelfHeal.Preamble: CodeyBox.Core embeds THIS file as a manifest
+# resource and lifts the marked region verbatim into the C# preamble, so a
+# guard change here lands in both the dot-sourced recovery and the wrapped
+# `dotnet` preamble automatically — there is no second copy to hand-sync.
+#
+# The two leaf assignments are likewise the single source for the C# names:
+# NuGetHomeSelfHeal.WritableHomeLeaf (the per-user fallback home under
+# ${TMPDIR:-/tmp}) and DotnetCliHomeConventions.DirectoryName (the stamped
+# repo-local CLI home) are parsed out of these lines, so a rename cannot
+# desync — BuildScriptNuGetHealTests pins that both names resolve.
 _codeybox_home_leaf="codeybox-nuget-home"
 _codeybox_repo_home_leaf=".dotnet-cli-home"
 _codeybox_euid="$(id -u)"
@@ -147,10 +153,16 @@ _codeybox_adopt_dir() {
         _codeybox_secure_dir "$1" private "${2:-}"
         return
     fi
-    _codeybox_adopt_parent="$(dirname "$1" 2>/dev/null)" || return 1
+    _codeybox_adopt_leaf="${1%/}"
+    _codeybox_adopt_parent="$(dirname "$_codeybox_adopt_leaf" 2>/dev/null)" \
+        || return 1
     _codeybox_adopt_parent="$(_codeybox_secure_dir \
         "$_codeybox_adopt_parent" anchor writable)" || return 1
-    mkdir -m 700 "$1" 2>/dev/null || return 1
+    # Create the leaf under the CANONICAL parent, not the raw env path: an
+    # intermediate swapped for a symlink between the anchor check and the
+    # mkdir cannot redirect the create (worst case the mkdir simply fails).
+    mkdir -m 700 "$_codeybox_adopt_parent/${_codeybox_adopt_leaf##*/}" \
+        2>/dev/null || return 1
     _codeybox_secure_dir "$1" private "${2:-}"
 }
 
@@ -166,8 +178,8 @@ _codeybox_adopt_dir() {
 # foreign-controlled directories. The shared per-user dir — kept shared so
 # one healed home, its seeded cache, and the mutex location are stable across
 # execs — is adopted under the same terms, else a private mktemp dir, itself
-# re-verified because TMPDIR is env input too. Same chain as the C# preamble's
-# _codeybox_pick_user_dir.
+# re-verified because TMPDIR is env input too. Shared verbatim into the C#
+# preamble (see the region sentinel above).
 _codeybox_pick_user_dir() {
     _codeybox_pick="${1:-}"
     if [ -n "$_codeybox_pick" ]; then
@@ -187,6 +199,7 @@ _codeybox_pick_user_dir() {
     fi
     printf '%s\n' "$_codeybox_pick"
 }
+# === codeybox-shared-helpers: end ===
 
 # Writability is necessary but not sufficient: an inherited NuGet.Config that
 # is present but unreadable (e.g. baked mode 0600 under another account, inside
@@ -195,8 +208,10 @@ _codeybox_pick_user_dir() {
 # additionally be "private" per-user storage — a merely-writable or
 # foreign-owned one cannot keep a NuGet.Config NuGet trusts. Probe with touch
 # (a real command) rather than a shell redirect so a failure cannot abort a
-# `set -e` caller. The caller sets _codeybox_nuget_root and
-# _codeybox_nuget_user_dir under a cli-home it already verified private.
+# `set -e` caller. The caller sets _codeybox_nuget_root,
+# _codeybox_nuget_user_dir, and _codeybox_nuget_probe (the transient
+# writability-probe path inside the settings dir) under a cli-home it already
+# verified private.
 _codeybox_nuget_home_usable() {
     # Never descend through a symlinked .nuget or NuGet component — `mkdir -p`
     # would create the settings dir inside whatever directory the link's owner
@@ -206,7 +221,12 @@ _codeybox_nuget_home_usable() {
     # An existing .nuget must not admit co-tenant writes at all — a
     # group/other-writable one would let a co-tenant plant the packages/
     # cache or the settings dir NuGet trusts — so require it be owned by this
-    # uid or root with no group/other write bits.
+    # uid or root with no group/other write bits. "trusted" alone suffices
+    # here: the mkdir -p below probes writability itself, and an unwritable
+    # trusted .nuget can still be quarantined aside under the verified
+    # cli-home parent. The C# preamble checks "trusted writable" instead —
+    # it cannot recreate the directory in place, so it must require a
+    # writable .nuget up front (intentional divergence, same outcome).
     if [ -d "$_codeybox_nuget_root" ]; then
         _codeybox_secure_dir "$_codeybox_nuget_root" trusted >/dev/null 2>&1 \
             || return 1
@@ -229,6 +249,9 @@ _codeybox_nuget_home_usable() {
 # cache to reuse as the sibling global-packages folder. Every step is
 # best-effort so a failure can never abort a `set -e` caller. Shared by the
 # in-place and DOTNET_CLI_HOME-redirect recovery paths so both stay offline-safe.
+# A merely-existing $2 is not enough: it is consumed only when it verifies as
+# "trusted" storage (canonical, owned by this uid or root, never
+# group/other-writable) — a co-tenant-controlled cache is refused.
 _codeybox_seed_nuget_home() {
     _codeybox_seed_user_dir="$1"
     _codeybox_seed_cache_src="$2"
@@ -471,8 +494,9 @@ codeybox_ensure_dotnet_runtime_dir() {
 # anchor parent — never `-p`, which would descend planted symlinked
 # intermediates — and an existing entry must already be private per-user
 # storage (a squatted or planted path is refused). The seeder's private-dir
-# checks re-verify either way.
-_codeybox_ensure_owned_home() {
+# checks re-verify either way. Best-effort only: an adoption failure is
+# swallowed — the candidate stays absent and the seeder simply skips it.
+_codeybox_try_adopt_home() {
     [ -n "${1:-}" ] || return 0
     _codeybox_adopt_dir "$1" writable >/dev/null 2>&1 || true
 }
@@ -496,10 +520,14 @@ _codeybox_seed_migration_marker() {
         || _codeybox_marker_base=
     [ -n "$_codeybox_marker_base" ] || return 0
     _codeybox_marker_dir="$_codeybox_marker_base/$2"
-    case " ${_codeybox_seen_marker_dirs:-} " in
-        *" $_codeybox_marker_dir "*) return 0 ;;
-    esac
-    _codeybox_seen_marker_dirs="${_codeybox_seen_marker_dirs:-}$_codeybox_marker_dir "
+    # Newline-separated exact match: a space-joined list cannot represent a
+    # candidate home whose path itself contains a space.
+    if printf '%s\n' "${_codeybox_seen_marker_dirs:-}" \
+        | grep -qxF "$_codeybox_marker_dir" 2>/dev/null; then
+        return 0
+    fi
+    _codeybox_seen_marker_dirs="${_codeybox_seen_marker_dirs:-}${_codeybox_seen_marker_dirs:+
+}$_codeybox_marker_dir"
 
     # Descend one component at a time rather than `mkdir -p`: a planted
     # symlink at any intermediate level would otherwise be followed, planting
@@ -538,11 +566,11 @@ _codeybox_seed_home_migration_marker() {
 }
 
 codeybox_seed_nuget_migration_state() {
-    _codeybox_seen_marker_dirs=" "
+    _codeybox_seen_marker_dirs=
     _codeybox_seed_home_migration_marker "${HOME:-}"
     # Stamped/redirected homes the heal itself materializes may not exist yet;
     # create just the leaf, then let the seeder's private-dir checks re-verify.
-    _codeybox_ensure_owned_home "${DOTNET_CLI_HOME:-}"
+    _codeybox_try_adopt_home "${DOTNET_CLI_HOME:-}"
     _codeybox_seed_home_migration_marker "${DOTNET_CLI_HOME:-}"
     # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
     # home the orchestrator stamps onto raw dotnet auditor execs;
@@ -552,18 +580,18 @@ codeybox_seed_nuget_migration_state() {
     # directory as its cwd and must not grow a stray home there.
     if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then
         _codeybox_repo_cli_home="$(pwd -P)/${_codeybox_repo_home_leaf}"
-        _codeybox_ensure_owned_home "$_codeybox_repo_cli_home"
+        _codeybox_try_adopt_home "$_codeybox_repo_cli_home"
         _codeybox_seed_home_migration_marker "$_codeybox_repo_cli_home"
     fi
     # The shared per-user fallback both preamble generations redirect to.
     _codeybox_fallback_home="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-${_codeybox_euid}"
-    _codeybox_ensure_owned_home "$_codeybox_fallback_home"
+    _codeybox_try_adopt_home "$_codeybox_fallback_home"
     _codeybox_seed_home_migration_marker "$_codeybox_fallback_home"
     # Environment.GetFolderPath(UserProfile) falls back to the passwd entry
     # when $HOME is unset — cover a gate exec that resolves no HOME at all.
     # `getent` does not exist on macOS, where this candidate silently skips.
     _codeybox_seed_home_migration_marker \
-        "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+        "$(getent passwd "$_codeybox_euid" 2>/dev/null | cut -d: -f6)"
     # $XDG_DATA_HOME relocates the whole Migrations tree (no .local/share) —
     # same private-dir and no-symlink rules via the shared helper.
     if [ -n "${XDG_DATA_HOME:-}" ]; then

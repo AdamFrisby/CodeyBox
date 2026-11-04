@@ -9,12 +9,18 @@ namespace CodeyBox.Orchestrator;
 /// build environment cannot drift between the two paths: opted-in builds
 /// execute in exactly the same environment as the default path, plus the
 /// least-data <c>-bl</c> capture. The capture variant only appends the
-/// configuration guard, the fixed binlog directory setup, and per-target
+/// configuration guard, the per-exec binlog directory setup, and per-target
 /// log arguments — it never re-states discovery or isolation.
 /// </summary>
 internal static class RequiredBuildScript
 {
-    internal const string BinlogDirectoryName = "codeybox-msbuild-binlogs";
+    // Name prefix of the per-exec binlog directory. The build script creates
+    // it via `mktemp -d` (an unpredictable O_EXCL create), and the diagnostics
+    // fetch step globs `prefix.*` directories owned by its own uid — a fixed
+    // name in the world-writable temp could be squatted by a co-tenant with
+    // planted target-N.binlog symlinks, turning `dotnet -bl:` into a
+    // create/overwrite at an attacker-chosen path.
+    internal const string BinlogDirectoryPrefix = "codeybox-msbuild-binlogs";
     internal const string BinlogConfigVariable = "CODEYBOX_MSBUILD_CONFIG";
 
     // POSIX shells conventionally use 127 for "command not found".
@@ -33,7 +39,11 @@ internal static class RequiredBuildScript
         fi
 
         tmp_root="${TMPDIR:-/tmp}"
-        targets_file="$tmp_root/codeybox-required-build-targets-$$"
+        # mktemp's unpredictable O_EXCL create: a PID-predictable name in the
+        # world-writable temp could be squatted by a co-tenant, and the `>`/`>>`
+        # redirects plus `sort -o` below would then follow a planted symlink —
+        # a create/truncate at an attacker-chosen path as the gate user.
+        targets_file="$(mktemp "$tmp_root/codeybox-required-build-targets.XXXXXX")"
         """;
 
     // Capture-only head: the build configuration arrives via
@@ -41,8 +51,6 @@ internal static class RequiredBuildScript
     // case guard below); binlog file names are index-derived, never taken
     // from branch-controlled paths.
     private const string CaptureConfigFragment = """
-        binlog_dir="$tmp_root/codeybox-msbuild-binlogs"
-
         msbuild_config="${CODEYBOX_MSBUILD_CONFIG:-Debug}"
         case "$msbuild_config" in
           ''|*[!A-Za-z0-9_.-]*)
@@ -80,9 +88,18 @@ internal static class RequiredBuildScript
         # package cache under the original per-user home would then restore
         # against an empty folder and require network access. Preserve that
         # cache (read access is sufficient — restore never writes to an
-        # already-extracted package) so offline/pinned images keep working.
-        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$original_home" ] && [ -d "$original_home/.nuget/packages" ]; then
-          export NUGET_PACKAGES="$original_home/.nuget/packages"
+        # already-extracted package) so offline/pinned images keep working —
+        # but only when its canonical directory verifies as "trusted" storage
+        # (owned by this uid or root, never group/other-writable): a
+        # foreign-controlled or co-tenant-writable cache would satisfy package
+        # installs with planted or tampered extracted entries. The helper is
+        # defined by the self-heal preamble composed ahead of this fragment.
+        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$original_home" ]; then
+          original_packages="$(_codeybox_secure_dir \
+            "$original_home/.nuget/packages" trusted)" || original_packages=
+          if [ -n "$original_packages" ]; then
+            export NUGET_PACKAGES="$original_packages"
+          fi
         fi
 
         # Some NuGet builds resolve their user-config path from HOME even when
@@ -149,35 +166,41 @@ internal static class RequiredBuildScript
         fi
         """;
 
-    // Capture-only setup: a fixed directory (no PID interpolation: each exec
-    // is a fresh shell with its own $$, so the fetch step could never find a
-    // PID-suffixed directory). Earlier attempts in this sandbox are purged so
-    // a failed build can never attach a stale binlog from a previous run.
-    private const string BinlogSetupFragment = """
-        mkdir -p "$binlog_dir"
-        # Purge logs from any earlier attempt in this sandbox so a failed build
-        # can never attach a stale binlog from a previous run.
-        rm -f "$binlog_dir"/target-*.binlog
+    // Capture-only setup: the binlogs land in a per-exec `mktemp -d` (an
+    // unpredictable O_EXCL, mode-700 create — a fixed name in the
+    // world-writable temp could be squatted by a co-tenant, and planted
+    // target-N.binlog symlinks inside it would turn `dotnet -bl:` into a
+    // create/overwrite at an attacker-chosen path). The diagnostics fetch
+    // step rediscovers the directory by globbing the prefix for entries it
+    // owns (see MSBuildDiagnosticsEnrichment). A fresh dir can hold no stale
+    // logs from earlier attempts, so no purge is needed.
+    private static readonly string BinlogSetupFragment = $$"""
+        binlog_dir="$(mktemp -d "$tmp_root/{{BinlogDirectoryPrefix}}.XXXXXX")"
         """;
 
     private const string PlainBuildLoopFragment = """
         while IFS= read -r target; do
           [ -n "$target" ] || continue
-          echo "CodeyBox required build: dotnet build $target"
+          # The target name comes from branch-controlled paths: strip control
+          # characters so a crafted filename cannot spoof operator-facing
+          # output with ANSI escapes.
+          safe_target="$(printf '%s' "$target" | LC_ALL=C tr -d '[:cntrl:]')"
+          echo "CodeyBox required build: dotnet build $safe_target"
           dotnet build "$target" --disable-build-servers --maxcpucount:1
         done < "$targets_file"
         """;
 
     // Capture loop: identical iteration, but each `dotnet build` also writes
     // a least-data binary log (ProjectImports=None: no embedded
-    // imported-project content) into the fixed directory the fetch step
-    // knows. The configuration was validated by the case guard above.
+    // imported-project content) into the per-exec directory the fetch step
+    // rediscovers. The configuration was validated by the case guard above.
     private const string CaptureBuildLoopFragment = """
         idx=0
         while IFS= read -r target; do
           [ -n "$target" ] || continue
           idx=$((idx+1))
-          echo "CodeyBox required build: dotnet build $target"
+          safe_target="$(printf '%s' "$target" | LC_ALL=C tr -d '[:cntrl:]')"
+          echo "CodeyBox required build: dotnet build $safe_target"
           dotnet build "$target" --disable-build-servers --maxcpucount:1 -c "$msbuild_config" -bl:"$binlog_dir/target-$idx.binlog;ProjectImports=None"
         done < "$targets_file"
         """;

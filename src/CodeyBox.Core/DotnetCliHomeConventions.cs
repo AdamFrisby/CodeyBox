@@ -10,13 +10,14 @@ namespace CodeyBox.Core;
 public static class DotnetCliHomeConventions
 {
     /// <summary>
-    /// Mirrored as <c>_codeybox_repo_home_leaf</c> in
-    /// <c>scripts/nuget-home-heal.sh</c> (shell cannot read this constant);
-    /// renaming it without updating that mirror desyncs the migration-marker
-    /// seeding for the stamped repo-local home — pinned by
-    /// <c>BuildScriptNuGetHealTests</c>.
+    /// Backed by <c>_codeybox_repo_home_leaf</c> in
+    /// <c>scripts/nuget-home-heal.sh</c>: that shell assignment is the single
+    /// source of the literal (the C# value is parsed out of the script's
+    /// embedded copy by <see cref="NuGetHomeSelfHeal.RepoCliHomeLeaf"/>), so a
+    /// rename cannot desync the stamped repo-local home or the
+    /// migration-marker seeding — pinned by <c>BuildScriptNuGetHealTests</c>.
     /// </summary>
-    public const string DirectoryName = ".dotnet-cli-home";
+    public static readonly string DirectoryName = NuGetHomeSelfHeal.RepoCliHomeLeaf;
 
     public static string ResolvePath(string workingDirectory)
     {
@@ -55,9 +56,7 @@ public static class DotnetCliHomeConventions
     /// before the <c>$HOME</c> fallback, so an unusable ambient value would
     /// abort first-use before MSBuild. Matching all three to the same
     /// directory lands every NuGet resolution strategy on one writable home.
-    /// This mirrors
-    /// <c>SandboxRequiredBuildVerifier.DotnetCliHomeSelectionScript</c>, which
-    /// pins all three for the same reason. <c>build.sh</c> instead inherits
+    /// <c>build.sh</c> instead inherits
     /// this stamped <c>HOME</c>/<c>DOTNET_CLI_HOME</c> and repairs whichever it
     /// resolves via the shared <c>scripts/nuget-home-heal.sh</c> recovery.
     /// <para>Unlike <see cref="ApplyIfAbsent"/> (used at sandbox creation, where

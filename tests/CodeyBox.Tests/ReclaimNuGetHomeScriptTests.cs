@@ -89,7 +89,13 @@ public sealed class ReclaimNuGetHomeScriptTests : IDisposable
         // The poisoned config was moved aside and a fresh home put in place.
         Assert.Single(AsideDirs(nugetHome));
         var freshConfig = Path.Combine(nugetHome, "NuGet", "NuGet.Config");
-        Assert.False(File.Exists(freshConfig));
+        Assert.True(
+            File.Exists(freshConfig),
+            "the heal seeds a readable user config so the fatal read succeeds");
+        Assert.Contains(
+            "<configuration",
+            File.ReadAllText(freshConfig),
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -128,7 +134,7 @@ public sealed class ReclaimNuGetHomeScriptTests : IDisposable
         var parent = Path.GetDirectoryName(nugetHome)!;
         var name = Path.GetFileName(nugetHome);
         return Directory.Exists(parent)
-            ? Directory.GetDirectories(parent, name + ".root-owned.*")
+            ? Directory.GetDirectories(parent, name + ".codeybox-unwritable.*")
             : [];
     }
 
@@ -146,9 +152,15 @@ public sealed class ReclaimNuGetHomeScriptTests : IDisposable
         };
         psi.ArgumentList.Add(script);
         psi.ArgumentList.Add(nugetHome);
-        // Isolate the reclaim lock to this test's workspace so parallel test
-        // classes cannot contend on a shared /tmp lock.
+        // Isolate the reclaim fallback dir to this test's workspace so parallel
+        // test classes cannot contend on a shared /tmp fallback home, and strip
+        // any stamped cli-home/runtime vars so the $1-mapped HOME is the home
+        // the heal repairs.
         psi.Environment["TMPDIR"] = _workspace;
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("XDG_RUNTIME_DIR");
+        psi.Environment.Remove("XDG_DATA_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
 
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start /bin/sh for the reclaim script.");

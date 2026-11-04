@@ -257,28 +257,53 @@ public sealed class BuildScriptNuGetHealTests
             ?? throw new InvalidOperationException(
                 "Cannot locate the repository root from " + AppContext.BaseDirectory);
 
-    private static async Task<ProcessRunResult> DotSourceHealAsync(string root, string home)
-    {
-        var repoRoot = HealScriptRepoRoot();
-        Assert.True(
-            File.Exists(Path.Combine(repoRoot, "scripts", "nuget-home-heal.sh")),
-            "the shared heal script must exist for the gate call sites to source it");
+    private static string HealScriptPath()
+        => Path.Combine(HealScriptRepoRoot(), "scripts", "nuget-home-heal.sh");
 
-        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+    // The minimal replaced environment every heal fixture runs under: the
+    // fixture HOME is authoritative (the real user's NuGet home can never be
+    // touched) and TMPDIR is contained under the test root. Tests add
+    // case-specific keys (DOTNET_CLI_HOME, XDG_*) on top.
+    private static Dictionary<string, string> NewHealEnv(string root, string home)
+        => new(StringComparer.Ordinal)
         {
             ["HOME"] = home,
             ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             ["TMPDIR"] = root,
         };
-        // Mirror the gate call sites verbatim: cd into the checkout, then dot-source
-        // the repository-relative recovery.
+
+    // Runs `sh -c <command> sh <args...>` with the given environment — the
+    // shared runner for every dot-source-the-heal scenario below so each test
+    // only states its fixture env and its command.
+    private static async Task<ProcessRunResult> RunHealShellAsync(
+        IReadOnlyDictionary<string, string> environment,
+        string command,
+        params string[] args)
+    {
+        var argv = new List<string> { "/bin/sh", "-c", command, "sh" };
+        argv.AddRange(args);
         return await new DefaultProcessRunner().RunAsync(
-            ["/bin/sh", "-c", "cd \"$1\" && . ./scripts/nuget-home-heal.sh", "sh", repoRoot],
+            argv,
             null,
             CancellationToken.None,
             maxStdoutBytes: 65536,
             maxStderrBytes: 65536,
-            environment: env);
+            environment: environment);
+    }
+
+    private static async Task<ProcessRunResult> DotSourceHealAsync(string root, string home)
+    {
+        var repoRoot = HealScriptRepoRoot();
+        Assert.True(
+            File.Exists(HealScriptPath()),
+            "the shared heal script must exist for the gate call sites to source it");
+
+        // Mirror the gate call sites verbatim: cd into the checkout, then dot-source
+        // the repository-relative recovery.
+        return await RunHealShellAsync(
+            NewHealEnv(root, home),
+            "cd \"$1\" && . ./scripts/nuget-home-heal.sh",
+            repoRoot);
     }
 
     [Fact]
@@ -342,26 +367,12 @@ public sealed class BuildScriptNuGetHealTests
             await ChmodAsync("555", home);                          // unwritable: cannot quarantine .nuget aside
 
             var sentinel = Path.Combine(root, "cli-home");
-            var repoRoot = HealScriptRepoRoot();
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
             // Dot-source the heal, then record the exported DOTNET_CLI_HOME so the
             // test can inspect the scratch home the fallback redirected dotnet to.
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . ./scripts/nuget-home-heal.sh && printf '%s' \"$DOTNET_CLI_HOME\" > \"$2\"",
-                    "sh", repoRoot, sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . ./scripts/nuget-home-heal.sh && printf '%s' \"$DOTNET_CLI_HOME\" > \"$2\"",
+                HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var scratchHome = await File.ReadAllTextAsync(sentinel);
@@ -411,24 +422,10 @@ public sealed class BuildScriptNuGetHealTests
             await ChmodAsync("555", home);
 
             var sentinel = Path.Combine(root, "vars");
-            var repoRoot = HealScriptRepoRoot();
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . ./scripts/nuget-home-heal.sh && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$2\"",
-                    "sh", repoRoot, sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . ./scripts/nuget-home-heal.sh && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$2\"",
+                HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var lines = await File.ReadAllLinesAsync(sentinel);
@@ -454,17 +451,17 @@ public sealed class BuildScriptNuGetHealTests
         }
     }
 
-    // The heal script mirrors two C# constants as shell variables (shell cannot
-    // read them): DotnetCliHomeConventions.DirectoryName for the stamped
-    // repo-local home and NuGetHomeSelfHeal.WritableHomeLeaf for the shared
-    // per-user fallback. Pin the mirror so renaming either constant without
-    // updating the script fails here instead of silently desyncing the
-    // fallback selection and the migration-marker seeding.
+    // The heal script's leaf assignments are the single source for the two
+    // C# directory names: DotnetCliHomeConventions.DirectoryName (the stamped
+    // repo-local home) and NuGetHomeSelfHeal.WritableHomeLeaf (the shared
+    // per-user fallback) are both parsed out of the embedded script. Pin the
+    // contract so the assignments cannot be dropped or renamed without the
+    // parse failing — which would silently desync the fallback selection and
+    // the migration-marker seeding.
     [Fact]
     public async Task HealScript_MirrorsCliHomeLeafConstants()
     {
-        var script = await File.ReadAllTextAsync(
-            Path.Combine(HealScriptRepoRoot(), "scripts", "nuget-home-heal.sh"));
+        var script = await File.ReadAllTextAsync(HealScriptPath());
 
         Assert.Contains(
             $"_codeybox_repo_home_leaf=\"{DotnetCliHomeConventions.DirectoryName}\"",
@@ -472,6 +469,24 @@ public sealed class BuildScriptNuGetHealTests
         Assert.Contains(
             $"_codeybox_home_leaf=\"{NuGetHomeSelfHeal.WritableHomeLeaf}\"",
             script, StringComparison.Ordinal);
+    }
+
+    // The C# preamble does not carry a second copy of the dir-admission
+    // policy: it is composed from the marked region of
+    // scripts/nuget-home-heal.sh (embedded into CodeyBox.Core at build time).
+    // Pin both halves of that contract — the sentinels in the script and the
+    // helpers actually reaching the composed Preamble — so a guard edit can
+    // never land in only one copy again.
+    [Fact]
+    public async Task HealScript_SharedHelpers_ReachTheCSharpPreamble()
+    {
+        var script = await File.ReadAllTextAsync(HealScriptPath());
+
+        Assert.Contains(NuGetHomeSelfHeal.SharedHelpersBeginMarker, script, StringComparison.Ordinal);
+        Assert.Contains(NuGetHomeSelfHeal.SharedHelpersEndMarker, script, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_secure_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_adopt_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_pick_user_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
     }
 
     // The seeded user-config staging file must come from mktemp's unpredictable
@@ -506,25 +521,13 @@ public sealed class BuildScriptNuGetHealTests
         var sentinel = Path.Combine(root, "vars");
         try
         {
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                // No usable HOME at all forces the runtime-dir pin.
-                ["HOME"] = Path.Combine(root, "no-such-home"),
-                ["DOTNET_CLI_HOME"] = cliLink,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" > \"$3\"",
-                    "sh", root, HealScriptRepoRoot(), sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var env = NewHealEnv(root, Path.Combine(root, "no-such-home"));
+            // No usable HOME at all forces the runtime-dir pin.
+            env["DOTNET_CLI_HOME"] = cliLink;
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" > \"$3\"",
+                root, HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var lines = await File.ReadAllLinesAsync(sentinel);
@@ -564,24 +567,12 @@ public sealed class BuildScriptNuGetHealTests
         Directory.CreateDirectory(root);
         try
         {
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = Path.Combine(root, "no-such-home"),
-                ["DOTNET_CLI_HOME"] = "/tmp",
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" > \"$3\"",
-                    "sh", root, HealScriptRepoRoot(), sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var env = NewHealEnv(root, Path.Combine(root, "no-such-home"));
+            env["DOTNET_CLI_HOME"] = "/tmp";
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" > \"$3\"",
+                root, HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var lines = await File.ReadAllLinesAsync(sentinel);
@@ -618,23 +609,10 @@ public sealed class BuildScriptNuGetHealTests
         {
             await ChmodAsync("777", home); // writable by every co-tenant
 
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$3\"",
-                    "sh", root, HealScriptRepoRoot(), sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$3\"",
+                root, HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var lines = await File.ReadAllLinesAsync(sentinel);
@@ -672,24 +650,12 @@ public sealed class BuildScriptNuGetHealTests
         {
             await ChmodAsync("777", cliHome); // writable by every co-tenant
 
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["DOTNET_CLI_HOME"] = cliHome,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$3\"",
-                    "sh", root, HealScriptRepoRoot(), sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var env = NewHealEnv(root, home);
+            env["DOTNET_CLI_HOME"] = cliHome;
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s\\n%s\\n%s' \"$HOME\" \"${XDG_RUNTIME_DIR:-}\" \"${DOTNET_CLI_HOME:-}\" > \"$3\"",
+                root, HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var lines = await File.ReadAllLinesAsync(sentinel);
@@ -726,24 +692,12 @@ public sealed class BuildScriptNuGetHealTests
         File.CreateSymbolicLink(link, outside);
         try
         {
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["DOTNET_CLI_HOME"] = Path.Combine(link, "deep", "deeper"),
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
-                    "sh", root, HealScriptRepoRoot(),
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var env = NewHealEnv(root, home);
+            env["DOTNET_CLI_HOME"] = Path.Combine(link, "deep", "deeper");
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                root, HealScriptRepoRoot());
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             Assert.Empty(Directory.GetFileSystemEntries(outside));
@@ -823,24 +777,10 @@ public sealed class BuildScriptNuGetHealTests
             await ChmodAsync("555", Path.Combine(home, ".nuget"));
             await ChmodAsync("555", home);
 
-            var repoRoot = HealScriptRepoRoot();
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s' \"$DOTNET_CLI_HOME\" > \"$3\"",
-                    "sh", root, repoRoot, sentinel,
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s' \"$DOTNET_CLI_HOME\" > \"$3\"",
+                root, HealScriptRepoRoot(), sentinel);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var scratchHome = await File.ReadAllTextAsync(sentinel);
@@ -925,24 +865,12 @@ public sealed class BuildScriptNuGetHealTests
         await File.WriteAllTextAsync(existingMarker, "preexisting");
         try
         {
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["DOTNET_CLI_HOME"] = cliHome,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
-                    "sh", workdir, HealScriptRepoRoot(),
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var env = NewHealEnv(root, home);
+            env["DOTNET_CLI_HOME"] = cliHome;
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                workdir, HealScriptRepoRoot());
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var uid = await TestSupport.CurrentUidAsync();
@@ -998,24 +926,12 @@ public sealed class BuildScriptNuGetHealTests
             var linkTarget = Path.Combine(outside, "planted-target");
             File.CreateSymbolicLink(markerLink, linkTarget);
 
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["XDG_DATA_HOME"] = xdgData,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
-                    "sh", root, HealScriptRepoRoot(),
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var env = NewHealEnv(root, home);
+            env["XDG_DATA_HOME"] = xdgData;
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                root, HealScriptRepoRoot());
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             // The link's target must not exist — nothing was written through
@@ -1050,23 +966,10 @@ public sealed class BuildScriptNuGetHealTests
         {
             File.CreateSymbolicLink(Path.Combine(home, ".local"), outside);
 
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-            };
-            var result = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
-                    "sh", root, HealScriptRepoRoot(),
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: env);
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                root, HealScriptRepoRoot());
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             Assert.False(
@@ -1157,17 +1060,10 @@ public sealed class BuildScriptNuGetHealTests
                 ["TMPDIR"] = root,
             };
             Directory.CreateDirectory(healEnv["HOME"]);
-            var heal = await new DefaultProcessRunner().RunAsync(
-                [
-                    "/bin/sh", "-c",
-                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
-                    "sh", workdir, HealScriptRepoRoot(),
-                ],
-                null,
-                CancellationToken.None,
-                maxStdoutBytes: 65536,
-                maxStderrBytes: 65536,
-                environment: healEnv);
+            var heal = await RunHealShellAsync(
+                healEnv,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                workdir, HealScriptRepoRoot());
             Assert.True(heal.Success, heal.Stdout + heal.Stderr);
             Assert.True(
                 File.Exists(MigrationMarkerPath(gateHome)),

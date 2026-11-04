@@ -10,4 +10,17 @@
     <PackageReference Include="Serilog" Version="4.2.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The NuGet-home recovery script is the single source for the shell
+         preamble NuGetHomeSelfHeal composes: its marked shared-helpers region
+         is lifted verbatim out of this resource at load time, so a guard
+         change in the script cannot land in only one copy. -->
+    <EmbeddedResource Include="../../scripts/nuget-home-heal.sh"
+                      LogicalName="CodeyBox.Core.nuget-home-heal.sh" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodeyBox.Tests" />
+  </ItemGroup>
+
 </Project>

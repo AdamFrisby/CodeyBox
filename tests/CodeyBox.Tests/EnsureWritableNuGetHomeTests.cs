@@ -76,7 +76,7 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         Assert.Equal(0, (await RunScriptAsync(home)).ExitCode);
         Assert.Equal(0, (await RunScriptAsync(home)).ExitCode);
         Assert.True(Directory.Exists(Path.Combine(home, ".nuget", "NuGet")));
-        Assert.False(Directory.Exists(Path.Combine(home, ".nuget.rootbaked")));
+        Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
     }
 
     [Fact]
@@ -101,7 +101,7 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
 
             Assert.Equal(0, exit);
             Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
-            Assert.False(Directory.Exists(Path.Combine(home, ".nuget.rootbaked")));
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
         }
         finally
         {
@@ -213,6 +213,13 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         };
         psi.Environment["HOME"] = home;
         psi.Environment["TMPDIR"] = _workspace;
+        // The fixture home must be authoritative: a stamped DOTNET_CLI_HOME or
+        // runtime dir inherited from the test host would make the heal repair
+        // that home instead of the fixture's.
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("XDG_RUNTIME_DIR");
+        psi.Environment.Remove("XDG_DATA_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
 
         using var proc = Process.Start(psi)!;
         var stdout = await proc.StandardOutput.ReadToEndAsync();

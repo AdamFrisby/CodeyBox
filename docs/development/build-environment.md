@@ -31,15 +31,19 @@ each test DLL path as an "invalid argument".
 MSBuild aggregates `InitialTargets` from the imported
 `Directory.Build.props`/`.targets` and runs them at the very start of every
 project evaluation — before restore resolves the NuGet user-settings directory.
-That is the only committed-file hook early enough to matter, and CodeyBox uses
-it twice: `Directory.Build.props` runs `scripts/reclaim-nuget-home.sh`
-(fast-path no-op when the home is already usable, non-destructive, race-safe
-across parallel evaluations via an atomic `mkdir` lock, and never fails the
-build), and `Directory.Build.targets` runs
-`scripts/ensure-writable-nuget-home.sh`. When `$HOME/.nuget` exists but is
-not writable, the scripts rename it aside — the build user owns `$HOME`, so the
-rename needs no root — recreate a writable `$HOME/.nuget`, and preserve any
-pre-baked `packages` cache by symlink.
+That is the only committed-file hook early enough to matter, and CodeyBox runs
+three entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
+`Directory.Build.props`) dot-sources `scripts/nuget-home-heal.sh` against the
+effective cli home, `Directory.Build.props` also runs
+`scripts/reclaim-nuget-home.sh`, and `Directory.Build.targets` runs
+`scripts/ensure-writable-nuget-home.sh`. All three delegate the repair to the
+shared `scripts/nuget-home-heal.sh` recovery (fast-path no-op when the home is
+already usable, never fails the build). When `$HOME/.nuget` exists but is not
+usable — foreign-owned, unwritable, unreadable config, or a planted link — the
+heal relocates it aside — the build user owns `$HOME`, so the rename needs no
+root — recreates a writable private `$HOME/.nuget` with a seeded readable
+config, and preserves a trusted (uid- or root-owned) pre-baked `packages`
+cache by symlink.
 
 A `BeforeTargets="Restore"` target is *not* early enough: solution restore
 aborts during graph construction, before any project's `Restore` chain runs. Nor

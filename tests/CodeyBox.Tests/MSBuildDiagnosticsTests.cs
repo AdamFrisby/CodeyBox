@@ -675,7 +675,7 @@ public sealed class MSBuildDiagnosticsEnrichmentTests : IDisposable
                     return BuildFailureResult("Build FAILED\nerror CS1525: Invalid expression term ';'\n");
                 }
                 if (script.Contains("ls -1", StringComparison.Ordinal))
-                    return new SandboxExecResult(0, "target-1.binlog\n", string.Empty);
+                    return new SandboxExecResult(0, "DIR=codeybox-msbuild-binlogs.t0st01\ntarget-1.binlog\n", string.Empty);
                 if (script.Contains("base64 -w0", StringComparison.Ordinal))
                     return new SandboxExecResult(0, $"{binlog.Length}\n{Convert.ToBase64String(binlog)}", string.Empty);
             }
@@ -732,11 +732,13 @@ public sealed class MSBuildDiagnosticsEnrichmentTests : IDisposable
         Assert.Contains("-bl:", script, StringComparison.Ordinal);
         Assert.Contains("ProjectImports=None", script, StringComparison.Ordinal);
         Assert.DoesNotContain("ProjectImports=Embed", script, StringComparison.Ordinal);
-        // Fixed directory: every exec is a fresh shell with its own $$, so
-        // the fetch step could never find a PID-suffixed directory.
-        Assert.Contains("binlog_dir=\"$tmp_root/codeybox-msbuild-binlogs\"", script, StringComparison.Ordinal);
-        // A stale log from an earlier attempt must never attach to this one.
-        Assert.Contains("rm -f \"$binlog_dir\"/target-*.binlog", script, StringComparison.Ordinal);
+        // Unpredictable per-exec directory: a fixed name in the world-writable
+        // temp could be squatted by a co-tenant with planted target-N.binlog
+        // symlinks, so the dir comes from mktemp's O_EXCL create and the fetch
+        // step rediscovers it by owner-filtered glob.
+        Assert.Contains(
+            "binlog_dir=\"$(mktemp -d \"$tmp_root/codeybox-msbuild-binlogs.XXXXXX\")\"",
+            script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -781,7 +783,7 @@ public sealed class MSBuildDiagnosticsEnrichmentTests : IDisposable
                     && script.Contains("-bl:", StringComparison.Ordinal))
                     return BuildFailureResult("Build FAILED\nerror CS1525: Invalid expression term ';'\n");
                 if (script.Contains("ls -1", StringComparison.Ordinal))
-                    return new SandboxExecResult(0, "target-1.binlog\ntarget-2.binlog\n", string.Empty);
+                    return new SandboxExecResult(0, "DIR=codeybox-msbuild-binlogs.t0st01\ntarget-1.binlog\ntarget-2.binlog\n", string.Empty);
                 if (script.Contains("base64 -w0", StringComparison.Ordinal))
                 {
                     var path = exec.Argv.Count > 4 ? exec.Argv[4] : string.Empty;
@@ -867,7 +869,7 @@ public sealed class MSBuildDiagnosticsEnrichmentTests : IDisposable
                         && script.Contains("-bl:", StringComparison.Ordinal))
                         return BuildFailureResult("Build FAILED\n");
                     if (script.Contains("ls -1", StringComparison.Ordinal))
-                        return new SandboxExecResult(0, "target-1.binlog\ntarget-2.binlog\n", string.Empty);
+                        return new SandboxExecResult(0, "DIR=codeybox-msbuild-binlogs.t0st01\ntarget-1.binlog\ntarget-2.binlog\n", string.Empty);
                     if (script.Contains("base64 -w0", StringComparison.Ordinal))
                         return new SandboxExecResult(1, string.Empty, "transport lost");
                 }
@@ -976,8 +978,10 @@ public sealed class MSBuildDiagnosticsEnrichmentTests : IDisposable
         var (gitHost, repoId, workBranch) = await SetupRepoAsync(withDotnetMarker: true);
         var provider = new ScriptedSandboxProvider(exec =>
         {
+            // The binlog dir exists (rediscovered by the owned-glob) but the
+            // build wrote no logs into it.
             if (exec.Argv.Count >= 3 && exec.Argv[1] == "-c" && exec.Argv[2].Contains("ls -1", StringComparison.Ordinal))
-                return new SandboxExecResult(0, string.Empty, string.Empty);
+                return new SandboxExecResult(0, "DIR=codeybox-msbuild-binlogs.t0st01\n", string.Empty);
             return FailedBuildWithBinlog([])(exec);
         });
         var verifier = new SandboxRequiredBuildVerifier(
