@@ -31,16 +31,27 @@ public static class DevinKnownModels
         "fable",
 
         // The swe-2 variants, re-verified 2026-09-22 against the same command.
-        // These are the ONLY entries the catalog reports as cost_tier "Free";
-        // every other family — including the other swe-* families (swe-1.6,
-        // swe-1.7, swe-1.7-lightning) and every fusion-*-sidekick-swe-2-*
-        // combination — is billed. Prefer one of these exact uids over the
-        // "swe" alias when a deployment must not spend: an alias resolves
-        // through the account's registry and can be repointed at a later,
-        // paid generation without the configuration changing.
+        // These were the ONLY entries the catalog reported as cost_tier "Free"
+        // at that verification; every other family — including the other
+        // swe-* families (swe-1.6, swe-1.7, swe-1.7-lightning) and every
+        // fusion-*-sidekick-swe-2-* combination — is billed. Prefer one of
+        // these exact uids over the "swe" alias when a deployment must not
+        // spend: an alias resolves through the account's registry and can be
+        // repointed at a later, paid generation without the configuration
+        // changing.
         "swe-2-high",
         "swe-2-medium",
         "swe-2-max",
+
+        // The swe-2-flash variants, verified 2026-11-05 against
+        // `devin models list` (v3000.11.1). The catalog reports them as
+        // cost_tier "Free" only under a promotional free tier ending
+        // 2026-11-30 — being on this list does not guarantee they stay
+        // free, so re-check `devin models list` after the promotion before
+        // relying on them for a no-spend deployment.
+        "swe-2-flash-high",
+        "swe-2-flash-medium",
+        "swe-2-flash-max",
     };
 
     public static bool IsKnown(string? modelId)
