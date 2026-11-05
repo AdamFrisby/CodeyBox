@@ -61,14 +61,17 @@ namespace CodeyBox.Agents.Devin;
 /// anyway, on a possibly metered default (verified against devin
 /// 3000.11.1). The shim aborts with a <c>model_mismatch</c> terminal
 /// envelope at the earliest observable point whenever the active model is
-/// not the requested one — strictly before <c>session/prompt</c> for the
-/// structured signals (<c>session/new</c> <c>models.currentModelId</c>,
-/// category-"model" <c>config_option_update</c>), the stderr WARN text as
-/// bounded-grace fallback — and the host classifies it as
-/// provider-transient so the item re-runs on the configured model. A
-/// <c>turn_error</c> the provider marked <c>cognition.ai/retryable</c>
-/// takes the same transient path. Print mode (<c>devin -p</c>) has no
-/// structured active-model signal, so
+/// not the requested one — the structured signals
+/// (<c>session/new</c> <c>models.currentModelId</c>, category-"model"
+/// <c>config_option_update</c>) ride the session-id-pinned ACP wire and
+/// stay armed for the whole turn, while the stderr WARN text fallback is
+/// honoured only inside the pre-prompt window (after
+/// <c>session/prompt</c> fd 2 also carries tool-subprocess stderr the
+/// agent controls, so the marker phrase is no longer provider-authentic).
+/// The host classifies it as provider-transient so the item re-runs on
+/// the configured model. A <c>turn_error</c> the provider marked
+/// <c>cognition.ai/retryable</c> takes the same transient path. Print
+/// mode (<c>devin -p</c>) has no structured active-model signal, so
 /// <see cref="RejectSuccessfulTextOnlyResult"/> vetoes a successful exec
 /// whose stderr carries the WARN phrase.</para>
 ///
@@ -555,7 +558,13 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         if (!string.IsNullOrEmpty(result.TerminalDiagnostic))
             return result;
 
-        var outcome = DevinAcpOutcome.Extract(result.Stdout);
+        // Envelope structure is trusted only on captures the runner stamped
+        // StdoutIsEnvelopeFramed: early-failure results can carry non-null
+        // Stdout (host-script output, prep diagnostics) that must never be
+        // envelope-parsed as shim evidence.
+        var outcome = result.StdoutIsEnvelopeFramed
+            ? DevinAcpOutcome.Extract(result.Stdout)
+            : new DevinAcpOutcome.Outcome(DevinAcpOutcome.TerminalEvent.None, null);
 
         // A zero exit without a turn_complete envelope is never a silent
         // success: either the run was cut short before the turn outcome was

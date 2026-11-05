@@ -24,9 +24,11 @@ namespace CodeyBox.Agents.Devin;
 ///
 /// <para>Bounded: the framed scan truncates to the last
 /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars (the fatal is
-/// the terminal line), at most <see cref="MaxLinesScanned"/> lines and
-/// <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/> envelopes are examined,
-/// and every evaluation is total (never throws). The returned detection
+/// the terminal line) and last <see cref="MaxLinesScanned"/> lines, then
+/// examines the last <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
+/// devin.acp envelopes — every bound favours the tail the terminal
+/// signature lives on — and every evaluation is total (never throws). The
+/// returned detection
 /// carries only the fixed signature label — never raw agent output, which may
 /// contain secrets.</para>
 ///
@@ -53,39 +55,14 @@ internal static class DevinTeamSettingsTimeoutDetector
     internal static ProviderTransientDetection? TryDetect(
         AgentResult result,
         IReadOnlyList<QuotaFailurePattern> unauthorizedPatterns)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(result.Stderr)
-                && string.IsNullOrEmpty(result.Stdout)
-                && string.IsNullOrEmpty(result.Summary))
-            {
-                return null;
-            }
-
-            var framedStdout = result.StdoutIsEnvelopeFramed ? result.Stdout : null;
-            var matched = HasStructuredTimeout(framedStdout)
-                || HasLiftedFatalDiagnostic(result.Stderr)
-                || (result.StdoutIsEnvelopeFramed && HasLiftedFatalDiagnostic(result.Summary));
-            if (!matched)
-                return null;
-
-            if (DevinAuthSignals.HasAuthSignal(
-                    result.Stderr, result.Stdout, result.Summary, unauthorizedPatterns))
-            {
-                return null;
-            }
-
-            return new ProviderTransientDetection(
-                ProviderTransientKind.InfraTransport,
-                Signature,
-                "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff");
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
+        => DevinTransientDetectionCore.TryMatch(
+            result,
+            unauthorizedPatterns,
+            Signature,
+            "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff",
+            r => HasStructuredTimeout(r.StdoutIsEnvelopeFramed ? r.Stdout : null)
+                || HasLiftedFatalDiagnostic(r.Stderr)
+                || (r.StdoutIsEnvelopeFramed && HasLiftedFatalDiagnostic(r.Summary)));
 
     private static bool HasStructuredTimeout(string? text)
     {
@@ -116,11 +93,12 @@ internal static class DevinTeamSettingsTimeoutDetector
 
     private static bool HasStructuredTimeoutInText(string bounded)
     {
-        var examined = 0;
-        foreach (var envelope in DevinAcpEnvelope.Enumerate(bounded))
+        // The fatal envelope is terminal — the last devin.acp line — so the
+        // shared bounded scan examines the LAST MaxEnvelopesExamined
+        // envelopes of the char-bounded window (re-bounding is a no-op on
+        // the already-bounded input).
+        foreach (var envelope in DevinAcpEnvelope.EnumerateBounded(bounded))
         {
-            if (++examined > DevinAcpEnvelope.MaxEnvelopesExamined)
-                break;
             if (!string.Equals(envelope.Event, DevinAcpEnvelope.EventFatal, StringComparison.Ordinal))
                 continue;
             if (IsSessionNewTeamSettingsTimeout(envelope.Root))
@@ -226,8 +204,7 @@ internal static class DevinTeamSettingsTimeoutDetector
 
     private static string BoundInput(string text)
     {
-        const int max = ProviderTransientMatcher.MaxScannedChars;
-        var bounded = text.Length > max ? text[^max..] : text;
+        var bounded = ProviderTransientMatcher.BoundToScannedTail(text);
         if (CountLines(bounded) > MaxLinesScanned)
             bounded = TakeLastLines(bounded, MaxLinesScanned);
         return bounded;
@@ -352,9 +329,7 @@ internal static class DevinTeamSettingsTimeoutDetector
 
         try
         {
-            var bounded = text.Length > ProviderTransientMatcher.MaxScannedChars
-                ? text[^ProviderTransientMatcher.MaxScannedChars..]
-                : text;
+            var bounded = ProviderTransientMatcher.BoundToScannedTail(text);
             return bounded.Contains("devin acp fatal", StringComparison.OrdinalIgnoreCase)
                 && bounded.Contains("session/new", StringComparison.Ordinal)
                 && bounded.Contains("-32603", StringComparison.Ordinal)

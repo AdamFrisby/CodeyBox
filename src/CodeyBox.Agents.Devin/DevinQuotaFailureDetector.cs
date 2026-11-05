@@ -154,8 +154,11 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     /// <summary>
     /// Result-shaped detection: the structured ACP detectors only trust
     /// envelope structure when <see cref="AgentResult.StdoutIsEnvelopeFramed"/>
-    /// proves the shim owns the stream; raw stderr still feeds the WARN-text
-    /// fallback and the shared signatures scan every stream as before.
+    /// proves the shim owns the stream. The model-substitution WARN text is
+    /// matched only inside pre-prompt <c>codeybox.stderr</c> envelopes on
+    /// such captures (post-prompt fd 2 carries agent-controlled tool
+    /// stderr); raw stderr is never scanned for it, and the shared
+    /// signatures scan every stream as before.
     /// </summary>
     public ProviderTransientDetection? DetectProviderTransient(AgentResult result)
     {

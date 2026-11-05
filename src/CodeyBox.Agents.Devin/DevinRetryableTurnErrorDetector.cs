@@ -21,7 +21,7 @@ namespace CodeyBox.Agents.Devin;
 /// stderr, and summary are agent/model text that could quote a forged
 /// <c>turn_error</c> line, so they never match. Bounded: the framed scan
 /// truncates to the last <see cref="ProviderTransientMatcher.MaxScannedChars"/>
-/// chars and examines at most <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
+/// chars and examines the last <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
 /// envelopes; every evaluation is total (never throws). The detection
 /// carries only the fixed signature label. An auth signal in the same
 /// capture suppresses the match (<see cref="DevinAuthSignals"/>).</para>
@@ -34,36 +34,13 @@ internal static class DevinRetryableTurnErrorDetector
     internal static ProviderTransientDetection? TryDetect(
         AgentResult result,
         IReadOnlyList<QuotaFailurePattern> unauthorizedPatterns)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(result.Stderr)
-                && string.IsNullOrEmpty(result.Stdout)
-                && string.IsNullOrEmpty(result.Summary))
-            {
-                return null;
-            }
-
-            if (!HasRetryableTurnError(result.Stdout, framed: result.StdoutIsEnvelopeFramed))
-                return null;
-
-            if (DevinAuthSignals.HasAuthSignal(
-                    result.Stderr, result.Stdout, result.Summary, unauthorizedPatterns))
-            {
-                return null;
-            }
-
-            return new ProviderTransientDetection(
-                ProviderTransientKind.InfraTransport,
-                Signature,
-                "the provider marked the turn error retryable "
-                + "(cognition.ai/retryable); retry the turn with backoff");
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
+        => DevinTransientDetectionCore.TryMatch(
+            result,
+            unauthorizedPatterns,
+            Signature,
+            "the provider marked the turn error retryable "
+            + "(cognition.ai/retryable); retry the turn with backoff",
+            r => HasRetryableTurnError(r.Stdout, framed: r.StdoutIsEnvelopeFramed));
 
     /// <summary>
     /// Framed-capture envelope scan for a <c>turn_error</c> carrying
@@ -79,11 +56,8 @@ internal static class DevinRetryableTurnErrorDetector
         {
             foreach (var envelope in DevinAcpEnvelope.EnumerateBounded(stdout))
             {
-                if (envelope.Type != DevinAcpEnvelope.EnvelopeType
-                    || !string.Equals(envelope.Event, DevinAcpEnvelope.EventTurnError, StringComparison.Ordinal))
-                {
+                if (!string.Equals(envelope.Event, DevinAcpEnvelope.EventTurnError, StringComparison.Ordinal))
                     continue;
-                }
                 if (envelope.Root.TryGetProperty("retryable", out var retryable)
                     && retryable.ValueKind == JsonValueKind.True)
                 {

@@ -47,6 +47,14 @@ internal static class DevinAcpEnvelope
     internal const string EventFatal = "fatal";
 
     /// <summary>
+    /// Emitted immediately after <c>session/prompt</c> is sent — the
+    /// boundary between the pre-prompt handshake (where fd-2 stderr is
+    /// still provider-authentic) and the running turn (where tool
+    /// subprocesses share fd 2 and their stderr is agent/model-controlled).
+    /// </summary>
+    internal const string EventPromptSent = "prompt_sent";
+
+    /// <summary>
     /// Terminal event emitted when the shim detects the CLI substituted a
     /// different model for the requested <c>--model</c> (stderr WARN, a
     /// mismatched <c>models.currentModelId</c> in the session/new result,
@@ -54,6 +62,15 @@ internal static class DevinAcpEnvelope
     /// turn rather than bill a substituted model.
     /// </summary>
     internal const string EventModelMismatch = "model_mismatch";
+
+    /// <summary>
+    /// Permission-request auto-answers the shim emits while the turn runs —
+    /// post-<see cref="EventPromptSent"/> by construction, so they prove the
+    /// turn started even when <c>prompt_sent</c> itself scrolled out of a
+    /// retained tail.
+    /// </summary>
+    internal const string EventPermissionAutoGranted = "permission_auto_granted";
+    internal const string EventPermissionAutoCancelled = "permission_auto_cancelled";
 
     /// <summary>
     /// The <c>sessionUpdate</c> discriminator values inside an
@@ -65,6 +82,13 @@ internal static class DevinAcpEnvelope
     internal const string UpdateKindToolCall = "tool_call";
     internal const string UpdateKindToolCallUpdate = "tool_call_update";
     internal const string UpdateKindAgentMessageChunk = "agent_message_chunk";
+
+    /// <summary>
+    /// The one <c>session/update</c> kind the ACP handshake itself produces
+    /// (the substitution guard reads a category-"model" option from it
+    /// before the first prompt). Every other kind reflects turn activity.
+    /// </summary>
+    internal const string UpdateKindConfigOptionUpdate = "config_option_update";
 
     /// <summary>
     /// One parsed envelope: the <c>event</c> name plus a detached clone of
@@ -150,29 +174,50 @@ internal static class DevinAcpEnvelope
     }
 
     /// <summary>
-    /// Bounded typed-envelope scan for provider-transient detection:
-    /// truncates the input to the last
-    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars (the
-    /// terminal envelope is the last line) and examines at most
-    /// <see cref="MaxEnvelopesExamined"/> envelopes — the single bound
-    /// policy shared by the Devin detectors.
+    /// Bounded <c>devin.acp</c> envelope scan for provider-transient
+    /// detection: truncates the input to the last
+    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars and
+    /// yields the LAST <see cref="MaxEnvelopesExamined"/> devin.acp
+    /// envelopes of that window — the single bound policy shared by the
+    /// Devin detectors. Both bounds favour the tail because the signatures
+    /// they scan for (terminal <c>model_mismatch</c>/<c>turn_error</c>/
+    /// <c>fatal</c> envelopes) are the last lines of the capture: a chatty
+    /// turn — including <c>codeybox.stderr</c> relay lines flushed after
+    /// the terminal envelope — must not push the signature out of the
+    /// examined set. Non-devin.acp lines are parsed but never counted
+    /// against the envelope bound.
     /// </summary>
-    internal static IEnumerable<TypedEnvelope> EnumerateBounded(string? stdout)
+    internal static IEnumerable<Envelope> EnumerateBounded(string? stdout)
     {
         if (string.IsNullOrEmpty(stdout))
             yield break;
 
-        var bounded = stdout.Length > ProviderTransientMatcher.MaxScannedChars
-            ? stdout[^ProviderTransientMatcher.MaxScannedChars..]
-            : stdout;
-
-        var examined = 0;
-        foreach (var envelope in EnumerateEnvelopes(bounded))
-        {
-            if (++examined > MaxEnvelopesExamined)
-                yield break;
+        var bounded = ProviderTransientMatcher.BoundToScannedTail(stdout);
+        foreach (var envelope in LastEnvelopes(Enumerate(bounded), MaxEnvelopesExamined))
             yield return envelope;
+    }
+
+    /// <summary>
+    /// Buffers <paramref name="source"/> and yields only its last
+    /// <paramref name="count"/> items, in stream order. The buffer holds at
+    /// most <paramref name="count"/> items, so the bound is enforced
+    /// before buffering rather than after.
+    /// </summary>
+    internal static IEnumerable<T> LastEnvelopes<T>(IEnumerable<T> source, int count)
+    {
+        if (count <= 0)
+            yield break;
+
+        var tail = new Queue<T>(count + 1);
+        foreach (var item in source)
+        {
+            if (tail.Count == count)
+                tail.Dequeue();
+            tail.Enqueue(item);
         }
+
+        while (tail.Count > 0)
+            yield return tail.Dequeue();
     }
 
     /// <summary>

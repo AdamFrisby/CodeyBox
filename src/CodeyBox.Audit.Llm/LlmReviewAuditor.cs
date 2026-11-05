@@ -288,7 +288,7 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
         string? stderr,
         string? summary,
         string? stdout,
-        bool agentStdoutIsEnvelopeFramed = false)
+        bool agentStdoutIsEnvelopeFramed)
     {
         if (string.IsNullOrWhiteSpace(verdictJson))
         {

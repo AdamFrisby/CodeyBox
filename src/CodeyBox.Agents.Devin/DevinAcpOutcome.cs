@@ -95,10 +95,18 @@ internal static class DevinAcpOutcome
             && codeEl.ValueKind is JsonValueKind.Number or JsonValueKind.String
             ? codeEl.ToString()
             : null;
+        // model_mismatch envelopes carry the signal discriminator
+        // (session/new | config_option_update | stderr-warn) — surface it so
+        // the diagnostic says WHICH check fired, not just that one did.
+        var via = root.TryGetProperty("via", out var viaEl)
+            && viaEl.ValueKind == JsonValueKind.String
+            ? viaEl.GetString()
+            : null;
+        var viaSuffix = via is null ? string.Empty : $" (via {via})";
 
         var text = stage is null
-            ? $"devin acp {prefix}: {message ?? "unknown"}"
-            : $"devin acp {prefix} during {stage}: {message ?? "unknown"}";
+            ? $"devin acp {prefix}{viaSuffix}: {message ?? "unknown"}"
+            : $"devin acp {prefix}{viaSuffix} during {stage}: {message ?? "unknown"}";
         if (code is not null)
             text += $" (code {code})";
         return DevinTerminalDiagnoser.TruncateDiagnostic(text);

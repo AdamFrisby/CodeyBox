@@ -18,9 +18,12 @@ namespace CodeyBox.Tests;
 /// <para>Envelope-structure signatures only match on captures stamped
 /// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — the provenance the
 /// runner sets when the shim owns the stream. Unframed stdout/summary is
-/// agent/model text and a forged envelope line there must never classify;
-/// the WARN-text fallback matches only raw stderr and verified
-/// <c>codeybox.stderr</c> envelope text fields.</para>
+/// agent/model text and a forged envelope line there must never classify.
+/// The WARN-text fallback matches only verified
+/// <c>codeybox.stderr</c> envelope text fields that precede any
+/// turn-proof envelope: once the turn runs, fd 2 also carries
+/// tool-subprocess stderr the agent controls, so the marker phrase is a
+/// forgery vector there — and raw stderr is never scanned at all.</para>
 /// </summary>
 public sealed class DevinModelSubstitutionTests
 {
@@ -79,6 +82,9 @@ public sealed class DevinModelSubstitutionTests
         Assert.NotNull(outcome.Diagnostic);
         Assert.Contains("model mismatch", outcome.Diagnostic, StringComparison.Ordinal);
         Assert.Contains("swe-2-high", outcome.Diagnostic, StringComparison.Ordinal);
+        // The via discriminator must survive into the diagnostic so
+        // operators can tell WHICH substitution signal fired.
+        Assert.Contains("(via stderr-warn)", outcome.Diagnostic, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -129,7 +135,10 @@ public sealed class DevinModelSubstitutionTests
         // The WARN always reaches the capture folded inside a
         // codeybox.stderr envelope — the fallback must still recognise it
         // (e.g. a shim killed between the WARN and its abort envelope).
+        // It sits after session_started but before any turn-proof envelope,
+        // so it is provably pre-prompt fd-2 output.
         var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}",
             "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}");
 
         var detection = Detect(Framed(stdout: stdout));
@@ -146,31 +155,89 @@ public sealed class DevinModelSubstitutionTests
         // agent-printed text — the envelope claim requires the framed
         // provenance stamp.
         var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}",
             "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}");
 
         Assert.Null(Detect(Unframed(stdout: stdout)));
     }
 
     [Fact]
-    public void StderrWarnOnRawStderr_ClassifiesInfraTransport()
+    public void StderrWarnInsideStderrEnvelope_WithoutAnyDevinAcpEnvelope_ReturnsNull()
     {
-        // Raw stderr is the provider's own diagnostic channel on every
-        // capture shape — no framing required.
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(StderrWarnLine, null, null);
+        // Retained-tail edge: a post-terminal stderr flood can fill the
+        // whole scan window with codeybox.stderr lines and no devin.acp
+        // evidence at all. With no handshake envelope proving the shim was
+        // mid-handshake, agent text must not pose as the WARN fallback.
+        var stdout = StdoutWith(
+            "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}");
 
-        Assert.NotNull(detection);
-        Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
-        Assert.Equal(DevinModelMismatchDetector.Signature, detection.MatchedSignature);
+        Assert.Null(Detect(Framed(stdout: stdout)));
     }
 
     [Fact]
-    public void StderrWarnOnRawStderr_UnframedResult_ClassifiesInfraTransport()
+    public void StderrWarnInsideStderrEnvelope_AfterPromptSent_ReturnsNull()
     {
-        var detection = Detect(Unframed(stderr: StderrWarnLine));
+        // THE forgery vector: a tool subprocess prints the marker phrase to
+        // fd 2 mid-turn (e.g. `ls "did not resolve to an available model"`).
+        // Once prompt_sent exists, fd 2 is agent/model-controlled — the
+        // phrase is text, not provider evidence, and must never classify.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}",
+            "{\"type\":\"devin.acp\",\"event\":\"prompt_sent\",\"promptBytes\":10}",
+            "{\"type\":\"codeybox.stderr\",\"text\":\"ls: cannot access '"
+                + StderrWarnLine + "': No such file or directory\"}",
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}");
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+    }
+
+    [Fact]
+    public void StderrWarnInsideStderrEnvelope_TurnEvidenceWithoutPromptSent_ReturnsNull()
+    {
+        // prompt_sent itself can scroll out of the retained tail on a long
+        // turn — but turn_complete/turn_error/session_update envelopes can
+        // only exist post-prompt, so they prove the same boundary and the
+        // marker still must not classify.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":\"hi\"}}}",
+            "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}",
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}");
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+    }
+
+    [Fact]
+    public void StderrWarnInsideStderrEnvelope_BeforePromptSent_ClassifiesEvenWhenTurnRan()
+    {
+        // A marker relayed BEFORE the first turn-proof envelope genuinely
+        // predates the prompt — fd 2 was still CLI-only stderr, so the WARN
+        // is provider-authentic even though the (grace-expired) turn went
+        // on to run. The substitution really happened; classifying it
+        // transient re-runs the item on the configured model.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}",
+            "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}",
+            "{\"type\":\"devin.acp\",\"event\":\"prompt_sent\",\"promptBytes\":10}",
+            "{\"type\":\"devin.acp\",\"event\":\"turn_error\",\"code\":-32013,\"message\":\"x\"}");
+
+        var detection = Detect(Framed(stdout: stdout));
 
         Assert.NotNull(detection);
-        Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
-        Assert.Equal(DevinModelMismatchDetector.Signature, detection.MatchedSignature);
+        Assert.Equal(DevinModelMismatchDetector.Signature, detection!.MatchedSignature);
+    }
+
+    [Fact]
+    public void StderrWarnOnRawStderr_ReturnsNull()
+    {
+        // Raw stderr is never scanned for the WARN: on framed runs the
+        // exec wrapper pins the CLI's fd 2 into codeybox.stderr envelopes
+        // (the WARN cannot appear there), and on unframed captures stderr
+        // is agent/model text — including reconstructed results whose
+        // stderr slot carries exec stdout.
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(StderrWarnLine, null, null));
+        Assert.Null(Detect(Unframed(stderr: StderrWarnLine)));
+        Assert.Null(Detect(Framed(stderr: StderrWarnLine,
+            stdout: "{\"type\":\"devin.acp\",\"event\":\"session_started\",\"sessionId\":\"s-1\"}")));
     }
 
     [Fact]
@@ -311,6 +378,62 @@ public sealed class DevinModelSubstitutionTests
 
         Assert.Contains(DevinRetryableTurnErrorDetector.Signature, parkedError, StringComparison.Ordinal);
         Assert.DoesNotContain("Permission denied", parkedError, StringComparison.Ordinal);
+    }
+
+    // Bounded tail scans: the signatures are TERMINAL envelopes — the last
+    // lines of the capture — so the examined set must be the LAST
+    // MaxEnvelopesExamined envelopes of the char-bounded window. A chatty
+    // turn (agent_message_chunk deltas, stderr relay lines) must never
+    // push its terminal envelope out of view.
+
+    private static string[] ChattySessionUpdates(int count)
+        => Enumerable.Range(0, count)
+            .Select(i => "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":\"chunk" + i + "\"}}}")
+            .ToArray();
+
+    [Fact]
+    public void ModelMismatchEnvelope_BeyondEnvelopeCap_StillDetected()
+    {
+        var lines = ChattySessionUpdates(DevinAcpEnvelope.MaxEnvelopesExamined + 40)
+            .Append(ModelMismatchEnvelope)
+            .ToArray();
+
+        var detection = Detect(Framed(stdout: StdoutWith(lines)));
+
+        Assert.NotNull(detection);
+        Assert.Equal(DevinModelMismatchDetector.Signature, detection!.MatchedSignature);
+    }
+
+    [Fact]
+    public void RetryableTurnErrorEnvelope_BeyondEnvelopeCap_StillDetected()
+    {
+        var lines = ChattySessionUpdates(DevinAcpEnvelope.MaxEnvelopesExamined + 40)
+            .Append(RetryableTurnErrorEnvelope)
+            .ToArray();
+
+        var detection = Detect(Framed(stdout: StdoutWith(lines)));
+
+        Assert.NotNull(detection);
+        Assert.Equal(DevinRetryableTurnErrorDetector.Signature, detection!.MatchedSignature);
+    }
+
+    [Fact]
+    public void RetryableTurnErrorEnvelope_StderrEnvelopeFlood_DoesNotConsumeEnvelopeCap()
+    {
+        // codeybox.stderr relay lines are typed envelopes on the same
+        // stream but are not devin.acp events — a stderr flood must not
+        // push the terminal turn_error out of the examined set either.
+        var stderrFlood = Enumerable.Range(0, DevinAcpEnvelope.MaxEnvelopesExamined + 40)
+            .Select(i => "{\"type\":\"codeybox.stderr\",\"text\":\"tool noise " + i + "\"}");
+        var lines = ChattySessionUpdates(5)
+            .Concat(stderrFlood)
+            .Append(RetryableTurnErrorEnvelope)
+            .ToArray();
+
+        var detection = Detect(Framed(stdout: StdoutWith(lines)));
+
+        Assert.NotNull(detection);
+        Assert.Equal(DevinRetryableTurnErrorDetector.Signature, detection!.MatchedSignature);
     }
 
     [Fact]

@@ -97,6 +97,13 @@ FINAL_TEXT_TRUNCATION_MARKER = "[...final text truncated]"
 # stderr-text fallback keys on; structured signals (the session/new
 # result's models.currentModelId and config_option_update model options)
 # are checked first whenever the peer exposes them.
+#
+# Provenance bound: fd 2 is shared by the CLI AND every tool subprocess,
+# so once session/prompt has been sent the marker phrase is
+# agent/model-controlled text, not provider evidence. The watch is
+# therefore honoured only inside the pre-prompt window (model resolution
+# precedes the first prompt; tools cannot exist before it) — see
+# abort_model_substitution.
 MODEL_FALLBACK_STDERR_MARKER = "did not resolve to an available model"
 # Bounded grace before the FIRST prompt for the stderr relay to surface
 # the WARN: the server emits it while resolving the model, concurrently
@@ -213,7 +220,9 @@ def install_stderr_envelope_relay(on_line=None):
 def _model_fallback_hook(event):
     """Per-stderr-line observer that flags the CLI's silent --model
     substitution. Only armed when the dispatch requested a model: with no
-    flag the account default applies and nothing can substitute."""
+    flag the account default applies and nothing can substitute. The flag
+    is only CONSULTED before prompt_sent (see abort_model_substitution) —
+    after that, fd 2 carries tool-subprocess stderr the agent controls."""
     def hook(line):
         if MODEL_FALLBACK_STDERR_MARKER in line:
             event.set()
@@ -255,6 +264,11 @@ class AcpClient:
         # (active_model, via) when a structured signal reported the session
         # is running a model other than requested_model.
         self.model_conflict = None
+        # Set once session/prompt has been sent. fd 2 is shared by the CLI
+        # and every tool subprocess, so after this point stderr lines are
+        # agent/model-controlled and the substitution WARN watch is
+        # disarmed — only the session-id-pinned structured signals remain.
+        self.prompt_sent = False
 
     def request(self, stage, method, params):
         # Unguessable ids: a process that inherited the agent's stdout fd (a
@@ -340,13 +354,23 @@ def session_new_active_model(result):
 
 
 def emit_model_mismatch(client, via, active_model=None):
+    # The message must only claim what the via actually proved: the
+    # stderr WARN names the unresolved --model resolution failure, while
+    # the structured vias only observed activeModel != requestedModel —
+    # asserting "did not resolve" there would report an unverified cause.
+    if via == "stderr-warn":
+        message = ("requested --model %s did not resolve to an available "
+                   "model; refusing to run the turn on a substituted model"
+                   % client.requested_model)
+    else:
+        message = ("active model %r differs from requested --model %s; "
+                   "refusing to run the turn on a substituted model"
+                   % (active_model, client.requested_model))
     emit("model_mismatch",
          requestedModel=client.requested_model,
          activeModel=active_model,
          via=via,
-         message="requested --model %s did not resolve to an available "
-                 "model; refusing to run the turn on a substituted model"
-                 % client.requested_model)
+         message=message)
 
 
 def abort_model_substitution(client, model_fallback):
@@ -354,14 +378,23 @@ def abort_model_substitution(client, model_fallback):
     substitution signal has fired — a structured session signal
     (client.model_conflict) or the stderr WARN watch flag. Returns False
     on the normal path, and whenever no model was requested (the account
-    default applies and there is nothing to substitute away from)."""
+    default applies and there is nothing to substitute away from).
+
+    The stderr WARN is honoured only inside the pre-prompt window: the
+    CLI emits it while resolving --model, before session/prompt, whereas
+    tool subprocesses (which inherit fd 2 and can print the marker phrase
+    themselves) can only exist once the turn runs. After prompt_sent the
+    flag is ignored so mid-turn tool stderr cannot abort a healthy run;
+    the structured model_conflict signal stays armed — it arrives on the
+    session-id-pinned ACP wire, not the shared stderr channel."""
     if not client.requested_model:
         return False
     if client.model_conflict is not None:
         active, via = client.model_conflict
         emit_model_mismatch(client, via=via, active_model=active)
         return True
-    if model_fallback is not None and model_fallback.is_set():
+    if (not client.prompt_sent
+            and model_fallback is not None and model_fallback.is_set()):
         emit_model_mismatch(client, via="stderr-warn")
         return True
     return False
@@ -531,6 +564,11 @@ def send_prompt(client, session_id, prompt, model_fallback):
         "prompt": [{"type": "text", "text": prompt}],
     })
     emit("prompt_sent", promptBytes=len(prompt.encode("utf-8")))
+    # The substitution WARN watch closes here: from this point fd 2 also
+    # carries tool-subprocess stderr, which the coding agent/model
+    # controls, so the marker phrase can no longer be trusted as
+    # provider-authentic (see abort_model_substitution).
+    client.prompt_sent = True
     return True
 
 
@@ -591,8 +629,10 @@ def handle_notification(client, frame, final_text_parts, final_text_chars):
         update = sanitise_update(params.get("update"))
         # Structured substitution signal: a config_option_update carrying a
         # category-"model" option whose currentValue is not the requested
-        # model means the session drifted mid-handshake — flag it so the
-        # loop aborts before/at the first prompt.
+        # model means the session is running a different model — flag it so
+        # the loop aborts at the next check. Unlike the stderr WARN this
+        # signal rides the session-id-pinned ACP wire, so it stays trusted
+        # for the whole turn (a mid-turn model drift must not bill either).
         if (client.requested_model and isinstance(update, dict)
                 and update.get("sessionUpdate") == "config_option_update"):
             active = config_options_model(update.get("configOptions"))

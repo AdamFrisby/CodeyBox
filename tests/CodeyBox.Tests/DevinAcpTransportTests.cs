@@ -60,6 +60,17 @@ public sealed class DevinAcpTransportTests
     ///   <item><c>retryable_turn_error</c> — answers session/prompt with a
     ///   JSON-RPC error whose data carries cognition.ai/retryable: true —
     ///   the real -32013 "model no longer available" shape.</item>
+    ///   <item><c>late_stderr_warn</c> — writes the real
+    ///   chisel_server::acp "--model did not resolve" WARN to stderr AFTER
+    ///   session/prompt (the shape a tool subprocess produces when it
+    ///   quotes the phrase), then completes normally. The pre-prompt WARN
+    ///   watch must be disarmed by then: the run succeeds and no
+    ///   model_mismatch is emitted.</item>
+    ///   <item><c>midturn_config_option_mismatch</c> — sends a
+    ///   config_option_update reporting a different model AFTER
+    ///   session/prompt. Structured signals ride the session-pinned ACP
+    ///   wire, so unlike the stderr WARN they stay armed for the whole
+    ///   turn: the shim must still abort with model_mismatch.</item>
     /// </list>
     /// When FAKE_GATE is set, the peer blocks after emitting its progress
     /// notifications until the gate file exists — letting the test prove
@@ -140,6 +151,25 @@ public sealed class DevinAcpTransportTests
                 send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
             elif method == "session/prompt":
                 rec({"prompt": msg.get("params")})
+                if behavior == "late_stderr_warn":
+                    # Post-prompt fd 2 is shared with tool subprocesses —
+                    # the agent controls it, so the marker phrase here is
+                    # forgeable text, not the CLI's model-resolution WARN.
+                    sys.stderr.write("ls: cannot access 'did not resolve to an "
+                                     "available model': No such file or directory\n")
+                    sys.stderr.flush()
+                if behavior == "midturn_config_option_mismatch":
+                    # Structured substitution signal mid-turn: unlike the
+                    # stderr WARN this rides the session-pinned ACP wire,
+                    # so it stays trusted — the shim must abort.
+                    send({"jsonrpc": "2.0", "method": "session/update",
+                          "params": {"sessionId": sid,
+                                     "update": {"sessionUpdate": "config_option_update",
+                                                "configOptions": [{"id": "model",
+                                                                   "category": "model",
+                                                                   "currentValue": "swe-substitute"}]}}})
+                    time.sleep(0.3)
+                    os._exit(0)
                 if behavior == "forged_response":
                     # A wire-pipe writer guessing the legacy sequential id
                     # space: under sequential ids session/prompt is id 4, so
@@ -572,6 +602,75 @@ public sealed class DevinAcpTransportTests
         Assert.Equal(DevinAcpOutcome.TerminalEvent.ModelMismatch, outcome.Event);
         Assert.DoesNotContain(ReadRecords(recordPath), r => r.Contains("\"prompt\""));
         Assert.DoesNotContain("\"event\": \"prompt_sent\"", result.Stdout!, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_FakeAcpPeer_MidTurnConfigOptionMismatch_AbortsWithModelMismatch()
+    {
+        // Structured signals ride the session-id-pinned ACP wire, so unlike
+        // the stderr WARN they stay armed for the whole turn: a
+        // config_option_update reporting a different model AFTER
+        // session/prompt is still provider-authentic evidence of
+        // substitution and must abort — a mid-turn model drift must never
+        // bill the substituted model either.
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox ACP test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("python3"), "python3 is required for the devin acp shim.");
+
+        using var temp = new TemporaryDir("codeybox-devin-acp-");
+        var (binDir, recordPath) = WriteFakeDevin(temp.Path);
+        await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "midturn_config_option_mismatch");
+
+        var runner = new DevinAgentRunner();
+        var result = await runner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, "do the thing", credential: null,
+            modelId: ConfiguredModel);
+
+        Assert.False(result.Success);
+        var outcome = DevinAcpOutcome.Extract(result.Stdout!);
+        Assert.Equal(DevinAcpOutcome.TerminalEvent.ModelMismatch, outcome.Event);
+        Assert.Contains("\"event\": \"prompt_sent\"", result.Stdout!, StringComparison.Ordinal);
+        Assert.Contains("\"via\": \"config_option_update\"", result.Stdout!, StringComparison.Ordinal);
+        Assert.Single(ReadRecords(recordPath), r => r.Contains("\"prompt\""));
+
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(result);
+        Assert.NotNull(detection);
+        Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
+        Assert.Equal(DevinModelMismatchDetector.Signature, detection.MatchedSignature);
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_FakeAcpPeer_LateStderrWarn_DoesNotAbortHealthyTurn()
+    {
+        // The audit's forgery vector end-to-end: fd 2 is shared by the CLI
+        // and every tool subprocess, so once session/prompt has been sent
+        // the marker phrase is agent/model-controlled text (here: a tool
+        // error quoting it, exactly like `ls "did not resolve…"`). The
+        // shim's pre-prompt WARN watch must be disarmed — the healthy turn
+        // completes, no model_mismatch is emitted, and the host detector
+        // must not classify the forged phrase as substitution evidence.
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox ACP test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("python3"), "python3 is required for the devin acp shim.");
+
+        using var temp = new TemporaryDir("codeybox-devin-acp-");
+        var (binDir, _) = WriteFakeDevin(temp.Path);
+        await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "late_stderr_warn");
+
+        var runner = new DevinAgentRunner();
+        var result = await runner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, "do the thing", credential: null,
+            modelId: ConfiguredModel);
+
+        Assert.True(result.Success, $"expected success; stderr={result.Stderr}");
+        // The forged phrase DID reach the capture — folded inside a
+        // codeybox.stderr envelope, after prompt_sent — proving the vector
+        // is real and the gate (not absence of the text) stopped it.
+        Assert.Contains("codeybox.stderr", result.Stdout!, StringComparison.Ordinal);
+        Assert.Contains("did not resolve to an available model", result.Stdout!, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"event\": \"model_mismatch\"", result.Stdout!, StringComparison.Ordinal);
+        var outcome = DevinAcpOutcome.Extract(result.Stdout!);
+        Assert.Equal(DevinAcpOutcome.TerminalEvent.TurnComplete, outcome.Event);
+
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(result));
     }
 
     [SkippableFact]

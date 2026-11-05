@@ -120,6 +120,23 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     }
 
     [Fact]
+    public void FatalEnvelope_BeyondEnvelopeCap_StillDetected()
+    {
+        // The fatal envelope is terminal — the last devin.acp line — so a
+        // chatty turn must not push it out of the examined set: the bounded
+        // scan takes the LAST MaxEnvelopesExamined envelopes, not the first.
+        var filler = Enumerable.Range(0, DevinAcpEnvelope.MaxEnvelopesExamined + 40)
+            .Select(i => "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":\"chunk" + i + "\"}}}");
+        var stdout = StdoutWith(filler.Append(FatalEnvelope()).ToArray());
+
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout));
+
+        Assert.NotNull(detection);
+        Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
+        Assert.Equal("devin-team-settings-timeout", detection.MatchedSignature);
+    }
+
+    [Fact]
     public void LiftedDiagnosticShape_ClassifiesInfraTransport()
     {
         var summary = $"devin acp fatal during session/new: {ExactMessage} (code -32603)";

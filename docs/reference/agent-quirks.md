@@ -461,20 +461,30 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   model; falling back to your configured `agent.model` or the default`)
   and proceeds on `agent.model`/the default — possibly metered. The shim
   refuses the substitution: it aborts with a `model_mismatch` terminal
-  envelope at the earliest observable point whenever the active model is
-  not the requested one — strictly before `session/prompt` for the
-  structured signals (`session/new` `models.currentModelId` and
-  category-`"model"` `config_option_update`), and on the stderr WARN
-  text as fallback (bounded grace, then a mid-turn abort at the first
-  frame carrying the marker). The host classifies the abort
+  envelope (carrying `via` = `session/new`, `config_option_update`, or
+  `stderr-warn`, plus the observed `activeModel`) whenever the active
+  model is not the requested one. The structured signals
+  (`session/new` `models.currentModelId`, category-`"model"`
+  `config_option_update`) ride the session-id-pinned ACP wire and stay
+  armed for the whole turn — a mid-turn model drift aborts too. The
+  stderr WARN is honoured only inside the pre-prompt window: model
+  resolution precedes `session/prompt`, while after it fd 2 is shared
+  with tool subprocesses whose stderr the agent/model controls, so the
+  marker phrase is forgeable there (a tool error quoting it must never
+  abort a healthy run). The host classifies the abort
   provider-transient so the item retries on the configured model instead
   of terminal-failing — structured envelopes are only trusted on
   captures the runner stamped envelope-framed
   (`AgentResult.StdoutIsEnvelopeFramed`); unframed stdout/summary is
-  agent text and never parsed as envelopes, while raw stderr still feeds
-  the WARN-text fallback. A `turn_error` whose error `data` carries
-  `cognition.ai/retryable: true` is forwarded as `"retryable": true` and
-  parks on the same bounded path.
+  agent text and never parsed as envelopes. The WARN-text fallback
+  matches only verified `codeybox.stderr` envelope `text` fields that
+  precede any turn-proof envelope in the bounded tail scan (a
+  `prompt_sent`/`turn_*`/turn-scoped `session_update`/post-prompt
+  `fatal` envelope proves fd 2 was already agent-shared, and a window
+  with no devin.acp handshake envelope at all proves nothing); raw
+  stderr is never scanned for it. A `turn_error` whose error `data`
+  carries `cognition.ai/retryable: true` is forwarded as
+  `"retryable": true` and parks on the same bounded path.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
   128 KiB per argv element and rework prompts exceed it) and reaches the
   agent only as `session/prompt` JSON — never in argv, the environment,
