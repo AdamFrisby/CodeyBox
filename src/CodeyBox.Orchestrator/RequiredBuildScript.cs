@@ -47,15 +47,32 @@ internal static class RequiredBuildScript
         # the capture variant's binlog writes — into a create/truncate at
         # an attacker-chosen path. Fall back to /tmp — itself
         # anchor-verified — and only then to a private mktemp dir (born
-        # mode-700 owned by this user), so the binlog fetch step still finds
-        # its directory under ${TMPDIR:-/tmp} in the common case. The helper
-        # is defined by the self-heal preamble composed ahead of this
-        # fragment (see Build()).
+        # mode-700 owned by this user); the binlog fetch step searches the
+        # same candidate roots in order, so the directory is found wherever
+        # it landed. The helper is defined by the self-heal preamble
+        # composed ahead of this fragment (see Build()).
         tmp_root="$(_codeybox_secure_dir "${TMPDIR:-/tmp}" anchor writable)" || tmp_root=
         if [ -z "$tmp_root" ]; then
           tmp_root="$(_codeybox_secure_dir /tmp anchor writable)" \
             || tmp_root="$(mktemp -d "/tmp/codeybox-gate-tmp.XXXXXX")"
         fi
+        # Sweep per-exec binlog dirs left by earlier attempts under EVERY
+        # root the diagnostics fetch searches, so its owner-filtered
+        # rediscovery can only ever find the directory THIS attempt's
+        # capture variant creates below — a leftover would otherwise attach
+        # a previous build's logs to this attempt's evidence whenever the
+        # run exits before that creation. The dirs cannot be removed at
+        # exit (the fetch runs after this script), so they are purged at
+        # start instead; only entries owned by this uid are removed — a
+        # co-tenant's planted match is left for the fetch's own owner
+        # filter to refuse.
+        for old_binlogs in \
+            "${TMPDIR:-/tmp}/{{BinlogDirectoryPrefix}}."* \
+            /tmp/{{BinlogDirectoryPrefix}}.* \
+            /tmp/codeybox-gate-tmp.*/{{BinlogDirectoryPrefix}}.*; do
+          { [ -d "$old_binlogs" ] && [ -O "$old_binlogs" ] \
+            && rm -rf "$old_binlogs"; } || true
+        done
         # mktemp's unpredictable O_EXCL create: a PID-predictable name in the
         # world-writable temp could be squatted by a co-tenant, and the `>`/`>>`
         # redirects plus `sort -o` below would then follow a planted symlink —
@@ -170,9 +187,11 @@ internal static class RequiredBuildScript
         # COW-inherited root-owned $HOME/.nuget cannot abort the build with
         # "Failed to read NuGet.Config due to unauthorized access". The recovery
         # is repository-owned (scripts/nuget-home-heal.sh) and dot-sourced so its
-        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below; it
-        # is a no-op when the home is usable and is skipped when the repository
-        # does not ship it. This adds no capability the gate lacks — it already
+        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below;
+        # its settings/runtime-dir repair is a no-op when the home is usable
+        # (the only writes then are the idempotent migration-marker seed) and
+        # it is skipped when the repository does not ship it. This adds no
+        # capability the gate lacks — it already
         # runs the branch's arbitrary build logic via `dotnet build`.
         if [ -f scripts/nuget-home-heal.sh ]; then
           . ./scripts/nuget-home-heal.sh
@@ -185,8 +204,9 @@ internal static class RequiredBuildScript
     // target-N.binlog symlinks inside it would turn `dotnet -bl:` into a
     // create/overwrite at an attacker-chosen path). The diagnostics fetch
     // step rediscovers the directory by globbing the prefix for entries it
-    // owns (see MSBuildDiagnosticsEnrichment). A fresh dir can hold no stale
-    // logs from earlier attempts, so no purge is needed.
+    // owns under every candidate tmp root (see MSBuildDiagnosticsEnrichment);
+    // the prologue already swept owned leftovers from earlier attempts, so a
+    // fresh dir plus that purge can never attach stale logs to this attempt.
     private static readonly string BinlogSetupFragment = $$"""
         binlog_dir="$(mktemp -d "$tmp_root/{{BinlogDirectoryPrefix}}.XXXXXX")"
         """;

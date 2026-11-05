@@ -14,8 +14,9 @@
 # canonical storage owned by this uid or root with no co-tenant write bits;
 # a foreign-owned, co-tenant-writable, or symlinked entry is quarantined
 # aside; a fresh private settings dir is created with a readable seeded
-# config; and the package cache is relinked only when its canonical dir is
-# owned by this uid or root.
+# config; and the package cache is relinked only when its WHOLE tree
+# verifies as consumable storage — every descendant owned by this uid or
+# root with no group/other write bits and no access-broadening ACL.
 #
 # When $HOME itself cannot be repaired in place, no in-place fix exists —
 # the DOTNET_CLI_HOME redirect (the NuGetHomeSelfHeal preamble wrapping

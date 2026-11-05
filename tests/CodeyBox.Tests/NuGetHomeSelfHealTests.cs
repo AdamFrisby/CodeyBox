@@ -50,6 +50,10 @@ public sealed class NuGetHomeSelfHealTests
     {
         if (OperatingSystem.IsWindows())
             return;
+        // A privileged process ignores the unreadable-config fixture bit, so
+        // the home verifies usable and the redirect is unobservable as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
 
         using var fixture = SelfHealFixture.WithUnreadableNuGetConfig();
         var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
@@ -73,6 +77,10 @@ public sealed class NuGetHomeSelfHealTests
     public async Task WrapDotnetInvocation_FallsBackToMktemp_WhenPerUserHomeUnusable()
     {
         if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process ignores the unreadable-config fixture bit, so
+        // the home verifies usable and the redirect is unobservable as root.
+        if (Environment.IsPrivilegedProcess)
             return;
 
         using var fixture = SelfHealFixture.WithUnreadableNuGetConfig();
@@ -319,6 +327,10 @@ public sealed class NuGetHomeSelfHealTests
     {
         if (OperatingSystem.IsWindows())
             return;
+        // A privileged process ignores the unreadable-config fixture bit, so
+        // the home verifies usable and the redirect is unobservable as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
 
         using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
             packages => Directory.CreateDirectory(Path.Combine(packages, "pkg")));
@@ -339,6 +351,10 @@ public sealed class NuGetHomeSelfHealTests
     public async Task WrapDotnetInvocation_DoesNotExportCache_WithCoTenantWritableDescendant()
     {
         if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process ignores the unreadable-config fixture bit, so
+        // the home verifies usable and the redirect is unobservable as root.
+        if (Environment.IsPrivilegedProcess)
             return;
 
         using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
@@ -375,6 +391,10 @@ public sealed class NuGetHomeSelfHealTests
     {
         if (OperatingSystem.IsWindows())
             return;
+        // A privileged process ignores the unreadable-config fixture bit, so
+        // the home verifies usable and the redirect is unobservable as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
 
         using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
             packages =>
@@ -409,6 +429,10 @@ public sealed class NuGetHomeSelfHealTests
     public async Task WrapDotnetInvocation_KeepsOperatorNuGetPackages_OverInheritedCache()
     {
         if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process ignores the unreadable-config fixture bit, so
+        // the home verifies usable and the redirect is unobservable as root.
+        if (Environment.IsPrivilegedProcess)
             return;
 
         using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(

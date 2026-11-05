@@ -52,9 +52,11 @@
 #
 # The two leaf assignments are likewise the single source for the C# names:
 # NuGetHomeSelfHeal.WritableHomeLeaf (the per-user fallback home under
-# ${TMPDIR:-/tmp}) and DotnetCliHomeConventions.DirectoryName (the stamped
-# repo-local CLI home) are parsed out of these lines, so a rename cannot
-# desync — BuildScriptNuGetHealTests pins that both names resolve.
+# ${TMPDIR:-/tmp}) is parsed out of the embedded copy of this file, and
+# _codeybox_repo_home_leaf mirrors the DotnetCliHomeConventions.DirectoryName
+# constant (the stamped repo-local CLI home) — BuildScriptNuGetHealTests
+# pins both, so a rename cannot desync the fallback selection or the
+# migration-marker seeding.
 _codeybox_home_leaf="codeybox-nuget-home"
 _codeybox_repo_home_leaf=".dotnet-cli-home"
 _codeybox_euid="$(id -u)"
@@ -286,25 +288,35 @@ _codeybox_cache_scan_limit=500000
 # Print the canonical path of package-cache candidate $1 only when the WHOLE
 # tree is consumable storage — the root canonicalizes under the "trusted"
 # rule AND every descendant is owned by this uid or root with no group/other
-# write bits. Verifying the root alone would admit a co-tenant-writable or
-# foreign-owned subtree, and NuGet consumes extracted entries as-is: a
-# present .nupkg.metadata skips re-extraction, and a package's
-# build/.props/.targets execute inside the consuming build, so one planted
-# or tampered descendant is attacker code in the gate.
-# `find -L` evaluates each entry as its link target, so a planted symlink
-# cannot smuggle in a writable target outside the tree under a clean-looking
-# link — a dangling link evaluates as the link itself, whose mode trips the
-# write-bit test. Entries find cannot read are unreachable to NuGet too, and
-# an unreadable entry's own metadata is still tested, so a partial traversal
-# cannot hide a foreign-owned or co-tenant-writable dir. The scan is bounded
-# by _codeybox_cache_scan_limit and the offender scan stops at the first hit.
+# write bits and no ACL broadening access beyond what the mode bits show.
+# Verifying the root alone would admit a co-tenant-writable or foreign-owned
+# subtree, and NuGet consumes extracted entries as-is: a present
+# .nupkg.metadata skips re-extraction, and a package's build/.props/.targets
+# execute inside the consuming build, so one planted or tampered descendant
+# is attacker code in the gate.
+#
+# The verification runs the tree through `find -L` driving one batched
+# `ls -ldnL` per ARG_MAX chunk: every entry's mode, owner, and
+# alternate-access marker are evaluated as its link TARGET, so a planted
+# symlink cannot smuggle in a writable target outside the tree under a
+# clean-looking link — a dangling link cannot be stat()ed and surfaces as an
+# error instead. Traversal failures fail CLOSED: find/ls diagnostics share
+# the scanned stream, so any entry the scan cannot reach — a directory that
+# grants execute without read (its children are unlistable yet still
+# consumable by NuGet through a constructed path), a mid-scan chmod or
+# delete, a symlink loop — trips the malformed-line check, and a partial
+# traversal can never admit an unverified subtree. The tree is bounded by
+# _codeybox_cache_scan_limit and the scan stops at the first offender.
 _codeybox_secure_package_cache() {
     _codeybox_cache_root="$(_codeybox_secure_dir "${1:-}" trusted)" \
         || return 1
     # `set --` word-splits the (possibly space-padded) wc output so the count
     # is a bare number on every wc dialect. An existing dir always
     # enumerates at least itself, so a zero count means find could not scan
-    # at all — decline rather than trust an unverified tree.
+    # at all — decline rather than trust an unverified tree. This pass only
+    # bounds the tree's size; discarding its stderr is safe because the
+    # verification pass below re-traverses and refuses on any reachability
+    # error.
     set -- $(find -L "$_codeybox_cache_root" -print 2>/dev/null \
         | head -n "$_codeybox_cache_scan_limit" | wc -l)
     _codeybox_cache_entries=${1:-0}
@@ -313,9 +325,28 @@ _codeybox_secure_package_cache() {
         return 1
     fi
     _codeybox_cache_bad="$(find -L "$_codeybox_cache_root" \
-        \( \( ! -user "$_codeybox_euid" ! -user 0 \) \
-           -o -perm -020 -o -perm -002 \) -print 2>/dev/null \
-        | head -n 1)"
+            -exec ls -ldnL {} + 2>&1 \
+        | awk -v euid="$_codeybox_euid" '
+            {
+                mode = $1
+                n = length(mode)
+                # An ls -l entry line is exactly type char + 9 mode chars
+                # plus an optional alternate-access marker. Anything else —
+                # a find/ls diagnostic for an entry the scan could not
+                # reach, garbled output — means part of the tree escaped
+                # verification: fail closed.
+                if (n != 10 && n != 11) { print; exit }
+                if (substr(mode, 1, 1) !~ /[-bcdlps]/) { print; exit }
+                if (substr(mode, 2, 9) !~ /^[-rwxsStT]+$/) { print; exit }
+                # "+" marks a POSIX ACL the mode bits cannot represent — it
+                # could grant a co-tenant the access this scan denies, so
+                # refuse it (any other marker is not an ACL). "." (SELinux
+                # context) and "@" (xattrs) do not widen DAC access.
+                if (n == 11 && substr(mode, 11, 1) !~ /^[.@]$/) { print; exit }
+                if (substr(mode, 6, 1) == "w" || substr(mode, 9, 1) == "w") { print; exit }
+                if ($3 + 0 != euid + 0 && $3 + 0 != 0) { print; exit }
+            }
+            END { if (NR == 0) exit 1 }')" || return 1
     [ -z "$_codeybox_cache_bad" ] || return 1
     printf '%s\n' "$_codeybox_cache_root"
 }
@@ -418,6 +449,25 @@ codeybox_pin_runtime_dirs() {
     fi
     export XDG_RUNTIME_DIR
     return 0
+}
+
+# Unset the environment variable a REJECTED per-user home arrived as —
+# DOTNET_CLI_HOME when set (the home resolved from it), else HOME — so the
+# refused value cannot stay exported for the caller's dotnet: left exported
+# it would hand the CLI foreign-controlled storage, while unset falls back
+# to $HOME / the passwd entry / platform defaults. Shared by the dot-sourced
+# recovery and the exec preamble so the "which variable" policy cannot
+# drift; each caller decides WHEN it applies — the dot-sourced recovery
+# calls it only when the cli home itself was rejected (a verified cli home
+# is canonical private storage and stays exported even when its .nuget
+# repair failed), while the preamble has no in-place repair and calls it
+# whenever the home failed verification and no private fallback exists.
+_codeybox_unset_home_env() {
+    if [ -n "${DOTNET_CLI_HOME:-}" ]; then
+        unset DOTNET_CLI_HOME
+    else
+        unset HOME
+    fi
 }
 # === codeybox-shared-helpers: end ===
 
@@ -547,8 +597,10 @@ codeybox_heal_nuget_home() {
                 # Reuse the quarantined package cache and seed a readable user
                 # config so the next `dotnet`'s user-config *read* (the exact
                 # operation the broken home fails) succeeds and restore stays
-                # offline-safe. The seeder links the cache only when its
-                # canonical dir is owned by this uid or root.
+                # offline-safe. The seeder links the cache only when its WHOLE
+                # tree verifies as consumable storage — every descendant owned
+                # by this uid or root with no group/other write bits and no
+                # access-broadening ACL.
                 _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
                     "$_codeybox_quarantine/packages"
                 return 0
@@ -569,15 +621,13 @@ codeybox_heal_nuget_home() {
     if [ -z "$_codeybox_scratch_home" ]; then
         # No private fallback could be materialized: an env value this
         # function REJECTED (empty _codeybox_cli_home) must not stay exported
-        # for the caller's dotnet — unset it so the CLI falls back to HOME /
-        # the passwd entry instead of consuming foreign-controlled storage.
-        # A verified cli home is canonical private storage and safe to keep.
+        # for the caller's dotnet — the shared helper unsets the variable it
+        # arrived as. A verified cli home is canonical private storage and
+        # stays exported even when its .nuget repair failed; the preamble
+        # calls the same helper whenever verification failed AND no fallback
+        # exists, because it has no in-place repair.
         if [ -z "$_codeybox_cli_home" ]; then
-            if [ -n "${DOTNET_CLI_HOME:-}" ]; then
-                unset DOTNET_CLI_HOME
-            else
-                unset HOME
-            fi
+            _codeybox_unset_home_env
         fi
         return 0
     fi
@@ -741,8 +791,9 @@ codeybox_seed_nuget_migration_state() {
     _codeybox_seed_home_migration_marker "${DOTNET_CLI_HOME:-}"
     # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
     # home the orchestrator stamps onto raw dotnet auditor execs;
-    # _codeybox_repo_home_leaf mirrors DotnetCliHomeConventions.DirectoryName
-    # (see the constants block at the top of this file). Only the repository
+    # _codeybox_repo_home_leaf mirrors the DotnetCliHomeConventions.DirectoryName
+    # constant (see the constants block at the top of this file; pinned by the
+    # mirror test). Only the repository
     # root can be that working directory — an MSBuild-Exec'd run has a project
     # directory as its cwd and must not grow a stray home there.
     if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then

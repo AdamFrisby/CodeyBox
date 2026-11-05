@@ -36,8 +36,10 @@ two entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
 `Directory.Build.props`) dot-sources `scripts/nuget-home-heal.sh` against the
 effective cli home, and `Directory.Build.targets` runs
 `scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both
-delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery
-(fast-path no-op when the home is already usable, never fails the build). When `$HOME/.nuget` exists but is not
+delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
+whose settings/runtime-dir repair is a fast-path no-op when the home is
+already usable (the only writes then are the idempotent migration-marker
+seed) and which never fails the build. When `$HOME/.nuget` exists but is not
 usable — foreign-owned, unwritable, unreadable config, or a planted link — the
 heal relocates it aside — the build user owns `$HOME`, so the rename needs no
 root — recreates a writable private `$HOME/.nuget` with a seeded readable

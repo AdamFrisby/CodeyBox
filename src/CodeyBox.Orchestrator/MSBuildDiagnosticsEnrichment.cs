@@ -247,15 +247,17 @@ internal static class MSBuildDiagnosticsEnrichment
         CancellationToken ct)
     {
         // The build script writes binlogs into a per-exec `mktemp -d`
-        // directory (an unpredictable name: a fixed one in the world-writable
-        // temp could be squatted by a co-tenant with planted target-N.binlog
-        // symlinks). Rediscover it by globbing the name prefix and keeping
-        // the newest directory owned by this exec's uid — a co-tenant's
-        // planted match is foreign-owned and excluded by -O. The leaf is
-        // echoed as DIR=<leaf> so the fetch step builds its path from a
-        // validated prefix-only name, never a raw sandbox path. Structured
-        // argv only; the listing is filtered by an exact file-name allowlist
-        // below.
+        // directory under whichever tmp root it resolved — ${TMPDIR:-/tmp}
+        // when that verifies as a writable anchor, else /tmp, else a private
+        // /tmp/codeybox-gate-tmp.* dir — so rediscovery must search the same
+        // candidate roots (an unpredictable name: a fixed one in the
+        // world-writable temp could be squatted by a co-tenant with planted
+        // target-N.binlog symlinks). Keep the newest directory owned by this
+        // exec's uid — a co-tenant's planted match is foreign-owned and
+        // excluded by -O. The leaf is echoed as DIR=<leaf> so the fetch step
+        // builds its path from a validated prefix-only name, never a raw
+        // sandbox path. Structured argv only; the listing is filtered by an
+        // exact file-name allowlist below.
         // TMPDIR is resolved inside the remote script: argv is transported
         // verbatim, so a literal "${TMPDIR:-/tmp}" element would never
         // expand — the remote sh must evaluate it itself.
@@ -264,14 +266,16 @@ internal static class MSBuildDiagnosticsEnrichment
             Argv = [
                 "sh", "-c",
                 $$"""
-                tmp="${TMPDIR:-/tmp}"
                 latest=
-                for dir in "$tmp/{{BinlogDirectoryPrefix}}."*; do
-                  [ -d "$dir" ] || continue
-                  [ -O "$dir" ] || continue
-                  if [ -z "$latest" ] || [ "$dir" -nt "$latest" ]; then
-                    latest=$dir
-                  fi
+                for base in "${TMPDIR:-/tmp}" /tmp /tmp/codeybox-gate-tmp.*; do
+                  [ -d "$base" ] || continue
+                  for dir in "$base/{{BinlogDirectoryPrefix}}."*; do
+                    [ -d "$dir" ] || continue
+                    [ -O "$dir" ] || continue
+                    if [ -z "$latest" ] || [ "$dir" -nt "$latest" ]; then
+                      latest=$dir
+                    fi
+                  done
                 done
                 [ -n "$latest" ] || exit 3
                 printf 'DIR=%s\n' "${latest##*/}"
@@ -338,9 +342,12 @@ internal static class MSBuildDiagnosticsEnrichment
         // was validated against the mktemp naming pattern and the file name
         // was allowlisted by ListBinlogNamesAsync; both travel as "$1" (never
         // interpolated), so branch-controlled content cannot reach a shell.
-        // TMPDIR is resolved inside the remote script — a literal
-        // "${TMPDIR:-/tmp}" argv element would be transported verbatim and
-        // never expand.
+        // The remote script re-derives the tmp root the way the listing did —
+        // the build may have used ${TMPDIR:-/tmp}, /tmp, or a private
+        // codeybox-gate-tmp.* dir — accepting only an owned directory leaf and
+        // an owned file beneath it. TMPDIR is resolved inside the remote
+        // script — a literal "${TMPDIR:-/tmp}" argv element would be
+        // transported verbatim and never expand.
         var fetchCap = checked((int)Math.Min(
             options.MaxBinlogBytes / 3 * 4 + 128,
             int.MaxValue / 2));
@@ -348,7 +355,19 @@ internal static class MSBuildDiagnosticsEnrichment
         {
             Argv = [
                 "sh", "-c",
-                "path=\"${TMPDIR:-/tmp}/$1\"; size=$(stat -c %s -- \"$path\" 2>/dev/null) || exit 3; printf '%s\\n' \"$size\"; base64 -w0 -- \"$path\"",
+                """
+                path=
+                for base in "${TMPDIR:-/tmp}" /tmp /tmp/codeybox-gate-tmp.*; do
+                  if [ -d "$base/${1%%/*}" ] && [ -O "$base/${1%%/*}" ] && [ -O "$base/$1" ]; then
+                    path="$base/$1"
+                    break
+                  fi
+                done
+                [ -n "$path" ] || exit 3
+                size=$(stat -c %s -- "$path" 2>/dev/null) || exit 3
+                printf '%s\n' "$size"
+                base64 -w0 -- "$path"
+                """,
                 "codeybox-binlog-fetch",
                 directoryLeaf + "/" + fileName,
             ],

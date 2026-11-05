@@ -47,8 +47,9 @@ public static class NuGetHomeSelfHeal
     /// The directory-admission policy helpers (<c>_codeybox_lstat_dir</c>,
     /// <c>_codeybox_secure_dir</c>, <c>_codeybox_adopt_dir</c>,
     /// <c>_codeybox_pick_user_dir</c>), the shared decision skeleton
-    /// (<c>_codeybox_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>),
-    /// the consumed-cache admission (<c>_codeybox_secure_package_cache</c>,
+    /// (<c>_codeybox_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>,
+    /// <c>_codeybox_unset_home_env</c>), the consumed-cache admission
+    /// (<c>_codeybox_secure_package_cache</c>,
     /// <c>_codeybox_reuse_nuget_packages</c>), the output-encoding helper
     /// (<c>_codeybox_strip_ctrl</c>), and the leaf constants, lifted verbatim
     /// from the marked region of
@@ -81,15 +82,6 @@ public static class NuGetHomeSelfHeal
     /// </summary>
     internal static string WritableHomeLeaf { get; } =
         ParseLeafConstant(SharedHelpers, "_codeybox_home_leaf");
-
-    /// <summary>
-    /// Name of the stamped repo-local CLI home directory
-    /// (<see cref="DotnetCliHomeConventions.DirectoryName"/> backs onto this),
-    /// parsed from <c>_codeybox_repo_home_leaf</c> in the embedded
-    /// <c>scripts/nuget-home-heal.sh</c> — the single source of the literal.
-    /// </summary>
-    internal static string RepoCliHomeLeaf { get; } =
-        ParseLeafConstant(SharedHelpers, "_codeybox_repo_home_leaf");
 
     /// <summary>
     /// POSIX shell preamble that exports a redirected <c>DOTNET_CLI_HOME</c> (and,
@@ -169,13 +161,17 @@ public static class NuGetHomeSelfHeal
             _codeybox_heal_note="$(_codeybox_strip_ctrl "$nuget_root")"
             _codeybox_heal_pkgs="$(_codeybox_strip_ctrl "${NUGET_PACKAGES:-}")"
             echo "nuget-home self-heal: '${_codeybox_heal_note}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${_codeybox_heal_pkgs})}" >&2
-          elif [ -n "${DOTNET_CLI_HOME:-}" ]; then
+          else
             # No private fallback could be materialized: the env value this
             # check rejected must not stay exported for the wrapped dotnet —
-            # unset it so the CLI falls back to $HOME / the passwd entry.
-            unset DOTNET_CLI_HOME
-          else
-            unset HOME
+            # the shared helper unsets whichever variable carried it so the
+            # CLI falls back to the passwd entry / platform defaults. The
+            # dot-sourced recovery calls the same helper only when the cli
+            # home itself was rejected — a verified cli home stays exported
+            # even when its .nuget subtree could not be repaired — while this
+            # preamble has no in-place repair and unsets whenever the home
+            # failed verification and no fallback exists.
+            _codeybox_unset_home_env
           fi
         fi
         # A usable NuGet settings home is not enough by itself: since runtime

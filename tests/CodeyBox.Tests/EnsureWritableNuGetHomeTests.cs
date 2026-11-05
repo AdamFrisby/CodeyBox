@@ -136,9 +136,9 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         }
     }
 
-    // The $1 home override below exercises the same hook the retired
-    // scripts/reclaim-nuget-home.sh carried — the two wrappers converged into
-    // this one, so its coverage moved here.
+    // The CODEYBOX_NUGET_HOME_UNDER_TEST override below exercises the same
+    // hook the retired scripts/reclaim-nuget-home.sh carried — the two
+    // wrappers converged into this one, so its coverage moved here.
     [Fact]
     public async Task Script_AlreadyUsableHome_IsNoOp()
     {

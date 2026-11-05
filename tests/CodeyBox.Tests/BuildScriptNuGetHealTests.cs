@@ -451,13 +451,13 @@ public sealed class BuildScriptNuGetHealTests
         }
     }
 
-    // The heal script's leaf assignments are the single source for the two
-    // C# directory names: DotnetCliHomeConventions.DirectoryName (the stamped
-    // repo-local home) and NuGetHomeSelfHeal.WritableHomeLeaf (the shared
-    // per-user fallback) are both parsed out of the embedded script. Pin the
-    // contract so the assignments cannot be dropped or renamed without the
-    // parse failing — which would silently desync the fallback selection and
-    // the migration-marker seeding.
+    // The heal script's leaf assignments are kept in sync with the two C#
+    // directory names: DotnetCliHomeConventions.DirectoryName (the stamped
+    // repo-local home — a compile-time constant the script mirrors) and
+    // NuGetHomeSelfHeal.WritableHomeLeaf (the shared per-user fallback,
+    // parsed out of the embedded script). Pin both so the assignments cannot
+    // be dropped or renamed without desyncing the fallback selection or the
+    // migration-marker seeding.
     [Fact]
     public async Task HealScript_MirrorsCliHomeLeafConstants()
     {
@@ -489,6 +489,7 @@ public sealed class BuildScriptNuGetHealTests
         Assert.Contains("_codeybox_pick_user_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
         Assert.Contains("_codeybox_secure_package_cache()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
         Assert.Contains("_codeybox_reuse_nuget_packages()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_unset_home_env()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
         Assert.Contains("_codeybox_strip_ctrl()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
     }
 
@@ -865,6 +866,11 @@ public sealed class BuildScriptNuGetHealTests
     {
         if (!OperatingSystem.IsLinux())
             return;
+        // A privileged process ignores the unreadable config that forces the
+        // quarantine path, so the home verifies usable and no quarantine is
+        // created when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
 
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
         var home = Path.Combine(root, "home");
@@ -912,6 +918,11 @@ public sealed class BuildScriptNuGetHealTests
     public async Task HealScript_Quarantine_DoesNotLinkCache_WhoseSymlinkEscapesToWritableTarget()
     {
         if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process ignores the unreadable config that forces the
+        // quarantine path, so the home verifies usable and no quarantine is
+        // created when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
             return;
 
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
@@ -996,6 +1007,56 @@ public sealed class BuildScriptNuGetHealTests
         }
         finally
         {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Regression: a directory that grants execute without read is unlistable
+    // to find, so its children escaped the old discarded-stderr scan while
+    // remaining consumable by NuGet through a constructed path — a tampered
+    // extracted entry hidden there would still run its .props/.targets in
+    // the gate. The admission scan must fail CLOSED on the traversal error
+    // rather than admit a partially verified tree.
+    [Fact]
+    public async Task HealScript_AdmissionGuards_DeclineUnlistableCacheSubtree()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process lists every directory, so the traversal error
+        // is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var cache = Path.Combine(root, "cache");
+        Directory.CreateDirectory(home);
+        try
+        {
+            // A clean-looking cache whose sealed subdirectory hides a planted
+            // entry: everything VISIBLE is euid-owned with no write bits, so a
+            // scan that swallows traversal errors would wrongly admit it.
+            var hidden = Path.Combine(cache, "pkg", "sealed");
+            Directory.CreateDirectory(hidden);
+            await File.WriteAllTextAsync(Path.Combine(hidden, "marker.txt"), "planted");
+            await ChmodAsync("111", hidden); // execute without read: unlistable
+
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && "
+                + "{ _codeybox_secure_package_cache \"$3\" >/dev/null 2>&1 "
+                + "  && echo CACHE=accepted || echo CACHE=declined; }",
+                root, HealScriptRepoRoot(), cache);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("CACHE=declined", lines);
+        }
+        finally
+        {
+            var sealedDir = Path.Combine(cache, "pkg", "sealed");
+            if (Directory.Exists(sealedDir))
+                await ChmodAsync("755", sealedDir);
             Directory.Delete(root, recursive: true);
         }
     }
