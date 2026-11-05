@@ -340,7 +340,7 @@ public sealed class SandboxRequiredBuildVerifier : IRequiredBuildVerifier
         // command is byte-identical to the historical one. Options are
         // read once here so the script, fetch caps, and evidence binding
         // agree for the whole verification.
-        var captureOptions = MSBuildDiagnosticsEnrichment.ReadOptions(_msBuildDiagnostics);
+        var captureOptions = MSBuildDiagnosticsEnrichment.ReadOptions(_msBuildDiagnostics, _logger);
         var captureDiagnostics = captureOptions.Enabled
             && _buildDiagnosticsProducer is { IsEnabled: true };
         try

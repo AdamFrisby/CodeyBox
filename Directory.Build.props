@@ -3,9 +3,10 @@
   <!-- Heal an unwritable inherited per-user NuGet home before restore reads it.
        InitialTargets runs this at the start of every project MSBuild invocation,
        before NuGet's user-config read; the target lives in one shared file so the
-       solution- and project-level hooks stay identical. The $HOME-side repair
-       runs once from Directory.Build.targets (scripts/ensure-writable-nuget-home.sh);
-       this hook covers the DOTNET_CLI_HOME home. -->
+       solution- and project-level hooks stay identical. This hook resolves
+       ${DOTNET_CLI_HOME:-$HOME}; the sibling hook in Directory.Build.targets
+       (scripts/ensure-writable-nuget-home.sh) always resolves $HOME, so the
+       two overlap harmlessly whenever DOTNET_CLI_HOME is unset. -->
   <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
   <PropertyGroup>

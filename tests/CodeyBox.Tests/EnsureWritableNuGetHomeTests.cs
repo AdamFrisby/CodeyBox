@@ -354,11 +354,13 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
             UseShellExecute = false,
         };
         psi.ArgumentList.Add(ScriptPath);
-        // $1 is the script's .nuget-override test hook: it repairs the cli
-        // home above that directory instead of the ambient $HOME.
-        if (nugetArg is not null)
-            psi.ArgumentList.Add(nugetArg);
         psi.Environment["HOME"] = home;
+        // The .nuget-override test hook: it repairs the cli home above that
+        // directory instead of the ambient $HOME. Cleared first so a value
+        // inherited from the test host cannot leak into the fixture.
+        psi.Environment.Remove("CODEYBOX_NUGET_HOME_UNDER_TEST");
+        if (nugetArg is not null)
+            psi.Environment["CODEYBOX_NUGET_HOME_UNDER_TEST"] = nugetArg;
         psi.Environment["TMPDIR"] = _workspace;
         // The fixture home must be authoritative: a stamped DOTNET_CLI_HOME or
         // runtime dir inherited from the test host would make the heal repair

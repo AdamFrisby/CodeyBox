@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using CodeyBox.Build.MSBuild;
 using CodeyBox.Core;
 using CodeyBox.Sandbox;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
 
@@ -34,7 +35,7 @@ internal static class MSBuildDiagnosticsEnrichment
     // match the mktemp naming the build script produces (fixed prefix plus
     // its suffix characters only — no separators, no traversal).
     private static readonly Regex BinlogDirectoryLeafPattern = new(
-        "^" + Regex.Escape(RequiredBuildScript.BinlogDirectoryPrefix) + "\\.[A-Za-z0-9._-]{1,64}$",
+        "^" + Regex.Escape(BinlogDirectoryPrefix) + "\\.[A-Za-z0-9._-]{1,64}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly Regex CommitShaPattern = new(
@@ -46,8 +47,8 @@ internal static class MSBuildDiagnosticsEnrichment
     // as the default path, with least-data `-bl` logging added to each
     // `dotnet build` (ProjectImports=None: no embedded imported-project
     // content) into the per-exec directory this file's fetch step
-    // rediscovers by owner-filtered glob. The
-    // build configuration arrives via CODEYBOX_MSBUILD_CONFIG (validated
+    // rediscovers by owner-filtered glob. The build configuration arrives
+    // via CODEYBOX_MSBUILD_CONFIG (validated
     // operator config, re-checked by the case guard); binlog file names are
     // index-derived, never taken from branch-controlled paths.
     internal static readonly string BuildScriptWithBinlogCapture =
@@ -56,16 +57,22 @@ internal static class MSBuildDiagnosticsEnrichment
     /// <summary>
     /// Reads the live options once per verification (hot-reloadable, no
     /// restart). Fail-safe: if options cannot be read, capture stays off and
-    /// the build runs exactly as it does today.
+    /// the build runs exactly as it does today — but the failure is logged
+    /// so a malformed binding is not a silent feature outage.
     /// </summary>
-    internal static MSBuildDiagnosticsOptions ReadOptions(Func<MSBuildDiagnosticsOptions>? optionsAccessor)
+    internal static MSBuildDiagnosticsOptions ReadOptions(
+        Func<MSBuildDiagnosticsOptions>? optionsAccessor,
+        ILogger? logger = null)
     {
         try
         {
             return optionsAccessor?.Invoke() ?? new MSBuildDiagnosticsOptions();
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            logger?.LogWarning(
+                ex,
+                "MSBuild diagnostics options could not be read; binlog capture stays disabled for this verification");
             return new MSBuildDiagnosticsOptions();
         }
     }
@@ -249,13 +256,17 @@ internal static class MSBuildDiagnosticsEnrichment
         // validated prefix-only name, never a raw sandbox path. Structured
         // argv only; the listing is filtered by an exact file-name allowlist
         // below.
+        // TMPDIR is resolved inside the remote script: argv is transported
+        // verbatim, so a literal "${TMPDIR:-/tmp}" element would never
+        // expand — the remote sh must evaluate it itself.
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = [
                 "sh", "-c",
                 $$"""
+                tmp="${TMPDIR:-/tmp}"
                 latest=
-                for dir in "$1/{{BinlogDirectoryPrefix}}."*; do
+                for dir in "$tmp/{{BinlogDirectoryPrefix}}."*; do
                   [ -d "$dir" ] || continue
                   [ -O "$dir" ] || continue
                   if [ -z "$latest" ] || [ "$dir" -nt "$latest" ]; then
@@ -267,7 +278,6 @@ internal static class MSBuildDiagnosticsEnrichment
                 ls -1 -- "$latest"
                 """,
                 "codeybox-binlog-list",
-                "${TMPDIR:-/tmp}",
             ],
             WorkingDirectory = SandboxConventions.WorkDir,
             MaxStdoutBytes = 4096,
@@ -328,6 +338,9 @@ internal static class MSBuildDiagnosticsEnrichment
         // was validated against the mktemp naming pattern and the file name
         // was allowlisted by ListBinlogNamesAsync; both travel as "$1" (never
         // interpolated), so branch-controlled content cannot reach a shell.
+        // TMPDIR is resolved inside the remote script — a literal
+        // "${TMPDIR:-/tmp}" argv element would be transported verbatim and
+        // never expand.
         var fetchCap = checked((int)Math.Min(
             options.MaxBinlogBytes / 3 * 4 + 128,
             int.MaxValue / 2));
@@ -335,9 +348,9 @@ internal static class MSBuildDiagnosticsEnrichment
         {
             Argv = [
                 "sh", "-c",
-                "size=$(stat -c %s -- \"$1\" 2>/dev/null) || exit 3; printf '%s\\n' \"$size\"; base64 -w0 -- \"$1\"",
+                "path=\"${TMPDIR:-/tmp}/$1\"; size=$(stat -c %s -- \"$path\" 2>/dev/null) || exit 3; printf '%s\\n' \"$size\"; base64 -w0 -- \"$path\"",
                 "codeybox-binlog-fetch",
-                "${TMPDIR:-/tmp}/" + directoryLeaf + "/" + fileName,
+                directoryLeaf + "/" + fileName,
             ],
             WorkingDirectory = SandboxConventions.WorkDir,
             MaxStdoutBytes = fetchCap,

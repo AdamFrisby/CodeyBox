@@ -156,6 +156,47 @@ public sealed class RequiredBuildGateTests : IDisposable
         }
     }
 
+    // A clean cache ROOT is not enough for preservation: a co-tenant-writable
+    // descendant anywhere in the tree could satisfy package installs with
+    // planted or tampered extracted entries (NuGet skips re-extraction when
+    // .nupkg.metadata is present), so the gate must refuse to export it.
+    [Fact]
+    public async Task BuildScript_DoesNotPreserveCache_WithCoTenantWritableDescendant()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var brokenHome = Path.Combine(_workspace, "dirty-cache-home-" + Guid.NewGuid().ToString("N")[..8]);
+        // The packages root itself is clean; only a deeper entry is writable
+        // by every co-tenant, so a root-only check would wrongly admit it.
+        var nested = Path.Combine(brokenHome, ".nuget", "packages", "pkg", "contents");
+        Directory.CreateDirectory(nested);
+        File.SetUnixFileMode(nested,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+        var brokenNuGetDir = Path.Combine(brokenHome, ".nuget", "NuGet");
+        Directory.CreateDirectory(brokenNuGetDir);
+        File.SetUnixFileMode(brokenNuGetDir, UnixFileMode.None);
+
+        try
+        {
+            var (_, output) = await RunBuildScriptAsync(brokenHome);
+
+            // The fake dotnet fails when the pre-baked cache was not
+            // preserved; its message echoes the value it saw, proving the
+            // gate declined the dirty tree instead of exporting it.
+            Assert.Contains("NUGET_PACKAGES=unset", output);
+        }
+        finally
+        {
+            File.SetUnixFileMode(brokenNuGetDir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(nested,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
     [Fact]
     public async Task BuildScript_FakeDotnet_IsADiscriminatingDetector()
     {

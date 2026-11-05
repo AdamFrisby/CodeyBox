@@ -48,7 +48,10 @@ public static class NuGetHomeSelfHeal
     /// <c>_codeybox_secure_dir</c>, <c>_codeybox_adopt_dir</c>,
     /// <c>_codeybox_pick_user_dir</c>), the shared decision skeleton
     /// (<c>_codeybox_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>),
-    /// and the leaf constants, lifted verbatim from the marked region of
+    /// the consumed-cache admission (<c>_codeybox_secure_package_cache</c>,
+    /// <c>_codeybox_reuse_nuget_packages</c>), the output-encoding helper
+    /// (<c>_codeybox_strip_ctrl</c>), and the leaf constants, lifted verbatim
+    /// from the marked region of
     /// <c>scripts/nuget-home-heal.sh</c> — embedded into this assembly as a
     /// manifest resource at build time — so a guard or policy change in the
     /// shell file lands in both the dot-sourced recovery and this preamble
@@ -155,20 +158,16 @@ public static class NuGetHomeSelfHeal
           writable_home="$(_codeybox_pick_user_dir)" || writable_home=
           if [ -n "$writable_home" ]; then
             export DOTNET_CLI_HOME="$writable_home"
-            existing_packages="${nuget_root}/packages"
-            # Only an owned cache is consumable — a co-tenant-controlled cache
-            # would satisfy package installs with planted or tampered extracted
-            # entries, running attacker code in the wrapped build.
-            _codeybox_existing_packages="$(_codeybox_secure_dir \
-              "$existing_packages" trusted)" || _codeybox_existing_packages=
-            if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_existing_packages" ]; then
-              export NUGET_PACKAGES="$_codeybox_existing_packages"
-            fi
+            # Only a verified cache tree is consumable — a cache a co-tenant
+            # can write anywhere below its root would satisfy package installs
+            # with planted or tampered extracted entries, running attacker
+            # code in the wrapped build.
+            _codeybox_reuse_nuget_packages "${nuget_root}/packages"
             # The reported paths are env-derived input bound for the
             # terminal/log: strip control characters so a crafted value
             # cannot spoof operator-facing output with ANSI escapes.
-            _codeybox_heal_note="$(printf '%s' "$nuget_root" | LC_ALL=C tr -d '[:cntrl:]')"
-            _codeybox_heal_pkgs="$(printf '%s' "${NUGET_PACKAGES:-}" | LC_ALL=C tr -d '[:cntrl:]')"
+            _codeybox_heal_note="$(_codeybox_strip_ctrl "$nuget_root")"
+            _codeybox_heal_pkgs="$(_codeybox_strip_ctrl "${NUGET_PACKAGES:-}")"
             echo "nuget-home self-heal: '${_codeybox_heal_note}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${_codeybox_heal_pkgs})}" >&2
           elif [ -n "${DOTNET_CLI_HOME:-}" ]; then
             # No private fallback could be materialized: the env value this
@@ -193,18 +192,13 @@ public static class NuGetHomeSelfHeal
         codeybox_pin_runtime_dirs
         if [ -n "$_codeybox_pin_home_redirected" ]; then
           # Redirecting HOME would orphan a pre-baked package cache under the
-          # original home's .nuget — preserve it for restore like the
-          # broken-home branch does. The dot-sourced recovery makes the same
-          # move material on disk (linked cache + seeded config) because it
-          # must also cover children that resolve packages off $HOME without
-          # inheriting exports, while this preamble only has to keep the
-          # single wrapped `dotnet` working.
-          _codeybox_old_packages="${nuget_root}/packages"
-          _codeybox_old_resolved="$(_codeybox_secure_dir \
-            "$_codeybox_old_packages" trusted)" || _codeybox_old_resolved=
-          if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_old_resolved" ]; then
-            export NUGET_PACKAGES="$_codeybox_old_resolved"
-          fi
+          # original home's .nuget — preserve it for restore through the same
+          # shared admission the broken-home branch above uses. The
+          # dot-sourced recovery makes the same move material on disk (linked
+          # cache + seeded config) because it must also cover children that
+          # resolve packages off $HOME without inheriting exports, while this
+          # preamble only has to keep the single wrapped `dotnet` working.
+          _codeybox_reuse_nuget_packages "${nuget_root}/packages"
         fi
         """;
 

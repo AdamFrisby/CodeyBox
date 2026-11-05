@@ -45,10 +45,12 @@ internal static class RequiredBuildScript
         # co-tenant-writable dir the owner could swap a just-created file or
         # dir for a symlink, turning the `>`/`sort -o` writes below — plus
         # the capture variant's binlog writes — into a create/truncate at
-        # an attacker-chosen path. Fall back to
-        # /tmp — itself anchor-verified — and only then to a private mktemp
-        # dir (born mode-700 owned by this user), so the binlog fetch step
-        # still finds its directory under ${TMPDIR:-/tmp} in the common case.
+        # an attacker-chosen path. Fall back to /tmp — itself
+        # anchor-verified — and only then to a private mktemp dir (born
+        # mode-700 owned by this user), so the binlog fetch step still finds
+        # its directory under ${TMPDIR:-/tmp} in the common case. The helper
+        # is defined by the self-heal preamble composed ahead of this
+        # fragment (see Build()).
         tmp_root="$(_codeybox_secure_dir "${TMPDIR:-/tmp}" anchor writable)" || tmp_root=
         if [ -z "$tmp_root" ]; then
           tmp_root="$(_codeybox_secure_dir /tmp anchor writable)" \
@@ -104,17 +106,13 @@ internal static class RequiredBuildScript
         # against an empty folder and require network access. Preserve that
         # cache (read access is sufficient — restore never writes to an
         # already-extracted package) so offline/pinned images keep working —
-        # but only when its canonical directory verifies as "trusted" storage
-        # (owned by this uid or root, never group/other-writable): a
-        # foreign-controlled or co-tenant-writable cache would satisfy package
-        # installs with planted or tampered extracted entries. The helper is
+        # but only when its WHOLE tree verifies as consumable storage (every
+        # descendant owned by this uid or root, never group/other-writable):
+        # a foreign-controlled or co-tenant-writable entry satisfies package
+        # installs with planted or tampered extracted content. The helper is
         # defined by the self-heal preamble composed ahead of this fragment.
-        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$original_home" ]; then
-          original_packages="$(_codeybox_secure_dir \
-            "$original_home/.nuget/packages" trusted)" || original_packages=
-          if [ -n "$original_packages" ]; then
-            export NUGET_PACKAGES="$original_packages"
-          fi
+        if [ -n "$original_home" ]; then
+          _codeybox_reuse_nuget_packages "$original_home/.nuget/packages"
         fi
 
         # Some NuGet builds resolve their user-config path from HOME even when
@@ -199,7 +197,7 @@ internal static class RequiredBuildScript
           # The target name comes from branch-controlled paths: strip control
           # characters so a crafted filename cannot spoof operator-facing
           # output with ANSI escapes.
-          safe_target="$(printf '%s' "$target" | LC_ALL=C tr -d '[:cntrl:]')"
+          safe_target="$(_codeybox_strip_ctrl "$target")"
           echo "CodeyBox required build: dotnet build $safe_target"
           dotnet build "$target" --disable-build-servers --maxcpucount:1
         done < "$targets_file"
@@ -214,7 +212,7 @@ internal static class RequiredBuildScript
         while IFS= read -r target; do
           [ -n "$target" ] || continue
           idx=$((idx+1))
-          safe_target="$(printf '%s' "$target" | LC_ALL=C tr -d '[:cntrl:]')"
+          safe_target="$(_codeybox_strip_ctrl "$target")"
           echo "CodeyBox required build: dotnet build $safe_target"
           dotnet build "$target" --disable-build-servers --maxcpucount:1 -c "$msbuild_config" -bl:"$binlog_dir/target-$idx.binlog;ProjectImports=None"
         done < "$targets_file"

@@ -38,9 +38,10 @@
 # writes under or exports is therefore admitted only after it canonicalizes to
 # storage owned by this uid and not writable by any co-tenant (the "private"
 # rule below), or — for data we only consume, like an image-baked package
-# cache — owned by this uid or root (the "trusted" rule). Anything else falls
-# through to an owned fallback instead of being trusted because it was
-# writable.
+# cache — owned by this uid or root across the WHOLE tree (the "trusted" rule
+# on the root plus the descendant scan in _codeybox_secure_package_cache).
+# Anything else falls through to an owned fallback instead of being trusted
+# because it was writable.
 
 # === codeybox-shared-helpers: begin ===
 # Everything between the "codeybox-shared-helpers" sentinels is the head of
@@ -101,10 +102,21 @@ _codeybox_secure_dir() {
     # current directory in several shells, which would "verify" the cwd.
     [ -n "${1:-}" ] || return 1
     _codeybox_sec="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    _codeybox_sec_rule=${2:-private}
+    # Fail closed on an unrecognised rule or modifier: anything else would
+    # silently degrade to the trusted policy below, so a typo in a caller's
+    # rule name must refuse rather than weaken the admission check.
+    case $_codeybox_sec_rule in
+        private|trusted|anchor) ;;
+        *) return 1 ;;
+    esac
+    case ${3:-} in
+        ""|writable) ;;
+        *) return 1 ;;
+    esac
     if [ "${3:-}" = "writable" ] && [ ! -w "$_codeybox_sec" ]; then
         return 1
     fi
-    _codeybox_sec_rule=${2:-private}
     _codeybox_sec_walk=$_codeybox_sec
     _codeybox_sec_leaf=1
     while :; do
@@ -257,6 +269,75 @@ _codeybox_nuget_home_usable() {
     printf '%s\n' "$_codeybox_nuget_resolved"
 }
 
+# Print $1 with every control character stripped — the single policy for
+# putting env- or branch-derived text into operator-facing output (the heal
+# notice and the gate's per-target echo): a crafted value must not spoof the
+# terminal/log with ANSI escapes.
+_codeybox_strip_ctrl() {
+    printf '%s' "${1:-}" | LC_ALL=C tr -d '[:cntrl:]'
+}
+
+# Upper bound on entries a consumed package cache may hold. The admission
+# scan below verifies EVERY descendant before the cache is consumed, so an
+# unbounded tree would be an unbounded scan — a cache larger than a real
+# restore baseline needs is declined rather than verified.
+_codeybox_cache_scan_limit=500000
+
+# Print the canonical path of package-cache candidate $1 only when the WHOLE
+# tree is consumable storage — the root canonicalizes under the "trusted"
+# rule AND every descendant is owned by this uid or root with no group/other
+# write bits. Verifying the root alone would admit a co-tenant-writable or
+# foreign-owned subtree, and NuGet consumes extracted entries as-is: a
+# present .nupkg.metadata skips re-extraction, and a package's
+# build/.props/.targets execute inside the consuming build, so one planted
+# or tampered descendant is attacker code in the gate.
+# `find -L` evaluates each entry as its link target, so a planted symlink
+# cannot smuggle in a writable target outside the tree under a clean-looking
+# link — a dangling link evaluates as the link itself, whose mode trips the
+# write-bit test. Entries find cannot read are unreachable to NuGet too, and
+# an unreadable entry's own metadata is still tested, so a partial traversal
+# cannot hide a foreign-owned or co-tenant-writable dir. The scan is bounded
+# by _codeybox_cache_scan_limit and the offender scan stops at the first hit.
+_codeybox_secure_package_cache() {
+    _codeybox_cache_root="$(_codeybox_secure_dir "${1:-}" trusted)" \
+        || return 1
+    # `set --` word-splits the (possibly space-padded) wc output so the count
+    # is a bare number on every wc dialect. An existing dir always
+    # enumerates at least itself, so a zero count means find could not scan
+    # at all — decline rather than trust an unverified tree.
+    set -- $(find -L "$_codeybox_cache_root" -print 2>/dev/null \
+        | head -n "$_codeybox_cache_scan_limit" | wc -l)
+    _codeybox_cache_entries=${1:-0}
+    if [ "$_codeybox_cache_entries" -lt 1 ] \
+        || [ "$_codeybox_cache_entries" -ge "$_codeybox_cache_scan_limit" ]; then
+        return 1
+    fi
+    _codeybox_cache_bad="$(find -L "$_codeybox_cache_root" \
+        \( \( ! -user "$_codeybox_euid" ! -user 0 \) \
+           -o -perm -020 -o -perm -002 \) -print 2>/dev/null \
+        | head -n 1)"
+    [ -z "$_codeybox_cache_bad" ] || return 1
+    printf '%s\n' "$_codeybox_cache_root"
+}
+
+# Export NUGET_PACKAGES=<canonical $1> when inherited package-cache candidate
+# $1 verifies as a consumable tree (_codeybox_secure_package_cache above) and
+# NUGET_PACKAGES is not already set — an operator-provided value always wins.
+# Restore only READS an already-extracted package (a present .nupkg.metadata
+# skips re-extraction), so a read-only cache satisfies every restore and
+# keeps offline/pinned images working after DOTNET_CLI_HOME relocates the
+# global-packages folder away from the original home's .nuget. Best-effort:
+# an unverifiable candidate is simply not exported. Shared by every site
+# that preserves an inherited cache — the exec preamble (both branches) and
+# the gate's env-isolation fragment — so the admission policy has one source.
+_codeybox_reuse_nuget_packages() {
+    [ -z "${NUGET_PACKAGES:-}" ] || return 0
+    _codeybox_reuse="$(_codeybox_secure_package_cache "${1:-}")" || return 0
+    NUGET_PACKAGES="$_codeybox_reuse"
+    export NUGET_PACKAGES
+    return 0
+}
+
 # Pin HOME and XDG_RUNTIME_DIR to verified private per-user storage for this
 # process tree — the shared runtime-dir skeleton run by BOTH the dot-sourced
 # recovery and the exec preamble, so the two can never drift on which dir is
@@ -348,9 +429,11 @@ codeybox_pin_runtime_dirs() {
 # cache to reuse as the sibling global-packages folder. Every step is
 # best-effort so a failure can never abort a `set -e` caller. Shared by the
 # in-place and DOTNET_CLI_HOME-redirect recovery paths so both stay offline-safe.
-# A merely-existing $2 is not enough: it is consumed only when it verifies as
-# "trusted" storage (canonical, owned by this uid or root, never
-# group/other-writable) — a co-tenant-controlled cache is refused.
+# A merely-existing $2 is not enough: it is consumed only when its WHOLE tree
+# verifies as trusted storage (canonical root owned by this uid or root, and
+# every descendant owned by this uid or root with no group/other write bits —
+# see _codeybox_secure_package_cache) — a co-tenant-controlled cache is
+# refused.
 _codeybox_seed_nuget_home() {
     _codeybox_seed_user_dir="$1"
     _codeybox_seed_cache_src="$2"
@@ -369,14 +452,14 @@ _codeybox_seed_nuget_home() {
     # .nupkg.metadata marker and skips extraction), so a read-only inherited
     # cache satisfies every restore; a writable one additionally lets NuGet add
     # packages the baseline lacks. But readable is not trustworthy: only a
-    # cache whose canonical dir is owned by this uid or root and never
-    # group/other-writable may be consumed — a co-tenant-controlled cache
-    # would satisfy package installs with planted or tampered extracted
-    # entries, running attacker code in the gate build.
+    # cache whose WHOLE TREE is owned by this uid or root with no group/other
+    # write bits may be consumed — the root check alone would admit a
+    # co-tenant-writable or foreign-owned descendant, and a tampered extracted
+    # entry's build/.props/.targets run attacker code in the gate build.
     _codeybox_seed_cache=
     if [ -n "$_codeybox_seed_cache_src" ]; then
-        _codeybox_seed_cache="$(_codeybox_secure_dir \
-            "$_codeybox_seed_cache_src" trusted)" || _codeybox_seed_cache=
+        _codeybox_seed_cache="$(_codeybox_secure_package_cache \
+            "$_codeybox_seed_cache_src")" || _codeybox_seed_cache=
     fi
     if [ -n "$_codeybox_seed_cache" ] \
         && [ ! -e "$_codeybox_seed_root/packages" ] \

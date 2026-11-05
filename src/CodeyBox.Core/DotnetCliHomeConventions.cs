@@ -56,9 +56,9 @@ public static class DotnetCliHomeConventions
     /// before the <c>$HOME</c> fallback, so an unusable ambient value would
     /// abort first-use before MSBuild. Matching all three to the same
     /// directory lands every NuGet resolution strategy on one writable home.
-    /// <c>build.sh</c> instead inherits
-    /// this stamped <c>HOME</c>/<c>DOTNET_CLI_HOME</c> and repairs whichever it
-    /// resolves via the shared <c>scripts/nuget-home-heal.sh</c> recovery.
+    /// <c>build.sh</c> instead inherits this stamped
+    /// <c>HOME</c>/<c>DOTNET_CLI_HOME</c> and repairs whichever it resolves via
+    /// the shared <c>scripts/nuget-home-heal.sh</c> recovery.
     /// <para>Unlike <see cref="ApplyIfAbsent"/> (used at sandbox creation, where
     /// overriding <c>HOME</c> would disturb sibling git/tool steps that need the
     /// caller's home), this is safe to override <c>HOME</c> because callers apply

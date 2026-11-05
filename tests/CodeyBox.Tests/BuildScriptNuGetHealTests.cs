@@ -487,6 +487,9 @@ public sealed class BuildScriptNuGetHealTests
         Assert.Contains("_codeybox_secure_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
         Assert.Contains("_codeybox_adopt_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
         Assert.Contains("_codeybox_pick_user_dir()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_secure_package_cache()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_reuse_nuget_packages()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
+        Assert.Contains("_codeybox_strip_ctrl()", NuGetHomeSelfHeal.Preamble, StringComparison.Ordinal);
     }
 
     // The seeded user-config staging file must come from mktemp's unpredictable
@@ -798,6 +801,201 @@ public sealed class BuildScriptNuGetHealTests
             await ChmodAsync("755", home);
             await ChmodAsync("755", Path.Combine(home, ".nuget"));
             await ChmodAsync("755", Path.Combine(home, ".nuget", "packages"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // A clean cache ROOT is not enough: a co-tenant-writable DESCENDANT must
+    // also refuse the link. NuGet consumes an extracted entry as-is once
+    // .nupkg.metadata is present, and a package's build/.props/.targets
+    // execute inside the consuming build, so one tampered descendant is
+    // attacker code in the gate — the admission scan covers the whole tree.
+    [Fact]
+    public async Task HealScript_Redirect_DoesNotLinkCacheWithCoTenantWritableDescendant()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process can write anywhere; the unwritable-home
+        // redirect this test needs is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var sentinel = Path.Combine(root, "cli-home");
+        try
+        {
+            var nested = Path.Combine(home, ".nuget", "packages", "pkg", "contents");
+            Directory.CreateDirectory(nested);
+            await File.WriteAllTextAsync(Path.Combine(nested, "marker.txt"), "planted");
+            // The packages ROOT stays clean — only a deeper dir is writable
+            // by every co-tenant, so a root-only check would wrongly admit it.
+            await ChmodAsync("777", nested);
+            await ChmodAsync("555", Path.Combine(home, ".nuget"));
+            await ChmodAsync("555", home);
+
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf '%s' \"$DOTNET_CLI_HOME\" > \"$3\"",
+                root, HealScriptRepoRoot(), sentinel);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var scratchHome = await File.ReadAllTextAsync(sentinel);
+            Assert.False(string.IsNullOrEmpty(scratchHome), "fallback must export a scratch DOTNET_CLI_HOME");
+            Assert.True(File.Exists(Path.Combine(scratchHome, ".nuget", "NuGet", "NuGet.Config")));
+            Assert.False(
+                File.Exists(Path.Combine(scratchHome, ".nuget", "packages"))
+                || Directory.Exists(Path.Combine(scratchHome, ".nuget", "packages")),
+                "a cache with a co-tenant-writable descendant must not be linked into the healed home");
+        }
+        finally
+        {
+            await ChmodAsync("755", home);
+            await ChmodAsync("755", Path.Combine(home, ".nuget"));
+            await ChmodAsync("755", Path.Combine(home, ".nuget", "packages", "pkg", "contents"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Same tree-wide rule on the in-place quarantine path: the quarantined
+    // cache must not be linked into the rebuilt home when a descendant is
+    // co-tenant-writable, even though the packages root itself is clean.
+    [Fact]
+    public async Task HealScript_Quarantine_DoesNotLinkCacheWithCoTenantWritableDescendant()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+            Directory.CreateDirectory(nugetDir);
+            var config = Path.Combine(nugetDir, "NuGet.Config");
+            await File.WriteAllTextAsync(config, "<configuration/>");
+            await ChmodAsync("000", config); // present-but-unreadable forces the quarantine path
+
+            var nested = Path.Combine(home, ".nuget", "packages", "pkg", "contents");
+            Directory.CreateDirectory(nested);
+            await File.WriteAllTextAsync(Path.Combine(nested, "marker.txt"), "planted");
+            await ChmodAsync("777", nested);
+
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(
+                File.Exists(Path.Combine(home, ".nuget", "NuGet", "NuGet.Config")),
+                "the rebuilt home must carry the seeded readable user config");
+            Assert.False(
+                File.Exists(Path.Combine(home, ".nuget", "packages"))
+                || Directory.Exists(Path.Combine(home, ".nuget", "packages")),
+                "a cache with a co-tenant-writable descendant must not be linked into the rebuilt home");
+        }
+        finally
+        {
+            // The broken .nuget was quarantined aside, so the dirty
+            // descendant lives under the moved directory now.
+            var quarantined = Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*");
+            if (quarantined.Length > 0)
+                await ChmodAsync("755", Path.Combine(quarantined[0], "packages", "pkg", "contents"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // A planted symlink inside an otherwise-clean cache must not smuggle in a
+    // co-tenant-writable target outside the tree: the scan evaluates each
+    // link as its target, so this cache is declined like a dirty descendant.
+    [Fact]
+    public async Task HealScript_Quarantine_DoesNotLinkCache_WhoseSymlinkEscapesToWritableTarget()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+            Directory.CreateDirectory(nugetDir);
+            var config = Path.Combine(nugetDir, "NuGet.Config");
+            await File.WriteAllTextAsync(config, "<configuration/>");
+            await ChmodAsync("000", config);
+
+            var packages = Path.Combine(home, ".nuget", "packages");
+            Directory.CreateDirectory(packages);
+            var target = Path.Combine(outside, "planted.props");
+            await File.WriteAllTextAsync(target, "<Project/>");
+            await ChmodAsync("666", target); // writable by every co-tenant
+            File.CreateSymbolicLink(Path.Combine(packages, "pkg"), target);
+
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.False(
+                File.Exists(Path.Combine(home, ".nuget", "packages"))
+                || Directory.Exists(Path.Combine(home, ".nuget", "packages")),
+                "a cache whose symlink escapes to a writable target must not be linked");
+        }
+        finally
+        {
+            await ChmodAsync("644", Path.Combine(outside, "planted.props"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The dir-admission helper is the file's single entry point for trusting
+    // storage, so it must fail CLOSED on an unrecognised rule name rather
+    // than silently degrade to the trusted policy — and the package-cache
+    // scan must decline a tree it cannot verify within its entry bound. Run
+    // both helpers directly in the sourced shell against real fixtures.
+    [Fact]
+    public async Task HealScript_AdmissionGuards_FailClosed_OnUnknownRuleAndUnboundedTree()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var cache = Path.Combine(root, "cache");
+        Directory.CreateDirectory(home);
+        try
+        {
+            // A small clean cache the limit override can cover, and a larger
+            // one that exceeds it — both euid-owned with no co-tenant writes.
+            Directory.CreateDirectory(Path.Combine(cache, "pkg", "contents"));
+            await File.WriteAllTextAsync(
+                Path.Combine(cache, "pkg", "contents", "marker.txt"), "cached");
+
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && "
+                + "{ _codeybox_secure_dir \"$3\" bogus-rule >/dev/null 2>&1 "
+                + "  && echo RULE=accepted || echo RULE=refused; } && "
+                + "{ _codeybox_secure_dir \"$3\" trusted >/dev/null 2>&1 "
+                + "  && echo TRUSTED=accepted || echo TRUSTED=refused; } && "
+                + "{ _codeybox_secure_package_cache \"$3\" >/dev/null 2>&1 "
+                + "  && echo CACHE=accepted || echo CACHE=declined; } && "
+                + "{ _codeybox_cache_scan_limit=3; "
+                + "  _codeybox_secure_package_cache \"$3\" >/dev/null 2>&1 "
+                + "  && echo BOUNDED=accepted || echo BOUNDED=declined; }",
+                root, HealScriptRepoRoot(), cache);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("RULE=refused", lines);
+            Assert.Contains("TRUSTED=accepted", lines);
+            Assert.Contains("CACHE=accepted", lines);
+            Assert.Contains("BOUNDED=declined", lines);
+        }
+        finally
+        {
             Directory.Delete(root, recursive: true);
         }
     }

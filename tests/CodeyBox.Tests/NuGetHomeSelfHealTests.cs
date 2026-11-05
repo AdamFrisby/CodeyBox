@@ -308,6 +308,121 @@ public sealed class NuGetHomeSelfHealTests
         Assert.Equal(fixture.Home, ParseVar(stdout, "HOME"));
     }
 
+    // The broken-home redirect preserves an inherited package cache by
+    // exporting it as NUGET_PACKAGES so restore stays offline-safe — but only
+    // when the WHOLE tree is consumable. A clean root alone is not enough:
+    // NuGet skips re-extraction when .nupkg.metadata is present, so a
+    // co-tenant-writable descendant anywhere under the root could satisfy
+    // installs with planted or tampered content.
+    [Fact]
+    public async Task WrapDotnetInvocation_ExportsInheritedCache_WhenWholeTreeIsClean()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
+            packages => Directory.CreateDirectory(Path.Combine(packages, "pkg")));
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(
+            Path.Combine(fixture.Home, ".nuget", "packages"),
+            ParseVar(stdout, "PKGS"));
+        var uid = await TestSupport.CurrentUidAsync();
+        Assert.Equal(
+            Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
+            ParseVar(stdout, "CLI_HOME"));
+    }
+
+    [Fact]
+    public async Task WrapDotnetInvocation_DoesNotExportCache_WithCoTenantWritableDescendant()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
+            packages =>
+            {
+                var nested = Path.Combine(packages, "pkg", "contents");
+                Directory.CreateDirectory(nested);
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(
+                        nested,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+                }
+            });
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        // The redirect still happens — only the dirty cache is refused.
+        var uid = await TestSupport.CurrentUidAsync();
+        Assert.Equal(
+            Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
+            ParseVar(stdout, "CLI_HOME"));
+        Assert.Equal(string.Empty, ParseVar(stdout, "PKGS"));
+    }
+
+    // A planted symlink inside an otherwise-clean cache must not smuggle in a
+    // co-tenant-writable target outside the tree — the admission scan
+    // evaluates each link as its target.
+    [Fact]
+    public async Task WrapDotnetInvocation_DoesNotExportCache_WhoseSymlinkEscapesToWritableTarget()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
+            packages =>
+            {
+                // The link's target lives outside the packages tree but
+                // inside the fixture home (deleted with the fixture), and
+                // stays co-tenant-writable for the whole run.
+                var homeDir = Directory.GetParent(packages)!.Parent!.FullName;
+                var target = Path.Combine(homeDir, "planted-target.props");
+                File.WriteAllText(target, "<Project/>");
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(
+                        target,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite
+                        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                }
+
+                File.CreateSymbolicLink(Path.Combine(packages, "pkg"), target);
+            });
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(string.Empty, ParseVar(stdout, "PKGS"));
+    }
+
+    // An operator-provided NUGET_PACKAGES always wins over the inherited
+    // cache — the reuse helper must never overwrite an exported value.
+    [Fact]
+    public async Task WrapDotnetInvocation_KeepsOperatorNuGetPackages_OverInheritedCache()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithBrokenSettingsAndCache(
+            packages => Directory.CreateDirectory(Path.Combine(packages, "pkg")));
+        var operatorCache = Path.Combine(fixture.Tmp, "operator-cache");
+        Directory.CreateDirectory(operatorCache);
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string> { ["NUGET_PACKAGES"] = operatorCache });
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(operatorCache, ParseVar(stdout, "PKGS"));
+    }
+
     private static string ParseVar(string stdout, string name)
     {
         var line = stdout.Split('\n').Single(l => l.StartsWith(name + "=", StringComparison.Ordinal));
@@ -370,6 +485,34 @@ public sealed class NuGetHomeSelfHealTests
             fakeDotnetBody:
                 "#!/bin/sh\nprintf 'CLI_HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
             extraEnvRemovals: [],
+            restorePermissions: static fixture =>
+            {
+                var config = Path.Combine(fixture.Home, ".nuget", "NuGet", "NuGet.Config");
+                if (File.Exists(config) && !OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            });
+
+        // Broken NuGet settings home (the unreadable user-config fault shape)
+        // plus a `.nuget/packages` cache the caller seeds; fake `dotnet`
+        // additionally echoes NUGET_PACKAGES so tests can assert whether the
+        // inherited cache was preserved.
+        public static SelfHealFixture WithBrokenSettingsAndCache(Action<string> seedCache) => new(
+            prepareHome: home =>
+            {
+                var nugetRoot = Path.Combine(home, ".nuget");
+                var settingsDir = Path.Combine(nugetRoot, "NuGet");
+                Directory.CreateDirectory(settingsDir);
+                var config = Path.Combine(settingsDir, "NuGet.Config");
+                File.WriteAllText(config, "<configuration/>");
+                if (!OperatingSystem.IsWindows())
+                    File.SetUnixFileMode(config, UnixFileMode.None);
+                var packages = Path.Combine(nugetRoot, "packages");
+                Directory.CreateDirectory(packages);
+                seedCache(packages);
+            },
+            fakeDotnetBody:
+                "#!/bin/sh\nprintf 'CLI_HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'HOME=%s\\n' \"${HOME:-}\"\nprintf 'XDG=%s\\n' \"${XDG_RUNTIME_DIR:-}\"\nprintf 'PKGS=%s\\n' \"${NUGET_PACKAGES:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
+            extraEnvRemovals: ["XDG_RUNTIME_DIR"],
             restorePermissions: static fixture =>
             {
                 var config = Path.Combine(fixture.Home, ".nuget", "NuGet", "NuGet.Config");

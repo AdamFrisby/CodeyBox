@@ -35,17 +35,18 @@ if [ ! -f "$codeybox_heal_script" ]; then
     exit 0
 fi
 
-# $1, when given, is the .nuget directory to repair — an override so tests
-# can exercise the heal against a temporary home without touching the
-# caller's real $HOME; the heal operates on the cli home above it. Either
-# way this hook's mission is the $HOME-based home — an InitialTarget's
-# exports cannot reach the already-running build anyway — so heal $HOME
-# specifically, not a stamped DOTNET_CLI_HOME (that home is the sibling
-# InitialTarget's job, Directory.NuGetHomeHeal.targets). Unset it so the
-# shared recovery resolves HOME as the cli home to repair; the variable
-# then comes back non-empty only when the heal took its redirect fallback.
-if [ -n "${1:-}" ]; then
-    HOME="$(dirname "${1%/}")"
+# CODEYBOX_NUGET_HOME_UNDER_TEST, when set, names the .nuget directory to
+# repair — an override so tests can exercise the heal against a temporary
+# home without touching the caller's real $HOME; the heal operates on the
+# cli home above it. Either way this hook's mission is the $HOME-based home
+# — an InitialTarget's exports cannot reach the already-running build
+# anyway — so heal $HOME specifically, not a stamped DOTNET_CLI_HOME (that
+# home is the sibling InitialTarget's job, Directory.NuGetHomeHeal.targets).
+# Unset it so the shared recovery resolves HOME as the cli home to repair;
+# the variable then comes back non-empty only when the heal took its
+# redirect fallback.
+if [ -n "${CODEYBOX_NUGET_HOME_UNDER_TEST:-}" ]; then
+    HOME="$(dirname "${CODEYBOX_NUGET_HOME_UNDER_TEST%/}")"
     export HOME
 fi
 unset DOTNET_CLI_HOME
