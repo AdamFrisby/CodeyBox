@@ -255,6 +255,59 @@ public sealed class NuGetHomeSelfHealTests
             ParseVar(stdout, "CLI_HOME"));
     }
 
+    // Total fallback failure: TMPDIR naming a regular file means neither the
+    // shared per-user dir nor a private mktemp can be materialized, so the
+    // pick chain fails outright. The env values the preamble rejected must be
+    // UNSET for the wrapped dotnet — left exported, dotnet would consume
+    // foreign-controlled storage for its user-config and mutex dirs.
+    [Fact]
+    public async Task WrapDotnetInvocation_UnsetsRejectedVars_WhenNoFallbackExists()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        using var fixture = SelfHealFixture.WithUnwritableHome();
+        var tmpFile = Path.Combine(fixture.Tmp, "tmp-as-file");
+        await File.WriteAllTextAsync(tmpFile, "x");
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string> { ["TMPDIR"] = tmpFile });
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(string.Empty, ParseVar(stdout, "HOME"));
+        Assert.Equal(string.Empty, ParseVar(stdout, "XDG"));
+        Assert.Contains("ARGS=build", stdout);
+    }
+
+    // Same no-fallback path one variable over: a rejected DOTNET_CLI_HOME is
+    // unset so dotnet falls back to a healthy HOME rather than consuming the
+    // foreign value.
+    [Fact]
+    public async Task WrapDotnetInvocation_UnsetsRejectedCliHome_WhenNoFallbackExists()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+
+        using var fixture = SelfHealFixture.WithHealthyHome();
+        var tmpFile = Path.Combine(fixture.Tmp, "tmp-as-file");
+        var cliFile = Path.Combine(fixture.Tmp, "cli-as-file");
+        await File.WriteAllTextAsync(tmpFile, "x");
+        await File.WriteAllTextAsync(cliFile, "x");
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync(
+            new Dictionary<string, string>
+            {
+                ["TMPDIR"] = tmpFile,
+                ["DOTNET_CLI_HOME"] = cliFile,
+            });
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(string.Empty, ParseVar(stdout, "CLI_HOME"));
+        Assert.Equal(fixture.Home, ParseVar(stdout, "HOME"));
+    }
+
     private static string ParseVar(string stdout, string name)
     {
         var line = stdout.Split('\n').Single(l => l.StartsWith(name + "=", StringComparison.Ordinal));
@@ -422,7 +475,7 @@ public sealed class NuGetHomeSelfHealTests
         public void Dispose()
         {
             _restorePermissions(this);
-            try { Directory.Delete(_root, recursive: true); } catch { }
+            try { Directory.Delete(_root, recursive: true); } catch { /* best-effort cleanup */ }
         }
     }
 }

@@ -129,6 +129,14 @@ internal static class MSBuildDiagnosticsEnrichment
                     MSBuildDiagnosticsOptions.ProviderId,
                     binding,
                     "missing: the failed build wrote no binary log");
+            // Available implies a validated leaf (enforced inside
+            // ListBinlogNamesAsync); bind it once here rather than relying on
+            // that cross-method invariant at every use site.
+            if (listing.DirectoryLeaf is not { } directoryLeaf)
+                return BuildDiagnosticsEvidence.Insufficient(
+                    MSBuildDiagnosticsOptions.ProviderId,
+                    binding,
+                    "capture-failure: the failed build's binary log directory could not be validated");
 
             var parts = new List<BuildDiagnosticsEvidence>(listing.Names.Count);
             // Every listed log that yields no usable diagnostics is named
@@ -140,7 +148,7 @@ internal static class MSBuildDiagnosticsEnrichment
             foreach (var name in listing.Names)
             {
                 var fetch = await FetchAndProduceAsync(
-                        sandbox, listing.DirectoryLeaf!, name, binding, options, producer, ct)
+                        sandbox, directoryLeaf, name, binding, options, producer, ct)
                     .ConfigureAwait(false);
                 if (fetch.Evidence is null)
                 {

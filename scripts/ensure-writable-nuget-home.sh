@@ -35,12 +35,19 @@ if [ ! -f "$codeybox_heal_script" ]; then
     exit 0
 fi
 
-# This hook's mission is the on-disk $HOME/.nuget repair — an InitialTarget's
+# $1, when given, is the .nuget directory to repair — an override so tests
+# can exercise the heal against a temporary home without touching the
+# caller's real $HOME; the heal operates on the cli home above it. Either
+# way this hook's mission is the $HOME-based home — an InitialTarget's
 # exports cannot reach the already-running build anyway — so heal $HOME
 # specifically, not a stamped DOTNET_CLI_HOME (that home is the sibling
 # InitialTarget's job, Directory.NuGetHomeHeal.targets). Unset it so the
-# shared recovery resolves HOME as the cli home to repair; the variable then
-# comes back non-empty only when the heal took its redirect fallback.
+# shared recovery resolves HOME as the cli home to repair; the variable
+# then comes back non-empty only when the heal took its redirect fallback.
+if [ -n "${1:-}" ]; then
+    HOME="$(dirname "${1%/}")"
+    export HOME
+fi
 unset DOTNET_CLI_HOME
 codeybox_home_before="${HOME:-}"
 # Dot-sourcing runs the whole recovery: settings heal, runtime-dir pinning,
@@ -49,6 +56,6 @@ codeybox_home_before="${HOME:-}"
 # private home, seeded config and markers — persist for every later exec.
 . "$codeybox_heal_script" || true
 if [ -n "${DOTNET_CLI_HOME:-}" ]; then
-    echo "ensure-writable-nuget-home: cannot repair $codeybox_home_before/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
+    echo "ensure-writable-nuget-home: cannot repair ${codeybox_home_before:-<unset>}/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
 fi
 exit 0

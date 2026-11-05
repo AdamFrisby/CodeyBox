@@ -985,6 +985,125 @@ public sealed class BuildScriptNuGetHealTests
         }
     }
 
+    // Total fallback failure: HOME naming a regular file is rejected by the
+    // adopt chain, and TMPDIR naming a regular file means neither the shared
+    // per-user dir nor a private mktemp can be materialized. The rejected env
+    // values must be UNSET for the caller's dotnet — left exported they would
+    // hand it foreign-controlled storage.
+    [Fact]
+    public async Task HealScript_UnsetsRejectedVars_WhenNoFallbackExists()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home-as-file");
+        var tmpFile = Path.Combine(root, "tmp-as-file");
+        var workdir = Path.Combine(root, "work");
+        Directory.CreateDirectory(workdir);
+        try
+        {
+            await File.WriteAllTextAsync(home, "x");
+            await File.WriteAllTextAsync(tmpFile, "x");
+
+            var env = NewHealEnv(root, home);
+            env["TMPDIR"] = tmpFile;
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf 'HOME=%s\\nXDG=%s\\nCLI=%s\\n' \"${HOME-UNSET}\" \"${XDG_RUNTIME_DIR-UNSET}\" \"${DOTNET_CLI_HOME-UNSET}\"",
+                workdir, HealScriptRepoRoot());
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("HOME=UNSET", lines);
+            Assert.Contains("XDG=UNSET", lines);
+            Assert.Contains("CLI=UNSET", lines);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Same no-fallback path one variable over: a rejected env-provided
+    // DOTNET_CLI_HOME is unset so dotnet falls back to a healthy HOME rather
+    // than consuming the foreign value.
+    [Fact]
+    public async Task HealScript_UnsetsRejectedCliHome_WhenNoFallbackExists()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var cliFile = Path.Combine(root, "cli-as-file");
+        var tmpFile = Path.Combine(root, "tmp-as-file");
+        var workdir = Path.Combine(root, "work");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(workdir);
+        try
+        {
+            await File.WriteAllTextAsync(cliFile, "x");
+            await File.WriteAllTextAsync(tmpFile, "x");
+
+            var env = NewHealEnv(root, home);
+            env["TMPDIR"] = tmpFile;
+            env["DOTNET_CLI_HOME"] = cliFile;
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && printf 'HOME=%s\\nCLI=%s\\n' \"${HOME-UNSET}\" \"${DOTNET_CLI_HOME-UNSET}\"",
+                workdir, HealScriptRepoRoot());
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("CLI=UNSET", lines);
+            Assert.Contains("HOME=" + home, lines);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The marker descent verifies each EXISTING component like the base — not
+    // merely for symlink-ness: a co-tenant-writable intermediate inside a
+    // private base can be swapped for a symlink between the checks and the
+    // write, so the seeder must refuse to traverse it.
+    [Fact]
+    public async Task HealScript_DirectDotSource_SkipsCoTenantWritableMarkerComponent()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var localDir = Path.Combine(home, ".local");
+        var workdir = Path.Combine(root, "work");
+        Directory.CreateDirectory(localDir);
+        Directory.CreateDirectory(workdir);
+        try
+        {
+            await ChmodAsync("777", localDir); // writable by every co-tenant
+
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\"",
+                workdir, HealScriptRepoRoot());
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.False(
+                File.Exists(MigrationMarkerPath(home)),
+                "no marker may be seeded under a co-tenant-writable component");
+            Assert.False(
+                Directory.Exists(Path.Combine(localDir, "share")),
+                "no part of the marker tree may be created under it");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     // End-to-end: a gate exec whose env gives no usable runtime dir — here a
     // non-writable $XDG_RUNTIME_DIR, which takes precedence over a healthy
     // $HOME — crashed in dotnet first-use creating "NuGet-Migrations" before

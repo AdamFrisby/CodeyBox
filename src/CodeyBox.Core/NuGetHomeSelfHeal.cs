@@ -46,12 +46,14 @@ public static class NuGetHomeSelfHeal
     /// <summary>
     /// The directory-admission policy helpers (<c>_codeybox_lstat_dir</c>,
     /// <c>_codeybox_secure_dir</c>, <c>_codeybox_adopt_dir</c>,
-    /// <c>_codeybox_pick_user_dir</c>) and the leaf constants, lifted verbatim
-    /// from the marked region of <c>scripts/nuget-home-heal.sh</c> — embedded
-    /// into this assembly as a manifest resource at build time — so a guard
-    /// change in the shell file lands in both the dot-sourced recovery and
-    /// this preamble automatically. There is intentionally no second copy of
-    /// the guard logic in this file to drift out of sync.
+    /// <c>_codeybox_pick_user_dir</c>), the shared decision skeleton
+    /// (<c>_codeybox_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>),
+    /// and the leaf constants, lifted verbatim from the marked region of
+    /// <c>scripts/nuget-home-heal.sh</c> — embedded into this assembly as a
+    /// manifest resource at build time — so a guard or policy change in the
+    /// shell file lands in both the dot-sourced recovery and this preamble
+    /// automatically. There is intentionally no second copy of either in
+    /// this file to drift out of sync.
     /// </summary>
     private static readonly string SharedHelpers = LoadSharedHelpers();
 
@@ -61,17 +63,20 @@ public static class NuGetHomeSelfHeal
     /// preamble appends the current numeric UID (<c>{leaf}-$(id -u)</c>) so
     /// concurrent audits by the same user share one healed home (reusing its
     /// package cache) while different principals never collide on one predictable
-    /// path. That shared per-user dir is reused only when it already exists, is
-    /// owned by the current user, and is writable; otherwise the preamble falls
-    /// back to a private <c>mktemp</c> dir (<c>{leaf}.XXXXXX</c>) so a squatted or
-    /// root-left directory in a world-writable temp cannot make the healed home
-    /// itself unusable. NuGet manages its own settings-dir creation within it.
+    /// path. That shared per-user dir is reused only when it verifies as
+    /// "private" storage — canonicalized, owned by the current uid, writable,
+    /// never group/other-writable (no ACL-broadened access either), under an
+    /// anchor-checked ancestor chain; otherwise the preamble falls back to a
+    /// private <c>mktemp</c> dir (<c>{leaf}.XXXXXX</c>) so a squatted or
+    /// root-left directory in a world-writable temp cannot make the healed
+    /// home itself unusable. NuGet manages its own settings-dir creation
+    /// within it.
     /// Parsed from <c>_codeybox_home_leaf</c> in the embedded
     /// <c>scripts/nuget-home-heal.sh</c>, which is the single source of the
     /// literal — a rename there updates this name automatically (pinned by
     /// <c>BuildScriptNuGetHealTests</c>).
     /// </summary>
-    public static string WritableHomeLeaf { get; } =
+    internal static string WritableHomeLeaf { get; } =
         ParseLeafConstant(SharedHelpers, "_codeybox_home_leaf");
 
     /// <summary>
@@ -105,56 +110,41 @@ public static class NuGetHomeSelfHeal
     /// helper invocation is a command substitution guarded by
     /// <c>|| var=</c> (or an <c>if</c>/<c>||</c>/<c>&amp;&amp;</c> member) so a
     /// degraded step — including a total <c>mktemp</c> failure — cannot abort
-    /// the script before <c>exec "$@"</c>; the caller-side
-    /// <c>[ -n "$var" ]</c> gates then simply skip the pin. Every variable
-    /// expansion uses a <c>:-</c> default so it is also <c>set -u</c>-safe.</para>
+    /// the script before <c>exec "$@"</c>. When no verified private fallback
+    /// can be materialized at all, a rejected env variable is <c>unset</c>
+    /// rather than left exported — leaving it would hand the wrapped
+    /// <c>dotnet</c> co-tenant-controlled storage, while unset falls back to
+    /// the passwd entry / platform defaults. Every variable expansion uses a
+    /// <c>:-</c> default so it is also <c>set -u</c>-safe.</para>
     /// </summary>
     public static string Preamble { get; } = SharedHelpers + "\n" + DecisionFragment;
 
     // The preamble's decision half: deliberately NOT part of the embedded
-    // shared region, because the wrapped-exec preamble and the dot-sourced
-    // script diverge by design here — the script quarantines a broken .nuget
-    // in place, links a trusted package cache into the healed home, and seeds
-    // a readable user config (all on-disk repairs for later execs), while this
-    // preamble only needs to keep the single wrapped `dotnet` working and so
-    // exports NUGET_PACKAGES instead.
+    // shared region — but only the REMEDIATION lives here. The decision
+    // skeleton itself (the usable check, the pick chain, the runtime-dir
+    // pin) is in the shared region so the preamble and the dot-sourced
+    // script can never drift. The divergence is by design: the script
+    // quarantines a broken .nuget in place, links a trusted package cache
+    // into the healed home, and seeds a readable user config (on-disk
+    // repairs covering later execs), while this preamble only needs to keep
+    // the single wrapped `dotnet` working and so exports DOTNET_CLI_HOME /
+    // NUGET_PACKAGES instead.
     private const string DecisionFragment = """
         nuget_home="${DOTNET_CLI_HOME:-${HOME:-}}"
         nuget_root="${nuget_home}/.nuget"
-        nuget_settings_dir="${nuget_root}/NuGet"
-        nuget_settings_file="${nuget_settings_dir}/NuGet.Config"
-        nuget_home_broken=0
         nuget_home_resolved="$(_codeybox_adopt_dir "$nuget_home" writable)" \
             || nuget_home_resolved=
-        nuget_settings_resolved="$(_codeybox_secure_dir \
-            "$nuget_settings_dir" private writable)" || nuget_settings_resolved=
-        if [ -z "$nuget_home_resolved" ]; then
-          # The cli home itself is not private per-user storage — foreign-owned,
-          # unwritable, or resolving through a planted symlink — so nothing
-          # beneath it can keep a NuGet.Config NuGet trusts.
-          nuget_home_broken=1
-        elif [ -L "$nuget_root" ] || [ -L "$nuget_settings_dir" ]; then
-          # Never descend through a symlinked .nuget or NuGet component — the
-          # same up-front refusal the dot-sourced heal performs before probing
-          # (it quarantines the link aside; this preamble can only redirect).
-          nuget_home_broken=1
-        elif [ -n "$nuget_settings_resolved" ]; then
-          { [ -e "$nuget_settings_file" ] && [ ! -r "$nuget_settings_file" ]; } && nuget_home_broken=1
-        elif [ -e "$nuget_settings_dir" ] || [ -L "$nuget_settings_dir" ]; then
-          # A settings dir that is not private per-user storage — foreign-owned,
-          # co-tenant-writable, or a planted symlink — cannot keep a
-          # NuGet.Config NuGet trusts either.
-          nuget_home_broken=1
-        elif [ -d "$nuget_root" ]; then
-          # The settings dir is absent: .nuget must be trusted storage AND
-          # writable for NuGet to create the settings dir inside it — this
-          # preamble cannot recreate the directory in place the way the
-          # dot-sourced heal's quarantine path can, so it requires "trusted
-          # writable" up front where the script checks "trusted" alone and
-          # lets its mkdir probe discover the writability itself
-          # (intentional divergence, same outcome).
-          _codeybox_secure_dir "$nuget_root" trusted writable >/dev/null 2>&1 \
-            || nuget_home_broken=1
+        nuget_home_broken=1
+        if [ -n "$nuget_home_resolved" ]; then
+          # This preamble cannot quarantine a broken .nuget aside and
+          # recreate it the way the dot-sourced recovery can — it can only
+          # redirect — so the shared usable check runs with "trusted
+          # writable": an unwritable .nuget must fail up front rather than
+          # after NuGet's own settings-dir create fails.
+          if _codeybox_nuget_home_usable \
+            "$nuget_home_resolved" trusted writable >/dev/null 2>&1; then
+            nuget_home_broken=0
+          fi
         fi
         if [ "$nuget_home_broken" -eq 0 ] && [ -n "${DOTNET_CLI_HOME:-}" ]; then
           # Re-export the canonical path so a symlinked env value cannot be
@@ -174,11 +164,19 @@ public static class NuGetHomeSelfHeal
             if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_existing_packages" ]; then
               export NUGET_PACKAGES="$_codeybox_existing_packages"
             fi
-            # The reported home path is env-derived input bound for the
-            # terminal/log: strip control characters so a crafted value cannot
-            # spoof operator-facing output with ANSI escapes.
+            # The reported paths are env-derived input bound for the
+            # terminal/log: strip control characters so a crafted value
+            # cannot spoof operator-facing output with ANSI escapes.
             _codeybox_heal_note="$(printf '%s' "$nuget_root" | LC_ALL=C tr -d '[:cntrl:]')"
-            echo "nuget-home self-heal: '${_codeybox_heal_note}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${NUGET_PACKAGES})}" >&2
+            _codeybox_heal_pkgs="$(printf '%s' "${NUGET_PACKAGES:-}" | LC_ALL=C tr -d '[:cntrl:]')"
+            echo "nuget-home self-heal: '${_codeybox_heal_note}' is not usable by $(id -un) (root-owned NuGet home?); redirecting DOTNET_CLI_HOME=${DOTNET_CLI_HOME}${NUGET_PACKAGES:+ (reusing package cache ${_codeybox_heal_pkgs})}" >&2
+          elif [ -n "${DOTNET_CLI_HOME:-}" ]; then
+            # No private fallback could be materialized: the env value this
+            # check rejected must not stay exported for the wrapped dotnet —
+            # unset it so the CLI falls back to $HOME / the passwd entry.
+            unset DOTNET_CLI_HOME
+          else
+            unset HOME
           fi
         fi
         # A usable NuGet settings home is not enough by itself: since runtime
@@ -188,48 +186,25 @@ public static class NuGetHomeSelfHeal
         # user paths off $HOME hit the same broken home. When neither variable
         # resolves to verified private storage the CLI aborts before MSBuild
         # with "The system cannot open the device or file specified:
-        # 'NuGet-Migrations'" (dotnet/runtime#135726, #136802). Pin each
-        # unusable variable to a writable dir: preferring the (possibly
-        # just-healed) DOTNET_CLI_HOME, else the shared per-user fallback.
-        # Usable values are re-exported under their canonical path so a
-        # symlinked env value cannot be retargeted after the check.
-        home_resolved="$(_codeybox_secure_dir "${HOME:-}" private writable)" \
-          || home_resolved=
-        xdg_resolved="$(_codeybox_secure_dir "${XDG_RUNTIME_DIR:-}" private writable)" \
-          || xdg_resolved=
-        if [ -z "$home_resolved" ] || [ -z "$xdg_resolved" ]; then
-          user_dir="$(_codeybox_pick_user_dir "${DOTNET_CLI_HOME:-}")" || user_dir=
-          if [ -n "$user_dir" ]; then
-            if [ -n "$home_resolved" ]; then
-              export HOME="$home_resolved"
-            else
-              # Redirecting HOME would orphan a pre-baked package cache under
-              # the original $HOME/.nuget — preserve it for restore like the
-              # broken-home branch does. The dot-sourced recovery
-              # (scripts/nuget-home-heal.sh) makes the equivalent move
-              # material on disk — it links the trusted cache into the
-              # redirected home's .nuget and seeds a readable user config —
-              # because it must also cover children that resolve packages or
-              # the settings path off $HOME without inheriting exports, while
-              # this preamble only has to keep the single wrapped `dotnet`
-              # working (NuGet creates the config itself in a writable home).
-              _codeybox_old_packages="${nuget_root}/packages"
-              _codeybox_old_resolved="$(_codeybox_secure_dir \
-                "$_codeybox_old_packages" trusted)" || _codeybox_old_resolved=
-              if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_old_resolved" ]; then
-                export NUGET_PACKAGES="$_codeybox_old_resolved"
-              fi
-              export HOME="$user_dir"
-            fi
-            if [ -n "$xdg_resolved" ]; then
-              export XDG_RUNTIME_DIR="$xdg_resolved"
-            else
-              export XDG_RUNTIME_DIR="$user_dir"
-            fi
+        # 'NuGet-Migrations'" (dotnet/runtime#135726, #136802). The shared pin
+        # picks the (possibly just-healed) DOTNET_CLI_HOME, else the shared
+        # per-user fallback, else a private mktemp dir; verified values are
+        # re-exported under their canonical path.
+        codeybox_pin_runtime_dirs
+        if [ -n "$_codeybox_pin_home_redirected" ]; then
+          # Redirecting HOME would orphan a pre-baked package cache under the
+          # original home's .nuget — preserve it for restore like the
+          # broken-home branch does. The dot-sourced recovery makes the same
+          # move material on disk (linked cache + seeded config) because it
+          # must also cover children that resolve packages off $HOME without
+          # inheriting exports, while this preamble only has to keep the
+          # single wrapped `dotnet` working.
+          _codeybox_old_packages="${nuget_root}/packages"
+          _codeybox_old_resolved="$(_codeybox_secure_dir \
+            "$_codeybox_old_packages" trusted)" || _codeybox_old_resolved=
+          if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$_codeybox_old_resolved" ]; then
+            export NUGET_PACKAGES="$_codeybox_old_resolved"
           fi
-        else
-          export HOME="$home_resolved"
-          export XDG_RUNTIME_DIR="$xdg_resolved"
         fi
         """;
 
@@ -293,7 +268,15 @@ public static class NuGetHomeSelfHeal
     private static string ParseLeafConstant(string helpers, string variableName)
     {
         var prefix = variableName + "=\"";
-        var start = helpers.IndexOf(prefix, StringComparison.Ordinal);
+        // Anchor the match at a line start so a prose mention of the variable
+        // earlier in the region cannot parse as the real assignment.
+        var start = helpers.IndexOf("\n" + prefix, StringComparison.Ordinal);
+        if (start >= 0)
+            start += 1;
+        else if (helpers.StartsWith(prefix, StringComparison.Ordinal))
+            start = 0;
+        else
+            start = -1;
         if (start < 0)
         {
             throw new InvalidOperationException(

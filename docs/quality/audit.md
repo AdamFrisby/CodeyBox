@@ -229,9 +229,9 @@ deterministic configuration errors.
 
 No committed repository file can redirect that read — NuGet resolves the path
 from process environment. CodeyBox works around it in three places instead: the
-`Directory.Build.props` `InitialTargets` hook reclaims an unwritable `~/.nuget`
-before restore (`scripts/reclaim-nuget-home.sh`, a no-op when the home is
-already fine), the required-build gate and dotnet shell auditors export a
+`Directory.Build.targets` `InitialTargets` hook repairs an unwritable `~/.nuget`
+before restore (`scripts/ensure-writable-nuget-home.sh`, a no-op when the home
+is already fine), the required-build gate and dotnet shell auditors export a
 writable `DOTNET_CLI_HOME` and `HOME`, and `build.sh` does the same.
 
 The durable fix is provisioning: bake the sandbox image so the build user owns

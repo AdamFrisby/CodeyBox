@@ -32,13 +32,12 @@ MSBuild aggregates `InitialTargets` from the imported
 `Directory.Build.props`/`.targets` and runs them at the very start of every
 project evaluation — before restore resolves the NuGet user-settings directory.
 That is the only committed-file hook early enough to matter, and CodeyBox runs
-three entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
+two entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
 `Directory.Build.props`) dot-sources `scripts/nuget-home-heal.sh` against the
-effective cli home, `Directory.Build.props` also runs
-`scripts/reclaim-nuget-home.sh`, and `Directory.Build.targets` runs
-`scripts/ensure-writable-nuget-home.sh`. All three delegate the repair to the
-shared `scripts/nuget-home-heal.sh` recovery (fast-path no-op when the home is
-already usable, never fails the build). When `$HOME/.nuget` exists but is not
+effective cli home, and `Directory.Build.targets` runs
+`scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both
+delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery
+(fast-path no-op when the home is already usable, never fails the build). When `$HOME/.nuget` exists but is not
 usable — foreign-owned, unwritable, unreadable config, or a planted link — the
 heal relocates it aside — the build user owns `$HOME`, so the rename needs no
 root — recreates a writable private `$HOME/.nuget` with a seeded readable

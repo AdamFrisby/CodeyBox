@@ -38,7 +38,21 @@ internal static class RequiredBuildScript
           exit "$dotnet_command_not_found_exit"
         fi
 
-        tmp_root="${TMPDIR:-/tmp}"
+        # TMPDIR is launch-env input like every other directory this script
+        # trusts: admit it only as a writable "anchor" (the /tmp rule — owned
+        # by this uid or root, group/other-writable tolerated only under the
+        # sticky bit) before the mktemp creates below. In a non-sticky
+        # co-tenant-writable dir the owner could swap a just-created file or
+        # dir for a symlink, turning the `>`/`sort -o`/`-bl:` writes below
+        # into a create/truncate at an attacker-chosen path. Fall back to
+        # /tmp — itself anchor-verified — and only then to a private mktemp
+        # dir (born mode-700 owned by this user), so the binlog fetch step
+        # still finds its directory under ${TMPDIR:-/tmp} in the common case.
+        tmp_root="$(_codeybox_secure_dir "${TMPDIR:-/tmp}" anchor writable)" || tmp_root=
+        if [ -z "$tmp_root" ]; then
+          tmp_root="$(_codeybox_secure_dir /tmp anchor writable)" \
+            || tmp_root="$(mktemp -d "/tmp/codeybox-gate-tmp.XXXXXX")"
+        fi
         # mktemp's unpredictable O_EXCL create: a PID-predictable name in the
         # world-writable temp could be squatted by a co-tenant, and the `>`/`>>`
         # redirects plus `sort -o` below would then follow a planted symlink —
