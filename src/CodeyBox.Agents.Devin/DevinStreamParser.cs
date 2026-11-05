@@ -65,7 +65,9 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                 TimeToFirstToken: null,
                 // Terminal failure envelopes carry the shim's diagnostic in
                 // `message`; every other envelope leaves FinalText unset.
-                FinalText: eventName is DevinAcpEnvelope.EventTurnError or DevinAcpEnvelope.EventFatal
+                FinalText: eventName is DevinAcpEnvelope.EventTurnError
+                        or DevinAcpEnvelope.EventFatal
+                        or DevinAcpEnvelope.EventModelMismatch
                     ? FirstString(root, "message")
                     : null,
                 IsRecognized: true),

@@ -456,6 +456,19 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   the first switches refused requests to other (paid) Devin models, the
   second would silently pick the session model when no `--model` flag is
   passed; neither may act on a dispatch.
+- The CLI also substitutes a different model when the `--model` value
+  does not resolve: it warns on stderr (`did not resolve to an available
+  model; falling back to your configured `agent.model` or the default`)
+  and proceeds on `agent.model`/the default — possibly metered. The shim
+  refuses the substitution: it aborts with a `model_mismatch` terminal
+  envelope before or at the first prompt whenever the active model is not
+  the requested one (structured signals first — `session/new`
+  `models.currentModelId` and category-`"model"` `config_option_update` —
+  the stderr WARN text as fallback). The host classifies the abort
+  provider-transient so the item retries on the configured model instead
+  of terminal-failing; a `turn_error` whose error `data` carries
+  `cognition.ai/retryable: true` is forwarded as `"retryable": true` and
+  parks on the same bounded path.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
   128 KiB per argv element and rework prompts exceed it) and reaches the
   agent only as `session/prompt` JSON — never in argv, the environment,

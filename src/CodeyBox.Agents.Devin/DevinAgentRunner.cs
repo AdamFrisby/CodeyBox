@@ -54,6 +54,20 @@ namespace CodeyBox.Agents.Devin;
 /// picks the session model when no flag is passed — a dispatch must never
 /// drift off the configured model.</para>
 ///
+/// <para><b>Substitution guard.</b> The CLI itself substitutes a different
+/// model when the <c>--model</c> value does not resolve — it warns on
+/// stderr (<c>did not resolve to an available model; falling back to your
+/// configured `agent.model` or the default</c>) and runs the session
+/// anyway, on a possibly metered default (verified against devin
+/// 3000.11.1). The shim aborts with a <c>model_mismatch</c> terminal
+/// envelope before or at the first prompt whenever the active model is
+/// not the requested one — structured signals first (<c>session/new</c>
+/// <c>models.currentModelId</c>, category-"model"
+/// <c>config_option_update</c>), the stderr WARN text as fallback — and
+/// the host classifies it as provider-transient so the item re-runs on
+/// the configured model. A <c>turn_error</c> the provider marked
+/// <c>cognition.ai/retryable</c> takes the same transient path.</para>
+///
 /// <para><b>Prompt delivery.</b> The prompt travels on stdin after the
 /// base64 shim block and reaches the shim through the still-open descriptor
 /// 0 (<c>--prompt-file -</c>); it never enters argv, the environment, or a

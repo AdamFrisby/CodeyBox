@@ -14,7 +14,8 @@ watchdog on long turns. Envelope shape:
 
 Events: session_started, prompt_sent, session_update, notification,
 permission_auto_granted, permission_auto_cancelled, unhandled_request,
-mode_set, turn_complete, turn_error, fatal, protocol_error.
+mode_set, turn_complete, turn_error, fatal, protocol_error,
+model_mismatch.
 
 Exit status: 0 only after a session/prompt response carrying a stopReason;
 2 for any protocol, spawn, or turn-level failure.
@@ -82,6 +83,29 @@ MAX_PROMPT_BYTES = 32 * 1024 * 1024
 MAX_FINAL_TEXT_CHARS = 256 * 1024
 FINAL_TEXT_TRUNCATION_MARKER = "[...final text truncated]"
 
+# devin 3000.11.1 `chisel_server::acp` stderr WARN emitted when the
+# `devin acp --model` value does not resolve against the CLI's model
+# registry — the full line is:
+#   chisel_server::acp: `devin acp --model` value did not resolve to an
+#   available model; falling back to your configured `agent.model` or the
+#   default
+# The CLI then silently runs the session on a DIFFERENT model, which may
+# be metered. Observed when the VM's remote-config fetch timed out and the
+# registry was stale. The shim aborts with a model_mismatch envelope
+# rather than let a turn bill on a substituted model. Match only this
+# stable phrase, never the module prefix. This is the single constant the
+# stderr-text fallback keys on; structured signals (the session/new
+# result's models.currentModelId and config_option_update model options)
+# are checked first whenever the peer exposes them.
+MODEL_FALLBACK_STDERR_MARKER = "did not resolve to an available model"
+# Bounded grace before the FIRST prompt for the stderr relay to surface
+# the WARN: the server emits it while resolving the model, concurrently
+# with the request/response exchange, so the flag can land a scheduling
+# quantum behind the response frame. Applies only when --model was
+# requested; event.wait() returns immediately once the flag is set, so a
+# clean run pays at most this fixed handshake delay.
+MODEL_FALLBACK_GRACE_SECONDS = 0.5
+
 EXIT_TURN_FAILED = 2
 
 
@@ -107,11 +131,13 @@ def _emit_stderr_line(raw):
     _write_stdout_line(json.dumps({"type": STDERR_ENVELOPE_TYPE, "text": text}))
 
 
-def _stderr_relay_loop(read_fd):
+def _stderr_relay_loop(read_fd, on_line=None):
     """Drain the stderr pipe and re-emit each line on stdout as a
     codeybox.stderr envelope. Keeps draining on envelope-write failure so a
     dead stdout can never block writers on a full pipe; bounded per line so
-    a runaway writer cannot grow the buffer without limit."""
+    a runaway writer cannot grow the buffer without limit. on_line, when
+    given, is invoked with each decoded line (the model-substitution watch)
+    and must never raise into the relay loop."""
     pending = bytearray()
     overflowed = False
 
@@ -122,6 +148,11 @@ def _stderr_relay_loop(read_fd):
             _emit_stderr_line(raw)
         except Exception:
             pass
+        if on_line is not None:
+            try:
+                on_line(raw.decode("utf-8", errors="replace").rstrip("\r"))
+            except Exception:
+                pass
 
     while True:
         try:
@@ -153,7 +184,7 @@ def _stderr_relay_loop(read_fd):
         flush_line(bytes(pending))
 
 
-def install_stderr_envelope_relay():
+def install_stderr_envelope_relay(on_line=None):
     """Retarget fd 2 to a pipe drained by a daemon relay thread that
     re-emits every line on stdout as a codeybox.stderr envelope.
 
@@ -165,15 +196,28 @@ def install_stderr_envelope_relay():
     stderr and have it claimed as genuine shim output host-side. The CLI
     and every tool subprocess inherit fd 2, so all of their stderr passes
     through the relay — including this shim's own tracebacks.
+
+    on_line, when given, observes every decoded stderr line (used by the
+    model-substitution watch); it must be cheap and must never raise.
     """
     read_fd, write_fd = os.pipe()
     os.dup2(write_fd, 2)
     os.close(write_fd)
     thread = threading.Thread(
-        target=_stderr_relay_loop, args=(read_fd,), daemon=True,
+        target=_stderr_relay_loop, args=(read_fd, on_line), daemon=True,
         name="stderr-envelope-relay")
     thread.start()
     return thread
+
+
+def _model_fallback_hook(event):
+    """Per-stderr-line observer that flags the CLI's silent --model
+    substitution. Only armed when the dispatch requested a model: with no
+    flag the account default applies and nothing can substitute."""
+    def hook(line):
+        if MODEL_FALLBACK_STDERR_MARKER in line:
+            event.set()
+    return hook
 
 
 class FrameTooLargeError(Exception):
@@ -205,6 +249,12 @@ class AcpClient:
         # frames for any other id are dropped — the agent's sessionId is a
         # server-chosen opaque string a wire-pipe writer cannot guess.
         self.session_id = None
+        # The --model value the dispatch requested, or None when the account
+        # default applies (no substitution guard is armed then).
+        self.requested_model = None
+        # (active_model, via) when a structured signal reported the session
+        # is running a model other than requested_model.
+        self.model_conflict = None
 
     def request(self, stage, method, params):
         # Unguessable ids: a process that inherited the agent's stdout fd (a
@@ -260,7 +310,75 @@ def truncated_append(parts, total, text):
     return total
 
 
-def run_turn(client, prompt, cwd, mode):
+def config_options_model(options):
+    """currentValue of the config option whose category is "model" (the
+    ACP config-options taxonomy), or None when the list does not expose
+    one. Peers that do not implement the config-options API simply carry
+    no such entry."""
+    if not isinstance(options, list):
+        return None
+    for option in options:
+        if not isinstance(option, dict) or option.get("category") != "model":
+            continue
+        value = option.get("currentValue")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def session_new_active_model(result):
+    """Structured active-model signal from the session/new result, when the
+    server exposes it: the ACP models.currentModelId session state, or a
+    configOptions entry of category "model". Returns None when the peer
+    reports neither — the stderr WARN watch remains the fallback."""
+    models = result.get("models")
+    if isinstance(models, dict):
+        current = models.get("currentModelId")
+        if isinstance(current, str) and current:
+            return current
+    return config_options_model(result.get("configOptions"))
+
+
+def emit_model_mismatch(client, via, active_model=None):
+    emit("model_mismatch",
+         requestedModel=client.requested_model,
+         activeModel=active_model,
+         via=via,
+         message="requested --model %s did not resolve to an available "
+                 "model; refusing to run the turn on a substituted model"
+                 % client.requested_model)
+
+
+def abort_model_substitution(client, model_fallback):
+    """Emit the terminal model_mismatch envelope and return True when a
+    substitution signal has fired — a structured session signal
+    (client.model_conflict) or the stderr WARN watch flag. Returns False
+    on the normal path, and whenever no model was requested (the account
+    default applies and there is nothing to substitute away from)."""
+    if not client.requested_model:
+        return False
+    if client.model_conflict is not None:
+        active, via = client.model_conflict
+        emit_model_mismatch(client, via=via, active_model=active)
+        return True
+    if model_fallback is not None and model_fallback.is_set():
+        emit_model_mismatch(client, via="stderr-warn")
+        return True
+    return False
+
+
+def provider_retryable(error):
+    """True only when the peer's JSON-RPC error carries
+    data["cognition.ai/retryable"] == true — the provider's own declared
+    retryability signal, forwarded verbatim (bool only) onto the
+    turn_error envelope so the host can park for bounded transient retry
+    instead of failing the item."""
+    data = error.get("data")
+    return isinstance(data, dict) and data.get("cognition.ai/retryable") is True
+
+
+def run_turn(client, prompt, cwd, mode, requested_model, model_fallback):
+    client.requested_model = requested_model
     final_text_parts = []
     final_text_chars = 0
 
@@ -276,8 +394,12 @@ def run_turn(client, prompt, cwd, mode):
     while True:
         raw = read_frame(client.proc.stdout)
         if raw is None:
-            emit("fatal", stage="turn",
-                 message="devin acp closed its stdout before the turn completed")
+            if not abort_model_substitution(client, model_fallback):
+                emit("fatal", stage="turn",
+                     message="devin acp closed its stdout before the turn completed")
+            return EXIT_TURN_FAILED
+
+        if abort_model_substitution(client, model_fallback):
             return EXIT_TURN_FAILED
 
         try:
@@ -295,6 +417,11 @@ def run_turn(client, prompt, cwd, mode):
 
         if "method" in frame:
             final_text_chars = handle_notification(client, frame, final_text_parts, final_text_chars)
+            # A config_option_update can only be recognised after the
+            # notification is handled — abort now rather than wait for a
+            # next frame that may never arrive.
+            if abort_model_substitution(client, model_fallback):
+                return EXIT_TURN_FAILED
             continue
 
         if "id" not in frame:
@@ -311,7 +438,10 @@ def run_turn(client, prompt, cwd, mode):
             error = frame["error"] if isinstance(frame["error"], dict) else {}
             message = error.get("message", "unknown error")
             if stage == "prompt":
-                emit("turn_error", code=error.get("code"), message=message)
+                fields = {"code": error.get("code"), "message": message}
+                if provider_retryable(error):
+                    fields["retryable"] = True
+                emit("turn_error", **fields)
             else:
                 emit("fatal", stage=stage, code=error.get("code"), message=message)
             return EXIT_TURN_FAILED
@@ -344,14 +474,25 @@ def run_turn(client, prompt, cwd, mode):
                 return EXIT_TURN_FAILED
             client.session_id = session_id
             emit("session_started", sessionId=session_id)
+            # Structured substitution check: when the server reports the
+            # session's active model and it is not the one we requested,
+            # abort before the first prompt — never run a turn on a model
+            # the operator did not configure.
+            active_model = session_new_active_model(result)
+            if (requested_model and active_model
+                    and active_model != requested_model):
+                emit_model_mismatch(client, via="session/new",
+                                    active_model=active_model)
+                return EXIT_TURN_FAILED
             if mode:
                 client.request("session/set_mode", "session/set_mode",
                                {"sessionId": session_id, "modeId": mode})
-            else:
-                send_prompt(client, session_id, prompt)
+            elif not send_prompt(client, session_id, prompt, model_fallback):
+                return EXIT_TURN_FAILED
         elif stage == "session/set_mode":
             emit("mode_set", modeId=mode)
-            send_prompt(client, session_id, prompt)
+            if not send_prompt(client, session_id, prompt, model_fallback):
+                return EXIT_TURN_FAILED
         elif stage == "prompt":
             stop_reason = result.get("stopReason")
             if not isinstance(stop_reason, str) or not stop_reason:
@@ -374,12 +515,23 @@ def run_turn(client, prompt, cwd, mode):
             return EXIT_TURN_FAILED
 
 
-def send_prompt(client, session_id, prompt):
+def send_prompt(client, session_id, prompt, model_fallback):
+    if model_fallback is not None:
+        # Bounded grace for the stderr relay to surface the CLI's "did not
+        # resolve" WARN before the first prompt leaves: the server emits it
+        # while resolving the model, concurrently with this exchange, so
+        # the flag can land a scheduling quantum behind the response we
+        # just processed. Returns immediately once set; a clean run pays
+        # at most MODEL_FALLBACK_GRACE_SECONDS.
+        model_fallback.wait(MODEL_FALLBACK_GRACE_SECONDS)
+    if abort_model_substitution(client, model_fallback):
+        return False
     client.request("prompt", "session/prompt", {
         "sessionId": session_id,
         "prompt": [{"type": "text", "text": prompt}],
     })
     emit("prompt_sent", promptBytes=len(prompt.encode("utf-8")))
+    return True
 
 
 def numeric_map(value):
@@ -437,6 +589,15 @@ def handle_notification(client, frame, final_text_parts, final_text_chars):
                  message="session/update for a session id this client did not open")
             return final_text_chars
         update = sanitise_update(params.get("update"))
+        # Structured substitution signal: a config_option_update carrying a
+        # category-"model" option whose currentValue is not the requested
+        # model means the session drifted mid-handshake — flag it so the
+        # loop aborts before/at the first prompt.
+        if (client.requested_model and isinstance(update, dict)
+                and update.get("sessionUpdate") == "config_option_update"):
+            active = config_options_model(update.get("configOptions"))
+            if active and active != client.requested_model:
+                client.model_conflict = (active, "config_option_update")
         emit("session_update", sessionId=session_id, update=update)
         if isinstance(update, dict) and update.get("sessionUpdate") == "agent_message_chunk":
             content = update.get("content")
@@ -539,12 +700,18 @@ def read_prompt(path):
 def main(argv=None):
     args = parse_args(argv)
 
+    # The substitution watch arms only when a --model was requested: with
+    # no flag the account default applies and nothing can substitute.
+    model_fallback = threading.Event() if args.model else None
+
     # Everything the CLI and its tool subprocesses write to fd 2 from here on
     # is folded into codeybox.stderr envelopes on stdout — a bare stderr line
     # can never reach the claimable envelope stream.
-    stderr_relay = install_stderr_envelope_relay()
+    stderr_relay = install_stderr_envelope_relay(
+        on_line=_model_fallback_hook(model_fallback)
+        if model_fallback is not None else None)
     try:
-        return run(args)
+        return run(args, model_fallback)
     finally:
         # Best-effort drain: once the CLI and any grandchildren close their
         # copies of the pipe's write end the relay sees EOF; a lingering
@@ -552,7 +719,7 @@ def main(argv=None):
         stderr_relay.join(timeout=2.0)
 
 
-def run(args):
+def run(args, model_fallback=None):
     try:
         prompt = read_prompt(args.prompt_file)
     except (OSError, ValueError) as exc:
@@ -587,7 +754,8 @@ def run(args):
 
     install_signal_handlers(proc)
     try:
-        return run_turn(AcpClient(proc), prompt, cwd, args.mode)
+        return run_turn(AcpClient(proc), prompt, cwd, args.mode,
+                        args.model, model_fallback)
     except BrokenPipeError:
         emit("fatal", stage="turn",
              message="devin acp closed its stdin before the turn completed")

@@ -7,7 +7,9 @@ namespace CodeyBox.Agents.Devin;
 /// <c>devin.acp</c> NDJSON stream. The shim emits exactly one terminal
 /// envelope per run — <c>turn_complete</c> (session/prompt answered with a
 /// stopReason), <c>turn_error</c> (the agent returned a JSON-RPC error for
-/// the prompt), or <c>fatal</c> (spawn/handshake/protocol failure,
+/// the prompt), <c>model_mismatch</c> (the CLI substituted a different
+/// model for the requested <c>--model</c>; the turn was aborted), or
+/// <c>fatal</c> (spawn/handshake/protocol failure,
 /// including a prompt result that carried no stopReason) — so the last
 /// terminal envelope found is authoritative.
 ///
@@ -34,6 +36,7 @@ internal static class DevinAcpOutcome
         TurnComplete,
         TurnError,
         Fatal,
+        ModelMismatch,
     }
 
     internal sealed record Outcome(TerminalEvent Event, string? Diagnostic);
@@ -60,6 +63,10 @@ internal static class DevinAcpOutcome
                 case DevinAcpEnvelope.EventTurnError:
                     lastEvent = TerminalEvent.TurnError;
                     lastDiagnostic = Describe("turn error", envelope.Root);
+                    break;
+                case DevinAcpEnvelope.EventModelMismatch:
+                    lastEvent = TerminalEvent.ModelMismatch;
+                    lastDiagnostic = Describe("model mismatch", envelope.Root);
                     break;
                 case DevinAcpEnvelope.EventFatal:
                     lastEvent = TerminalEvent.Fatal;

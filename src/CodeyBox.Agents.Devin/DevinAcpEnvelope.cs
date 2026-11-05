@@ -45,6 +45,15 @@ internal static class DevinAcpEnvelope
     internal const string EventFatal = "fatal";
 
     /// <summary>
+    /// Terminal event emitted when the shim detects the CLI substituted a
+    /// different model for the requested <c>--model</c> (stderr WARN, a
+    /// mismatched <c>models.currentModelId</c> in the session/new result,
+    /// or a category-"model" <c>config_option_update</c>) and aborts the
+    /// turn rather than bill a substituted model.
+    /// </summary>
+    internal const string EventModelMismatch = "model_mismatch";
+
+    /// <summary>
     /// The <c>sessionUpdate</c> discriminator values inside an
     /// <see cref="EventSessionUpdate"/> envelope's <c>update</c> object —
     /// the ACP notification kinds the stream parser folds into stream

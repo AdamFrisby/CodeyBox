@@ -117,12 +117,16 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     /// agent-neutral sets. The devin CLI wraps provider refusals in its own
     /// <c>Agent error: Client error: Protocol error (unimplemented)</c>
     /// envelope (verified), which is devin-shaped rather than
-    /// provider-relayed. The ACP startup transport failure
+    /// provider-relayed. The structured ACP signals are checked first:
+    /// the startup transport failure
     /// (<see cref="DevinTeamSettingsTimeoutDetector"/>: <c>fatal</c>
-    /// <c>session/new</c> team-settings fetch timeout, code -32603) is
-    /// checked first as a structured envelope — never a bare timeout or
-    /// code — so only that startup shape parks for transient retry.
-    /// Operator extras from
+    /// <c>session/new</c> team-settings fetch timeout, code -32603), the
+    /// model-substitution abort (<see cref="DevinModelMismatchDetector"/>:
+    /// <c>model_mismatch</c> — the CLI's <c>--model</c> fallback must retry,
+    /// never bill a substituted model), and a provider-declared retryable
+    /// turn error (<see cref="DevinRetryableTurnErrorDetector"/>:
+    /// <c>turn_error</c> with <c>cognition.ai/retryable</c>) — never a bare
+    /// timeout, code, or prose shape. Operator extras from
     /// <c>CodeyBox:ProviderTransientSignatures:devin</c> are appended at
     /// detect time via <see cref="ProviderTransientSignatureStore"/>.
     /// </summary>
@@ -143,6 +147,12 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
         {
             if (DevinTeamSettingsTimeoutDetector.TryDetect(stderr, stdout, summary) is { } startupTransient)
                 return startupTransient;
+
+            if (DevinModelMismatchDetector.TryDetect(stderr, stdout, summary) is { } modelMismatch)
+                return modelMismatch;
+
+            if (DevinRetryableTurnErrorDetector.TryDetect(stderr, stdout, summary) is { } retryableTurnError)
+                return retryableTurnError;
         }
         catch (Exception)
         {

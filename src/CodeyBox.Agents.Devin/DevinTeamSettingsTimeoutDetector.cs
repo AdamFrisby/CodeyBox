@@ -47,7 +47,7 @@ internal static class DevinTeamSettingsTimeoutDetector
             if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
                 return null;
 
-            if (HasAuthSignal(stderr, stdout, summary))
+            if (DevinAuthSignals.HasAuthSignal(stderr, stdout, summary))
                 return null;
 
             if (HasStructuredTimeout(stderr) || HasStructuredTimeout(stdout) || HasStructuredTimeout(summary))
@@ -67,58 +67,6 @@ internal static class DevinTeamSettingsTimeoutDetector
         catch (Exception)
         {
             return null;
-        }
-    }
-
-    private static bool HasAuthSignal(string? stderr, string? stdout, string? summary)
-    {
-        try
-        {
-            if (!string.IsNullOrEmpty(stderr))
-            {
-                if (AgentFailureClassifier.ContainsAuthErrorPattern(stderr))
-                    return true;
-                if (AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr))
-                    return true;
-                if (IsDevinUnauthorized(stderr, null))
-                    return true;
-            }
-
-            if (!string.IsNullOrEmpty(stdout))
-            {
-                if (AgentFailureClassifier.ContainsAuthErrorPattern(stdout))
-                    return true;
-                if (AgentFailureClassifier.ContainsAuthRequiredPatternInStdout(stdout))
-                    return true;
-            }
-
-            if (!string.IsNullOrEmpty(summary) && AgentFailureClassifier.ContainsAuthErrorPattern(summary))
-                return true;
-        }
-        catch (Exception)
-        {
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Devin-owned auth shapes (<c>Not logged in</c>, <c>Authentication
-    /// required</c>, <c>401 Unauthorized</c> — the CLI's own status wording
-    /// from <see cref="DevinQuotaFailureDetector"/>) take precedence over the
-    /// startup-transport signature. Reuses the detector's quota/auth
-    /// vocabulary as the single source of truth instead of re-listing the
-    /// strings. Never throws.
-    /// </summary>
-    private static bool IsDevinUnauthorized(string? stderr, string? stdout)
-    {
-        try
-        {
-            return new DevinQuotaFailureDetector().Detect(stderr, stdout)?.Kind == QuotaFailureKind.Unauthorized;
-        }
-        catch (Exception)
-        {
-            return false;
         }
     }
 
