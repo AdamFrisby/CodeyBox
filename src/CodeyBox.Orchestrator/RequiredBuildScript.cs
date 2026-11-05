@@ -23,6 +23,22 @@ internal static class RequiredBuildScript
     internal const string BinlogDirectoryPrefix = "codeybox-msbuild-binlogs";
     internal const string BinlogConfigVariable = "CODEYBOX_MSBUILD_CONFIG";
 
+    // Name prefix of the last-resort private tmp root the prologue creates
+    // via `mktemp -d` when neither ${TMPDIR:-/tmp} nor /tmp verifies as a
+    // writable anchor — and of the glob the binlog rediscovery searches for
+    // that root under.
+    internal const string GateTmpDirectoryPrefix = "codeybox-gate-tmp";
+
+    // The tmp roots a per-exec binlog directory can land under, stated once
+    // for every place that re-discovers it: the prologue's leftover sweep
+    // below and the diagnostics listing/fetch scripts in
+    // MSBuildDiagnosticsEnrichment all iterate this exact candidate list, so
+    // a root the prologue's tmp_root chain can produce is never missed by a
+    // drifted consumer. The chain itself must keep producing only roots this
+    // expression covers: ${TMPDIR:-/tmp}, /tmp, then the private gate-tmp dir.
+    internal const string BinlogTmpRootCandidates =
+        "\"${TMPDIR:-/tmp}\" /tmp /tmp/" + GateTmpDirectoryPrefix + ".*";
+
     // POSIX shells conventionally use 127 for "command not found".
     internal const int DotnetCommandNotFoundExitCode = 127;
     // Internal script sentinel: marker inspection said this gate applies,
@@ -54,7 +70,7 @@ internal static class RequiredBuildScript
         tmp_root="$(_codeybox_secure_dir "${TMPDIR:-/tmp}" anchor writable)" || tmp_root=
         if [ -z "$tmp_root" ]; then
           tmp_root="$(_codeybox_secure_dir /tmp anchor writable)" \
-            || tmp_root="$(mktemp -d "/tmp/codeybox-gate-tmp.XXXXXX")"
+            || tmp_root="$(mktemp -d "/tmp/{{GateTmpDirectoryPrefix}}.XXXXXX")"
         fi
         # Sweep per-exec binlog dirs left by earlier attempts under EVERY
         # root the diagnostics fetch searches, so its owner-filtered
@@ -65,13 +81,15 @@ internal static class RequiredBuildScript
         # exit (the fetch runs after this script), so they are purged at
         # start instead; only entries owned by this uid are removed — a
         # co-tenant's planted match is left for the fetch's own owner
-        # filter to refuse.
-        for old_binlogs in \
-            "${TMPDIR:-/tmp}/{{BinlogDirectoryPrefix}}."* \
-            /tmp/{{BinlogDirectoryPrefix}}.* \
-            /tmp/codeybox-gate-tmp.*/{{BinlogDirectoryPrefix}}.*; do
-          { [ -d "$old_binlogs" ] && [ -O "$old_binlogs" ] \
-            && rm -rf "$old_binlogs"; } || true
+        # filter to refuse. The roots swept are the shared
+        # BinlogTmpRootCandidates list the fetch iterates.
+        for tmp_candidate in {{BinlogTmpRootCandidates}}; do
+          [ -d "$tmp_candidate" ] || continue
+          for old_binlogs in \
+              "$tmp_candidate/{{BinlogDirectoryPrefix}}."*; do
+            { [ -d "$old_binlogs" ] && [ -O "$old_binlogs" ] \
+              && rm -rf "$old_binlogs"; } || true
+          done
         done
         # mktemp's unpredictable O_EXCL create: a PID-predictable name in the
         # world-writable temp could be squatted by a co-tenant, and the `>`/`>>`
@@ -188,10 +206,13 @@ internal static class RequiredBuildScript
         # "Failed to read NuGet.Config due to unauthorized access". The recovery
         # is repository-owned (scripts/nuget-home-heal.sh) and dot-sourced so its
         # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below;
-        # its settings/runtime-dir repair is a no-op when the home is usable
-        # (the only writes then are the idempotent migration-marker seed) and
-        # it is skipped when the repository does not ship it. This adds no
-        # capability the gate lacks — it already
+        # its settings/runtime-dir repair is a no-op when the home is usable —
+        # the writes on every evaluation are just the settings dir's
+        # create-if-missing, a transient create-then-delete writability probe
+        # inside it, and the idempotent migration-marker seed, which may also
+        # materialize its candidate home directories — and it is skipped when
+        # the repository does not ship it. This adds no capability the gate
+        # lacks — it already
         # runs the branch's arbitrary build logic via `dotnet build`.
         if [ -f scripts/nuget-home-heal.sh ]; then
           . ./scripts/nuget-home-heal.sh
@@ -260,10 +281,16 @@ internal static class RequiredBuildScript
             parts.Add(BinlogSetupFragment);
         parts.Add(captureBinlogs ? CaptureBuildLoopFragment : PlainBuildLoopFragment);
 
-        // The NuGet-home self-heal preamble runs before any dotnet
-        // invocation, exactly as in the historical gate script.
+        // The gate composes the self-heal's two halves EXPLICITLY rather
+        // than consuming NuGetHomeSelfHeal.Preamble as a blob: the fragments
+        // above call helpers defined in SharedHelpers
+        // (_codeybox_secure_dir, _codeybox_reuse_nuget_packages,
+        // _codeybox_strip_ctrl), so that dependency is declared here, and the
+        // decision half still runs before any dotnet invocation, exactly as
+        // in the historical gate script.
         return "set -eu\n"
-            + NuGetHomeSelfHeal.Preamble + "\n"
+            + NuGetHomeSelfHeal.SharedHelpers + "\n"
+            + NuGetHomeSelfHeal.DecisionFragment + "\n"
             + string.Join("\n", parts);
     }
 }

@@ -17,10 +17,13 @@
 # DOT-SOURCE this file (`. scripts/nuget-home-heal.sh`) BEFORE invoking dotnet.
 # It never fails the caller (safe under `set -e`), and — because it is
 # dot-sourced — can export a fallback DOTNET_CLI_HOME into the caller's
-# environment. The settings heal and runtime-dir pinning are strict no-ops on
-# an already-usable home; the only writes in that case are the transient
-# create-then-delete writability probe and the idempotent migration-marker
-# seeding described below. build.sh and the audit build/test gates all source
+# environment. "Usable" covers the consumed side too: a home whose settings
+# dir verifies but whose .nuget/packages tree fails the whole-tree cache
+# admission below is still healed (quarantined aside or redirected). On a
+# fully-usable home the only writes are the settings dir's create-if-missing,
+# the transient create-then-delete writability probe inside it, and the
+# idempotent migration-marker seeding (which may materialize its candidate
+# homes) described below. build.sh and the audit build/test gates all source
 # this rather than re-implementing the recovery.
 #
 # It is ALSO run from MSBuild via an InitialTargets hook (see
@@ -223,7 +226,12 @@ _codeybox_pick_user_dir() {
 
 # Print the canonical "<cli-home>/.nuget/NuGet" settings dir when the NuGet
 # user home under cli home $1 (already verified private per-user storage) is
-# usable by NuGet; return 1 otherwise. Both consumers run this ONE check —
+# usable by NuGet; return 1 otherwise. Callers use it in `if` conditions, but
+# this is an ENSURE, not a pure predicate: it creates the settings dir with
+# `mkdir -p` under the admitted .nuget when missing, and — when $4 is
+# non-empty — touches that file inside the resolved settings dir as a real
+# create-probe (`touch`, a real command, rather than a shell redirect so a
+# failure cannot abort a `set -e` caller). Both consumers run this ONE check —
 # $2/$3 name the .nuget admission rule each needs WHEN the settings dir still
 # has to be created: `trusted` for the dot-sourced recovery (an unwritable
 # .nuget can still be quarantined aside, so the mkdir probe may discover the
@@ -231,11 +239,8 @@ _codeybox_pick_user_dir() {
 # redirect — an unwritable .nuget must fail up front). An already-verified
 # settings dir still requires a `trusted` .nuget either way: a
 # co-tenant-writable one lets its owner swap the sibling package cache — or
-# the settings dir itself — for a symlink after these checks. $4, when
-# non-empty, is a file additionally touched inside the resolved settings dir
-# as a real create-probe; `touch` (a real command) is used rather than a shell
-# redirect so a failure cannot abort a `set -e` caller.
-_codeybox_nuget_home_usable() {
+# the settings dir itself — for a symlink after these checks.
+_codeybox_ensure_nuget_home_usable() {
     _codeybox_nuget_root="${1%/}/.nuget"
     _codeybox_nuget_user_dir="$_codeybox_nuget_root/NuGet"
     # Never descend through a symlinked .nuget or NuGet component — the mkdir
@@ -263,6 +268,22 @@ _codeybox_nuget_home_usable() {
     # missing one.
     if [ -e "$_codeybox_nuget_resolved/NuGet.Config" ] \
         && [ ! -r "$_codeybox_nuget_resolved/NuGet.Config" ]; then
+        return 1
+    fi
+    # A usable SETTINGS dir does not make the consumed sibling cache safe:
+    # <cli-home>/.nuget/packages is NuGet's default global-packages folder on
+    # this home (RestorePackagesPath also pins it back to the original home),
+    # and an extracted package's build/.props/.targets run inside the
+    # consuming build — so a present entry is admitted only when its WHOLE
+    # tree passes the same _codeybox_secure_package_cache check the reuse and
+    # seed paths apply. A dangling symlink reports -e false, so -L is tested
+    # too; a symlinked entry is judged by its target's ownership and modes.
+    # On failure the home is refused so the caller quarantines or redirects
+    # and NuGet re-extracts into clean storage.
+    if { [ -e "$_codeybox_nuget_root/packages" ] \
+            || [ -L "$_codeybox_nuget_root/packages" ]; } \
+        && ! _codeybox_secure_package_cache \
+            "$_codeybox_nuget_root/packages" >/dev/null 2>&1; then
         return 1
     fi
     if [ -n "${4:-}" ]; then
@@ -574,14 +595,16 @@ codeybox_heal_nuget_home() {
         # shared check's own mkdir probe to discover. The exec preamble runs
         # the same check with "trusted writable" because it cannot recreate
         # the directory in place.
-        if _codeybox_nuget_home_usable \
+        if _codeybox_ensure_nuget_home_usable \
             "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
             rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
             return 0
         fi
 
         # The inherited per-user NuGet directory is not usable — e.g. an image
-        # baked $HOME/.nuget owned by root, or a planted link. The cli home is
+        # baked $HOME/.nuget owned by root, a planted link, or a consumed
+        # .nuget/packages cache whose tree failed the shared whole-tree
+        # admission. The cli home is
         # verified private storage above, so relocate the broken entry aside
         # (preserving it, not deleting) and recreate a writable one, so EVERY
         # later `dotnet` in this environment can write its per-user config —
@@ -591,7 +614,7 @@ codeybox_heal_nuget_home() {
         _codeybox_quarantine="$_codeybox_nuget_root.codeybox-unwritable.$$"
         if { [ ! -e "$_codeybox_nuget_root" ] && [ ! -L "$_codeybox_nuget_root" ]; } \
             || mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
-            if _codeybox_nuget_home_usable \
+            if _codeybox_ensure_nuget_home_usable \
                 "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
                 rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
                 # Reuse the quarantined package cache and seed a readable user

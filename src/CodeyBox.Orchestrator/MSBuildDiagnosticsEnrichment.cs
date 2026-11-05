@@ -23,6 +23,10 @@ internal static class MSBuildDiagnosticsEnrichment
 {
     internal const string BinlogDirectoryPrefix = RequiredBuildScript.BinlogDirectoryPrefix;
     internal const string BinlogConfigVariable = RequiredBuildScript.BinlogConfigVariable;
+    // The tmp roots the build's tmp_root chain can land the binlog dir under,
+    // mirrored from the build script so listing and fetch search exactly the
+    // set the producer can create.
+    internal const string BinlogTmpRootCandidates = RequiredBuildScript.BinlogTmpRootCandidates;
 
     private const int BinlogFileNameMaxIndex = 9999;
 
@@ -247,10 +251,10 @@ internal static class MSBuildDiagnosticsEnrichment
         CancellationToken ct)
     {
         // The build script writes binlogs into a per-exec `mktemp -d`
-        // directory under whichever tmp root it resolved — ${TMPDIR:-/tmp}
-        // when that verifies as a writable anchor, else /tmp, else a private
-        // /tmp/codeybox-gate-tmp.* dir — so rediscovery must search the same
-        // candidate roots (an unpredictable name: a fixed one in the
+        // directory under whichever tmp root it resolved — the shared
+        // BinlogTmpRootCandidates list covers every root its chain can
+        // produce, so rediscovery searches the same candidate set (an
+        // unpredictable name: a fixed one in the
         // world-writable temp could be squatted by a co-tenant with planted
         // target-N.binlog symlinks). Keep the newest directory owned by this
         // exec's uid — a co-tenant's planted match is foreign-owned and
@@ -258,16 +262,17 @@ internal static class MSBuildDiagnosticsEnrichment
         // builds its path from a validated prefix-only name, never a raw
         // sandbox path. Structured argv only; the listing is filtered by an
         // exact file-name allowlist below.
-        // TMPDIR is resolved inside the remote script: argv is transported
-        // verbatim, so a literal "${TMPDIR:-/tmp}" element would never
-        // expand — the remote sh must evaluate it itself.
+        // The searched roots are the build's shared BinlogTmpRootCandidates
+        // list; TMPDIR is resolved inside the remote script: argv is
+        // transported verbatim, so a literal "${TMPDIR:-/tmp}" element would
+        // never expand — the remote sh must evaluate it itself.
         var result = await sandbox.ExecAsync(new SandboxExec
         {
             Argv = [
                 "sh", "-c",
                 $$"""
                 latest=
-                for base in "${TMPDIR:-/tmp}" /tmp /tmp/codeybox-gate-tmp.*; do
+                for base in {{BinlogTmpRootCandidates}}; do
                   [ -d "$base" ] || continue
                   for dir in "$base/{{BinlogDirectoryPrefix}}."*; do
                     [ -d "$dir" ] || continue
@@ -343,10 +348,10 @@ internal static class MSBuildDiagnosticsEnrichment
         // was allowlisted by ListBinlogNamesAsync; both travel as "$1" (never
         // interpolated), so branch-controlled content cannot reach a shell.
         // The remote script re-derives the tmp root the way the listing did —
-        // the build may have used ${TMPDIR:-/tmp}, /tmp, or a private
-        // codeybox-gate-tmp.* dir — accepting only an owned directory leaf and
-        // an owned file beneath it. TMPDIR is resolved inside the remote
-        // script — a literal "${TMPDIR:-/tmp}" argv element would be
+        // the build may have used any root in the shared
+        // BinlogTmpRootCandidates list — accepting only an owned directory
+        // leaf and an owned file beneath it. TMPDIR is resolved inside the
+        // remote script — a literal "${TMPDIR:-/tmp}" argv element would be
         // transported verbatim and never expand.
         var fetchCap = checked((int)Math.Min(
             options.MaxBinlogBytes / 3 * 4 + 128,
@@ -355,9 +360,9 @@ internal static class MSBuildDiagnosticsEnrichment
         {
             Argv = [
                 "sh", "-c",
-                """
+                $$"""
                 path=
-                for base in "${TMPDIR:-/tmp}" /tmp /tmp/codeybox-gate-tmp.*; do
+                for base in {{BinlogTmpRootCandidates}}; do
                   if [ -d "$base/${1%%/*}" ] && [ -O "$base/${1%%/*}" ] && [ -O "$base/$1" ]; then
                     path="$base/$1"
                     break

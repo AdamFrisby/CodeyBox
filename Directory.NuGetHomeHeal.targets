@@ -21,8 +21,9 @@
     The repair itself is the single source of truth in scripts/nuget-home-heal.sh
     (also dot-sourced by build.sh and the orchestrator's audit gates). The
     settings heal and runtime-dir pinning are strict no-ops on a healthy home;
-    the only writes on every evaluation are the transient create-then-delete
-    writability probe and the idempotent migration-marker seed described next,
+    the only writes on every evaluation are the settings dir's
+    create-if-missing, the transient create-then-delete writability probe
+    inside it, and the idempotent migration-marker seed described next,
     so re-running it on every project evaluation stays cheap.
     The same script seeds NuGet's applied-migration marker
     (`.local/share/NuGet/Migrations/1`) under the homes a later dotnet exec

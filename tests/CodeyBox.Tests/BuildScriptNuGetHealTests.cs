@@ -451,24 +451,27 @@ public sealed class BuildScriptNuGetHealTests
         }
     }
 
-    // The heal script's leaf assignments are kept in sync with the two C#
-    // directory names: DotnetCliHomeConventions.DirectoryName (the stamped
-    // repo-local home — a compile-time constant the script mirrors) and
-    // NuGetHomeSelfHeal.WritableHomeLeaf (the shared per-user fallback,
-    // parsed out of the embedded script). Pin both so the assignments cannot
-    // be dropped or renamed without desyncing the fallback selection or the
-    // migration-marker seeding.
+    // The C# directory names are parsed OUT of the script's leaf assignments —
+    // DotnetCliHomeConventions.DirectoryName via NuGetHomeSelfHeal.RepoHomeLeaf
+    // and NuGetHomeSelfHeal.WritableHomeLeaf — so the script is the single
+    // source and the assertions can only fail on a missing/malformed
+    // assignment or a deliberate rename. The leaf strings themselves are baked
+    // into sandbox path conventions (the stamped repo-local home, the shared
+    // per-user fallback under TMPDIR), so a rename must trip this pin
+    // deliberately rather than drift silently.
     [Fact]
     public async Task HealScript_MirrorsCliHomeLeafConstants()
     {
         var script = await File.ReadAllTextAsync(HealScriptPath());
 
         Assert.Contains(
-            $"_codeybox_repo_home_leaf=\"{DotnetCliHomeConventions.DirectoryName}\"",
+            "_codeybox_repo_home_leaf=\".dotnet-cli-home\"",
             script, StringComparison.Ordinal);
         Assert.Contains(
-            $"_codeybox_home_leaf=\"{NuGetHomeSelfHeal.WritableHomeLeaf}\"",
+            "_codeybox_home_leaf=\"codeybox-nuget-home\"",
             script, StringComparison.Ordinal);
+        Assert.Equal(".dotnet-cli-home", DotnetCliHomeConventions.DirectoryName);
+        Assert.Equal("codeybox-nuget-home", NuGetHomeSelfHeal.WritableHomeLeaf);
     }
 
     // The C# preamble does not carry a second copy of the dir-admission
@@ -1084,6 +1087,110 @@ public sealed class BuildScriptNuGetHealTests
             Assert.False(File.Exists(
                 Path.Combine(home, ".nuget", "NuGet", ".codeybox-writable-probe")));
             Assert.Equal("cached", await File.ReadAllTextAsync(marker));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // A usable SETTINGS dir does not make the consumed sibling cache safe:
+    // <cli-home>/.nuget/packages is NuGet's default global-packages folder on
+    // every live path (RestorePackagesPath also pins it), and an extracted
+    // package's build/.props/.targets run inside the consuming build — so a
+    // present cache must pass the same whole-tree admission the reuse/seed
+    // paths apply. A co-tenant-writable tree is quarantined aside like any
+    // other broken .nuget so NuGet re-extracts into clean storage.
+    [Fact]
+    public async Task HealScript_UsableHome_QuarantinesCoTenantWritableCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process can write anywhere; the writable-cache fixture
+        // bit is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            // Healthy settings home (readable config, private dirs) — the
+            // only fault is the consumed cache carrying a co-tenant write bit.
+            var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+            Directory.CreateDirectory(nugetDir);
+            await File.WriteAllTextAsync(Path.Combine(nugetDir, "NuGet.Config"), "<configuration/>");
+            var packages = Path.Combine(home, ".nuget", "packages");
+            Directory.CreateDirectory(Path.Combine(packages, "pkg"));
+            await File.WriteAllTextAsync(Path.Combine(packages, "pkg", "marker.txt"), "planted");
+            await ChmodAsync("777", packages);
+
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(
+                File.Exists(Path.Combine(home, ".nuget", "NuGet", "NuGet.Config")),
+                "the rebuilt home must carry the seeded readable user config");
+            Assert.False(
+                File.Exists(Path.Combine(home, ".nuget", "packages"))
+                || Directory.Exists(Path.Combine(home, ".nuget", "packages")),
+                "an unconsumable cache must be quarantined aside, not consumed");
+        }
+        finally
+        {
+            // The dirty tree moved aside with the quarantined .nuget; restore
+            // its write bits so the fixture can be removed.
+            var quarantined = Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*");
+            if (quarantined.Length > 0)
+                await ChmodAsync("755", Path.Combine(quarantined[0], "packages"));
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // Same consumed-cache invariant when `.nuget/packages` is a SYMLINK: the
+    // scan evaluates the link's target, so a link resolving into a
+    // co-tenant-writable directory outside the home is quarantined too — an
+    // existence-only check would have skipped the entry entirely (and -e
+    // alone cannot even see a dangling link).
+    [Fact]
+    public async Task HealScript_UsableHome_QuarantinesPackagesSymlink_ToWritableTarget()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        // A privileged process can write anywhere; the writable-target
+        // fixture bit is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var nugetDir = Path.Combine(home, ".nuget", "NuGet");
+            Directory.CreateDirectory(nugetDir);
+            await File.WriteAllTextAsync(Path.Combine(nugetDir, "NuGet.Config"), "<configuration/>");
+            await ChmodAsync("777", outside); // writable by every co-tenant
+            File.CreateSymbolicLink(Path.Combine(home, ".nuget", "packages"), outside);
+
+            var result = await DotSourceHealAsync(root, home);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(
+                File.Exists(Path.Combine(home, ".nuget", "NuGet", "NuGet.Config")),
+                "the rebuilt home must carry the seeded readable user config");
+            Assert.False(
+                File.Exists(Path.Combine(home, ".nuget", "packages"))
+                || Directory.Exists(Path.Combine(home, ".nuget", "packages")),
+                "a packages symlink to an unconsumable target must not be consumed");
+            // The quarantine moves the entry aside — it never deletes through
+            // the link, so the outside target survives untouched.
+            Assert.True(Directory.Exists(outside));
         }
         finally
         {

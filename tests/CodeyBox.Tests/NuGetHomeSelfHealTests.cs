@@ -423,6 +423,45 @@ public sealed class NuGetHomeSelfHealTests
         Assert.Equal(string.Empty, ParseVar(stdout, "PKGS"));
     }
 
+    // A usable SETTINGS dir alone is not the whole home: the sibling
+    // .nuget/packages is still consumed natively by restore, so a
+    // co-tenant-writable cache tree must flip the home to "broken" — the
+    // wrapped dotnet is redirected and the dirty cache is NOT exported.
+    [Fact]
+    public async Task WrapDotnetInvocation_UsableHome_Redirects_WhenCacheTreeIsDirty()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        // A privileged process can write anywhere; the writable-cache fixture
+        // bit is unobservable when the suite runs as root.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        using var fixture = SelfHealFixture.WithUsableSettingsAndCache(
+            packages =>
+            {
+                var nested = Path.Combine(packages, "pkg", "contents");
+                Directory.CreateDirectory(nested);
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(
+                        nested,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+                }
+            });
+
+        var (stdout, exitCode) = await fixture.RunWrappedDotnetAsync();
+
+        Assert.Equal(0, exitCode);
+        var uid = await TestSupport.CurrentUidAsync();
+        Assert.Equal(
+            Path.Combine(fixture.Tmp, NuGetHomeSelfHeal.WritableHomeLeaf + "-" + uid),
+            ParseVar(stdout, "CLI_HOME"));
+        Assert.Equal(string.Empty, ParseVar(stdout, "PKGS"));
+    }
+
     // An operator-provided NUGET_PACKAGES always wins over the inherited
     // cache — the reuse helper must never overwrite an exported value.
     [Fact]
@@ -543,6 +582,26 @@ public sealed class NuGetHomeSelfHealTests
                 if (File.Exists(config) && !OperatingSystem.IsWindows())
                     File.SetUnixFileMode(config, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             });
+
+        // A healthy NuGet SETTINGS home (readable user config, private dirs)
+        // carrying a `.nuget/packages` cache the caller seeds: usable settings
+        // do not admit the consumed cache — its whole tree must still pass the
+        // shared admission scan.
+        public static SelfHealFixture WithUsableSettingsAndCache(Action<string> seedCache) => new(
+            prepareHome: home =>
+            {
+                var nugetRoot = Path.Combine(home, ".nuget");
+                var settingsDir = Path.Combine(nugetRoot, "NuGet");
+                Directory.CreateDirectory(settingsDir);
+                File.WriteAllText(Path.Combine(settingsDir, "NuGet.Config"), "<configuration/>");
+                var packages = Path.Combine(nugetRoot, "packages");
+                Directory.CreateDirectory(packages);
+                seedCache(packages);
+            },
+            fakeDotnetBody:
+                "#!/bin/sh\nprintf 'CLI_HOME=%s\\n' \"${DOTNET_CLI_HOME:-}\"\nprintf 'HOME=%s\\n' \"${HOME:-}\"\nprintf 'XDG=%s\\n' \"${XDG_RUNTIME_DIR:-}\"\nprintf 'PKGS=%s\\n' \"${NUGET_PACKAGES:-}\"\nprintf 'ARGS=%s\\n' \"$*\"\n",
+            extraEnvRemovals: ["XDG_RUNTIME_DIR"],
+            restorePermissions: static fixture => { });
 
         // A perfectly healthy NuGet home — the preamble takes no redirect;
         // fake `dotnet` echoes every variable the preamble may pin.

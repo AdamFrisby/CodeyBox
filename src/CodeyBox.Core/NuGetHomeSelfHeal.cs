@@ -47,7 +47,7 @@ public static class NuGetHomeSelfHeal
     /// The directory-admission policy helpers (<c>_codeybox_lstat_dir</c>,
     /// <c>_codeybox_secure_dir</c>, <c>_codeybox_adopt_dir</c>,
     /// <c>_codeybox_pick_user_dir</c>), the shared decision skeleton
-    /// (<c>_codeybox_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>,
+    /// (<c>_codeybox_ensure_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>,
     /// <c>_codeybox_unset_home_env</c>), the consumed-cache admission
     /// (<c>_codeybox_secure_package_cache</c>,
     /// <c>_codeybox_reuse_nuget_packages</c>), the output-encoding helper
@@ -57,9 +57,15 @@ public static class NuGetHomeSelfHeal
     /// manifest resource at build time — so a guard or policy change in the
     /// shell file lands in both the dot-sourced recovery and this preamble
     /// automatically. There is intentionally no second copy of either in
-    /// this file to drift out of sync.
+    /// this file to drift out of sync. Exposed with
+    /// <see cref="DecisionFragment"/> so composers whose own fragments call
+    /// these helpers — the required-build gate's
+    /// <c>_codeybox_secure_dir</c>/<c>_codeybox_reuse_nuget_packages</c>/
+    /// <c>_codeybox_strip_ctrl</c> uses — state that dependency by composing
+    /// the region themselves rather than inheriting it as a side effect of
+    /// <see cref="Preamble"/>'s layout.
     /// </summary>
-    private static readonly string SharedHelpers = LoadSharedHelpers();
+    internal static readonly string SharedHelpers = LoadSharedHelpers();
 
     /// <summary>
     /// Base name of the writable fallback home directory created under
@@ -82,6 +88,17 @@ public static class NuGetHomeSelfHeal
     /// </summary>
     internal static string WritableHomeLeaf { get; } =
         ParseLeafConstant(SharedHelpers, "_codeybox_home_leaf");
+
+    /// <summary>
+    /// Name of the stamped repo-local CLI home —
+    /// <see cref="DotnetCliHomeConventions.DirectoryName"/> resolves to this
+    /// value. Parsed from <c>_codeybox_repo_home_leaf</c> in the embedded
+    /// <c>scripts/nuget-home-heal.sh</c>, which is the single source of the
+    /// literal, so the heal's migration-marker seeding always covers the same
+    /// home the convention stamps (pinned by <c>BuildScriptNuGetHealTests</c>).
+    /// </summary>
+    internal static string RepoHomeLeaf { get; } =
+        ParseLeafConstant(SharedHelpers, "_codeybox_repo_home_leaf");
 
     /// <summary>
     /// POSIX shell preamble that exports a redirected <c>DOTNET_CLI_HOME</c> (and,
@@ -123,8 +140,9 @@ public static class NuGetHomeSelfHeal
     // into the healed home, and seeds a readable user config (on-disk
     // repairs covering later execs), while this preamble only needs to keep
     // the single wrapped `dotnet` working and so exports DOTNET_CLI_HOME /
-    // NUGET_PACKAGES instead.
-    private const string DecisionFragment = """
+    // NUGET_PACKAGES instead. Internal so composers (the required-build gate)
+    // can lay out SharedHelpers + this decision half explicitly.
+    internal const string DecisionFragment = """
         nuget_home="${DOTNET_CLI_HOME:-${HOME:-}}"
         nuget_root="${nuget_home}/.nuget"
         nuget_home_resolved="$(_codeybox_adopt_dir "$nuget_home" writable)" \
@@ -136,7 +154,7 @@ public static class NuGetHomeSelfHeal
           # redirect — so the shared usable check runs with "trusted
           # writable": an unwritable .nuget must fail up front rather than
           # after NuGet's own settings-dir create fails.
-          if _codeybox_nuget_home_usable \
+          if _codeybox_ensure_nuget_home_usable \
             "$nuget_home_resolved" trusted writable >/dev/null 2>&1; then
             nuget_home_broken=0
           fi

@@ -38,9 +38,14 @@ effective cli home, and `Directory.Build.targets` runs
 `scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both
 delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
 whose settings/runtime-dir repair is a fast-path no-op when the home is
-already usable (the only writes then are the idempotent migration-marker
-seed) and which never fails the build. When `$HOME/.nuget` exists but is not
-usable — foreign-owned, unwritable, unreadable config, or a planted link — the
+already usable (the only writes then are the settings dir's create-if-missing,
+a transient create-then-delete writability probe inside it, and the idempotent
+migration-marker seed, which may also materialize its candidate homes) and
+which never fails the build. "Usable" covers the consumed side too: a present
+`.nuget/packages` entry must pass the same whole-tree cache admission the
+cache-reuse paths apply, or the home is still healed. When `$HOME/.nuget`
+exists but is not usable — foreign-owned, unwritable, unreadable config, a
+planted link, or an unconsumable consumed cache — the
 heal relocates it aside — the build user owns `$HOME`, so the rename needs no
 root — recreates a writable private `$HOME/.nuget` with a seeded readable
 config, and preserves a trusted (uid- or root-owned) pre-baked `packages`

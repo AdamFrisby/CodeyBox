@@ -114,8 +114,11 @@ internal sealed class PipelineAgentExecutor
     // never masks the real gate error. This adds no capability the audit sandbox
     // lacks — it already runs the branch's arbitrary build logic via `dotnet build`
     // in this same credential-free sandbox — and its settings/runtime-dir
-    // repair is a no-op when the home is already usable (the only writes then
-    // are the idempotent migration-marker seed).
+    // repair is a no-op when the home is already usable: the writes on every
+    // evaluation are just the settings dir's create-if-missing, the transient
+    // create-then-delete writability probe inside it, and the idempotent
+    // migration-marker seed, which may also materialize its candidate home
+    // directories.
     public static Task HealAuditNuGetHomeAsync(ISandbox sandbox, CancellationToken ct)
         => RunWithCancellation(
             sandbox,

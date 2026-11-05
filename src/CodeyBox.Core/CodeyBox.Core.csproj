@@ -21,6 +21,11 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="CodeyBox.Tests" />
+    <!-- The orchestrator's required-build gate composes the embedded heal
+         preamble's fragments (NuGetHomeSelfHeal.SharedHelpers /
+         DecisionFragment) explicitly rather than consuming the composed
+         Preamble. -->
+    <InternalsVisibleTo Include="CodeyBox.Orchestrator" />
   </ItemGroup>
 
 </Project>

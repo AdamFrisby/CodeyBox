@@ -10,13 +10,14 @@ namespace CodeyBox.Core;
 public static class DotnetCliHomeConventions
 {
     /// <summary>
-    /// Name of the stamped repo-local CLI home directory.
-    /// <c>_codeybox_repo_home_leaf</c> in <c>scripts/nuget-home-heal.sh</c>
-    /// mirrors this literal so the heal's migration-marker seeding covers the
-    /// same home — <c>BuildScriptNuGetHealTests</c> pins that the script's
-    /// assignment matches this constant, so a rename cannot desync.
+    /// Name of the stamped repo-local CLI home directory — resolved from
+    /// <see cref="NuGetHomeSelfHeal.RepoHomeLeaf"/>, which is parsed out of
+    /// <c>_codeybox_repo_home_leaf</c> in <c>scripts/nuget-home-heal.sh</c>.
+    /// The script is the single source of the literal, so the heal's
+    /// migration-marker seeding covers the same home without a hand-synced
+    /// mirror (<c>BuildScriptNuGetHealTests</c> pins the resolved value).
     /// </summary>
-    public const string DirectoryName = ".dotnet-cli-home";
+    public static string DirectoryName => NuGetHomeSelfHeal.RepoHomeLeaf;
 
     public static string ResolvePath(string workingDirectory)
     {
