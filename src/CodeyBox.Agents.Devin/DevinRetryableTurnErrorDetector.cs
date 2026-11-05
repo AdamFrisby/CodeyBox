@@ -22,7 +22,9 @@ namespace CodeyBox.Agents.Devin;
 /// <c>turn_error</c> line, so they never match. Bounded: the framed scan
 /// truncates to the last <see cref="ProviderTransientMatcher.MaxScannedChars"/>
 /// chars and examines the last <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
-/// envelopes; every evaluation is total (never throws). The detection
+/// envelopes via <see cref="DevinAcpEnvelope.EnumerateBounded"/>, which
+/// stops at <c>turn_complete</c> so post-terminal forged lines are never
+/// examined; every evaluation is total (never throws). The detection
 /// carries only the fixed signature label. An auth signal in the same
 /// capture suppresses the match (<see cref="DevinAuthSignals"/>).</para>
 /// </summary>

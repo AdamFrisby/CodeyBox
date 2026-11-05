@@ -20,10 +20,15 @@ namespace CodeyBox.Tests;
 /// runner sets when the shim owns the stream. Unframed stdout/summary is
 /// agent/model text and a forged envelope line there must never classify.
 /// The WARN-text fallback matches only verified
-/// <c>codeybox.stderr</c> envelope text fields that precede any
-/// turn-proof envelope: once the turn runs, fd 2 also carries
-/// tool-subprocess stderr the agent controls, so the marker phrase is a
-/// forgery vector there — and raw stderr is never scanned at all.</para>
+/// <c>codeybox.stderr</c> envelope text fields that precede the first
+/// turn-proof envelope while a strictly pre-prompt envelope
+/// (<c>session_started</c>/<c>mode_set</c>/handshake-stage <c>fatal</c>)
+/// is still in the window: once the turn runs, fd 2 also carries
+/// tool-subprocess stderr the agent controls, and mid-turn-legal kinds
+/// prove nothing about which side of the prompt the window sits on — so
+/// the marker phrase is a forgery vector there, and raw stderr is never
+/// scanned at all. Envelopes after <c>turn_complete</c> are never shim
+/// output and are ignored everywhere.</para>
 /// </summary>
 public sealed class DevinModelSubstitutionTests
 {
@@ -130,6 +135,24 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
+    public void ModelMismatchEnvelope_AfterTurnComplete_ReturnsNull()
+    {
+        // Post-terminal forgery: the shim exits immediately after
+        // turn_complete, so a devin.acp envelope positioned after it is
+        // pipe-injected, never shim output — it must not classify, and the
+        // outcome extraction must keep reporting the genuine turn_complete
+        // so a completed run is never flipped to failure.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+            ModelMismatchEnvelope);
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+        Assert.Equal(
+            DevinAcpOutcome.TerminalEvent.TurnComplete,
+            DevinAcpOutcome.Extract(stdout).Event);
+    }
+
+    [Fact]
     public void StderrWarnInsideStderrEnvelope_FramedCapture_ClassifiesInfraTransport()
     {
         // The WARN always reaches the capture folded inside a
@@ -219,6 +242,45 @@ public sealed class DevinModelSubstitutionTests
             "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}",
             "{\"type\":\"devin.acp\",\"event\":\"prompt_sent\",\"promptBytes\":10}",
             "{\"type\":\"devin.acp\",\"event\":\"turn_error\",\"code\":-32013,\"message\":\"x\"}");
+
+        var detection = Detect(Framed(stdout: stdout));
+
+        Assert.NotNull(detection);
+        Assert.Equal(DevinModelMismatchDetector.Signature, detection!.MatchedSignature);
+    }
+
+    [Fact]
+    public void StderrWarnInsideStderrEnvelope_MidTurnLegalEnvelopesOnly_ReturnsNull()
+    {
+        // Retained-tail edge: prompt_sent and the early turn-proof
+        // envelopes can scroll out of the 64 KiB window during a quiet
+        // tool-execution stretch, leaving only mid-turn-legal kinds
+        // (config_option_update session_updates, notifications,
+        // protocol_error, unhandled_request). Those prove nothing about
+        // which side of the prompt the window sits on, so a post-prompt
+        // forged marker positioned before the window's first turn-proof
+        // envelope must NOT classify — no strictly pre-prompt envelope
+        // remains as evidence.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"config_option_update\",\"configOptions\":[{\"id\":\"model\",\"category\":\"model\",\"currentValue\":\"swe-2-high\"}]}}",
+            "{\"type\":\"devin.acp\",\"event\":\"notification\",\"method\":\"unknown/method\"}",
+            "{\"type\":\"codeybox.stderr\",\"text\":\"ls: cannot access '"
+                + StderrWarnLine + "': No such file or directory\"}",
+            "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":\"hi\"}}}",
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}");
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+    }
+
+    [Fact]
+    public void StderrWarnInsideStderrEnvelope_HandshakeFatalStillCountsAsPrePromptEvidence()
+    {
+        // A shim killed between the WARN and its abort envelope can leave a
+        // handshake-stage fatal as the only devin.acp evidence — that stage
+        // can only exist pre-prompt, so the fallback still fires.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"fatal\",\"stage\":\"session/new\",\"code\":-32603,\"message\":\"boom\"}",
+            "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}");
 
         var detection = Detect(Framed(stdout: stdout));
 
@@ -334,6 +396,22 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
+    public void RetryableTurnErrorEnvelope_AfterTurnComplete_ReturnsNull()
+    {
+        // Same post-terminal rule for the shared bounded enumerator: a
+        // forged retryable turn_error appended after turn_complete is
+        // pipe-injected noise — never examined, never classified.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\"}",
+            RetryableTurnErrorEnvelope);
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+        Assert.Equal(
+            DevinAcpOutcome.TerminalEvent.TurnComplete,
+            DevinAcpOutcome.Extract(stdout).Event);
+    }
+
+    [Fact]
     public void TurnErrorWithoutRetryableFlag_FramedCapture_ReturnsNull()
     {
         // Same code and message shape, but the provider did not declare the
@@ -381,10 +459,13 @@ public sealed class DevinModelSubstitutionTests
     }
 
     // Bounded tail scans: the signatures are TERMINAL envelopes — the last
-    // lines of the capture — so the examined set must be the LAST
-    // MaxEnvelopesExamined envelopes of the char-bounded window. A chatty
-    // turn (agent_message_chunk deltas, stderr relay lines) must never
-    // push its terminal envelope out of view.
+    // lines of the capture — so the examined set must favour the tail of
+    // the char-bounded window. The turn_error detector uses the shared
+    // last-MaxEnvelopesExamined bound; the model_mismatch detector scans
+    // EVERY typed envelope in the window because its pre-prompt proof
+    // needs the interleaved codeybox.stderr ordering. A chatty turn
+    // (agent_message_chunk deltas, stderr relay lines) must never push a
+    // terminal envelope out of view on either path.
 
     private static string[] ChattySessionUpdates(int count)
         => Enumerable.Range(0, count)
@@ -392,8 +473,11 @@ public sealed class DevinModelSubstitutionTests
             .ToArray();
 
     [Fact]
-    public void ModelMismatchEnvelope_BeyondEnvelopeCap_StillDetected()
+    public void ModelMismatchEnvelope_PastSharedEnvelopeCap_StillDetected()
     {
+        // The model_mismatch scan has no envelope-count cap — it examines
+        // every typed envelope in the char window — so a capture carrying
+        // more devin.acp envelopes than MaxEnvelopesExamined still detects.
         var lines = ChattySessionUpdates(DevinAcpEnvelope.MaxEnvelopesExamined + 40)
             .Append(ModelMismatchEnvelope)
             .ToArray();

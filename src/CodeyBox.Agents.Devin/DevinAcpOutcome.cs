@@ -11,7 +11,11 @@ namespace CodeyBox.Agents.Devin;
 /// model for the requested <c>--model</c>; the turn was aborted), or
 /// <c>fatal</c> (spawn/handshake/protocol failure,
 /// including a prompt result that carried no stopReason) — so the last
-/// terminal envelope found is authoritative.
+/// terminal envelope found is authoritative. Enumeration stops at
+/// <c>turn_complete</c> (<see cref="DevinAcpEnvelope.Enumerate"/>): the shim
+/// exits immediately after emitting it, so a terminal-looking envelope
+/// appended later on the wire is pipe-injected, never shim output, and must
+/// not flip a completed run to failure.
 ///
 /// <para>Used to lift a typed failure into
 /// <see cref="AgentResult.TerminalDiagnostic"/> (and to confirm a run that

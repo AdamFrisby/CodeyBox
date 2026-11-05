@@ -42,6 +42,12 @@ are re-emitted as flat number maps, not verbatim objects — but the
 exec-pipe leg has no in-VM fix. Consumers must treat envelope payloads
 (usage counters, terminal event, finalText) as agent-influenceable
 telemetry, never authoritative accounting.
+
+The negotiated sessionId is deliberately NOT echoed into outbound
+envelopes: the envelope stream is tee'd to an in-VM log file readable by
+agent tools, so stamping it would hand a wire-pipe writer the session
+pin's key. (A /proc-level read of this client's pipe read-end remains a
+residual — see above.)
 """
 
 from __future__ import annotations
@@ -256,7 +262,9 @@ class AcpClient:
         self.pending = {}
         # Negotiated session id, set when session/new answers. Session-scoped
         # frames for any other id are dropped — the agent's sessionId is a
-        # server-chosen opaque string a wire-pipe writer cannot guess.
+        # server-chosen opaque string a wire-pipe writer cannot guess from
+        # the claimable stream (it is never echoed into outbound envelopes;
+        # a /proc-level read of the wire remains a documented residual).
         self.session_id = None
         # The --model value the dispatch requested, or None when the account
         # default applies (no substitution guard is armed then).
@@ -506,7 +514,9 @@ def run_turn(client, prompt, cwd, mode, requested_model, model_fallback):
                      message="session/new response did not carry a sessionId")
                 return EXIT_TURN_FAILED
             client.session_id = session_id
-            emit("session_started", sessionId=session_id)
+            # The sessionId is validated inbound but never stamped into
+            # claimable envelopes — see the module docstring.
+            emit("session_started")
             # Structured substitution check: when the server reports the
             # session's active model and it is not the one we requested,
             # abort before the first prompt — never run a turn on a model
@@ -638,7 +648,9 @@ def handle_notification(client, frame, final_text_parts, final_text_chars):
             active = config_options_model(update.get("configOptions"))
             if active and active != client.requested_model:
                 client.model_conflict = (active, "config_option_update")
-        emit("session_update", sessionId=session_id, update=update)
+        # sessionId stays out of the claimable envelope (module
+        # docstring); the pin is enforced inbound above.
+        emit("session_update", update=update)
         if isinstance(update, dict) and update.get("sessionUpdate") == "agent_message_chunk":
             content = update.get("content")
             if isinstance(content, dict) and isinstance(content.get("text"), str):

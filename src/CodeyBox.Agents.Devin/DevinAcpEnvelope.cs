@@ -55,6 +55,18 @@ internal static class DevinAcpEnvelope
     internal const string EventPromptSent = "prompt_sent";
 
     /// <summary>
+    /// Emitted once when <c>session/new</c> answers — a strictly pre-prompt
+    /// handshake event.
+    /// </summary>
+    internal const string EventSessionStarted = "session_started";
+
+    /// <summary>
+    /// Emitted once when <c>session/set_mode</c> answers — a strictly
+    /// pre-prompt handshake event.
+    /// </summary>
+    internal const string EventModeSet = "mode_set";
+
+    /// <summary>
     /// Terminal event emitted when the shim detects the CLI substituted a
     /// different model for the requested <c>--model</c> (stderr WARN, a
     /// mismatched <c>models.currentModelId</c> in the session/new result,
@@ -110,8 +122,12 @@ internal static class DevinAcpEnvelope
 
     /// <summary>
     /// Upper bound on envelopes examined per provider-transient detection
-    /// pass — the single bound shared by every detector scanning the
-    /// framed capture.
+    /// pass — the last-N tail policy applied by <see cref="EnumerateBounded"/>
+    /// for detectors that scan only <c>devin.acp</c> envelopes. Detectors
+    /// that must see the interleaved typed stream (e.g. the
+    /// <c>codeybox.stderr</c> relay lines) use <see cref="EnumerateEnvelopes"/>
+    /// over the same char-bounded window instead and are bounded by
+    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> alone.
     /// </summary>
     internal const int MaxEnvelopesExamined = 128;
 
@@ -163,13 +179,26 @@ internal static class DevinAcpEnvelope
     /// Never throws: blank lines, non-JSON lines, JSON that is not a
     /// devin.acp envelope, and lines truncated mid-write are all skipped —
     /// the capture may carry leading CLI noise or be cut by an output cap.
+    ///
+    /// <para>Enumeration stops after the first <c>turn_complete</c>
+    /// envelope: the shim exits immediately after emitting it, so any
+    /// <c>devin.acp</c> line positioned after it cannot be shim output — a
+    /// same-uid process can still append forged envelope lines to the exec
+    /// stdout pipe through <c>/proc/&lt;pid&gt;/fd</c> after the turn ends.
+    /// Consumers therefore never see post-terminal forged envelopes through
+    /// this enumerator (or through <see cref="EnumerateBounded"/>, which is
+    /// built on it).</para>
     /// </summary>
     internal static IEnumerable<Envelope> Enumerate(string? stdout)
     {
         foreach (var typed in EnumerateEnvelopes(stdout))
         {
             if (typed.Type == EnvelopeType && typed.Event is { } eventName)
+            {
                 yield return new Envelope(eventName, typed.Root);
+                if (string.Equals(eventName, EventTurnComplete, StringComparison.Ordinal))
+                    yield break;
+            }
         }
     }
 
@@ -178,14 +207,16 @@ internal static class DevinAcpEnvelope
     /// detection: truncates the input to the last
     /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars and
     /// yields the LAST <see cref="MaxEnvelopesExamined"/> devin.acp
-    /// envelopes of that window — the single bound policy shared by the
-    /// Devin detectors. Both bounds favour the tail because the signatures
-    /// they scan for (terminal <c>model_mismatch</c>/<c>turn_error</c>/
-    /// <c>fatal</c> envelopes) are the last lines of the capture: a chatty
-    /// turn — including <c>codeybox.stderr</c> relay lines flushed after
-    /// the terminal envelope — must not push the signature out of the
-    /// examined set. Non-devin.acp lines are parsed but never counted
-    /// against the envelope bound.
+    /// envelopes of that window — the bound policy for detectors that scan
+    /// only <c>devin.acp</c> envelopes. Both bounds favour the tail because
+    /// the signatures they scan for (terminal <c>model_mismatch</c>/
+    /// <c>turn_error</c>/<c>fatal</c> envelopes) are the last lines of the
+    /// capture: a chatty turn — including <c>codeybox.stderr</c> relay lines
+    /// flushed after the terminal envelope — must not push the signature
+    /// out of the examined set. Non-devin.acp lines are parsed but never
+    /// counted against the envelope bound. Like <see cref="Enumerate"/>,
+    /// enumeration stops at <c>turn_complete</c> so post-terminal forged
+    /// lines cannot consume the examined set.
     /// </summary>
     internal static IEnumerable<Envelope> EnumerateBounded(string? stdout)
     {
@@ -193,7 +224,7 @@ internal static class DevinAcpEnvelope
             yield break;
 
         var bounded = ProviderTransientMatcher.BoundToScannedTail(stdout);
-        foreach (var envelope in LastEnvelopes(Enumerate(bounded), MaxEnvelopesExamined))
+        foreach (var envelope in LastItems(Enumerate(bounded), MaxEnvelopesExamined))
             yield return envelope;
     }
 
@@ -203,7 +234,7 @@ internal static class DevinAcpEnvelope
     /// most <paramref name="count"/> items, so the bound is enforced
     /// before buffering rather than after.
     /// </summary>
-    internal static IEnumerable<T> LastEnvelopes<T>(IEnumerable<T> source, int count)
+    internal static IEnumerable<T> LastItems<T>(IEnumerable<T> source, int count)
     {
         if (count <= 0)
             yield break;

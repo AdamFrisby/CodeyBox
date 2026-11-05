@@ -478,11 +478,18 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   (`AgentResult.StdoutIsEnvelopeFramed`); unframed stdout/summary is
   agent text and never parsed as envelopes. The WARN-text fallback
   matches only verified `codeybox.stderr` envelope `text` fields that
-  precede any turn-proof envelope in the bounded tail scan (a
+  precede the first turn-proof envelope in the bounded tail scan, and
+  only while the window still carries a strictly pre-prompt envelope
+  (`session_started`, `mode_set`, or a handshake-stage `fatal` — a
   `prompt_sent`/`turn_*`/turn-scoped `session_update`/post-prompt
-  `fatal` envelope proves fd 2 was already agent-shared, and a window
-  with no devin.acp handshake envelope at all proves nothing); raw
-  stderr is never scanned for it. A `turn_error` whose error `data`
+  `fatal` envelope proves fd 2 was already agent-shared, mid-turn-legal
+  kinds like `notification`/`protocol_error`/`unhandled_request`/
+  `config_option_update` prove nothing either way, and a window with no
+  pre-prompt devin.acp envelope at all proves nothing); raw
+  stderr is never scanned for it. Envelopes positioned after
+  `turn_complete` are never shim output — the shim exits immediately —
+  so enumeration stops there and post-terminal forged lines cannot flip
+  a completed run or feed transient classification. A `turn_error` whose error `data`
   carries `cognition.ai/retryable: true` is forwarded as
   `"retryable": true` and parks on the same bounded path.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
@@ -523,7 +530,12 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   agent's fd 1 writes onto the shim's ACP wire pipe — the shim narrows the
   wire pipe with unguessable JSON-RPC request ids, session-id pinning on
   session-scoped frames, and flat-number-only usage bags, but the exec-pipe
-  leg has no in-VM fix. Envelope payloads are therefore agent-influenceable
+  leg has no in-VM fix. The negotiated sessionId is validated inbound but
+  never stamped into claimable envelopes — the stream is tee'd to an
+  in-VM log readable by agent tools, so publishing it would hand a
+  wire-pipe writer the pin's key (a `/proc`-level read of the shim's pipe
+  read-end remains a residual). Envelope payloads are therefore
+  agent-influenceable
   telemetry — usage, outcome, final text — never authoritative accounting.
   Usage counters specifically are never promoted to extracted token usage:
   `DevinCostExtractor` returns null and `DevinStreamParser` does not fold
@@ -534,10 +546,17 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   the read-only `auto` default is the conservative shape for answering
   questions on untrusted resolver input. Print mode exposes no
   structured active-model signal, so `DevinAgentRunner` vetoes a
-  successful `devin -p` exec whose stderr carries the same WARN phrase
-  (`RejectSuccessfulTextOnlyResult`): the substituted run is reported
-  as a failure and its stderr detail still classifies
-  provider-transient downstream. Residual gap: the WARN is
+  successful `devin -p` exec whose stderr carries the full WARN shape
+  (`RejectSuccessfulTextOnlyResult`): the run is reported as a failure
+  and the substituted output is never consumed. Because print-mode fd 2
+  is shared with agent-controlled tool subprocesses, the veto keys on
+  the extended WARN phrase (short marker plus the `falling back to your
+  configured agent.model or the default` clause) and reports only a
+  POSSIBLE substitution — it cannot verify the cause. Honest residual:
+  the vetoed `TextOnlyAgentResult` failure does NOT park for transient
+  retry — its consumers (the advisory merge security review) run no
+  provider-transient classification, so the call fails terminally;
+  fail-closed for billing either way. Residual gap: the WARN is
   `chisel_server::acp`-scoped and may never fire outside `devin acp` —
   treat print-mode `--model` pinning as best-effort until the CLI
   offers an equivalent signal.

@@ -293,6 +293,12 @@ public sealed class DevinAcpTransportTests
             < streamText.IndexOf("\"turn_complete\"", StringComparison.Ordinal),
             "progress envelopes must precede the terminal envelope");
 
+        // The negotiated sessionId is validated inbound but never stamped
+        // into claimable envelopes: the stream is tee'd to an in-VM log
+        // readable by agent tools, so publishing it would hand a
+        // wire-pipe writer the session pin's key.
+        Assert.DoesNotContain("sessionId", streamText, StringComparison.Ordinal);
+
         // The fake peer offered [reject_once, allow_always]; the shim must
         // answer with the durable allow, not a reject or a cancel.
         Assert.Contains("\"permission_auto_granted\"", streamText, StringComparison.Ordinal);
