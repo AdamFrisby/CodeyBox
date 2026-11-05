@@ -76,7 +76,198 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         Assert.Equal(0, (await RunScriptAsync(home)).ExitCode);
         Assert.Equal(0, (await RunScriptAsync(home)).ExitCode);
         Assert.True(Directory.Exists(Path.Combine(home, ".nuget", "NuGet")));
-        Assert.False(Directory.Exists(Path.Combine(home, ".nuget.rootbaked")));
+        Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+    }
+
+    [Fact]
+    public async Task Script_DefersToRedirect_WhenHomeUnwritable()
+    {
+        // An unwritable $HOME makes every in-place repair impossible — both the
+        // fast-path mkdir and the quarantine mv need a writable parent. The
+        // script must not turn that into a build failure (MSB3073): the
+        // DOTNET_CLI_HOME redirect is the designed fallback, so it exits 0 and
+        // leaves the broken tree untouched.
+        if (Environment.IsPrivilegedProcess)
+            return; // root can write anywhere; the unwritable branch is unobservable
+
+        var home = Path.Combine(_workspace, "home-unwritable");
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(nugetHome);
+        File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var (exit, output) = await RunScriptAsync(home);
+
+            Assert.Equal(0, exit);
+            Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+        }
+        finally
+        {
+            File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public async Task Script_DefersToRedirect_WhenNuGetHomeCannotBeCreated()
+    {
+        // $HOME unwritable with no .nuget at all: the mkdir fast path cannot
+        // succeed, so the script defers to the redirect instead of aborting a
+        // `set -e` caller.
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var home = Path.Combine(_workspace, "home-no-create");
+        Directory.CreateDirectory(home);
+        File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var (exit, output) = await RunScriptAsync(home);
+
+            Assert.Equal(0, exit);
+            Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(home, ".nuget")));
+        }
+        finally
+        {
+            File.SetUnixFileMode(home, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    // The CODEYBOX_NUGET_HOME_UNDER_TEST override below exercises the same
+    // hook the retired scripts/reclaim-nuget-home.sh carried — the two
+    // wrappers converged into this one, so its coverage moved here.
+    [Fact]
+    public async Task Script_AlreadyUsableHome_IsNoOp()
+    {
+        var home = Path.Combine(_workspace, "arg-home-ok");
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(Path.Combine(nugetHome, "NuGet"));
+
+        var (exit, _) = await RunScriptAsync(home, nugetHome);
+
+        Assert.Equal(0, exit);
+        // A usable home is left exactly as-is: no reclaim, no aside copy.
+        Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+        Assert.Empty(AsideDirs(nugetHome));
+    }
+
+    [Fact]
+    public async Task Script_UnwritableHome_IsReclaimedNonDestructively()
+    {
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var home = Path.Combine(_workspace, "arg-home-unwritable");
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(nugetHome);
+        var marker = Path.Combine(nugetHome, "packages-marker");
+        await File.WriteAllTextAsync(marker, "base-image-cache");
+        // Deny writes on the home itself so "mkdir $home/NuGet" fails exactly as a
+        // root-owned ~/.nuget denies the unprivileged build user; the parent
+        // stays writable so the reclaim can move it aside.
+        File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var (exit, output) = await RunScriptAsync(home, nugetHome);
+
+            Assert.Equal(0, exit);
+            // A fresh, writable home is in place so restore can create its config.
+            var nugetDir = Path.Combine(nugetHome, "NuGet");
+            Assert.True(Directory.Exists(nugetDir), output);
+            var probe = Path.Combine(nugetDir, "probe");
+            await File.WriteAllTextAsync(probe, "writable");
+            Assert.True(File.Exists(probe));
+            // Non-destructive: the original home (with its cache) is preserved aside.
+            var aside = Assert.Single(AsideDirs(nugetHome));
+            Assert.Equal("base-image-cache", await File.ReadAllTextAsync(Path.Combine(aside, "packages-marker")));
+        }
+        finally
+        {
+            if (Directory.Exists(nugetHome))
+                File.SetUnixFileMode(
+                    nugetHome,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+    }
+
+    [Fact]
+    public async Task Script_UnreadableConfigInWritableDir_IsReclaimed()
+    {
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var home = Path.Combine(_workspace, "arg-home-poisoned");
+        var nugetHome = Path.Combine(home, ".nuget");
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+        Directory.CreateDirectory(nugetDir);
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(config, "<configuration/>");
+        // Writable directory but a root-owned, unreadable config inside — NuGet
+        // aborts reading it just like the missing-directory case, so the reclaim
+        // must relocate it rather than treat the home as usable.
+        File.SetUnixFileMode(config, UnixFileMode.None);
+        try
+        {
+            var (exit, _) = await RunScriptAsync(home, nugetHome);
+
+            Assert.Equal(0, exit);
+            // The poisoned config was moved aside and a fresh home put in place.
+            Assert.Single(AsideDirs(nugetHome));
+            var freshConfig = Path.Combine(nugetHome, "NuGet", "NuGet.Config");
+            Assert.True(
+                File.Exists(freshConfig),
+                "the heal seeds a readable user config so the fatal read succeeds");
+            Assert.Contains(
+                "<configuration",
+                await File.ReadAllTextAsync(freshConfig),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            foreach (var aside in AsideDirs(nugetHome))
+            {
+                var quarantined = Path.Combine(aside, "NuGet", "NuGet.Config");
+                if (File.Exists(quarantined))
+                    File.SetUnixFileMode(quarantined, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Script_ParentNotWritable_IsLeftForRedirect()
+    {
+        if (Environment.IsPrivilegedProcess)
+            return;
+
+        var parent = Path.Combine(_workspace, "arg-readonly-home");
+        var nugetHome = Path.Combine(parent, ".nuget");
+        Directory.CreateDirectory(nugetHome);
+        // Both the home AND its parent are unwritable: no in-place repair is
+        // possible, so the script must leave everything untouched, defer to
+        // the DOTNET_CLI_HOME redirect, and exit cleanly.
+        File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        File.SetUnixFileMode(parent, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        try
+        {
+            var (exit, output) = await RunScriptAsync(parent, nugetHome);
+
+            Assert.Equal(0, exit);
+            Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+            Assert.Empty(AsideDirs(nugetHome));
+        }
+        finally
+        {
+            File.SetUnixFileMode(
+                parent,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(
+                nugetHome,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
     }
 
     [Fact]
@@ -145,17 +336,39 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
             "Directory.Build.targets must leave a writable NuGet home");
     }
 
-    private async Task<(int ExitCode, string Output)> RunScriptAsync(string home)
+    private static IReadOnlyList<string> AsideDirs(string nugetHome)
+    {
+        var parent = Path.GetDirectoryName(nugetHome)!;
+        var name = Path.GetFileName(nugetHome);
+        return Directory.Exists(parent)
+            ? Directory.GetDirectories(parent, name + ".codeybox-unwritable.*")
+            : [];
+    }
+
+    private async Task<(int ExitCode, string Output)> RunScriptAsync(string home, string? nugetArg = null)
     {
         var psi = new ProcessStartInfo("/bin/sh")
         {
-            ArgumentList = { ScriptPath },
             RedirectStandardError = true,
             RedirectStandardOutput = true,
             UseShellExecute = false,
         };
+        psi.ArgumentList.Add(ScriptPath);
         psi.Environment["HOME"] = home;
+        // The .nuget-override test hook: it repairs the cli home above that
+        // directory instead of the ambient $HOME. Cleared first so a value
+        // inherited from the test host cannot leak into the fixture.
+        psi.Environment.Remove("CODEYBOX_NUGET_HOME_UNDER_TEST");
+        if (nugetArg is not null)
+            psi.Environment["CODEYBOX_NUGET_HOME_UNDER_TEST"] = nugetArg;
         psi.Environment["TMPDIR"] = _workspace;
+        // The fixture home must be authoritative: a stamped DOTNET_CLI_HOME or
+        // runtime dir inherited from the test host would make the heal repair
+        // that home instead of the fixture's.
+        psi.Environment.Remove("DOTNET_CLI_HOME");
+        psi.Environment.Remove("XDG_RUNTIME_DIR");
+        psi.Environment.Remove("XDG_DATA_HOME");
+        psi.Environment.Remove("NUGET_PACKAGES");
 
         using var proc = Process.Start(psi)!;
         var stdout = await proc.StandardOutput.ReadToEndAsync();

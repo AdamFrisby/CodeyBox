@@ -1,68 +1,63 @@
 #!/bin/sh
-# Repair a non-writable $HOME/.nuget so NuGet can create its per-user settings
-# directory ($HOME/.nuget/NuGet). Sandbox images that pre-bake a package cache
-# under $HOME/.nuget/packages as root often leave the parent directory
-# root-owned mode 755; raw `dotnet build`/`dotnet restore` then fail with
-# "Failed to read NuGet.Config ... Permission denied" before any project-,
-# solution-, or RestoreConfigFile-level config is honoured.
+# Repair an unusable per-user NuGet home so NuGet can create/read its
+# per-user settings directory ($HOME/.nuget/NuGet). Sandbox images that
+# pre-bake a package cache under $HOME/.nuget/packages as root often leave
+# the parent directory foreign-owned or unwritable; raw `dotnet build`/
+# `dotnet restore` then fail with "Failed to read NuGet.Config ...
+# Permission denied" before any project-, solution-, or
+# RestoreConfigFile-level config is honoured.
 #
-# The build user owns $HOME even when .nuget does not, so renaming the entry
-# aside and recreating a writable one is allowed without root. Pre-baked
-# packages are preserved via symlink. Concurrent MSBuild nodes share a lock so
-# InitialTargets across many projects do not race.
+# The repair itself is the single source of truth in
+# scripts/nuget-home-heal.sh — the same recovery build.sh, the audit gates,
+# and the sibling InitialTargets hook all dot-source — so writability is
+# never mistaken for ownership: an existing .nuget is admitted only as
+# canonical storage owned by this uid or root with no co-tenant write bits;
+# a foreign-owned, co-tenant-writable, or symlinked entry is quarantined
+# aside; a fresh private settings dir is created with a readable seeded
+# config; and the package cache is relinked only when its WHOLE tree
+# verifies as consumable storage — every descendant owned by this uid or
+# root with no group/other write bits and no access-broadening ACL.
+#
+# When $HOME itself cannot be repaired in place, no in-place fix exists —
+# the DOTNET_CLI_HOME redirect (the NuGetHomeSelfHeal preamble wrapping
+# dotnet invocations, or the in-process NuGetHomeGuard.targets backstop) is
+# the designed fallback, and the heal takes it inside this process too.
+# Every path therefore exits 0: an impossible repair must never surface as
+# an MSB3073 that masks the real path.
 #
 # Invoked from Directory.Build.targets (InitialTargets) so every raw
 # `dotnet build` in this repository — including process:required-build and
 # csharp:build-WaE — self-heals on a misprovisioned image.
-set -eu
+set -u
 
-home="${HOME:-}"
-[ -n "$home" ] || exit 0
-
-nuget_home="$home/.nuget"
-
-# Fast path: absent or already writable — ensure the settings dir exists.
-if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
-  mkdir -p "$nuget_home/NuGet"
-  exit 0
-fi
-
-lock_dir="${TMPDIR:-/tmp}/codeybox-ensure-writable-nuget-home.lock"
-tries=0
-while ! mkdir "$lock_dir" 2>/dev/null; do
-  tries=$((tries + 1))
-  # Another node already finished the repair.
-  if [ -d "$nuget_home" ] && [ -w "$nuget_home" ]; then
-    mkdir -p "$nuget_home/NuGet"
+codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+codeybox_heal_script="$codeybox_script_dir/nuget-home-heal.sh"
+if [ ! -f "$codeybox_heal_script" ]; then
     exit 0
-  fi
-  if [ "$tries" -ge 200 ]; then
-    echo "error : timed out waiting to repair non-writable NuGet home at $nuget_home" >&2
-    exit 1
-  fi
-  # Portable ~50ms pause without requiring bash/usleep.
-  sleep 0.05 2>/dev/null || sleep 1
-done
-
-cleanup_lock() {
-  rmdir "$lock_dir" 2>/dev/null || true
-}
-trap cleanup_lock EXIT INT TERM
-
-# Re-check under the lock — a peer may have repaired while we waited.
-if [ ! -e "$nuget_home" ] || [ -w "$nuget_home" ]; then
-  mkdir -p "$nuget_home/NuGet"
-  exit 0
 fi
 
-baked="$home/.nuget.rootbaked"
-if [ -e "$baked" ]; then
-  baked="$home/.nuget.rootbaked-$$"
+# CODEYBOX_NUGET_HOME_UNDER_TEST, when set, names the .nuget directory to
+# repair — an override so tests can exercise the heal against a temporary
+# home without touching the caller's real $HOME; the heal operates on the
+# cli home above it. Either way this hook's mission is the $HOME-based home
+# — an InitialTarget's exports cannot reach the already-running build
+# anyway — so heal $HOME specifically, not a stamped DOTNET_CLI_HOME (that
+# home is the sibling InitialTarget's job, Directory.NuGetHomeHeal.targets).
+# Unset it so the shared recovery resolves HOME as the cli home to repair;
+# the variable then comes back non-empty only when the heal took its
+# redirect fallback.
+if [ -n "${CODEYBOX_NUGET_HOME_UNDER_TEST:-}" ]; then
+    HOME="$(dirname "${CODEYBOX_NUGET_HOME_UNDER_TEST%/}")"
+    export HOME
 fi
-
-mv "$nuget_home" "$baked"
-mkdir -p "$nuget_home"
-if [ -d "$baked/packages" ]; then
-  ln -s "$baked/packages" "$nuget_home/packages"
+unset DOTNET_CLI_HOME
+codeybox_home_before="${HOME:-}"
+# Dot-sourcing runs the whole recovery: settings heal, runtime-dir pinning,
+# and migration-marker seeding. The exports it makes die with this process
+# (MSBuild already runs), but the on-disk repairs — quarantine, recreated
+# private home, seeded config and markers — persist for every later exec.
+. "$codeybox_heal_script" || true
+if [ -n "${DOTNET_CLI_HOME:-}" ]; then
+    echo "ensure-writable-nuget-home: cannot repair ${codeybox_home_before:-<unset>}/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
 fi
-mkdir -p "$nuget_home/NuGet"
+exit 0

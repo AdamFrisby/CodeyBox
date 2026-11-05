@@ -19,9 +19,19 @@
     build/test gates invoke directly.
 
     The repair itself is the single source of truth in scripts/nuget-home-heal.sh
-    (also dot-sourced by build.sh and the orchestrator's audit gates). It is a
-    strict no-op when the home is already usable, so re-running it on every
-    project evaluation is cheap and side-effect-free.
+    (also dot-sourced by build.sh and the orchestrator's audit gates). The
+    settings heal and runtime-dir pinning are strict no-ops on a healthy home;
+    the only writes on every evaluation are the settings dir's
+    create-if-missing, the transient create-then-delete writability probe
+    inside it, and the idempotent migration-marker seed described next,
+    so re-running it on every project evaluation stays cheap.
+    The same script seeds NuGet's applied-migration marker
+    (`.local/share/NuGet/Migrations/1`) under the homes a later dotnet exec
+    could resolve, so restore's MigrationRunner skips the user-scoped
+    "NuGet-Migrations" named mutex — which aborts the whole build when the
+    launch environment resolves no usable runtime dir ($XDG_RUNTIME_DIR or
+    $HOME) — even when that marker was not planted before the dotnet process
+    started.
   -->
   <PropertyGroup>
     <CodeyBoxNuGetHomeHealScript>$(MSBuildThisFileDirectory)scripts/nuget-home-heal.sh</CodeyBoxNuGetHomeHealScript>

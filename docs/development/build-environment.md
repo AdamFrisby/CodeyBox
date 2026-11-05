@@ -31,21 +31,58 @@ each test DLL path as an "invalid argument".
 MSBuild aggregates `InitialTargets` from the imported
 `Directory.Build.props`/`.targets` and runs them at the very start of every
 project evaluation — before restore resolves the NuGet user-settings directory.
-That is the only committed-file hook early enough to matter, and CodeyBox uses
-it twice: `Directory.Build.props` runs `scripts/reclaim-nuget-home.sh`
-(fast-path no-op when the home is already usable, non-destructive, race-safe
-across parallel evaluations via an atomic `mkdir` lock, and never fails the
-build), and `Directory.Build.targets` runs
-`scripts/ensure-writable-nuget-home.sh`. When `$HOME/.nuget` exists but is
-not writable, the scripts rename it aside — the build user owns `$HOME`, so the
-rename needs no root — recreate a writable `$HOME/.nuget`, and preserve any
-pre-baked `packages` cache by symlink.
+That is the only committed-file hook early enough to matter, and CodeyBox runs
+two entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
+`Directory.Build.props`) dot-sources `scripts/nuget-home-heal.sh` against the
+effective cli home, and `Directory.Build.targets` runs
+`scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both
+delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
+whose settings/runtime-dir repair is a fast-path no-op when the home is
+already usable (the only writes then are the settings dir's create-if-missing,
+a transient create-then-delete writability probe inside it, and the idempotent
+migration-marker seed, which may also materialize its candidate homes) and
+which never fails the build. "Usable" covers the consumed side too: a present
+`.nuget/packages` entry must pass the same whole-tree cache admission the
+cache-reuse paths apply, or the home is still healed. When `$HOME/.nuget`
+exists but is not usable — foreign-owned, unwritable, unreadable config, a
+planted link, or an unconsumable consumed cache — the
+heal relocates it aside — the build user owns `$HOME`, so the rename needs no
+root — recreates a writable private `$HOME/.nuget` with a seeded readable
+config, and preserves a trusted (uid- or root-owned) pre-baked `packages`
+cache by symlink.
 
 A `BeforeTargets="Restore"` target is *not* early enough: solution restore
 aborts during graph construction, before any project's `Restore` chain runs. Nor
 can a props file re-point the home in process — MSBuild rejects
 `[System.Environment]::SetEnvironmentVariable` with `MSB4185`, since env
 mutation is not on the property-function allowlist.
+
+### The `NuGet-Migrations` named mutex needs a usable runtime dir at launch
+
+Since runtime 10.0.13, user-scoped named mutexes resolve under
+`$XDG_RUNTIME_DIR`, falling back to
+`$HOME/.dotnet/corefx/Runtime/SharedMemory` — and the runtime caches that answer
+at process start, so no in-process env change can help. NuGet creates that mutex
+in two places before/inside `dotnet build`: first-use configuration and restore
+(`MigrationRunner`). When the launch environment resolves neither variable to a
+usable directory the CLI aborts with
+`System.IO.IOException: The system cannot open the device or file specified. : 'NuGet-Migrations'`
+(dotnet/runtime#135726, #136802) — before MSBuild starts, so no `InitialTargets`
+hook can observe the failure itself.
+
+`scripts/nuget-home-heal.sh` answers this on two axes. Dot-sourced, it pins an
+unusable `HOME`/`XDG_RUNTIME_DIR` to a writable dir — which only helps the
+current process tree, since exports die with the exec. The durable part is
+`codeybox_seed_nuget_migration_state`: `MigrationRunner` checks
+`File.Exists(<user-profile>/.local/share/NuGet/Migrations/1)` (or
+`$XDG_DATA_HOME/NuGet/Migrations/1`) *before* creating the mutex, so seeding
+that empty marker — the exact state NuGet leaves after a no-op migration run —
+under every home a later exec could resolve (`$HOME`, `$DOTNET_CLI_HOME`, the
+stamped `<workdir>/.dotnet-cli-home`, the shared `codeybox-nuget-home-<uid>`
+fallback, the passwd-entry home, `$XDG_DATA_HOME`) keeps first-use and restore
+off the mutex with no env cooperation at all. A home that cannot even be
+traversed/written remains unfixable from the repository; that is image damage
+the preamble redirect, not this heal, is designed to outlive.
 
 This is the operative remediation for auditors that invoke `dotnet` **raw**
 (`process:required-build`, `csharp:build-WaE`) against a misprovisioned image:
@@ -72,12 +109,13 @@ complementary, branch-controlled path.)
 
 ### The `build.sh` entry point handles this itself
 
-`build.sh` — the repository's canonical build entry point — applies the same
-redirect as the gate: it points `DOTNET_CLI_HOME` at a script-owned, writable
-directory (cleaned up on exit) and preserves any pre-baked `$HOME/.nuget/packages`
-cache via `NUGET_PACKAGES` before running `dotnet build CodeyBox.slnx`. Running
-`sh build.sh` therefore succeeds even when the image's `$HOME/.nuget` is owned by
-another user.
+`build.sh` — the repository's canonical build entry point — dot-sources the
+same `scripts/nuget-home-heal.sh` recovery before running `dotnet` (or any
+forwarded gate command): it repairs a foreign-owned `$HOME/.nuget` in place
+when `$HOME` is writable, and otherwise redirects `DOTNET_CLI_HOME` (and the
+runtime-dir variables) to a verified per-user fallback, reusing the inherited
+package cache when its owner is trusted. Running `sh build.sh` therefore
+succeeds even when the image's `$HOME/.nuget` is owned by another user.
 
 ### Baseline seeding must guest-own `$HOME/.nuget`
 

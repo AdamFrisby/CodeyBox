@@ -9,13 +9,35 @@ namespace CodeyBox.Orchestrator;
 /// build environment cannot drift between the two paths: opted-in builds
 /// execute in exactly the same environment as the default path, plus the
 /// least-data <c>-bl</c> capture. The capture variant only appends the
-/// configuration guard, the fixed binlog directory setup, and per-target
+/// configuration guard, the per-exec binlog directory setup, and per-target
 /// log arguments — it never re-states discovery or isolation.
 /// </summary>
 internal static class RequiredBuildScript
 {
-    internal const string BinlogDirectoryName = "codeybox-msbuild-binlogs";
+    // Name prefix of the per-exec binlog directory. The build script creates
+    // it via `mktemp -d` (an unpredictable O_EXCL create), and the diagnostics
+    // fetch step globs `prefix.*` directories owned by its own uid — a fixed
+    // name in the world-writable temp could be squatted by a co-tenant with
+    // planted target-N.binlog symlinks, turning `dotnet -bl:` into a
+    // create/overwrite at an attacker-chosen path.
+    internal const string BinlogDirectoryPrefix = "codeybox-msbuild-binlogs";
     internal const string BinlogConfigVariable = "CODEYBOX_MSBUILD_CONFIG";
+
+    // Name prefix of the last-resort private tmp root the prologue creates
+    // via `mktemp -d` when neither ${TMPDIR:-/tmp} nor /tmp verifies as a
+    // writable anchor — and of the glob the binlog rediscovery searches for
+    // that root under.
+    internal const string GateTmpDirectoryPrefix = "codeybox-gate-tmp";
+
+    // The tmp roots a per-exec binlog directory can land under, stated once
+    // for every place that re-discovers it: the prologue's leftover sweep
+    // below and the diagnostics listing/fetch scripts in
+    // MSBuildDiagnosticsEnrichment all iterate this exact candidate list, so
+    // a root the prologue's tmp_root chain can produce is never missed by a
+    // drifted consumer. The chain itself must keep producing only roots this
+    // expression covers: ${TMPDIR:-/tmp}, /tmp, then the private gate-tmp dir.
+    internal const string BinlogTmpRootCandidates =
+        "\"${TMPDIR:-/tmp}\" /tmp /tmp/" + GateTmpDirectoryPrefix + ".*";
 
     // POSIX shells conventionally use 127 for "command not found".
     internal const int DotnetCommandNotFoundExitCode = 127;
@@ -32,8 +54,48 @@ internal static class RequiredBuildScript
           exit "$dotnet_command_not_found_exit"
         fi
 
-        tmp_root="${TMPDIR:-/tmp}"
-        targets_file="$tmp_root/codeybox-required-build-targets-$$"
+        # TMPDIR is launch-env input like every other directory this script
+        # trusts: admit it only as a writable "anchor" (the /tmp rule — owned
+        # by this uid or root, group/other-writable tolerated only under the
+        # sticky bit) before the mktemp creates below. In a non-sticky
+        # co-tenant-writable dir the owner could swap a just-created file or
+        # dir for a symlink, turning the `>`/`sort -o` writes below — plus
+        # the capture variant's binlog writes — into a create/truncate at
+        # an attacker-chosen path. Fall back to /tmp — itself
+        # anchor-verified — and only then to a private mktemp dir (born
+        # mode-700 owned by this user); the binlog fetch step searches the
+        # same candidate roots in order, so the directory is found wherever
+        # it landed. The helper is defined by the self-heal preamble
+        # composed ahead of this fragment (see Build()).
+        tmp_root="$(_codeybox_secure_dir "${TMPDIR:-/tmp}" anchor writable)" || tmp_root=
+        if [ -z "$tmp_root" ]; then
+          tmp_root="$(_codeybox_secure_dir /tmp anchor writable)" \
+            || tmp_root="$(mktemp -d "/tmp/{{GateTmpDirectoryPrefix}}.XXXXXX")"
+        fi
+        # Sweep per-exec binlog dirs left by earlier attempts under EVERY
+        # root the diagnostics fetch searches, so its owner-filtered
+        # rediscovery can only ever find the directory THIS attempt's
+        # capture variant creates below — a leftover would otherwise attach
+        # a previous build's logs to this attempt's evidence whenever the
+        # run exits before that creation. The dirs cannot be removed at
+        # exit (the fetch runs after this script), so they are purged at
+        # start instead; only entries owned by this uid are removed — a
+        # co-tenant's planted match is left for the fetch's own owner
+        # filter to refuse. The roots swept are the shared
+        # BinlogTmpRootCandidates list the fetch iterates.
+        for tmp_candidate in {{BinlogTmpRootCandidates}}; do
+          [ -d "$tmp_candidate" ] || continue
+          for old_binlogs in \
+              "$tmp_candidate/{{BinlogDirectoryPrefix}}."*; do
+            { [ -d "$old_binlogs" ] && [ -O "$old_binlogs" ] \
+              && rm -rf "$old_binlogs"; } || true
+          done
+        done
+        # mktemp's unpredictable O_EXCL create: a PID-predictable name in the
+        # world-writable temp could be squatted by a co-tenant, and the `>`/`>>`
+        # redirects plus `sort -o` below would then follow a planted symlink —
+        # a create/truncate at an attacker-chosen path as the gate user.
+        targets_file="$(mktemp "$tmp_root/codeybox-required-build-targets.XXXXXX")"
         """;
 
     // Capture-only head: the build configuration arrives via
@@ -41,8 +103,6 @@ internal static class RequiredBuildScript
     // case guard below); binlog file names are index-derived, never taken
     // from branch-controlled paths.
     private const string CaptureConfigFragment = """
-        binlog_dir="$tmp_root/codeybox-msbuild-binlogs"
-
         msbuild_config="${CODEYBOX_MSBUILD_CONFIG:-Debug}"
         case "$msbuild_config" in
           ''|*[!A-Za-z0-9_.-]*)
@@ -62,13 +122,15 @@ internal static class RequiredBuildScript
         # "Failed to read NuGet.Config ... Permission denied" and produces no
         # assemblies. Redirect the CLI/NuGet per-user home to a directory this
         # script owns so the gate no longer depends on $HOME being writable.
-        dotnet_home="$tmp_root/codeybox-dotnet-home-$$"
+        # mktemp -d (an unpredictable O_EXCL, mode-700 create): a PID-predictable
+        # name in the world-writable temp could be squatted by a co-tenant,
+        # which would put the exported per-user home inside storage the gate
+        # does not control.
+        dotnet_home="$(mktemp -d "$tmp_root/codeybox-dotnet-home.XXXXXX")"
         original_home="${HOME:-}"
 
         cleanup() { rm -rf "$targets_file" "$dotnet_home"; }
         trap cleanup EXIT INT TERM
-
-        mkdir -p "$dotnet_home"
         export DOTNET_CLI_HOME="$dotnet_home"
         export DOTNET_NOLOGO=1
         export DOTNET_CLI_TELEMETRY_OPTOUT=1
@@ -78,15 +140,26 @@ internal static class RequiredBuildScript
         # package cache under the original per-user home would then restore
         # against an empty folder and require network access. Preserve that
         # cache (read access is sufficient — restore never writes to an
-        # already-extracted package) so offline/pinned images keep working.
-        if [ -z "${NUGET_PACKAGES:-}" ] && [ -n "$original_home" ] && [ -d "$original_home/.nuget/packages" ]; then
-          export NUGET_PACKAGES="$original_home/.nuget/packages"
+        # already-extracted package) so offline/pinned images keep working —
+        # but only when its WHOLE tree verifies as consumable storage (every
+        # descendant owned by this uid or root, never group/other-writable):
+        # a foreign-controlled or co-tenant-writable entry satisfies package
+        # installs with planted or tampered extracted content. The helper is
+        # defined by the self-heal preamble composed ahead of this fragment.
+        if [ -n "$original_home" ]; then
+          _codeybox_reuse_nuget_packages "$original_home/.nuget/packages"
         fi
 
         # Some NuGet builds resolve their user-config path from HOME even when
         # DOTNET_CLI_HOME is set. Point both variables at the isolated writable
         # directory, after preserving the original package-cache path above.
         export HOME="$dotnet_home"
+
+        # Since runtime 10.0.13, user-scoped named mutexes (NuGet's first-use
+        # "NuGet-Migrations") resolve under $XDG_RUNTIME_DIR before the $HOME
+        # fallback; pin it too so first-use cannot abort the CLI creating that
+        # mutex when the ambient runtime dir is unset or unusable.
+        export XDG_RUNTIME_DIR="$dotnet_home"
         """;
 
     /// <summary>
@@ -132,44 +205,56 @@ internal static class RequiredBuildScript
         # COW-inherited root-owned $HOME/.nuget cannot abort the build with
         # "Failed to read NuGet.Config due to unauthorized access". The recovery
         # is repository-owned (scripts/nuget-home-heal.sh) and dot-sourced so its
-        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below; it
-        # is a no-op when the home is usable and is skipped when the repository
-        # does not ship it. This adds no capability the gate lacks — it already
+        # fallback DOTNET_CLI_HOME propagates to the dotnet invocations below;
+        # its settings/runtime-dir repair is a no-op when the home is usable —
+        # the writes on every evaluation are just the settings dir's
+        # create-if-missing, a transient create-then-delete writability probe
+        # inside it, and the idempotent migration-marker seed, which may also
+        # materialize its candidate home directories — and it is skipped when
+        # the repository does not ship it. This adds no capability the gate
+        # lacks — it already
         # runs the branch's arbitrary build logic via `dotnet build`.
         if [ -f scripts/nuget-home-heal.sh ]; then
           . ./scripts/nuget-home-heal.sh
         fi
         """;
 
-    // Capture-only setup: a fixed directory (no PID interpolation: each exec
-    // is a fresh shell with its own $$, so the fetch step could never find a
-    // PID-suffixed directory). Earlier attempts in this sandbox are purged so
-    // a failed build can never attach a stale binlog from a previous run.
-    private const string BinlogSetupFragment = """
-        mkdir -p "$binlog_dir"
-        # Purge logs from any earlier attempt in this sandbox so a failed build
-        # can never attach a stale binlog from a previous run.
-        rm -f "$binlog_dir"/target-*.binlog
+    // Capture-only setup: the binlogs land in a per-exec `mktemp -d` (an
+    // unpredictable O_EXCL, mode-700 create — a fixed name in the
+    // world-writable temp could be squatted by a co-tenant, and planted
+    // target-N.binlog symlinks inside it would turn `dotnet -bl:` into a
+    // create/overwrite at an attacker-chosen path). The diagnostics fetch
+    // step rediscovers the directory by globbing the prefix for entries it
+    // owns under every candidate tmp root (see MSBuildDiagnosticsEnrichment);
+    // the prologue already swept owned leftovers from earlier attempts, so a
+    // fresh dir plus that purge can never attach stale logs to this attempt.
+    private static readonly string BinlogSetupFragment = $$"""
+        binlog_dir="$(mktemp -d "$tmp_root/{{BinlogDirectoryPrefix}}.XXXXXX")"
         """;
 
     private const string PlainBuildLoopFragment = """
         while IFS= read -r target; do
           [ -n "$target" ] || continue
-          echo "CodeyBox required build: dotnet build $target"
+          # The target name comes from branch-controlled paths: strip control
+          # characters so a crafted filename cannot spoof operator-facing
+          # output with ANSI escapes.
+          safe_target="$(_codeybox_strip_ctrl "$target")"
+          echo "CodeyBox required build: dotnet build $safe_target"
           dotnet build "$target" --disable-build-servers --maxcpucount:1
         done < "$targets_file"
         """;
 
     // Capture loop: identical iteration, but each `dotnet build` also writes
     // a least-data binary log (ProjectImports=None: no embedded
-    // imported-project content) into the fixed directory the fetch step
-    // knows. The configuration was validated by the case guard above.
+    // imported-project content) into the per-exec directory the fetch step
+    // rediscovers. The configuration was validated by the case guard above.
     private const string CaptureBuildLoopFragment = """
         idx=0
         while IFS= read -r target; do
           [ -n "$target" ] || continue
           idx=$((idx+1))
-          echo "CodeyBox required build: dotnet build $target"
+          safe_target="$(_codeybox_strip_ctrl "$target")"
+          echo "CodeyBox required build: dotnet build $safe_target"
           dotnet build "$target" --disable-build-servers --maxcpucount:1 -c "$msbuild_config" -bl:"$binlog_dir/target-$idx.binlog;ProjectImports=None"
         done < "$targets_file"
         """;
@@ -196,10 +281,16 @@ internal static class RequiredBuildScript
             parts.Add(BinlogSetupFragment);
         parts.Add(captureBinlogs ? CaptureBuildLoopFragment : PlainBuildLoopFragment);
 
-        // The NuGet-home self-heal preamble runs before any dotnet
-        // invocation, exactly as in the historical gate script.
+        // The gate composes the self-heal's two halves EXPLICITLY rather
+        // than consuming NuGetHomeSelfHeal.Preamble as a blob: the fragments
+        // above call helpers defined in SharedHelpers
+        // (_codeybox_secure_dir, _codeybox_reuse_nuget_packages,
+        // _codeybox_strip_ctrl), so that dependency is declared here, and the
+        // decision half still runs before any dotnet invocation, exactly as
+        // in the historical gate script.
         return "set -eu\n"
-            + NuGetHomeSelfHeal.Preamble + "\n"
+            + NuGetHomeSelfHeal.SharedHelpers + "\n"
+            + NuGetHomeSelfHeal.DecisionFragment + "\n"
             + string.Join("\n", parts);
     }
 }

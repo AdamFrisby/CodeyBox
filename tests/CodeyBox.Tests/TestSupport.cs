@@ -45,6 +45,21 @@ internal static class TestSupport
             ? [.. argv.Skip(4)]
             : argv;
 
+    /// <summary>
+    /// Numeric uid of the current user via <c>id -u</c>, for tests that assert
+    /// on the uid-stamped per-user fallback dirs
+    /// (<see cref="NuGetHomeSelfHeal.WritableHomeLeaf"/>) the NuGet-home heal
+    /// creates.
+    /// </summary>
+    public static async Task<string> CurrentUidAsync()
+    {
+        var psi = new ProcessStartInfo("id", "-u") { RedirectStandardOutput = true, UseShellExecute = false };
+        using var process = Process.Start(psi)!;
+        var uid = (await process.StandardOutput.ReadToEndAsync()).Trim();
+        await process.WaitForExitAsync();
+        return uid;
+    }
+
     public static WorkItemTerminalTransition CreateTerminalTransition(
         IWorkItemStore store,
         IWebhookDispatcher? webhooks,

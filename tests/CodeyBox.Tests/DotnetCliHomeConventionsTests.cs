@@ -56,6 +56,22 @@ public sealed class DotnetCliHomeConventionsTests
 
         Assert.Equal("/work/.dotnet-cli-home", env["DOTNET_CLI_HOME"]);
         Assert.Equal("/work/.dotnet-cli-home", env["HOME"]);
+        // Runtime 10.0.13+ user-scoped named mutexes resolve under
+        // XDG_RUNTIME_DIR before the $HOME fallback, so it is pinned too.
+        Assert.Equal("/work/.dotnet-cli-home", env["XDG_RUNTIME_DIR"]);
+    }
+
+    [Fact]
+    public void ApplyIfDotnetInvocation_RespectsExistingXdgRuntimeDir()
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["XDG_RUNTIME_DIR"] = "/caller/run",
+        };
+
+        DotnetCliHomeConventions.ApplyIfDotnetInvocation(["dotnet", "build"], "/work", env);
+
+        Assert.Equal("/caller/run", env["XDG_RUNTIME_DIR"]);
     }
 
     [Fact]
