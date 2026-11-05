@@ -87,11 +87,11 @@ namespace CodeyBox.Agents.Devin;
 /// <c>~/.local/share/devin/cli/sessions.db</c>; ACP advertises
 /// <c>loadSession</c> but the resume hook is not wired — a restored run
 /// re-dispatches fresh like the other file-state agents. Terminal failures
-/// surface either as shim <c>turn_error</c>/<c>fatal</c> envelopes
-/// (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines lifted by
-/// <see cref="DevinTerminalDiagnoser"/>; <see cref="RunAsync"/> lifts the
-/// first into <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline
-/// parks quota/auth failures instead of dead-lettering them.</para>
+/// surface either as shim <c>turn_error</c>/<c>model_mismatch</c>/<c>fatal</c>
+/// envelopes (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines
+/// lifted by <see cref="DevinTerminalDiagnoser"/>; <see cref="RunAsync"/>
+/// lifts the first into <see cref="AgentResult.TerminalDiagnostic"/> so the
+/// pipeline parks quota/auth failures instead of dead-lettering them.</para>
 ///
 /// <para><b>Envelope provenance.</b> <c>devin.acp</c> lines are claimed by
 /// type tag. Emission-side hygiene closes the named injection vectors: the
@@ -511,13 +511,13 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// <summary>
     /// Maps the exec result through the shim's terminal outcome. Two failure
     /// surfaces exist: the shim reports protocol/turn failures as typed
-    /// terminal envelopes (<c>turn_error</c> / <c>fatal</c>), and the CLI
-    /// itself reports auth/startup failures on stderr as <c>Error: …</c>
-    /// lines (verified against devin 3000.11.1: "Error: Not logged in…"
-    /// exits nonzero before ACP starts). Whichever fired is lifted into
-    /// <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline can
-    /// classify it; without this a quota/auth give-up with no file changes
-    /// terminal-fails as "produced no changes".
+    /// terminal envelopes (<c>turn_error</c> / <c>model_mismatch</c> /
+    /// <c>fatal</c>), and the CLI itself reports auth/startup failures on
+    /// stderr as <c>Error: …</c> lines (verified against devin 3000.11.1:
+    /// "Error: Not logged in…" exits nonzero before ACP starts). Whichever
+    /// fired is lifted into <see cref="AgentResult.TerminalDiagnostic"/> so
+    /// the pipeline can classify it; without this a quota/auth give-up with
+    /// no file changes terminal-fails as "produced no changes".
     /// </summary>
     private static AgentResult PostProcessAcpResult(AgentResult result)
     {
@@ -532,8 +532,8 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         // shim DID report a terminal failure envelope, in which case the
         // summary must headline what the stream actually contained rather
         // than claim no outcome arrived. The flip runs before the diagnostic
-        // lift so a turn_error/fatal envelope can never keep Success=true
-        // even if the exec layer reported 0.
+        // lift so a turn_error/model_mismatch/fatal envelope can never keep
+        // Success=true even if the exec layer reported 0.
         if (result.Success && outcome.Event != DevinAcpOutcome.TerminalEvent.TurnComplete)
         {
             result = result with

@@ -11,8 +11,8 @@ namespace CodeyBox.Agents.Devin;
 /// envelope, so the capture file carries structured events this parser can
 /// claim and summarise: <c>session_update</c> envelopes wrap the ACP
 /// <c>session/update</c> notification (tool calls, message chunks, usage
-/// ticks) and <c>turn_complete</c>/<c>turn_error</c>/<c>fatal</c> carry the
-/// terminal outcome.
+/// ticks) and <c>turn_complete</c>/<c>turn_error</c>/<c>model_mismatch</c>/
+/// <c>fatal</c> carry the terminal outcome.
 /// </summary>
 /// <remarks>
 /// Usage envelopes are recognised for stream liveness but their token
