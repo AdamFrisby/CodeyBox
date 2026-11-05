@@ -43,8 +43,9 @@ internal static class RequiredBuildScript
         # by this uid or root, group/other-writable tolerated only under the
         # sticky bit) before the mktemp creates below. In a non-sticky
         # co-tenant-writable dir the owner could swap a just-created file or
-        # dir for a symlink, turning the `>`/`sort -o`/`-bl:` writes below
-        # into a create/truncate at an attacker-chosen path. Fall back to
+        # dir for a symlink, turning the `>`/`sort -o` writes below — plus
+        # the capture variant's binlog writes — into a create/truncate at
+        # an attacker-chosen path. Fall back to
         # /tmp — itself anchor-verified — and only then to a private mktemp
         # dir (born mode-700 owned by this user), so the binlog fetch step
         # still finds its directory under ${TMPDIR:-/tmp} in the common case.
