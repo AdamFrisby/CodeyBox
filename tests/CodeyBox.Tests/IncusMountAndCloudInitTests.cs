@@ -173,6 +173,17 @@ public sealed class IncusMountAndCloudInitTests
                 Directory.Exists(Path.Combine(cliHome, ".nuget", ".nuget")),
                 "the link must replace the stale directory, not nest inside it");
             Assert.True(File.Exists(cacheMarker));
+
+            // NuGet's applied-migration marker must exist under BOTH homes an
+            // exec can resolve — the guest home (unwrapped execs) and the CLI
+            // home (the home audit execs pin HOME/XDG_RUNTIME_DIR to) — so
+            // first-use never takes the "NuGet-Migrations" named-mutex path.
+            foreach (var home in new[] { guestHome, cliHome })
+            {
+                var marker = Path.Combine(home, ".local", "share", "NuGet", "Migrations", "1");
+                Assert.True(File.Exists(marker), $"expected migration marker under {home}");
+                Assert.Equal(string.Empty, await File.ReadAllTextAsync(marker));
+            }
         }
         finally
         {
@@ -197,6 +208,14 @@ public sealed class IncusMountAndCloudInitTests
         Assert.Contains("--no-new-privs", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains(
             $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
+            IncusCloudInit.ExecWrapper,
+            StringComparison.Ordinal);
+        // Every exec gets a valid XDG runtime dir (the guest-owned CLI home on
+        // tmpfs) so dotnet's user-scoped named mutexes never resolve against an
+        // unset or foreign-owned runtime location; stamped per-exec values
+        // still override it via the env file.
+        Assert.Contains(
+            $"XDG_RUNTIME_DIR={IncusCloudInit.DotnetCliHome}",
             IncusCloudInit.ExecWrapper,
             StringComparison.Ordinal);
         var cleanup = IncusCloudInit.ExecWrapper.IndexOf("rm -f -- \"$env_file\"", StringComparison.Ordinal);

@@ -40,6 +40,7 @@ internal static class IncusCloudInit
         environment=(
           "HOME=$guest_home"
           "{{DotnetCliHomeEnvironmentVariable}}={{DotnetCliHome}}"
+          "XDG_RUNTIME_DIR={{DotnetCliHome}}"
           "PATH={{NonLoginPath}}"
           "LANG=C.UTF-8"
         )

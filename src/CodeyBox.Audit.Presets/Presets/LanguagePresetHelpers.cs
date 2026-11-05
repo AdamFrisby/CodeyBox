@@ -110,6 +110,15 @@ internal static class LanguagePresetHelpers
             return new DotnetFormatCommandResultClassifier();
         }
 
+        if (string.Equals(language, "csharp", StringComparison.Ordinal)
+            && string.Equals(name, "csharp:build-WaE", StringComparison.Ordinal)
+            && argv.Count >= 2
+            && string.Equals(argv[0], "dotnet", StringComparison.Ordinal)
+            && string.Equals(argv[1], "build", StringComparison.Ordinal))
+        {
+            return new DotnetFirstRunCommandResultClassifier();
+        }
+
         return null;
     }
 }

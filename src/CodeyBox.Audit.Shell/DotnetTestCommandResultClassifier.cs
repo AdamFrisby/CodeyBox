@@ -32,6 +32,11 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
         var parsed = DotnetTestOutputParser.Parse(context.AuditorName, context.CombinedOutput);
         if (parsed.ParsedFailureCount == 0)
         {
+            // A dotnet first-use crash (NuGet-Migrations mutex, bare first-run
+            // banner) fires before any test executes — route it to
+            // infrastructure rather than a runner-invocation or command
+            // failure against the diff.
+            DotnetFirstRunFailure.ThrowIfInfrastructureFailure(context);
             ThrowIfRunnerInvocationError(context);
             return null;
         }

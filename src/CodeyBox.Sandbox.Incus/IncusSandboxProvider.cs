@@ -3030,6 +3030,40 @@ public sealed class IncusSandboxProvider :
           rm -rf "$cli_home/.nuget"
         fi
         ln -sfn "$nuget_home" "$cli_home/.nuget"
+        # NuGet's first-use "NuGet-Migrations" named mutex runs only while its
+        # applied-migration marker (<home>/.local/share/NuGet/Migrations/1) is
+        # absent, and first-use takes that mutex under whatever runtime dir the
+        # exec's launch env resolved — intermittently aborting the CLI before
+        # MSBuild with "The system cannot open the device or file specified:
+        # 'NuGet-Migrations'". Seed the empty marker NuGet itself leaves after
+        # a no-op migration run under both homes execs resolve — the guest
+        # home (unwrapped execs) and the CLI home (the home audit execs pin
+        # HOME/XDG_RUNTIME_DIR/DOTNET_CLI_HOME to) — so first-use never takes
+        # the mutex path at all. Guest-owned so File.Exists reads it.
+        for marker_home in "$guest_home" "$cli_home"; do
+          install -d -m 0700 -o "$guest_uid" -g "$guest_gid" \
+            "$marker_home/.local" "$marker_home/.local/share" \
+            "$marker_home/.local/share/NuGet" "$marker_home/.local/share/NuGet/Migrations"
+          marker_file="$marker_home/.local/share/NuGet/Migrations/1"
+          if [ ! -e "$marker_file" ] && [ ! -L "$marker_file" ]; then
+            install -m 0644 -o "$guest_uid" -g "$guest_gid" /dev/null "$marker_file"
+          fi
+        done
+        # Then run dotnet first-use once AS THE GUEST against the CLI home, so
+        # the first-run sentinels, dev cert, and any user-scoped runtime dirs
+        # are created serially by the build user before an audit exec can race
+        # or inherit a foreign-owned layout. Best-effort: a missing dotnet or
+        # setpriv, or a first-use hiccup, must never fail provisioning — the
+        # marker seed above already removes the mutex path.
+        setsid -- setpriv --no-new-privs \
+          --reuid="$guest_uid" --regid="$guest_gid" --clear-groups -- \
+          env -i -- \
+          HOME="$cli_home" \
+          XDG_RUNTIME_DIR="$cli_home" \
+          DOTNET_CLI_HOME="$cli_home" \
+          PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+          LANG=C.UTF-8 \
+          dotnet nuget --version >/dev/null 2>&1 || true
         """;
 
     private async Task PrepareDotnetCliHomeAsync(

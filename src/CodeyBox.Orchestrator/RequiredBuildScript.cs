@@ -277,6 +277,14 @@ internal static class RequiredBuildScript
         parts.Add(DotnetEnvIsolationFragment);
         parts.Add(TargetDiscoveryFragment);
         parts.Add(NuGetHealSourcingFragment);
+        // Seed NuGet's applied-migration marker under the ISOLATED homes as
+        // well: repositories that do not ship scripts/nuget-home-heal.sh skip
+        // the dot-source above, and without the marker dotnet first-use takes
+        // the "NuGet-Migrations" named mutex — the intermittent pre-compilation
+        // abort this gate must never hand to the diff. Idempotent; a repo that
+        // ships the script already seeded via its tail calls, and the
+        // DecisionFragment above seeded the pre-isolation homes.
+        parts.Add("codeybox_seed_nuget_migration_state");
         if (captureBinlogs)
             parts.Add(BinlogSetupFragment);
         parts.Add(captureBinlogs ? CaptureBuildLoopFragment : PlainBuildLoopFragment);

@@ -416,6 +416,16 @@ public sealed class ProjectAuditorComposer
                 Targets = targets,
                 Role = role,
                 BuildTestGateEvidence = gateEvidence,
+                // A custom dotnet gate hits the same unusable-NuGet-home and
+                // first-run mutex failures as the built-in csharp auditors, so
+                // it shares their heal + infrastructure classification — the
+                // same single sources the language presets use.
+                SelfHealNuGetHome = c.Argv.Count > 0
+                    && DotnetCliHomeConventions.IsDotnetInvocation(c.Argv),
+                ResultClassifier = c.Argv.Count > 0
+                    && DotnetCliHomeConventions.IsDotnetInvocation(c.Argv)
+                    ? new DotnetFirstRunCommandResultClassifier()
+                    : null,
             }),
             "diff-pattern" => new DiffPatternAuditor(new DiffPatternAuditorOptions
             {
