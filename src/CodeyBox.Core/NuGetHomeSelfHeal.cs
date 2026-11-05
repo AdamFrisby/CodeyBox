@@ -50,9 +50,11 @@ public static class NuGetHomeSelfHeal
     /// (<c>_codeybox_ensure_nuget_home_usable</c>, <c>codeybox_pin_runtime_dirs</c>,
     /// <c>_codeybox_unset_home_env</c>), the consumed-cache admission
     /// (<c>_codeybox_secure_package_cache</c>,
-    /// <c>_codeybox_reuse_nuget_packages</c>), the output-encoding helper
-    /// (<c>_codeybox_strip_ctrl</c>), and the leaf constants, lifted verbatim
-    /// from the marked region of
+    /// <c>_codeybox_reuse_nuget_packages</c>), the migration-marker seeding
+    /// (<c>codeybox_seed_nuget_migration_state</c> and its
+    /// <c>_codeybox_seed_*</c>/<c>_codeybox_try_adopt_home</c> helpers), the
+    /// output-encoding helper (<c>_codeybox_strip_ctrl</c>), and the leaf
+    /// constants, lifted verbatim from the marked region of
     /// <c>scripts/nuget-home-heal.sh</c> — embedded into this assembly as a
     /// manifest resource at build time — so a guard or policy change in the
     /// shell file lands in both the dot-sourced recovery and this preamble
@@ -101,13 +103,29 @@ public static class NuGetHomeSelfHeal
         ParseLeafConstant(SharedHelpers, "_codeybox_repo_home_leaf");
 
     /// <summary>
+    /// Relative path of NuGet's applied-migration marker directory under a
+    /// user home (<c>.local/share/NuGet/Migrations</c>): NuGet's first-use
+    /// "NuGet-Migrations" named mutex runs only while the marker file
+    /// (<c>&lt;dir&gt;/1</c>) inside it is absent. Parsed from
+    /// <c>_codeybox_nuget_migrations_marker</c> in the embedded
+    /// <c>scripts/nuget-home-heal.sh</c> — the single source of the literal —
+    /// so consumers that seed the marker outside the heal's own process tree
+    /// (the Incus provisioning script) can never drift from the runtime
+    /// heal's marker layout.
+    /// </summary>
+    public static string NuGetMigrationsMarkerDir { get; } =
+        ParseLeafConstant(SharedHelpers, "_codeybox_nuget_migrations_marker");
+
+    /// <summary>
     /// POSIX shell preamble that exports a redirected <c>DOTNET_CLI_HOME</c> (and,
     /// when reusable, <c>NUGET_PACKAGES</c>) iff the current user cannot use its
-    /// <c>~/.nuget</c> settings home, and pins <c>HOME</c>/<c>XDG_RUNTIME_DIR</c>
+    /// <c>~/.nuget</c> settings home, pins <c>HOME</c>/<c>XDG_RUNTIME_DIR</c>
     /// to a writable per-user dir when either is unusable (required by .NET
-    /// 10.0.13+ user-scoped named mutexes such as <c>NuGet-Migrations</c>).
-    /// A no-op when the NuGet home, <c>$HOME</c>, and <c>$XDG_RUNTIME_DIR</c>
-    /// are all usable.
+    /// 10.0.13+ user-scoped named mutexes such as <c>NuGet-Migrations</c>), and
+    /// seeds NuGet's applied-migration marker under every resolvable home so
+    /// first-use skips that mutex outright. A no-op for the redirects and pins
+    /// when the NuGet home, <c>$HOME</c>, and <c>$XDG_RUNTIME_DIR</c> are all
+    /// usable; the marker seeding is idempotent and writes only where absent.
     ///
     /// <para>The preamble is the embedded shared-helpers region of
     /// <c>scripts/nuget-home-heal.sh</c> followed by this class's decision
@@ -214,6 +232,14 @@ public static class NuGetHomeSelfHeal
           # preamble only has to keep the single wrapped `dotnet` working.
           _codeybox_reuse_nuget_packages "${nuget_root}/packages"
         fi
+        # Pinning a usable runtime dir is not the only guard against the
+        # first-use "NuGet-Migrations" named-mutex abort: the mutex is only
+        # created while NuGet's applied-migration marker is absent, so seeding
+        # that marker under every home a later exec could resolve lets the
+        # wrapped dotnet skip the mutex path outright — including for foreign
+        # repositories that never dot-source scripts/nuget-home-heal.sh, which
+        # is the only heal they get. Idempotent and best-effort.
+        codeybox_seed_nuget_migration_state
         """;
 
     /// <summary>

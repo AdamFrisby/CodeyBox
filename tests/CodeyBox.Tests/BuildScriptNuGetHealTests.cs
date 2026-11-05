@@ -452,12 +452,14 @@ public sealed class BuildScriptNuGetHealTests
     }
 
     // The C# directory names are parsed OUT of the script's leaf assignments —
-    // DotnetCliHomeConventions.DirectoryName via NuGetHomeSelfHeal.RepoHomeLeaf
-    // and NuGetHomeSelfHeal.WritableHomeLeaf — so the script is the single
-    // source and the assertions can only fail on a missing/malformed
-    // assignment or a deliberate rename. The leaf strings themselves are baked
-    // into sandbox path conventions (the stamped repo-local home, the shared
-    // per-user fallback under TMPDIR), so a rename must trip this pin
+    // DotnetCliHomeConventions.DirectoryName via NuGetHomeSelfHeal.RepoHomeLeaf,
+    // NuGetHomeSelfHeal.WritableHomeLeaf, and NuGetHomeSelfHeal
+    // .NuGetMigrationsMarkerDir (consumed by the Incus provisioning seed) — so
+    // the script is the single source and the assertions can only fail on a
+    // missing/malformed assignment or a deliberate rename. The leaf strings
+    // themselves are baked into sandbox path conventions (the stamped
+    // repo-local home, the shared per-user fallback under TMPDIR, NuGet's
+    // applied-migration marker layout), so a rename must trip this pin
     // deliberately rather than drift silently.
     [Fact]
     public async Task HealScript_MirrorsCliHomeLeafConstants()
@@ -470,8 +472,12 @@ public sealed class BuildScriptNuGetHealTests
         Assert.Contains(
             "_codeybox_home_leaf=\"codeybox-nuget-home\"",
             script, StringComparison.Ordinal);
+        Assert.Contains(
+            "_codeybox_nuget_migrations_marker=\".local/share/NuGet/Migrations\"",
+            script, StringComparison.Ordinal);
         Assert.Equal(".dotnet-cli-home", DotnetCliHomeConventions.DirectoryName);
         Assert.Equal("codeybox-nuget-home", NuGetHomeSelfHeal.WritableHomeLeaf);
+        Assert.Equal(".local/share/NuGet/Migrations", NuGetHomeSelfHeal.NuGetMigrationsMarkerDir);
     }
 
     // The C# preamble does not carry a second copy of the dir-admission

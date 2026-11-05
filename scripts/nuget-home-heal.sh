@@ -53,15 +53,23 @@
 # guard change here lands in both the dot-sourced recovery and the wrapped
 # `dotnet` preamble automatically — there is no second copy to hand-sync.
 #
-# The two leaf assignments are likewise the single source for the C# names:
+# The leaf assignments are likewise the single source for the C# names:
 # NuGetHomeSelfHeal.WritableHomeLeaf (the per-user fallback home under
-# ${TMPDIR:-/tmp}) is parsed out of the embedded copy of this file, and
-# _codeybox_repo_home_leaf mirrors the DotnetCliHomeConventions.DirectoryName
-# constant (the stamped repo-local CLI home) — BuildScriptNuGetHealTests
-# pins both, so a rename cannot desync the fallback selection or the
-# migration-marker seeding.
+# ${TMPDIR:-/tmp}) and NuGetHomeSelfHeal.RepoHomeLeaf (the stamped
+# repo-local CLI home, mirrored by DotnetCliHomeConventions.DirectoryName)
+# are parsed out of the embedded copy of this file, and
+# _codeybox_nuget_migrations_marker is parsed into
+# NuGetHomeSelfHeal.NuGetMigrationsMarkerDir for the Incus provisioning seed
+# — BuildScriptNuGetHealTests pins the assignments, so a rename cannot
+# desync the fallback selection or the migration-marker seeding.
 _codeybox_home_leaf="codeybox-nuget-home"
 _codeybox_repo_home_leaf=".dotnet-cli-home"
+# Relative path of NuGet's applied-migration marker DIRECTORY under a user
+# home: NuGet's first-use "NuGet-Migrations" named mutex runs only while the
+# marker file (<dir>/1) inside it is absent. One literal for every seed —
+# the dot-sourced recovery below and the Incus bake-time seed composed from
+# this file's parsed value — so a NuGet layout change moves both together.
+_codeybox_nuget_migrations_marker=".local/share/NuGet/Migrations"
 _codeybox_euid="$(id -u)"
 
 # Populate _codeybox_stat_mode (the "drwxr-xr-x" field) and _codeybox_stat_uid
@@ -490,6 +498,168 @@ _codeybox_unset_home_env() {
         unset HOME
     fi
 }
+
+# The runtime-dir pinning above only fixes THIS process tree: exported values
+# die with the exec that sourced this file. Audit gates run as separate execs
+# whose environment we do not control — the `sh -c` preamble wrapping them is
+# baked into the orchestrator binary and can predate the HOME/XDG pinning —
+# and the named-mutex directory is resolved from the launch environment, so an
+# MSBuild-time `Environment.SetEnvironmentVariable` cannot help either. What a
+# broken runtime dir actually breaks is narrower than dotnet in general: the
+# "NuGet-Migrations" mutex is created only while NuGet's applied-migration
+# marker is ABSENT. MigrationRunner checks
+# File.Exists(<user-profile>/.local/share/NuGet/Migrations/1) — or
+# $XDG_DATA_HOME/NuGet/Migrations/1 — BEFORE creating the mutex
+# (NuGet.Common.Migrations.MigrationRunner), so when the marker is present,
+# first-use and restore skip the mutex outright and the launch env's runtime
+# dir is never consulted.
+#
+# Seed that marker under every home a later exec in this sandbox could resolve:
+# the stamped repo-local CLI home (DotnetCliHomeConventions pins HOME/
+# DOTNET_CLI_HOME to <workdir>/.dotnet-cli-home for raw dotnet execs), the
+# ambient $HOME/$DOTNET_CLI_HOME, the shared per-user fallback both preamble
+# versions redirect to, the passwd-entry home (the UserProfile fallback when
+# $HOME is unset), and $XDG_DATA_HOME's marker layout when that is set. The
+# marker is the exact state NuGet leaves after a no-op migration run — an empty
+# file — and File.Exists only needs the path to be readable, which is precisely
+# what distinguishes it from the SharedMemory dir the mutex would have needed
+# to CREATE. Seeding is strictly best-effort: homes that cannot be written are
+# skipped (a marker cannot be planted there either), and an existing marker is
+# never touched so real migration state is preserved.
+#
+# The candidates are less-trusted-influenceable paths — a predictable name in
+# the world-writable ${TMPDIR:-/tmp} can be squatted by a co-tenant, and any of
+# them can contain a planted symlink — so seeding must never become a
+# confused-deputy write into an attacker-chosen directory: `mkdir -p` descends
+# through symlinked intermediate components and `: >` writes through a symlink
+# leaf. Every candidate is therefore admitted only as verified private
+# per-user storage — canonicalized, owned by this uid, writable, never
+# group/other-writable, under a safe ancestor chain (the same
+# _codeybox_secure_dir check every other admission in this file uses, so a
+# co-tenant cannot swap a marker-tree component for a symlink between the
+# checks and the write) — each Migrations-tree component is then created level
+# by level while refusing to descend through a symlink, and a symlink at the
+# marker leaf is never written through.
+#
+# Materialize a heal-controlled candidate home leaf via the shared adopt
+# chain: a missing leaf is created with ONE mode-700 `mkdir` under a verified
+# anchor parent — never `-p`, which would descend planted symlinked
+# intermediates — and an existing entry must already be private per-user
+# storage (a squatted or planted path is refused). The seeder's private-dir
+# checks re-verify either way. Best-effort only: an adoption failure is
+# swallowed — the candidate stays absent and the seeder simply skips it.
+_codeybox_try_adopt_home() {
+    [ -n "${1:-}" ] || return 0
+    _codeybox_adopt_dir "$1" writable >/dev/null 2>&1 || true
+}
+
+# Seed NuGet's applied-migration marker under candidate home $1, at relative
+# directory path $2 (the _codeybox_nuget_migrations_marker dir for a home,
+# "NuGet/Migrations" for $XDG_DATA_HOME). Safe to call with anything: a
+# missing, non-directory,
+# foreign-owned, co-tenant-writable, or foreign-owned-resolving candidate is
+# skipped, as is any symlink found while descending.
+_codeybox_seed_migration_marker() {
+    [ -n "${1:-}" ] || return 0
+    # Admit the candidate only as verified private per-user storage — the
+    # guard the preamble's WritableHomeLeaf comment already promises for a
+    # squatted or root-left directory in a world-writable temp, now with the
+    # full chain check so nothing above the base can be swapped for a symlink
+    # between the checks and the write.
+    # The `||` fallback keeps the assignment's status at zero: a bare
+    # `var=$(cd ...)` would propagate the failed substitution's status and
+    # abort a `set -e` caller merely because a candidate is absent.
+    _codeybox_marker_base="$(_codeybox_secure_dir "$1" private writable)" \
+        || _codeybox_marker_base=
+    [ -n "$_codeybox_marker_base" ] || return 0
+    _codeybox_marker_dir="$_codeybox_marker_base/$2"
+    # Newline-separated exact match: a space-joined list cannot represent a
+    # candidate home whose path itself contains a space.
+    if printf '%s\n' "${_codeybox_seen_marker_dirs:-}" \
+        | grep -qxF "$_codeybox_marker_dir" 2>/dev/null; then
+        return 0
+    fi
+    _codeybox_seen_marker_dirs="${_codeybox_seen_marker_dirs:-}${_codeybox_seen_marker_dirs:+
+}$_codeybox_marker_dir"
+
+    # Descend one component at a time rather than `mkdir -p`: a planted
+    # symlink at any intermediate level would otherwise be followed, planting
+    # the marker tree under a directory the candidate's owner never chose.
+    _codeybox_marker_walk="$_codeybox_marker_base"
+    _codeybox_marker_rel="$2"
+    while [ -n "$_codeybox_marker_rel" ]; do
+        case $_codeybox_marker_rel in
+            */*)
+                _codeybox_marker_part=${_codeybox_marker_rel%%/*}
+                _codeybox_marker_rel=${_codeybox_marker_rel#*/}
+                ;;
+            *)
+                _codeybox_marker_part=$_codeybox_marker_rel
+                _codeybox_marker_rel=
+                ;;
+        esac
+        _codeybox_marker_walk="$_codeybox_marker_walk/$_codeybox_marker_part"
+        [ -L "$_codeybox_marker_walk" ] && return 0
+        if [ -d "$_codeybox_marker_walk" ]; then
+            # Re-verify the descended component like the base: a foreign-owned
+            # or co-tenant-writable intermediate can be swapped for a symlink
+            # between these checks and the write, so only verified private
+            # storage is traversed.
+            _codeybox_secure_dir "$_codeybox_marker_walk" private writable \
+                >/dev/null 2>&1 || return 0
+        else
+            mkdir -m 700 "$_codeybox_marker_walk" 2>/dev/null || return 0
+        fi
+    done
+
+    _codeybox_marker="$_codeybox_marker_walk/1"
+    # An existing marker (or a symlink placeholder, which `-e` alone cannot
+    # see when dangling) is real migration state — never overwrite it and
+    # never write through a symlink.
+    { [ -e "$_codeybox_marker" ] || [ -L "$_codeybox_marker" ]; } && return 0
+    : > "$_codeybox_marker" 2>/dev/null || true
+    return 0
+}
+
+_codeybox_seed_home_migration_marker() {
+    _codeybox_seed_migration_marker "$1" "$_codeybox_nuget_migrations_marker"
+}
+
+codeybox_seed_nuget_migration_state() {
+    _codeybox_seen_marker_dirs=
+    _codeybox_seed_home_migration_marker "${HOME:-}"
+    # Stamped/redirected homes the heal itself materializes may not exist yet;
+    # create just the leaf, then let the seeder's private-dir checks re-verify.
+    _codeybox_try_adopt_home "${DOTNET_CLI_HOME:-}"
+    _codeybox_seed_home_migration_marker "${DOTNET_CLI_HOME:-}"
+    # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
+    # home the orchestrator stamps onto raw dotnet auditor execs;
+    # _codeybox_repo_home_leaf mirrors the DotnetCliHomeConventions.DirectoryName
+    # constant (see the constants block at the top of this file; pinned by the
+    # mirror test). Only the repository
+    # root can be that working directory — an MSBuild-Exec'd run has a project
+    # directory as its cwd and must not grow a stray home there.
+    if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then
+        _codeybox_repo_cli_home="$(pwd -P)/${_codeybox_repo_home_leaf}"
+        _codeybox_try_adopt_home "$_codeybox_repo_cli_home"
+        _codeybox_seed_home_migration_marker "$_codeybox_repo_cli_home"
+    fi
+    # The shared per-user fallback both preamble generations redirect to.
+    _codeybox_fallback_home="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-${_codeybox_euid}"
+    _codeybox_try_adopt_home "$_codeybox_fallback_home"
+    _codeybox_seed_home_migration_marker "$_codeybox_fallback_home"
+    # Environment.GetFolderPath(UserProfile) falls back to the passwd entry
+    # when $HOME is unset — cover a gate exec that resolves no HOME at all.
+    # `getent` does not exist on macOS, where this candidate silently skips.
+    _codeybox_seed_home_migration_marker \
+        "$(getent passwd "$_codeybox_euid" 2>/dev/null | cut -d: -f6)"
+    # $XDG_DATA_HOME relocates the whole Migrations tree (no .local/share) —
+    # same private-dir and no-symlink rules via the shared helper.
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        _codeybox_seed_migration_marker "$XDG_DATA_HOME" "NuGet/Migrations"
+    fi
+    return 0
+}
 # === codeybox-shared-helpers: end ===
 
 # Make a freshly created per-user NuGet home usable for the next `dotnet`: link
@@ -676,167 +846,6 @@ codeybox_ensure_dotnet_runtime_dir() {
         _codeybox_seed_nuget_home \
             "$_codeybox_pin_home_redirected/.nuget/NuGet" \
             "$_codeybox_pin_old_home/.nuget/packages"
-    fi
-    return 0
-}
-
-# The runtime-dir pinning above only fixes THIS process tree: exported values
-# die with the exec that sourced this file. Audit gates run as separate execs
-# whose environment we do not control — the `sh -c` preamble wrapping them is
-# baked into the orchestrator binary and can predate the HOME/XDG pinning —
-# and the named-mutex directory is resolved from the launch environment, so an
-# MSBuild-time `Environment.SetEnvironmentVariable` cannot help either. What a
-# broken runtime dir actually breaks is narrower than dotnet in general: the
-# "NuGet-Migrations" mutex is created only while NuGet's applied-migration
-# marker is ABSENT. MigrationRunner checks
-# File.Exists(<user-profile>/.local/share/NuGet/Migrations/1) — or
-# $XDG_DATA_HOME/NuGet/Migrations/1 — BEFORE creating the mutex
-# (NuGet.Common.Migrations.MigrationRunner), so when the marker is present,
-# first-use and restore skip the mutex outright and the launch env's runtime
-# dir is never consulted.
-#
-# Seed that marker under every home a later exec in this sandbox could resolve:
-# the stamped repo-local CLI home (DotnetCliHomeConventions pins HOME/
-# DOTNET_CLI_HOME to <workdir>/.dotnet-cli-home for raw dotnet execs), the
-# ambient $HOME/$DOTNET_CLI_HOME, the shared per-user fallback both preamble
-# versions redirect to, the passwd-entry home (the UserProfile fallback when
-# $HOME is unset), and $XDG_DATA_HOME's marker layout when that is set. The
-# marker is the exact state NuGet leaves after a no-op migration run — an empty
-# file — and File.Exists only needs the path to be readable, which is precisely
-# what distinguishes it from the SharedMemory dir the mutex would have needed
-# to CREATE. Seeding is strictly best-effort: homes that cannot be written are
-# skipped (a marker cannot be planted there either), and an existing marker is
-# never touched so real migration state is preserved.
-#
-# The candidates are less-trusted-influenceable paths — a predictable name in
-# the world-writable ${TMPDIR:-/tmp} can be squatted by a co-tenant, and any of
-# them can contain a planted symlink — so seeding must never become a
-# confused-deputy write into an attacker-chosen directory: `mkdir -p` descends
-# through symlinked intermediate components and `: >` writes through a symlink
-# leaf. Every candidate is therefore admitted only as verified private
-# per-user storage — canonicalized, owned by this uid, writable, never
-# group/other-writable, under a safe ancestor chain (the same
-# _codeybox_secure_dir check every other admission in this file uses, so a
-# co-tenant cannot swap a marker-tree component for a symlink between the
-# checks and the write) — each Migrations-tree component is then created level
-# by level while refusing to descend through a symlink, and a symlink at the
-# marker leaf is never written through.
-#
-# Materialize a heal-controlled candidate home leaf via the shared adopt
-# chain: a missing leaf is created with ONE mode-700 `mkdir` under a verified
-# anchor parent — never `-p`, which would descend planted symlinked
-# intermediates — and an existing entry must already be private per-user
-# storage (a squatted or planted path is refused). The seeder's private-dir
-# checks re-verify either way. Best-effort only: an adoption failure is
-# swallowed — the candidate stays absent and the seeder simply skips it.
-_codeybox_try_adopt_home() {
-    [ -n "${1:-}" ] || return 0
-    _codeybox_adopt_dir "$1" writable >/dev/null 2>&1 || true
-}
-
-# Seed NuGet's applied-migration marker under candidate home $1, at relative
-# path $2 (".local/share/NuGet/Migrations" for a home, "NuGet/Migrations" for
-# $XDG_DATA_HOME). Safe to call with anything: a missing, non-directory,
-# foreign-owned, co-tenant-writable, or foreign-owned-resolving candidate is
-# skipped, as is any symlink found while descending.
-_codeybox_seed_migration_marker() {
-    [ -n "${1:-}" ] || return 0
-    # Admit the candidate only as verified private per-user storage — the
-    # guard the preamble's WritableHomeLeaf comment already promises for a
-    # squatted or root-left directory in a world-writable temp, now with the
-    # full chain check so nothing above the base can be swapped for a symlink
-    # between the checks and the write.
-    # The `||` fallback keeps the assignment's status at zero: a bare
-    # `var=$(cd ...)` would propagate the failed substitution's status and
-    # abort a `set -e` caller merely because a candidate is absent.
-    _codeybox_marker_base="$(_codeybox_secure_dir "$1" private writable)" \
-        || _codeybox_marker_base=
-    [ -n "$_codeybox_marker_base" ] || return 0
-    _codeybox_marker_dir="$_codeybox_marker_base/$2"
-    # Newline-separated exact match: a space-joined list cannot represent a
-    # candidate home whose path itself contains a space.
-    if printf '%s\n' "${_codeybox_seen_marker_dirs:-}" \
-        | grep -qxF "$_codeybox_marker_dir" 2>/dev/null; then
-        return 0
-    fi
-    _codeybox_seen_marker_dirs="${_codeybox_seen_marker_dirs:-}${_codeybox_seen_marker_dirs:+
-}$_codeybox_marker_dir"
-
-    # Descend one component at a time rather than `mkdir -p`: a planted
-    # symlink at any intermediate level would otherwise be followed, planting
-    # the marker tree under a directory the candidate's owner never chose.
-    _codeybox_marker_walk="$_codeybox_marker_base"
-    _codeybox_marker_rel="$2"
-    while [ -n "$_codeybox_marker_rel" ]; do
-        case $_codeybox_marker_rel in
-            */*)
-                _codeybox_marker_part=${_codeybox_marker_rel%%/*}
-                _codeybox_marker_rel=${_codeybox_marker_rel#*/}
-                ;;
-            *)
-                _codeybox_marker_part=$_codeybox_marker_rel
-                _codeybox_marker_rel=
-                ;;
-        esac
-        _codeybox_marker_walk="$_codeybox_marker_walk/$_codeybox_marker_part"
-        [ -L "$_codeybox_marker_walk" ] && return 0
-        if [ -d "$_codeybox_marker_walk" ]; then
-            # Re-verify the descended component like the base: a foreign-owned
-            # or co-tenant-writable intermediate can be swapped for a symlink
-            # between these checks and the write, so only verified private
-            # storage is traversed.
-            _codeybox_secure_dir "$_codeybox_marker_walk" private writable \
-                >/dev/null 2>&1 || return 0
-        else
-            mkdir -m 700 "$_codeybox_marker_walk" 2>/dev/null || return 0
-        fi
-    done
-
-    _codeybox_marker="$_codeybox_marker_walk/1"
-    # An existing marker (or a symlink placeholder, which `-e` alone cannot
-    # see when dangling) is real migration state — never overwrite it and
-    # never write through a symlink.
-    { [ -e "$_codeybox_marker" ] || [ -L "$_codeybox_marker" ]; } && return 0
-    : > "$_codeybox_marker" 2>/dev/null || true
-    return 0
-}
-
-_codeybox_seed_home_migration_marker() {
-    _codeybox_seed_migration_marker "$1" ".local/share/NuGet/Migrations"
-}
-
-codeybox_seed_nuget_migration_state() {
-    _codeybox_seen_marker_dirs=
-    _codeybox_seed_home_migration_marker "${HOME:-}"
-    # Stamped/redirected homes the heal itself materializes may not exist yet;
-    # create just the leaf, then let the seeder's private-dir checks re-verify.
-    _codeybox_try_adopt_home "${DOTNET_CLI_HOME:-}"
-    _codeybox_seed_home_migration_marker "${DOTNET_CLI_HOME:-}"
-    # DotnetCliHomeConventions.ResolvePath(WorkingDirectory) — the repo-local
-    # home the orchestrator stamps onto raw dotnet auditor execs;
-    # _codeybox_repo_home_leaf mirrors the DotnetCliHomeConventions.DirectoryName
-    # constant (see the constants block at the top of this file; pinned by the
-    # mirror test). Only the repository
-    # root can be that working directory — an MSBuild-Exec'd run has a project
-    # directory as its cwd and must not grow a stray home there.
-    if [ -f "$(pwd -P)/scripts/nuget-home-heal.sh" ]; then
-        _codeybox_repo_cli_home="$(pwd -P)/${_codeybox_repo_home_leaf}"
-        _codeybox_try_adopt_home "$_codeybox_repo_cli_home"
-        _codeybox_seed_home_migration_marker "$_codeybox_repo_cli_home"
-    fi
-    # The shared per-user fallback both preamble generations redirect to.
-    _codeybox_fallback_home="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-${_codeybox_euid}"
-    _codeybox_try_adopt_home "$_codeybox_fallback_home"
-    _codeybox_seed_home_migration_marker "$_codeybox_fallback_home"
-    # Environment.GetFolderPath(UserProfile) falls back to the passwd entry
-    # when $HOME is unset — cover a gate exec that resolves no HOME at all.
-    # `getent` does not exist on macOS, where this candidate silently skips.
-    _codeybox_seed_home_migration_marker \
-        "$(getent passwd "$_codeybox_euid" 2>/dev/null | cut -d: -f6)"
-    # $XDG_DATA_HOME relocates the whole Migrations tree (no .local/share) —
-    # same private-dir and no-symlink rules via the shared helper.
-    if [ -n "${XDG_DATA_HOME:-}" ]; then
-        _codeybox_seed_migration_marker "$XDG_DATA_HOME" "NuGet/Migrations"
     fi
     return 0
 }

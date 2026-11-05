@@ -173,6 +173,66 @@ public sealed class IncusMountAndCloudInitTests
                 Directory.Exists(Path.Combine(cliHome, ".nuget", ".nuget")),
                 "the link must replace the stale directory, not nest inside it");
             Assert.True(File.Exists(cacheMarker));
+
+            // NuGet's applied-migration marker must exist under BOTH homes an
+            // exec can resolve — the guest home (unwrapped execs) and the CLI
+            // home (the home audit execs pin HOME/XDG_RUNTIME_DIR to) — so
+            // first-use never takes the "NuGet-Migrations" named-mutex path.
+            foreach (var home in new[] { guestHome, cliHome })
+            {
+                var marker = Path.Combine(home, ".local", "share", "NuGet", "Migrations", "1");
+                Assert.True(File.Exists(marker), $"expected migration marker under {home}");
+                Assert.Equal(string.Empty, await File.ReadAllTextAsync(marker));
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task PrepareDotnetHomesScript_SkipsMarkerSeedThroughSymlinkedComponent()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var runner = new DefaultProcessRunner();
+        var uid = (await runner.RunAsync(
+            ["id", "-u"], null, CancellationToken.None,
+            maxStdoutBytes: 64, maxStderrBytes: 64)).Stdout.Trim();
+        var gid = (await runner.RunAsync(
+            ["id", "-g"], null, CancellationToken.None,
+            maxStdoutBytes: 64, maxStderrBytes: 64)).Stdout.Trim();
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-dotnet-home-{Guid.NewGuid():N}");
+        var guestHome = Path.Combine(root, "home");
+        var cliHome = Path.Combine(root, "cli-home");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(guestHome);
+        Directory.CreateDirectory(cliHome);
+        Directory.CreateDirectory(outside);
+        try
+        {
+            // A persistent guest home can carry a planted symlink at a
+            // marker-path component; install -d and chown follow symlinks, so
+            // seeding through it would chmod/chown and write the marker under
+            // an attacker-chosen target. The script must skip that home.
+            File.CreateSymbolicLink(Path.Combine(cliHome, ".local"), outside);
+
+            var result = await runner.RunAsync(
+                ["/bin/sh", "-s", "--", guestHome, uid, gid, cliHome],
+                IncusSandboxProvider.PrepareDotnetHomesScript,
+                CancellationToken.None,
+                maxStdoutBytes: 4096,
+                maxStderrBytes: 4096);
+
+            Assert.True(result.Success, result.Stderr);
+            Assert.True(
+                File.Exists(Path.Combine(guestHome, ".local", "share", "NuGet", "Migrations", "1")),
+                "the unaffected home must still get its migration marker");
+            Assert.False(
+                Directory.Exists(Path.Combine(outside, "share")),
+                "marker seeding must not descend through a symlinked component");
         }
         finally
         {
@@ -197,6 +257,14 @@ public sealed class IncusMountAndCloudInitTests
         Assert.Contains("--no-new-privs", IncusCloudInit.ExecWrapper, StringComparison.Ordinal);
         Assert.Contains(
             $"DOTNET_CLI_HOME={IncusCloudInit.DotnetCliHome}",
+            IncusCloudInit.ExecWrapper,
+            StringComparison.Ordinal);
+        // Every exec gets a valid XDG runtime dir (the guest-owned CLI home on
+        // tmpfs) so dotnet's user-scoped named mutexes never resolve against an
+        // unset or foreign-owned runtime location; stamped per-exec values
+        // still override it via the env file.
+        Assert.Contains(
+            $"XDG_RUNTIME_DIR={IncusCloudInit.DotnetCliHome}",
             IncusCloudInit.ExecWrapper,
             StringComparison.Ordinal);
         var cleanup = IncusCloudInit.ExecWrapper.IndexOf("rm -f -- \"$env_file\"", StringComparison.Ordinal);

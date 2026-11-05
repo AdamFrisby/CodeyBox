@@ -164,8 +164,16 @@ internal static class AuditTypePresets
             // A dotnet audit command restores packages and fails for every
             // project when the sandbox ships an unusable $HOME/.nuget. Route it
             // through the single NuGet-home self-heal source (NuGetHomeSelfHeal);
-            // a no-op on a healthy home and for non-dotnet commands.
+            // a no-op on a healthy home and for non-dotnet commands. Dotnet
+            // commands also get the first-run classifier so a CLI first-use
+            // crash (NuGet-Migrations mutex, bare first-run banner) surfaces as
+            // retriable infrastructure instead of a blocking finding; the
+            // classifier self-guards on the argv shape and is a no-op for
+            // non-dotnet commands and genuine code failures.
             SelfHealNuGetHome = true,
+            ResultClassifier = DotnetCliHomeConventions.IsDotnetInvocation(argv)
+                ? new DotnetFirstRunCommandResultClassifier()
+                : null,
             MissingToolSeverity = missingToolSeverity,
             Required = required,
             Targets = targets,

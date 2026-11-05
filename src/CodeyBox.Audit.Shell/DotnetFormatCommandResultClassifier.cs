@@ -17,6 +17,11 @@ public sealed class DotnetFormatCommandResultClassifier : IAuditResultClassifier
             return null;
         }
 
+        // A dotnet first-use crash (NuGet-Migrations mutex, bare first-run
+        // banner) fires before `dotnet format` evaluates the tree — route it
+        // to infrastructure rather than reporting it as a formatting verdict.
+        DotnetFirstRunFailure.ThrowIfInfrastructureFailure(context);
+
         var lines = context.CombinedOutput
             .Replace("\r\n", "\n", StringComparison.Ordinal)
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

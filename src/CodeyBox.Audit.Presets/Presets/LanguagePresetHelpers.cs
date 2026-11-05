@@ -110,6 +110,16 @@ internal static class LanguagePresetHelpers
             return new DotnetFormatCommandResultClassifier();
         }
 
-        return null;
+        // Every remaining dotnet shell auditor gets the first-run classifier:
+        // it self-guards on the argv shape (DotnetCliHomeConventions
+        // .IsDotnetInvocation) and on genuine code-failure signals, so it is
+        // safe for any dotnet subcommand under any auditor name — including
+        // project-supplied language overrides that rename or add dotnet gates.
+        // csharp:test-pass never reaches here: it is composed as
+        // DotnetTestAuditor, whose own classifier already routes first-run
+        // failures to infrastructure.
+        return DotnetCliHomeConventions.IsDotnetInvocation(argv)
+            ? new DotnetFirstRunCommandResultClassifier()
+            : null;
     }
 }
