@@ -39,29 +39,41 @@ internal static class DotnetFirstRunFailure
     // The mutex name is constant across SDK versions and every PAL failure
     // variant; the stack-frame markers distinguish the first-use crash from
     // incidental output that merely mentions the name.
+    // Every regex below scans repo-controlled command output, so each carries
+    // the same match timeout the sibling output classifiers set
+    // (DotnetTestCommandResultClassifier, DotnetTestOutputParser): a bounded
+    // scan can never hang the orchestrator thread on adversarial output.
     private static readonly Regex NuGetMigrationsMutexRegex = new(
         @"NuGet-Migrations",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        RegexOptions.Compiled | RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(5));
 
     private static readonly Regex FirstRunStackRegex = new(
         @"\bMutex\b|MigrationRunner|DotnetFirstTimeUse",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        RegexOptions.Compiled | RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(5));
 
     // The .NET SDK first-run banner header — version-agnostic so SDK upgrades
-    // cannot silently drop the signature.
+    // cannot silently drop the signature. The leading class is [ \t], not \s:
+    // with Multiline, `^\s*` lets the greedy whitespace scan cross line
+    // boundaries and backtrack once per line start — O(n^2) on newline-heavy
+    // output — while horizontal whitespace keeps the scan inside one line.
     private static readonly Regex FirstRunBannerRegex = new(
-        @"^\s*Welcome to \.NET\b",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline);
+        @"^[ \t]*Welcome to \.NET\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline,
+        TimeSpan.FromSeconds(5));
 
     // Genuine toolchain verdicts about the code: any `error CODE:` diagnostic
     // line — compiler (CS), analyzer (IDE/CA/WHITESPACE/…), MSBuild (MSB),
     // NuGet (NU) — a bare MSBuild fatal (`MSB1009:` prints without an
     // "error" prefix), a failed-build summary, or a restore failure. Their
     // presence means the command evaluated the tree, so a co-occurring
-    // first-run signature must not mask the real verdict.
+    // first-run signature must not mask the real verdict. The `^[ \t]*`
+    // anchors share the banner regex's line-local whitespace bound.
     private static readonly Regex CodeFailureSignalRegex = new(
-        @"error\s+[A-Za-z][A-Za-z0-9_]*\d*\s*:|^\s*MSB\d{4}\s*:|^\s*Build FAILED\.|Restore failed",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        @"error\s+[A-Za-z][A-Za-z0-9_]*\d*\s*:|^[ \t]*MSB\d{4}\s*:|^[ \t]*Build FAILED\.|Restore failed",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase | RegexOptions.Multiline,
+        TimeSpan.FromSeconds(5));
 
     /// <summary>
     /// Throws <see cref="AuditUnavailableException"/> when
@@ -102,33 +114,14 @@ internal static class DotnetFirstRunFailure
         if (NuGetMigrationsMutexRegex.IsMatch(output)
             && FirstRunStackRegex.IsMatch(output))
         {
-            return FirstMatchingLine(output, NuGetMigrationsMutexRegex);
+            return RegexMatchLine.FirstMatchingLine(output, NuGetMigrationsMutexRegex, "(dotnet first-run failure)");
         }
 
         if (FirstRunBannerRegex.IsMatch(output))
         {
-            return FirstMatchingLine(output, FirstRunBannerRegex);
+            return RegexMatchLine.FirstMatchingLine(output, FirstRunBannerRegex, "(dotnet first-run failure)");
         }
 
         return null;
-    }
-
-    private static string FirstMatchingLine(string output, Regex regex)
-    {
-        foreach (var match in regex.EnumerateMatches(output.AsSpan()))
-        {
-            var start = match.Index;
-            while (start > 0 && output[start - 1] is not ('\r' or '\n'))
-                start--;
-            var end = match.Index + match.Length;
-            while (end < output.Length && output[end] is not ('\r' or '\n'))
-                end++;
-            var line = output[start..end].Trim();
-            if (line.Length == 0)
-                continue;
-            return line.Length <= 240 ? line : line[..240] + "...";
-        }
-
-        return "(dotnet first-run failure)";
     }
 }

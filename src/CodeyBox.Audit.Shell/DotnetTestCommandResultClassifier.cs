@@ -87,7 +87,8 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
         if (CodeFailureSignalRegex.IsMatch(context.CombinedOutput))
             return;
 
-        var signal = FirstSignalLine(context.CombinedOutput);
+        var signal = RegexMatchLine.FirstMatchingLine(
+            context.CombinedOutput, RunnerInvocationErrorRegex, "(runner invocation error)");
         if (MissingBuildOutputs.IsMissingBuildOutputs(context.ExecutedArgv, context.CombinedOutput)
             || MissingBuildOutputs.IsMissingBuildOutputs(context.Argv, context.CombinedOutput))
         {
@@ -104,23 +105,5 @@ public sealed class DotnetTestCommandResultClassifier : IAuditResultClassifier
         {
             IsDeterministic = true,
         };
-    }
-
-    private static string FirstSignalLine(string output)
-    {
-        foreach (var match in RunnerInvocationErrorRegex.EnumerateMatches(output.AsSpan()))
-        {
-            var start = match.Index;
-            while (start > 0 && output[start - 1] is not ('\r' or '\n'))
-                start--;
-            var end = match.Index + match.Length;
-            while (end < output.Length && output[end] is not ('\r' or '\n'))
-                end++;
-            var first = output.Substring(start, end - start).Trim();
-            if (first.Length > 0)
-                return first.Length <= 240 ? first : first[..240] + "...";
-        }
-
-        return "(runner invocation error)";
     }
 }

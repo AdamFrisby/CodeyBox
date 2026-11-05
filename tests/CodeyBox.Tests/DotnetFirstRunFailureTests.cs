@@ -1,4 +1,5 @@
 using CodeyBox.Audit.Presets;
+using CodeyBox.Audit.Presets.Presets;
 using CodeyBox.Audit.Shell;
 using CodeyBox.Core;
 using CodeyBox.Projects;
@@ -102,6 +103,25 @@ public sealed class DotnetFirstRunFailureTests
 
         Assert.Null(classifier.ClassifyFailedCommand(
             ContextFor("csharp:build-WaE", BuildArgv, output)));
+    }
+
+    [Fact]
+    public void GenericClassifier_NewlineHeavyBannerOutput_StillClassifies()
+    {
+        // Regression: the banner regex once led with `^\s*` under Multiline,
+        // letting the greedy whitespace scan cross line boundaries and
+        // backtrack once per line start — O(n^2) on repo-controlled,
+        // newline-heavy output. `^[ \t]*` keeps the scan inside one line, and
+        // the match timeout bounds whatever backtracking remains.
+        var classifier = new DotnetFirstRunCommandResultClassifier();
+        var output = new string('\n', 200_000) + "Welcome to .NET 10.0!\n";
+
+        var ex = Assert.Throws<AuditUnavailableException>(
+            () => classifier.ClassifyFailedCommand(
+                ContextFor("csharp:build-WaE", BuildArgv, output)));
+
+        Assert.Contains("first-run", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(ex.IsDeterministic);
     }
 
     [Fact]
@@ -249,6 +269,35 @@ public sealed class DotnetFirstRunFailureTests
     }
 
     [Fact]
+    public async Task LanguagePresetDotnetAuditor_FirstRunFailure_RoutesToInfrastructure()
+    {
+        // A dotnet gate under a non-csharp language id or auditor name —
+        // projects can add/override language auditors via Audit.Languages
+        // — must get the same first-run classification as csharp:build-WaE.
+        // The classifier self-guards on argv shape, so no name gate may
+        // exclude it.
+        var auditor = LanguagePresetHelpers.Shell(
+            "fsharp",
+            "*.fsproj",
+            "echo .",
+            "fsharp:build",
+            ["dotnet", "build", "--no-incremental", "/warnaserror"]);
+
+        var ex = await Assert.ThrowsAsync<AuditUnavailableException>(() =>
+            auditor.RunAsync(
+                new MarkerDiscoverySandbox(NuGetMigrationsException),
+                "/work",
+                new AuditContext(
+                    WorkItemId.New(),
+                    WorkBranch: "codeybox/test",
+                    BaseBranch: "main",
+                    Iteration: 1,
+                    OriginalPrompt: "add a feature")));
+
+        Assert.False(ex.IsDeterministic);
+    }
+
+    [Fact]
     public async Task CustomNonDotnetShellAuditor_SameOutput_StaysGenericFinding()
     {
         // The first-run signature is dotnet-specific: a non-dotnet custom
@@ -290,6 +339,39 @@ public sealed class DotnetFirstRunFailureTests
             ],
         },
     };
+
+    /// <summary>
+    /// Sandbox for the language-preset path: the preset discovery exec
+    /// (<c>sh -c "echo ."</c>) reports one project directory, the tool probe
+    /// succeeds, and every other exec — the wrapped dotnet command — fails
+    /// with the supplied output.
+    /// </summary>
+    private sealed class MarkerDiscoverySandbox(string commandOutput) : ISandbox
+    {
+        public string Id => "marker-discovery";
+
+        public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
+        {
+            if (exec.Argv.Count == 3
+                && exec.Argv[0] == "sh"
+                && exec.Argv[1] == "-c"
+                && exec.Argv[2] == "echo .")
+            {
+                return Task.FromResult(new SandboxExecResult(0, ".\n", string.Empty));
+            }
+
+            if (exec.Argv.Count > 2
+                && exec.Argv[0] == "sh"
+                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
+            }
+
+            return Task.FromResult(new SandboxExecResult(1, commandOutput, string.Empty));
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 
     /// <summary>
     /// Sandbox whose missing-tool probe succeeds and whose command exec fails

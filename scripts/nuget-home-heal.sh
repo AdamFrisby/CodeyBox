@@ -53,15 +53,23 @@
 # guard change here lands in both the dot-sourced recovery and the wrapped
 # `dotnet` preamble automatically — there is no second copy to hand-sync.
 #
-# The two leaf assignments are likewise the single source for the C# names:
+# The leaf assignments are likewise the single source for the C# names:
 # NuGetHomeSelfHeal.WritableHomeLeaf (the per-user fallback home under
-# ${TMPDIR:-/tmp}) is parsed out of the embedded copy of this file, and
-# _codeybox_repo_home_leaf mirrors the DotnetCliHomeConventions.DirectoryName
-# constant (the stamped repo-local CLI home) — BuildScriptNuGetHealTests
-# pins both, so a rename cannot desync the fallback selection or the
-# migration-marker seeding.
+# ${TMPDIR:-/tmp}) and NuGetHomeSelfHeal.RepoHomeLeaf (the stamped
+# repo-local CLI home, mirrored by DotnetCliHomeConventions.DirectoryName)
+# are parsed out of the embedded copy of this file, and
+# _codeybox_nuget_migrations_marker is parsed into
+# NuGetHomeSelfHeal.NuGetMigrationsMarkerDir for the Incus provisioning seed
+# — BuildScriptNuGetHealTests pins the assignments, so a rename cannot
+# desync the fallback selection or the migration-marker seeding.
 _codeybox_home_leaf="codeybox-nuget-home"
 _codeybox_repo_home_leaf=".dotnet-cli-home"
+# Relative path of NuGet's applied-migration marker DIRECTORY under a user
+# home: NuGet's first-use "NuGet-Migrations" named mutex runs only while the
+# marker file (<dir>/1) inside it is absent. One literal for every seed —
+# the dot-sourced recovery below and the Incus bake-time seed composed from
+# this file's parsed value — so a NuGet layout change moves both together.
+_codeybox_nuget_migrations_marker=".local/share/NuGet/Migrations"
 _codeybox_euid="$(id -u)"
 
 # Populate _codeybox_stat_mode (the "drwxr-xr-x" field) and _codeybox_stat_uid
@@ -546,8 +554,9 @@ _codeybox_try_adopt_home() {
 }
 
 # Seed NuGet's applied-migration marker under candidate home $1, at relative
-# path $2 (".local/share/NuGet/Migrations" for a home, "NuGet/Migrations" for
-# $XDG_DATA_HOME). Safe to call with anything: a missing, non-directory,
+# directory path $2 (the _codeybox_nuget_migrations_marker dir for a home,
+# "NuGet/Migrations" for $XDG_DATA_HOME). Safe to call with anything: a
+# missing, non-directory,
 # foreign-owned, co-tenant-writable, or foreign-owned-resolving candidate is
 # skipped, as is any symlink found while descending.
 _codeybox_seed_migration_marker() {
@@ -613,7 +622,7 @@ _codeybox_seed_migration_marker() {
 }
 
 _codeybox_seed_home_migration_marker() {
-    _codeybox_seed_migration_marker "$1" ".local/share/NuGet/Migrations"
+    _codeybox_seed_migration_marker "$1" "$_codeybox_nuget_migrations_marker"
 }
 
 codeybox_seed_nuget_migration_state() {

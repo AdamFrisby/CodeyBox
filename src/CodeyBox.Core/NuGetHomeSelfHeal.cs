@@ -103,6 +103,20 @@ public static class NuGetHomeSelfHeal
         ParseLeafConstant(SharedHelpers, "_codeybox_repo_home_leaf");
 
     /// <summary>
+    /// Relative path of NuGet's applied-migration marker directory under a
+    /// user home (<c>.local/share/NuGet/Migrations</c>): NuGet's first-use
+    /// "NuGet-Migrations" named mutex runs only while the marker file
+    /// (<c>&lt;dir&gt;/1</c>) inside it is absent. Parsed from
+    /// <c>_codeybox_nuget_migrations_marker</c> in the embedded
+    /// <c>scripts/nuget-home-heal.sh</c> — the single source of the literal —
+    /// so consumers that seed the marker outside the heal's own process tree
+    /// (the Incus provisioning script) can never drift from the runtime
+    /// heal's marker layout.
+    /// </summary>
+    public static string NuGetMigrationsMarkerDir { get; } =
+        ParseLeafConstant(SharedHelpers, "_codeybox_nuget_migrations_marker");
+
+    /// <summary>
     /// POSIX shell preamble that exports a redirected <c>DOTNET_CLI_HOME</c> (and,
     /// when reusable, <c>NUGET_PACKAGES</c>) iff the current user cannot use its
     /// <c>~/.nuget</c> settings home, pins <c>HOME</c>/<c>XDG_RUNTIME_DIR</c>

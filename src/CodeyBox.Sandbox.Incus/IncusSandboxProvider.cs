@@ -3004,67 +3004,118 @@ public sealed class IncusSandboxProvider :
     // dotnet's per-user state onto tmpfs, recreated empty each boot; link its
     // NuGet home at the guest's cache-populated one so restores reuse the baked
     // packages instead of trying to re-download them offline.
-    internal const string PrepareDotnetHomesScript = """
-        set -eu
-        guest_home=$1
-        guest_uid=$2
-        guest_gid=$3
-        cli_home=$4
-        install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$cli_home"
-        nuget_home="$guest_home/.nuget"
-        if [ -e "$nuget_home" ]; then
-          chown -R "$guest_uid:$guest_gid" "$nuget_home"
-        else
-          install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$nuget_home"
-        fi
-        # Point the CLI-home NuGet dir at the cache-populated guest one. ln -sfn
-        # replaces an existing symlink or file, but when the target path is a
-        # real directory it silently creates the link INSIDE it
-        # ($cli_home/.nuget/.nuget) instead of replacing it, leaving
-        # DOTNET_CLI_HOME with an empty .nuget that misses the baked offline
-        # packages. Drop a pre-existing real (non-symlink) directory first so the
-        # link always resolves to the cache, keeping the re-own idempotent across
-        # boots that start from either an empty tmpfs CLI home or one a prior boot
-        # already populated.
-        if [ -d "$cli_home/.nuget" ] && [ ! -L "$cli_home/.nuget" ]; then
-          rm -rf "$cli_home/.nuget"
-        fi
-        ln -sfn "$nuget_home" "$cli_home/.nuget"
-        # NuGet's first-use "NuGet-Migrations" named mutex runs only while its
-        # applied-migration marker (<home>/.local/share/NuGet/Migrations/1) is
-        # absent, and first-use takes that mutex under whatever runtime dir the
-        # exec's launch env resolved — intermittently aborting the CLI before
-        # MSBuild with "The system cannot open the device or file specified:
-        # 'NuGet-Migrations'". Seed the empty marker NuGet itself leaves after
-        # a no-op migration run under both homes execs resolve — the guest
-        # home (unwrapped execs) and the CLI home (the home audit execs pin
-        # HOME/XDG_RUNTIME_DIR/DOTNET_CLI_HOME to) — so first-use never takes
-        # the mutex path at all. Guest-owned so File.Exists reads it.
-        for marker_home in "$guest_home" "$cli_home"; do
-          install -d -m 0700 -o "$guest_uid" -g "$guest_gid" \
-            "$marker_home/.local" "$marker_home/.local/share" \
-            "$marker_home/.local/share/NuGet" "$marker_home/.local/share/NuGet/Migrations"
-          marker_file="$marker_home/.local/share/NuGet/Migrations/1"
-          if [ ! -e "$marker_file" ] && [ ! -L "$marker_file" ]; then
-            install -m 0644 -o "$guest_uid" -g "$guest_gid" /dev/null "$marker_file"
-          fi
-        done
-        # Then run dotnet first-use once AS THE GUEST against the CLI home, so
-        # the first-run sentinels, dev cert, and any user-scoped runtime dirs
-        # are created serially by the build user before an audit exec can race
-        # or inherit a foreign-owned layout. Best-effort: a missing dotnet or
-        # setpriv, or a first-use hiccup, must never fail provisioning — the
-        # marker seed above already removes the mutex path.
-        setsid -- setpriv --no-new-privs \
-          --reuid="$guest_uid" --regid="$guest_gid" --clear-groups -- \
-          env -i -- \
-          HOME="$cli_home" \
-          XDG_RUNTIME_DIR="$cli_home" \
-          DOTNET_CLI_HOME="$cli_home" \
-          PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-          LANG=C.UTF-8 \
-          dotnet nuget --version >/dev/null 2>&1 || true
-        """;
+    internal static string PrepareDotnetHomesScript { get; } = BuildPrepareDotnetHomesScript();
+
+    // The script is composed rather than a const literal so the NuGet
+    // migration-marker path is interpolated from
+    // NuGetHomeSelfHeal.NuGetMigrationsMarkerDir — parsed out of
+    // scripts/nuget-home-heal.sh — instead of living here as a second,
+    // hand-synced copy of the literal.
+    private static string BuildPrepareDotnetHomesScript()
+    {
+        var markerDir = NuGetHomeSelfHeal.NuGetMigrationsMarkerDir;
+        var dirArgs = new List<string>();
+        var symlinkChecks = new List<string>();
+        var prefix = string.Empty;
+        foreach (var component in markerDir.Split('/'))
+        {
+            if (!IsShellSafeMarkerPathComponent(component))
+            {
+                throw new InvalidOperationException(
+                    $"NuGet migration marker dir '{markerDir}' parsed from " +
+                    "scripts/nuget-home-heal.sh is not shell-safe");
+            }
+
+            prefix = prefix.Length == 0 ? component : prefix + "/" + component;
+            dirArgs.Add($"\"$marker_home/{prefix}\"");
+            symlinkChecks.Add($"[ -L \"$marker_home/{prefix}\" ]");
+        }
+
+        var installArgs = string.Join(' ', dirArgs);
+        var symlinkGuard = string.Join(" || ", symlinkChecks);
+        return $$"""
+            set -eu
+            guest_home=$1
+            guest_uid=$2
+            guest_gid=$3
+            cli_home=$4
+            install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$cli_home"
+            nuget_home="$guest_home/.nuget"
+            if [ -e "$nuget_home" ]; then
+              chown -R "$guest_uid:$guest_gid" "$nuget_home"
+            else
+              install -d -m 0700 -o "$guest_uid" -g "$guest_gid" "$nuget_home"
+            fi
+            # Point the CLI-home NuGet dir at the cache-populated guest one. ln -sfn
+            # replaces an existing symlink or file, but when the target path is a
+            # real directory it silently creates the link INSIDE it
+            # ($cli_home/.nuget/.nuget) instead of replacing it, leaving
+            # DOTNET_CLI_HOME with an empty .nuget that misses the baked offline
+            # packages. Drop a pre-existing real (non-symlink) directory first so the
+            # link always resolves to the cache, keeping the re-own idempotent across
+            # boots that start from either an empty tmpfs CLI home or one a prior boot
+            # already populated.
+            if [ -d "$cli_home/.nuget" ] && [ ! -L "$cli_home/.nuget" ]; then
+              rm -rf "$cli_home/.nuget"
+            fi
+            ln -sfn "$nuget_home" "$cli_home/.nuget"
+            # NuGet's first-use "NuGet-Migrations" named mutex runs only while its
+            # applied-migration marker (<home>/{{markerDir}}/1) is absent, and
+            # first-use takes that mutex under whatever runtime dir the exec's
+            # launch env resolved — intermittently aborting the CLI before
+            # MSBuild with "The system cannot open the device or file specified:
+            # 'NuGet-Migrations'". Seed the empty marker NuGet itself leaves
+            # after a no-op migration run under both homes execs resolve — the
+            # guest home (unwrapped execs) and the CLI home (the home audit
+            # execs pin HOME/XDG_RUNTIME_DIR/DOTNET_CLI_HOME to) — so first-use
+            # never takes the mutex path at all. Guest-owned so File.Exists
+            # reads it. {{markerDir}} is parsed out of
+            # scripts/nuget-home-heal.sh (NuGetHomeSelfHeal
+            # .NuGetMigrationsMarkerDir), the same source the runtime heal
+            # seeds from, so bake-time and runtime can never drift on NuGet's
+            # marker layout.
+            for marker_home in "$guest_home" "$cli_home"; do
+              # install -d applies mode/owner only to the leaf it creates, so
+              # every level of the marker path is passed explicitly; install,
+              # like chown, follows symlinks, so a planted link in a
+              # persistent guest home would redirect the chown onto an
+              # attacker-chosen target — skip the home rather than
+              # chmod/chowning through it.
+              if {{symlinkGuard}}; then
+                continue
+              fi
+              install -d -m 0700 -o "$guest_uid" -g "$guest_gid" {{installArgs}}
+              marker_file="$marker_home/{{markerDir}}/1"
+              if [ ! -e "$marker_file" ] && [ ! -L "$marker_file" ]; then
+                install -m 0644 -o "$guest_uid" -g "$guest_gid" /dev/null "$marker_file"
+              fi
+            done
+            # Then run dotnet first-use once AS THE GUEST against the CLI home, so
+            # the first-run sentinels, dev cert, and any user-scoped runtime dirs
+            # are created serially by the build user before an audit exec can race
+            # or inherit a foreign-owned layout. Best-effort: a missing dotnet or
+            # setpriv, or a first-use hiccup, must never fail provisioning — the
+            # marker seed above already removes the mutex path.
+            setsid -- setpriv --no-new-privs \
+              --reuid="$guest_uid" --regid="$guest_gid" --clear-groups -- \
+              env -i -- \
+              HOME="$cli_home" \
+              XDG_RUNTIME_DIR="$cli_home" \
+              DOTNET_CLI_HOME="$cli_home" \
+              PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              LANG=C.UTF-8 \
+              dotnet nuget --version >/dev/null 2>&1 || true
+            """;
+    }
+
+    // A marker-path component is interpolated into a root-run shell script, so
+    // it must be a plain path segment: the caller already split on '/', and
+    // anything beyond letters, digits, '.', '_' and '-' — or a "." / ".."
+    // segment — could alter the generated quoting or escape the home.
+    private static bool IsShellSafeMarkerPathComponent(string component)
+        => component.Length > 0
+            && component is not ("." or "..")
+            && component.All(static c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-');
 
     private async Task PrepareDotnetCliHomeAsync(
         IncusSandboxOptions options,

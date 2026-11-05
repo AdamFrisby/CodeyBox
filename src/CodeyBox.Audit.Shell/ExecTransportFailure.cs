@@ -20,6 +20,13 @@ public static class ExecTransportFailure
     public const int TransportFailureExitCode = 255;
 
     /// <summary>
+    /// Default bound (in chars) for a single output line embedded in an
+    /// exception message — the single source for the truncation every
+    /// bounded-line extractor in this assembly applies.
+    /// </summary>
+    public const int DefaultMaxDiagnosticLineChars = 240;
+
+    /// <summary>
     /// True when <paramref name="result"/> carries a transport-drop
     /// diagnostic: the exec exit code is 255 <em>and</em> the combined output
     /// contains an abnormal-closure marker. Both conditions are required — 255
@@ -50,7 +57,7 @@ public static class ExecTransportFailure
     /// The first output line carrying a transport diagnostic, single-lined and
     /// bounded for exception messages. Empty when no diagnostic is present.
     /// </summary>
-    public static string FirstDiagnosticLine(string? output, int maxLength = 240)
+    public static string FirstDiagnosticLine(string? output, int maxLength = DefaultMaxDiagnosticLineChars)
     {
         if (string.IsNullOrEmpty(output))
             return string.Empty;
