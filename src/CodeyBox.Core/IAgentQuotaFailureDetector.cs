@@ -60,6 +60,17 @@ public interface IAgentQuotaFailureDetector
     /// implementation returns null. Must never throw.
     /// </summary>
     ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary) => null;
+
+    /// <summary>
+    /// Result-shaped overload of <see cref="DetectProviderTransient(string?, string?, string?)"/>.
+    /// Detectors whose signatures depend on envelope provenance (e.g. the
+    /// devin ACP shim's typed <c>devin.acp</c> envelopes, which are only
+    /// authoritative when <see cref="AgentResult.StdoutIsEnvelopeFramed"/>)
+    /// override this; the default delegates to the stream-shaped overload
+    /// with no provenance. Must never throw.
+    /// </summary>
+    ProviderTransientDetection? DetectProviderTransient(AgentResult result)
+        => DetectProviderTransient(result.Stderr, result.Stdout, result.Summary);
 }
 
 /// <summary>

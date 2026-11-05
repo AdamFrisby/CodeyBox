@@ -395,6 +395,16 @@ public sealed record AuditResult
     }
 
     /// <summary>
+    /// Mirrors <see cref="AgentResult.StdoutIsEnvelopeFramed"/> for the
+    /// agent run that produced <see cref="AgentStdout"/>: true only when the
+    /// runner's envelope-framed stdout contract was in force, so downstream
+    /// failure classification may parse <see cref="AgentStdout"/> as typed
+    /// envelopes. False (the default) means <see cref="AgentStdout"/> is
+    /// agent/model text and must not be trusted as envelope structure.
+    /// </summary>
+    public bool AgentStdoutIsEnvelopeFramed { get; init; }
+
+    /// <summary>
     /// When set to false, the result explicitly did not verify build/test
     /// evidence. For BuildTestGate auditors, the pipeline treats that as a
     /// blocking gate failure before any dependent auditor can run. For

@@ -16,40 +16,48 @@ namespace CodeyBox.Agents.Devin;
 ///
 /// <para>Only the structured envelope flag counts — a bare code, the same
 /// message without the flag, or retryable text in prose never match.
-/// Bounded: each input is truncated to the last
-/// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars and at most
-/// <see cref="MaxEnvelopesExamined"/> envelopes are examined; every
-/// evaluation is total (never throws). The detection carries only the
-/// fixed signature label. An auth signal in the same capture suppresses
-/// the match (<see cref="DevinAuthSignals"/>).</para>
+/// Provenance: the envelope is trusted only when
+/// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — unframed stdout,
+/// stderr, and summary are agent/model text that could quote a forged
+/// <c>turn_error</c> line, so they never match. Bounded: the framed scan
+/// truncates to the last <see cref="ProviderTransientMatcher.MaxScannedChars"/>
+/// chars and examines at most <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
+/// envelopes; every evaluation is total (never throws). The detection
+/// carries only the fixed signature label. An auth signal in the same
+/// capture suppresses the match (<see cref="DevinAuthSignals"/>).</para>
 /// </summary>
 internal static class DevinRetryableTurnErrorDetector
 {
     /// <summary>Detector-owned signature label; never raw agent output.</summary>
     internal const string Signature = "devin-turn-error-retryable";
 
-    private const int MaxEnvelopesExamined = 128;
-
-    internal static ProviderTransientDetection? TryDetect(string? stderr, string? stdout, string? summary)
+    internal static ProviderTransientDetection? TryDetect(
+        AgentResult result,
+        IReadOnlyList<QuotaFailurePattern> unauthorizedPatterns)
     {
         try
         {
-            if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
-                return null;
-
-            if (DevinAuthSignals.HasAuthSignal(stderr, stdout, summary))
-                return null;
-
-            if (HasRetryableTurnError(stderr) || HasRetryableTurnError(stdout) || HasRetryableTurnError(summary))
+            if (string.IsNullOrEmpty(result.Stderr)
+                && string.IsNullOrEmpty(result.Stdout)
+                && string.IsNullOrEmpty(result.Summary))
             {
-                return new ProviderTransientDetection(
-                    ProviderTransientKind.InfraTransport,
-                    Signature,
-                    "the provider marked the turn error retryable "
-                    + "(cognition.ai/retryable); retry the turn with backoff");
+                return null;
             }
 
-            return null;
+            if (!HasRetryableTurnError(result.Stdout, framed: result.StdoutIsEnvelopeFramed))
+                return null;
+
+            if (DevinAuthSignals.HasAuthSignal(
+                    result.Stderr, result.Stdout, result.Summary, unauthorizedPatterns))
+            {
+                return null;
+            }
+
+            return new ProviderTransientDetection(
+                ProviderTransientKind.InfraTransport,
+                Signature,
+                "the provider marked the turn error retryable "
+                + "(cognition.ai/retryable); retry the turn with backoff");
         }
         catch (Exception)
         {
@@ -57,36 +65,36 @@ internal static class DevinRetryableTurnErrorDetector
         }
     }
 
-    private static bool HasRetryableTurnError(string? text)
+    /// <summary>
+    /// Framed-capture envelope scan for a <c>turn_error</c> carrying
+    /// <c>"retryable": true</c>. Unframed captures never match: their
+    /// stdout is agent/model text that could quote a forged envelope line.
+    /// </summary>
+    private static bool HasRetryableTurnError(string? stdout, bool framed)
     {
-        if (string.IsNullOrEmpty(text))
+        if (!framed || string.IsNullOrEmpty(stdout))
             return false;
 
         try
         {
-            var bounded = text.Length > ProviderTransientMatcher.MaxScannedChars
-                ? text[^ProviderTransientMatcher.MaxScannedChars..]
-                : text;
-
-            var examined = 0;
-            foreach (var envelope in DevinAcpEnvelope.Enumerate(bounded))
+            foreach (var envelope in DevinAcpEnvelope.EnumerateBounded(stdout))
             {
-                if (++examined > MaxEnvelopesExamined)
-                    break;
-                if (!string.Equals(envelope.Event, DevinAcpEnvelope.EventTurnError, StringComparison.Ordinal))
+                if (envelope.Type != DevinAcpEnvelope.EnvelopeType
+                    || !string.Equals(envelope.Event, DevinAcpEnvelope.EventTurnError, StringComparison.Ordinal))
+                {
                     continue;
+                }
                 if (envelope.Root.TryGetProperty("retryable", out var retryable)
                     && retryable.ValueKind == JsonValueKind.True)
                 {
                     return true;
                 }
             }
-
-            return false;
         }
         catch (Exception)
         {
-            return false;
         }
+
+        return false;
     }
 }

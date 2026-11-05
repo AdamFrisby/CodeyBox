@@ -22,15 +22,26 @@ namespace CodeyBox.Agents.Devin;
 /// -32603)</c>) is accepted as a secondary shape only when it carries the
 /// same stage, code, and message identity.</para>
 ///
-/// <para>Bounded: each input is truncated to the last
+/// <para>Bounded: the framed scan truncates to the last
 /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars (the fatal is
 /// the terminal line), at most <see cref="MaxLinesScanned"/> lines and
-/// <see cref="MaxEnvelopesExamined"/> envelopes are examined, and every
-/// evaluation is total (never throws). The returned detection carries only
-/// the fixed signature label — never raw agent output, which may contain
-/// secrets. An auth signal in the same capture suppresses the match so a
-/// genuine credential failure mixed with timeout chatter keeps its existing
-/// auth classification instead of being laundered into transient retries.</para>
+/// <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/> envelopes are examined,
+/// and every evaluation is total (never throws). The returned detection
+/// carries only the fixed signature label — never raw agent output, which may
+/// contain secrets.</para>
+///
+/// <para>Provenance: the envelope scan runs only on
+/// <see cref="AgentResult.Stdout"/> when
+/// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — unframed stdout,
+/// stderr, and summary are agent/model text that could quote a forged
+/// envelope line. The shim-owned lifted diagnostic
+/// (<c>devin acp fatal during session/new: … (code -32603)</c>) is
+/// accepted as a secondary shape on raw stderr, and on summary only for
+/// framed captures (the runner's terminal-outcome projection is its one
+/// legitimate producer). An auth signal in the same capture suppresses the
+/// match so a genuine credential failure mixed with timeout chatter keeps
+/// its existing auth classification instead of being laundered into
+/// transient retries.</para>
 /// </summary>
 internal static class DevinTeamSettingsTimeoutDetector
 {
@@ -38,31 +49,37 @@ internal static class DevinTeamSettingsTimeoutDetector
     internal const string Signature = "devin-team-settings-timeout";
 
     private const int MaxLinesScanned = 2000;
-    private const int MaxEnvelopesExamined = 128;
 
-    internal static ProviderTransientDetection? TryDetect(string? stderr, string? stdout, string? summary)
+    internal static ProviderTransientDetection? TryDetect(
+        AgentResult result,
+        IReadOnlyList<QuotaFailurePattern> unauthorizedPatterns)
     {
         try
         {
-            if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
+            if (string.IsNullOrEmpty(result.Stderr)
+                && string.IsNullOrEmpty(result.Stdout)
+                && string.IsNullOrEmpty(result.Summary))
+            {
+                return null;
+            }
+
+            var framedStdout = result.StdoutIsEnvelopeFramed ? result.Stdout : null;
+            var matched = HasStructuredTimeout(framedStdout)
+                || HasLiftedFatalDiagnostic(result.Stderr)
+                || (result.StdoutIsEnvelopeFramed && HasLiftedFatalDiagnostic(result.Summary));
+            if (!matched)
                 return null;
 
-            if (DevinAuthSignals.HasAuthSignal(stderr, stdout, summary))
+            if (DevinAuthSignals.HasAuthSignal(
+                    result.Stderr, result.Stdout, result.Summary, unauthorizedPatterns))
+            {
                 return null;
+            }
 
-            if (HasStructuredTimeout(stderr) || HasStructuredTimeout(stdout) || HasStructuredTimeout(summary))
-                return new ProviderTransientDetection(
-                    ProviderTransientKind.InfraTransport,
-                    Signature,
-                    "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff");
-
-            if (HasLiftedFatalDiagnostic(stderr) || HasLiftedFatalDiagnostic(stdout) || HasLiftedFatalDiagnostic(summary))
-                return new ProviderTransientDetection(
-                    ProviderTransientKind.InfraTransport,
-                    Signature,
-                    "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff");
-
-            return null;
+            return new ProviderTransientDetection(
+                ProviderTransientKind.InfraTransport,
+                Signature,
+                "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff");
         }
         catch (Exception)
         {
@@ -102,7 +119,7 @@ internal static class DevinTeamSettingsTimeoutDetector
         var examined = 0;
         foreach (var envelope in DevinAcpEnvelope.Enumerate(bounded))
         {
-            if (++examined > MaxEnvelopesExamined)
+            if (++examined > DevinAcpEnvelope.MaxEnvelopesExamined)
                 break;
             if (!string.Equals(envelope.Event, DevinAcpEnvelope.EventFatal, StringComparison.Ordinal))
                 continue;

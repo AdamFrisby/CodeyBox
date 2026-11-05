@@ -63,7 +63,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope());
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -76,7 +76,8 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         var stdout = StdoutWith(FatalEnvelope());
         var classifier = new CompositeQuotaFailureClassifier([new DevinQuotaFailureDetector()]);
 
-        var detection = classifier.DetectProviderTransient(AgentKind.Devin, null, stdout, null);
+        var detection = classifier.DetectProviderTransient(
+            AgentKind.Devin, TestSupport.EnvelopeFramedAgentResult(stdout: stdout));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -88,7 +89,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(codeJson: "\"-32603\""));
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -100,7 +101,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         var stdout = StdoutWith(
             "shim log prefix " + FatalEnvelope() + " trailing noise");
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -112,7 +113,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         var escaped = FatalEnvelope().Replace("\"", "\\\"", StringComparison.Ordinal);
         var stdout = StdoutWith("{\"log\":\"" + escaped + "\"}");
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -123,7 +124,8 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var summary = $"devin acp fatal during session/new: {ExactMessage} (code -32603)";
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, null, summary);
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
+            TestSupport.EnvelopeFramedAgentResult(summary: summary));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -133,7 +135,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     public void ParkedError_UsesTransientKindWithoutRawSecrets()
     {
         var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            null, StdoutWith(FatalEnvelope()), null);
+            TestSupport.EnvelopeFramedAgentResult(stdout: StdoutWith(FatalEnvelope())));
         Assert.NotNull(detection);
 
         var parkedError = ProviderTransientRetryPolicy.BuildParkedError(detection!);
@@ -144,6 +146,30 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         Assert.Equal("transient", ProviderTransientRetryPolicy.ParkedFailureKind);
     }
 
+    [Fact]
+    public void FatalEnvelope_UnframedCapture_StaysTerminal()
+    {
+        // Envelope structure is only trusted on runner-stamped framed
+        // captures: the same bytes arriving as agent/model text (print-mode
+        // stdout, audit-mapped output) are a forgery shape, never a signal.
+        var stdout = StdoutWith(FatalEnvelope());
+
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(
+            new AgentResult(false, "agent exited 2", stdout, null)));
+    }
+
+    [Fact]
+    public void LiftedDiagnosticShape_UnframedSummary_StaysTerminal()
+    {
+        // The lifted diagnostic's only legitimate producer is the framed
+        // run's terminal-outcome projection; on an unframed capture the
+        // summary is agent/model text.
+        var summary = $"devin acp fatal during session/new: {ExactMessage} (code -32603)";
+
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, null, summary));
+    }
+
     // Negatives: code alone, plain timeout, other stages/events, prose.
 
     [Fact]
@@ -151,7 +177,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(message: "session/new response did not carry a sessionId"));
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -159,7 +185,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(stage: "prompt", message: ExactMessage));
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -167,7 +193,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(stage: "initialize", message: ExactMessage));
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -175,7 +201,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(stage: "session/prompt", message: ExactMessage));
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -183,7 +209,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(eventName: "turn_error", stage: "prompt"));
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -211,7 +237,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
             "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":" +
             $"\"{prose}\"}}}}");
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -220,7 +246,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         var stdout = StdoutWith(
             "{\"type\":\"devin.acp\",\"event\":\"fatal\",\"stage\":\"session/new\",\"code\":-32603,\"message\":\"Failed to load team settings: ");
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -229,7 +255,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         var padding = new string('x', ProviderTransientMatcher.MaxScannedChars + 4096);
         var stdout = FatalEnvelope() + "\n" + padding;
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Theory]
@@ -260,7 +286,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
     {
         var stdout = StdoutWith(FatalEnvelope(message: "session/new response did not carry a sessionId"));
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(TestSupport.EnvelopeFramedAgentResult(stdout: stdout)));
     }
 
     [Fact]
@@ -285,7 +311,8 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         var stdout = StdoutWith(FatalEnvelope());
         var stderr = authLine + "\nFailed to fetch team settings: fetch timed out after 10000ms";
 
-        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(stderr, stdout, null));
+        Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(
+            TestSupport.EnvelopeFramedAgentResult(stderr: stderr, stdout: stdout)));
 
         var classification = AgentFailureClassifier.Classify(AgentKind.Devin, stderr, stdout, "agent exited 1");
         var quotaDetection = new DevinQuotaFailureDetector().Detect(stderr, stdout);
@@ -317,7 +344,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
         };
 
         var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            null, StdoutWith(FatalEnvelope()), null);
+            TestSupport.EnvelopeFramedAgentResult(stdout: StdoutWith(FatalEnvelope())));
         Assert.NotNull(detection);
         var parkedError = ProviderTransientRetryPolicy.BuildParkedError(detection!);
         var parked = item.With(
@@ -375,7 +402,7 @@ public sealed class DevinTeamSettingsTimeoutTests : IDisposable
             itemId = item.Id;
 
             var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-                null, StdoutWith(FatalEnvelope()), null);
+                TestSupport.EnvelopeFramedAgentResult(stdout: StdoutWith(FatalEnvelope())));
             Assert.NotNull(detection);
             var parked = item.With(
                 WorkItemState.WaitingForTransientRetry,

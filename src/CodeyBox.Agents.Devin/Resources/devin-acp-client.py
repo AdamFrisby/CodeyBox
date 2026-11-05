@@ -479,8 +479,8 @@ def run_turn(client, prompt, cwd, mode, requested_model, model_fallback):
             # abort before the first prompt — never run a turn on a model
             # the operator did not configure.
             active_model = session_new_active_model(result)
-            if (requested_model and active_model
-                    and active_model != requested_model):
+            if (client.requested_model and active_model
+                    and active_model != client.requested_model):
                 emit_model_mismatch(client, via="session/new",
                                     active_model=active_model)
                 return EXIT_TURN_FAILED

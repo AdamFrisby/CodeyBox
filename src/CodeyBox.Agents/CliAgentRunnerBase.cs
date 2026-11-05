@@ -1077,6 +1077,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         {
             ExecutionUnavailable = result.ExecutionUnavailable,
             OutputLimitExceeded = result.OutputLimitExceeded,
+            StdoutIsEnvelopeFramed = invocation.StdoutIsEnvelopeFramed,
         },
         stdoutHeadBuilder.Length == 0 ? null : stdoutHeadBuilder.ToString());
     }
@@ -1306,8 +1307,19 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
         }
 
         var output = string.IsNullOrWhiteSpace(result.Stdout) ? result.Stderr : result.Stdout;
-        return new TextOnlyAgentResult(true, "ok", output.Trim(), null);
+        return RejectSuccessfulTextOnlyResult(result)
+            ?? new TextOnlyAgentResult(true, "ok", output.Trim(), null);
     }
+
+    /// <summary>
+    /// Optional veto for a text-only exec that exited successfully: return a
+    /// failure <see cref="TextOnlyAgentResult"/> to reject the run when the
+    /// raw exec carries evidence the CLI did not honour the requested
+    /// invocation (e.g. a substituted model). The default accepts every
+    /// successful exec. Failure exits never reach this hook — their stderr
+    /// already flows through <see cref="TextOnlyAgentResult.Error"/>.
+    /// </summary>
+    protected virtual TextOnlyAgentResult? RejectSuccessfulTextOnlyResult(SandboxExecResult exec) => null;
 
     protected AgentResult? RejectUnsupportedFileBackedCredentials(ISandbox sandbox, AgentCredential? credential)
     {

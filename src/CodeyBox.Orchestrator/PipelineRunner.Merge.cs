@@ -244,7 +244,10 @@ public sealed partial class PipelineRunner
                         resolverResult.Success,
                         resolverResult.Summary,
                         resolverResult.Stdout,
-                        resolverResult.Stderr);
+                        resolverResult.Stderr)
+                    {
+                        StdoutIsEnvelopeFramed = resolverResult.StdoutIsEnvelopeFramed,
+                    };
                     if (resolverResult.Success && resolverResult.ChosenRunner is not null)
                     {
                         chosenMergeRunner = resolverResult.ChosenRunner;

@@ -179,6 +179,7 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 AgentStdout: agentResult.Stdout)
             {
                 AgentTerminalDiagnostic = agentResult.TerminalDiagnostic,
+                AgentStdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
             };
         }
 
@@ -210,6 +211,7 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 // the runner-lifted terminal region so the audit-phase quota routing
                 // can park instead of reading zero findings as a clean audit.
                 AgentTerminalDiagnostic = agentResult.TerminalDiagnostic,
+                AgentStdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
             };
         }
 
@@ -218,7 +220,8 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
             rawOutput,
             agentResult.Stderr,
             agentResult.Summary,
-            agentResult.Stdout);
+            agentResult.Stdout,
+            agentResult.StdoutIsEnvelopeFramed);
         return verdict;
     }
 
@@ -264,7 +267,8 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
             result.Output,
             result.Error,
             result.Summary,
-            result.Output);
+            result.Output,
+            agentStdoutIsEnvelopeFramed: false);
     }
 
     private AuditResult PlanReviewAgentUnavailable(string description)
@@ -283,7 +287,8 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
         string? rawOutput,
         string? stderr,
         string? summary,
-        string? stdout)
+        string? stdout,
+        bool agentStdoutIsEnvelopeFramed = false)
     {
         if (string.IsNullOrWhiteSpace(verdictJson))
         {
@@ -292,7 +297,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 Severity: AuditSeverity.Error,
                 Title: "review agent produced no verdict",
                 Description: summary ?? "")],
-                RawOutput: rawOutput, AgentStderr: stderr, AgentSummary: summary, AgentStdout: stdout);
+                RawOutput: rawOutput, AgentStderr: stderr, AgentSummary: summary, AgentStdout: stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentStdoutIsEnvelopeFramed,
+            };
         }
 
         try
@@ -307,7 +315,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 Description: f.Description ?? "",
                 Location: f.Location)).ToList();
             return new AuditResult(parsed.Passed, findings, RawOutput: rawOutput,
-                AgentStderr: stderr, AgentSummary: summary, AgentStdout: stdout);
+                AgentStderr: stderr, AgentSummary: summary, AgentStdout: stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentStdoutIsEnvelopeFramed,
+            };
         }
         catch (JsonException ex)
         {
@@ -316,7 +327,10 @@ public sealed class LlmReviewAuditor : IAuditor, IRequiresPassedBuildTestGate
                 Severity: AuditSeverity.Error,
                 Title: "review agent produced invalid JSON",
                 Description: $"{ex.Message}\n---\n{Truncate(verdictJson, 1024)}")],
-                RawOutput: rawOutput, AgentStderr: stderr, AgentSummary: summary, AgentStdout: stdout);
+                RawOutput: rawOutput, AgentStderr: stderr, AgentSummary: summary, AgentStdout: stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentStdoutIsEnvelopeFramed,
+            };
         }
     }
 

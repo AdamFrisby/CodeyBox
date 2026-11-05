@@ -51,6 +51,9 @@ public sealed class DevinAcpTransportTests
     ///   <item><c>session_new_model_mismatch</c> — session/new reports
     ///   models.currentModelId other than the requested --model. The shim
     ///   must abort before the first prompt.</item>
+    ///   <item><c>session_new_matching_model</c> — session/new reports
+    ///   models.currentModelId equal to the requested --model; the turn
+    ///   must complete normally (guard against over-broad aborts).</item>
     ///   <item><c>config_option_model_mismatch</c> — a session/update
     ///   config_option_update notification reports a category-"model" value
     ///   other than the requested --model before the set_mode response.</item>
@@ -509,9 +512,10 @@ public sealed class DevinAcpTransportTests
         Assert.DoesNotContain("\"event\": \"prompt_sent\"", result.Stdout!, StringComparison.Ordinal);
 
         // And it must classify as provider-transient so the item re-runs on
-        // the configured model instead of terminal-failing as "other".
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            result.Stderr, result.Stdout, result.Summary);
+        // the configured model instead of terminal-failing as "other". The
+        // result-shaped overload carries the runner's envelope-framing
+        // provenance the structured detectors require.
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(result);
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
         Assert.Equal(DevinModelMismatchDetector.Signature, detection.MatchedSignature);
@@ -597,8 +601,7 @@ public sealed class DevinAcpTransportTests
         Assert.NotNull(result.TerminalDiagnostic);
         Assert.Contains("no longer available", result.TerminalDiagnostic, StringComparison.Ordinal);
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            result.Stderr, result.Stdout, result.Summary);
+        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(result);
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
         Assert.Equal(DevinRetryableTurnErrorDetector.Signature, detection.MatchedSignature);

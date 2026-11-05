@@ -60,13 +60,17 @@ namespace CodeyBox.Agents.Devin;
 /// configured `agent.model` or the default</c>) and runs the session
 /// anyway, on a possibly metered default (verified against devin
 /// 3000.11.1). The shim aborts with a <c>model_mismatch</c> terminal
-/// envelope before or at the first prompt whenever the active model is
-/// not the requested one — structured signals first (<c>session/new</c>
-/// <c>models.currentModelId</c>, category-"model"
-/// <c>config_option_update</c>), the stderr WARN text as fallback — and
-/// the host classifies it as provider-transient so the item re-runs on
-/// the configured model. A <c>turn_error</c> the provider marked
-/// <c>cognition.ai/retryable</c> takes the same transient path.</para>
+/// envelope at the earliest observable point whenever the active model is
+/// not the requested one — strictly before <c>session/prompt</c> for the
+/// structured signals (<c>session/new</c> <c>models.currentModelId</c>,
+/// category-"model" <c>config_option_update</c>), the stderr WARN text as
+/// bounded-grace fallback — and the host classifies it as
+/// provider-transient so the item re-runs on the configured model. A
+/// <c>turn_error</c> the provider marked <c>cognition.ai/retryable</c>
+/// takes the same transient path. Print mode (<c>devin -p</c>) has no
+/// structured active-model signal, so
+/// <see cref="RejectSuccessfulTextOnlyResult"/> vetoes a successful exec
+/// whose stderr carries the WARN phrase.</para>
 ///
 /// <para><b>Prompt delivery.</b> The prompt travels on stdin after the
 /// base64 shim block and reaches the shim through the still-open descriptor
@@ -423,6 +427,33 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
 
         _ = reasoningMode;
         return PromptFileInvocation(argv, prompt);
+    }
+
+    /// <summary>
+    /// Print mode exposes no structured active-model signal, so the only
+    /// observable substitution evidence is the CLI's own stderr WARN phrase
+    /// (<see cref="DevinModelMismatchDetector.StderrFallbackMarker"/>) — when
+    /// it fires outside <c>devin acp</c> at all. A successful
+    /// <c>devin -p</c> run carrying it ran on the substituted (possibly
+    /// metered) model: veto the result so the caller sees a failure whose
+    /// stderr detail still classifies provider-transient downstream, and
+    /// the substituted output is never consumed as the answer.
+    /// </summary>
+    protected override TextOnlyAgentResult? RejectSuccessfulTextOnlyResult(SandboxExecResult exec)
+    {
+        if (!exec.Stderr.Contains(
+                DevinModelMismatchDetector.StderrFallbackMarker,
+                StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var detail = string.IsNullOrWhiteSpace(exec.Stderr) ? exec.Stdout : exec.Stderr;
+        return new TextOnlyAgentResult(
+            false,
+            $"{Kind.Value} text-only call failed: the requested --model did not resolve and the CLI substituted another model",
+            exec.Stdout,
+            detail.Trim());
     }
 
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)

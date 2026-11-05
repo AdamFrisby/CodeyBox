@@ -405,6 +405,30 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunTextOnlyAsync_VetoesSuccessfulRun_WhenStderrReportsModelSubstitution()
+    {
+        // Print mode has no structured active-model signal; the only
+        // observable substitution evidence is the CLI's stderr WARN. A
+        // successful `devin -p` carrying it ran on the substituted model —
+        // the runner must report failure (with the WARN preserved as the
+        // error detail so downstream transient classification still fires)
+        // rather than return the substituted answer as success.
+        var sandbox = new RecordingSandbox
+        {
+            TextOnlyStdout = "answer produced by the substituted model",
+            TextOnlyStderr = "chisel_server::acp: `devin acp --model` value "
+                + "did not resolve to an available model; falling back to your "
+                + "configured `agent.model` or the default",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunTextOnlyAsync("summarise", Cred(), sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.False(result.Success);
+        Assert.Contains("did not resolve", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task RunTextOnlyAsync_WithoutSandbox_FailsNamingSandboxRequirement()
     {
         var runner = RunnerWithDefault();
@@ -517,6 +541,9 @@ public sealed class DevinAgentRunnerTests
         public string DevinStdout { get; set; } = TurnCompleteStdout;
         public string DevinStderr { get; set; } = "stderr";
         public int AcpHelpExitCode { get; set; }
+        public int TextOnlyExitCode { get; set; }
+        public string TextOnlyStdout { get; set; } = "ok";
+        public string TextOnlyStderr { get; set; } = "";
 
         public string Id => "fake-devin";
         public List<SandboxExec> Execs { get; } = [];
@@ -540,6 +567,13 @@ public sealed class DevinAgentRunnerTests
                 && exec.Argv[2].Contains("cb_shim_b64", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(DevinExitCode, DevinStdout, DevinStderr));
+            }
+            // The print-mode text-only exec stages its prompt through
+            // $cb_prompt (see DevinAgentRunner.PromptFileInvocation).
+            if (exec.Argv.Count == 3 && exec.Argv[0] == "bash"
+                && exec.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(TextOnlyExitCode, TextOnlyStdout, TextOnlyStderr));
             }
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));
         }

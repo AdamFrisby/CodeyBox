@@ -14,6 +14,13 @@ namespace CodeyBox.Tests;
 /// the item on the configured model instead of hard-failing it. Input shapes
 /// are the real devin 3000.11.1 lines from the incident capture; no
 /// speculative vendor variants.
+///
+/// <para>Envelope-structure signatures only match on captures stamped
+/// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — the provenance the
+/// runner sets when the shim owns the stream. Unframed stdout/summary is
+/// agent/model text and a forged envelope line there must never classify;
+/// the WARN-text fallback matches only raw stderr and verified
+/// <c>codeybox.stderr</c> envelope text fields.</para>
 /// </summary>
 public sealed class DevinModelSubstitutionTests
 {
@@ -47,6 +54,15 @@ public sealed class DevinModelSubstitutionTests
 
     private static string StdoutWith(params string[] lines) => string.Join("\n", lines);
 
+    private static AgentResult Framed(string? stderr = null, string? stdout = null, string? summary = null)
+        => TestSupport.EnvelopeFramedAgentResult(stderr, stdout, summary);
+
+    private static AgentResult Unframed(string? stderr = null, string? stdout = null, string? summary = null)
+        => new(Success: false, Summary: summary ?? "agent exited 2", Stdout: stdout, Stderr: stderr);
+
+    private static ProviderTransientDetection? Detect(AgentResult result)
+        => new DevinQuotaFailureDetector().DetectProviderTransient(result);
+
     // model_mismatch: the abort is a typed terminal event and classifies
     // as provider-transient so the item re-runs on the configured model.
 
@@ -66,10 +82,9 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
-    public void ModelMismatchEnvelope_ClassifiesInfraTransport()
+    public void ModelMismatchEnvelope_FramedCapture_ClassifiesInfraTransport()
     {
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            null, StdoutWith(ModelMismatchEnvelope), null);
+        var detection = Detect(Framed(stdout: StdoutWith(ModelMismatchEnvelope)));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -77,12 +92,12 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
-    public void ModelMismatchEnvelope_CompositeDispatch_ClassifiesInfraTransport()
+    public void ModelMismatchEnvelope_CompositeDispatch_FramedCapture_ClassifiesInfraTransport()
     {
         var classifier = new CompositeQuotaFailureClassifier([new DevinQuotaFailureDetector()]);
 
         var detection = classifier.DetectProviderTransient(
-            AgentKind.Devin, null, StdoutWith(ModelMismatchEnvelope), null);
+            AgentKind.Devin, Framed(stdout: StdoutWith(ModelMismatchEnvelope)));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -90,7 +105,26 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
-    public void StderrWarnInsideStderrEnvelope_ClassifiesInfraTransport()
+    public void ModelMismatchEnvelope_UnframedCapture_ReturnsNull()
+    {
+        // Same envelope bytes on an unframed capture: the stream is
+        // agent/model text (print-mode stdout, audit-mapped output), so a
+        // quoted devin.acp line is a forgery attempt, never a signal.
+        var detection = Detect(Unframed(stdout: StdoutWith(ModelMismatchEnvelope)));
+
+        Assert.Null(detection);
+    }
+
+    [Fact]
+    public void ModelMismatchEnvelope_InSummary_ReturnsNull()
+    {
+        var detection = Detect(Unframed(summary: ModelMismatchEnvelope));
+
+        Assert.Null(detection);
+    }
+
+    [Fact]
+    public void StderrWarnInsideStderrEnvelope_FramedCapture_ClassifiesInfraTransport()
     {
         // The WARN always reaches the capture folded inside a
         // codeybox.stderr envelope — the fallback must still recognise it
@@ -98,7 +132,7 @@ public sealed class DevinModelSubstitutionTests
         var stdout = StdoutWith(
             "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}");
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
+        var detection = Detect(Framed(stdout: stdout));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -106,8 +140,22 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
+    public void StderrWarnInsideStderrEnvelope_UnframedCapture_ReturnsNull()
+    {
+        // A codeybox.stderr-shaped line on an unframed stream is just
+        // agent-printed text — the envelope claim requires the framed
+        // provenance stamp.
+        var stdout = StdoutWith(
+            "{\"type\":\"codeybox.stderr\",\"text\":\"" + StderrWarnLine + "\"}");
+
+        Assert.Null(Detect(Unframed(stdout: stdout)));
+    }
+
+    [Fact]
     public void StderrWarnOnRawStderr_ClassifiesInfraTransport()
     {
+        // Raw stderr is the provider's own diagnostic channel on every
+        // capture shape — no framing required.
         var detection = new DevinQuotaFailureDetector().DetectProviderTransient(StderrWarnLine, null, null);
 
         Assert.NotNull(detection);
@@ -116,12 +164,44 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
+    public void StderrWarnOnRawStderr_UnframedResult_ClassifiesInfraTransport()
+    {
+        var detection = Detect(Unframed(stderr: StderrWarnLine));
+
+        Assert.NotNull(detection);
+        Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
+        Assert.Equal(DevinModelMismatchDetector.Signature, detection.MatchedSignature);
+    }
+
+    [Fact]
+    public void StderrWarnInsideDevinAcpPayload_FramedCapture_ReturnsNull()
+    {
+        // The marker quoted inside an agent_message_chunk payload is model
+        // text riding a genuine envelope — payload fields are
+        // agent-influenceable and must never feed the text fallback.
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"session_update\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"text\":\""
+            + StderrWarnLine + "\"}}}");
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+    }
+
+    [Fact]
+    public void StderrWarnInsideTurnCompleteFinalText_FramedCapture_ReturnsNull()
+    {
+        var stdout = StdoutWith(
+            "{\"type\":\"devin.acp\",\"event\":\"turn_complete\",\"stopReason\":\"end_turn\",\"finalText\":\""
+            + StderrWarnLine + "\"}");
+
+        Assert.Null(Detect(Framed(stdout: stdout)));
+    }
+
+    [Fact]
     public void ModelMismatch_WithAuthSignalInCapture_Suppressed()
     {
-        var stdout = StdoutWith(ModelMismatchEnvelope);
-
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            "Error: Not logged in. Run `devin auth login` to authenticate.", stdout, null);
+        var detection = Detect(Framed(
+            stderr: "Error: Not logged in. Run `devin auth login` to authenticate.",
+            stdout: StdoutWith(ModelMismatchEnvelope)));
 
         Assert.Null(detection);
     }
@@ -129,8 +209,7 @@ public sealed class DevinModelSubstitutionTests
     [Fact]
     public void ModelMismatch_ParkedError_UsesTransientKindWithoutRawSecrets()
     {
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            null, StdoutWith(ModelMismatchEnvelope), null);
+        var detection = Detect(Framed(stdout: StdoutWith(ModelMismatchEnvelope)));
         Assert.NotNull(detection);
 
         var parkedError = ProviderTransientRetryPolicy.BuildParkedError(detection!);
@@ -154,10 +233,9 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
-    public void RetryableTurnErrorEnvelope_ClassifiesInfraTransport()
+    public void RetryableTurnErrorEnvelope_FramedCapture_ClassifiesInfraTransport()
     {
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            null, StdoutWith(RetryableTurnErrorEnvelope), null);
+        var detection = Detect(Framed(stdout: StdoutWith(RetryableTurnErrorEnvelope)));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -165,12 +243,12 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
-    public void RetryableTurnErrorEnvelope_CompositeDispatch_ClassifiesInfraTransport()
+    public void RetryableTurnErrorEnvelope_CompositeDispatch_FramedCapture_ClassifiesInfraTransport()
     {
         var classifier = new CompositeQuotaFailureClassifier([new DevinQuotaFailureDetector()]);
 
         var detection = classifier.DetectProviderTransient(
-            AgentKind.Devin, null, StdoutWith(RetryableTurnErrorEnvelope), null);
+            AgentKind.Devin, Framed(stdout: StdoutWith(RetryableTurnErrorEnvelope)));
 
         Assert.NotNull(detection);
         Assert.Equal(ProviderTransientKind.InfraTransport, detection!.Kind);
@@ -178,7 +256,18 @@ public sealed class DevinModelSubstitutionTests
     }
 
     [Fact]
-    public void TurnErrorWithoutRetryableFlag_ReturnsNull()
+    public void RetryableTurnErrorEnvelope_UnframedCapture_ReturnsNull()
+    {
+        // A forged turn_error line on an unframed stream (print-mode
+        // stdout, audit-mapped output, or raw stderr) is agent/model text —
+        // never a provider retryability declaration.
+        Assert.Null(Detect(Unframed(stdout: StdoutWith(RetryableTurnErrorEnvelope))));
+        Assert.Null(Detect(Unframed(stderr: StdoutWith(RetryableTurnErrorEnvelope))));
+        Assert.Null(Detect(Unframed(summary: RetryableTurnErrorEnvelope)));
+    }
+
+    [Fact]
+    public void TurnErrorWithoutRetryableFlag_FramedCapture_ReturnsNull()
     {
         // Same code and message shape, but the provider did not declare the
         // error retryable — no transient parking.
@@ -187,13 +276,11 @@ public sealed class DevinModelSubstitutionTests
             + "\"message\":\"Permission denied: This model is no longer available "
             + "for your account. Please switch to a different model.\"}");
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
-
-        Assert.Null(detection);
+        Assert.Null(Detect(Framed(stdout: stdout)));
     }
 
     [Fact]
-    public void TurnErrorWithRetryableFalse_ReturnsNull()
+    public void TurnErrorWithRetryableFalse_FramedCapture_ReturnsNull()
     {
         var stdout = StdoutWith(
             "{\"type\":\"devin.acp\",\"event\":\"turn_error\",\"code\":-32013,"
@@ -201,18 +288,15 @@ public sealed class DevinModelSubstitutionTests
             + "for your account. Please switch to a different model.\","
             + "\"retryable\":false}");
 
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(null, stdout, null);
-
-        Assert.Null(detection);
+        Assert.Null(Detect(Framed(stdout: stdout)));
     }
 
     [Fact]
     public void RetryableTurnError_WithAuthSignalInCapture_Suppressed()
     {
-        var stdout = StdoutWith(RetryableTurnErrorEnvelope);
-
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            "Error: Not logged in. Run `devin auth login` to authenticate.", stdout, null);
+        var detection = Detect(Framed(
+            stderr: "Error: Not logged in. Run `devin auth login` to authenticate.",
+            stdout: StdoutWith(RetryableTurnErrorEnvelope)));
 
         Assert.Null(detection);
     }
@@ -220,8 +304,7 @@ public sealed class DevinModelSubstitutionTests
     [Fact]
     public void RetryableTurnError_ParkedError_UsesTransientKindWithoutRawSecrets()
     {
-        var detection = new DevinQuotaFailureDetector().DetectProviderTransient(
-            null, StdoutWith(RetryableTurnErrorEnvelope), null);
+        var detection = Detect(Framed(stdout: StdoutWith(RetryableTurnErrorEnvelope)));
         Assert.NotNull(detection);
 
         var parkedError = ProviderTransientRetryPolicy.BuildParkedError(detection!);
@@ -235,5 +318,7 @@ public sealed class DevinModelSubstitutionTests
     {
         Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient(null, null, null));
         Assert.Null(new DevinQuotaFailureDetector().DetectProviderTransient("", "", ""));
+        Assert.Null(Detect(Framed()));
+        Assert.Null(Detect(Unframed()));
     }
 }

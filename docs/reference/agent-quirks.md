@@ -461,12 +461,18 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   model; falling back to your configured `agent.model` or the default`)
   and proceeds on `agent.model`/the default — possibly metered. The shim
   refuses the substitution: it aborts with a `model_mismatch` terminal
-  envelope before or at the first prompt whenever the active model is not
-  the requested one (structured signals first — `session/new`
-  `models.currentModelId` and category-`"model"` `config_option_update` —
-  the stderr WARN text as fallback). The host classifies the abort
+  envelope at the earliest observable point whenever the active model is
+  not the requested one — strictly before `session/prompt` for the
+  structured signals (`session/new` `models.currentModelId` and
+  category-`"model"` `config_option_update`), and on the stderr WARN
+  text as fallback (bounded grace, then a mid-turn abort at the first
+  frame carrying the marker). The host classifies the abort
   provider-transient so the item retries on the configured model instead
-  of terminal-failing; a `turn_error` whose error `data` carries
+  of terminal-failing — structured envelopes are only trusted on
+  captures the runner stamped envelope-framed
+  (`AgentResult.StdoutIsEnvelopeFramed`); unframed stdout/summary is
+  agent text and never parsed as envelopes, while raw stderr still feeds
+  the WARN-text fallback. A `turn_error` whose error `data` carries
   `cognition.ai/retryable: true` is forwarded as `"retryable": true` and
   parks on the same bounded path.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
@@ -480,8 +486,8 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   `O_WRONLY`, so delivered prompt bytes are agent-influenceable and must
   not be treated as operator-authentic (sudo defeats even a root-owned
   stdin sidecar — there is no in-VM fix).
-- Failure text surfaces either as shim `turn_error`/`fatal` envelopes
-  (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
+- Failure text surfaces either as shim `turn_error`/`model_mismatch`/`fatal`
+  envelopes (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
   `Error: …` lines — the CLI prints them to stderr (verified: `Error: Not
   logged in` exits nonzero before the handshake), which the shim's stderr
   relay delivers inside `codeybox.stderr` envelopes;
@@ -516,7 +522,15 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
 - The text-only path (`RunTextOnlyAsync`) still uses
   `devin -p --respect-workspace-trust false` with no permission flag —
   the read-only `auto` default is the conservative shape for answering
-  questions on untrusted resolver input.
+  questions on untrusted resolver input. Print mode exposes no
+  structured active-model signal, so `DevinAgentRunner` vetoes a
+  successful `devin -p` exec whose stderr carries the same WARN phrase
+  (`RejectSuccessfulTextOnlyResult`): the substituted run is reported
+  as a failure and its stderr detail still classifies
+  provider-transient downstream. Residual gap: the WARN is
+  `chisel_server::acp`-scoped and may never fire outside `devin acp` —
+  treat print-mode `--model` pinning as best-effort until the CLI
+  offers an equivalent signal.
 
 **Default model:** `claude-sonnet-5-medium` (verified live catalog variant;
 the documented examples `sonnet`/`opus`/`swe`/`fable` are also accepted

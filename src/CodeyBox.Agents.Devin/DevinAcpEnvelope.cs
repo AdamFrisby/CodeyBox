@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Agents;
+using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Devin;
 
@@ -72,12 +74,30 @@ internal static class DevinAcpEnvelope
     internal readonly record struct Envelope(string Event, JsonElement Root);
 
     /// <summary>
-    /// Enumerates the <c>devin.acp</c> envelopes in a captured stdout blob.
-    /// Never throws: blank lines, non-JSON lines, JSON that is not a
-    /// devin.acp envelope, and lines truncated mid-write are all skipped —
-    /// the capture may carry leading CLI noise or be cut by an output cap.
+    /// One parsed envelope line of ANY <c>type</c> tag: the type value, the
+    /// <c>event</c> name when present (null for typeless-event envelopes
+    /// such as <c>codeybox.stderr</c>), and a detached clone of the root
+    /// element. The typed view lets consumers distinguish shim-owned
+    /// <see cref="EnvelopeType"/> envelopes from host-injected
+    /// <see cref="CliAgentRunnerBase.StderrEnvelopeType"/> envelopes on the
+    /// same framed stream.
     /// </summary>
-    internal static IEnumerable<Envelope> Enumerate(string? stdout)
+    internal readonly record struct TypedEnvelope(string Type, string? Event, JsonElement Root);
+
+    /// <summary>
+    /// Upper bound on envelopes examined per provider-transient detection
+    /// pass — the single bound shared by every detector scanning the
+    /// framed capture.
+    /// </summary>
+    internal const int MaxEnvelopesExamined = 128;
+
+    /// <summary>
+    /// Enumerates every typed envelope line in a captured stdout blob —
+    /// both <c>devin.acp</c> and <c>codeybox.stderr</c> lines. Never throws:
+    /// blank lines, non-JSON lines, JSON without a string <c>type</c>, and
+    /// lines truncated mid-write are all skipped.
+    /// </summary>
+    internal static IEnumerable<TypedEnvelope> EnumerateEnvelopes(string? stdout)
     {
         if (string.IsNullOrWhiteSpace(stdout))
             yield break;
@@ -94,14 +114,64 @@ internal static class DevinAcpEnvelope
             using (doc)
             {
                 var root = doc.RootElement;
-                if (IsEnvelope(root)
-                    && root.TryGetProperty(EventPropertyName, out var eventEl)
-                    && eventEl.ValueKind == JsonValueKind.String
-                    && eventEl.GetString() is { } eventName)
+                if (root.ValueKind != JsonValueKind.Object
+                    || !root.TryGetProperty("type", out var typeEl)
+                    || typeEl.ValueKind != JsonValueKind.String
+                    || typeEl.GetString() is not { } type)
                 {
-                    yield return new Envelope(eventName, root.Clone());
+                    continue;
                 }
+
+                string? eventName = null;
+                if (root.TryGetProperty(EventPropertyName, out var eventEl)
+                    && eventEl.ValueKind == JsonValueKind.String)
+                {
+                    eventName = eventEl.GetString();
+                }
+
+                yield return new TypedEnvelope(type, eventName, root.Clone());
             }
+        }
+    }
+
+    /// <summary>
+    /// Enumerates the <c>devin.acp</c> envelopes in a captured stdout blob.
+    /// Never throws: blank lines, non-JSON lines, JSON that is not a
+    /// devin.acp envelope, and lines truncated mid-write are all skipped —
+    /// the capture may carry leading CLI noise or be cut by an output cap.
+    /// </summary>
+    internal static IEnumerable<Envelope> Enumerate(string? stdout)
+    {
+        foreach (var typed in EnumerateEnvelopes(stdout))
+        {
+            if (typed.Type == EnvelopeType && typed.Event is { } eventName)
+                yield return new Envelope(eventName, typed.Root);
+        }
+    }
+
+    /// <summary>
+    /// Bounded typed-envelope scan for provider-transient detection:
+    /// truncates the input to the last
+    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars (the
+    /// terminal envelope is the last line) and examines at most
+    /// <see cref="MaxEnvelopesExamined"/> envelopes — the single bound
+    /// policy shared by the Devin detectors.
+    /// </summary>
+    internal static IEnumerable<TypedEnvelope> EnumerateBounded(string? stdout)
+    {
+        if (string.IsNullOrEmpty(stdout))
+            yield break;
+
+        var bounded = stdout.Length > ProviderTransientMatcher.MaxScannedChars
+            ? stdout[^ProviderTransientMatcher.MaxScannedChars..]
+            : stdout;
+
+        var examined = 0;
+        foreach (var envelope in EnumerateEnvelopes(bounded))
+        {
+            if (++examined > MaxEnvelopesExamined)
+                yield break;
+            yield return envelope;
         }
     }
 

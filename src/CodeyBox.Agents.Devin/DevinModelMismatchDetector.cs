@@ -1,3 +1,4 @@
+using CodeyBox.Agents;
 using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Devin;
@@ -14,20 +15,29 @@ namespace CodeyBox.Agents.Devin;
 /// run.
 ///
 /// <para>Primary signal is the shim-emitted
-/// <see cref="DevinAcpEnvelope.EventModelMismatch"/> envelope. A secondary
-/// text fallback matches the CLI's own stderr WARN phrase inside a
-/// <c>codeybox.stderr</c> envelope (or a raw stream), covering a shim
-/// killed between the WARN and its abort envelope; the phrase is held in
-/// the single documented constant <see cref="StderrFallbackMarker"/>,
-/// mirrored verbatim by the shim's
-/// <c>MODEL_FALLBACK_STDERR_MARKER</c>.</para>
+/// <see cref="DevinAcpEnvelope.EventModelMismatch"/> envelope; the
+/// secondary text fallback matches the CLI's own stderr WARN phrase
+/// (<see cref="StderrFallbackMarker"/>) on exactly two trusted surfaces:
+/// raw stderr (the provider's own diagnostic channel on every capture
+/// shape) and the <c>text</c> field of <c>codeybox.stderr</c> envelopes on
+/// an envelope-framed capture (covering a shim killed between the WARN
+/// and its abort envelope). The phrase is held in the single documented
+/// constant <see cref="StderrFallbackMarker"/>, mirrored verbatim by the
+/// shim's <c>MODEL_FALLBACK_STDERR_MARKER</c>.</para>
 ///
-/// <para>Bounded: each input is truncated to the last
-/// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars and at most
-/// <see cref="MaxEnvelopesExamined"/> envelopes are examined; every
-/// evaluation is total (never throws). The detection carries only the fixed
-/// signature label — never raw agent output. An auth signal in the same
-/// capture suppresses the match (<see cref="DevinAuthSignals"/>).</para>
+/// <para>Provenance: envelope structure is only trusted when
+/// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — the runner stamped
+/// that the exec pinned stderr off stdout and the shim owns the stream.
+/// Envelope payload fields (agent_message_chunk text, turn_complete
+/// finalText) and unframed stdout/summary are agent-influenceable, so a
+/// marker phrase quoted there — or a forged <c>model_mismatch</c> line —
+/// never matches. Bounded: the framed scan truncates to the last
+/// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars and
+/// examines at most <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
+/// envelopes; every evaluation is total (never throws). The detection
+/// carries only the fixed signature label — never raw agent output. An
+/// auth signal in the same capture suppresses the match
+/// (<see cref="DevinAuthSignals"/>).</para>
 /// </summary>
 internal static class DevinModelMismatchDetector
 {
@@ -43,33 +53,40 @@ internal static class DevinModelMismatchDetector
     /// the default</c>). Keep in lockstep with the shim's
     /// <c>MODEL_FALLBACK_STDERR_MARKER</c>. The phrase contains no
     /// JSON-escapable characters, so it matches verbatim inside a
-    /// <c>codeybox.stderr</c> envelope line.
+    /// <c>codeybox.stderr</c> envelope's decoded <c>text</c> field.
     /// </summary>
     internal const string StderrFallbackMarker = "did not resolve to an available model";
 
-    private const int MaxEnvelopesExamined = 128;
-
-    internal static ProviderTransientDetection? TryDetect(string? stderr, string? stdout, string? summary)
+    internal static ProviderTransientDetection? TryDetect(
+        AgentResult result,
+        IReadOnlyList<QuotaFailurePattern> unauthorizedPatterns)
     {
         try
         {
-            if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
-                return null;
-
-            if (DevinAuthSignals.HasAuthSignal(stderr, stdout, summary))
-                return null;
-
-            if (HasMismatchSignal(stderr) || HasMismatchSignal(stdout) || HasMismatchSignal(summary))
+            if (string.IsNullOrEmpty(result.Stderr)
+                && string.IsNullOrEmpty(result.Stdout)
+                && string.IsNullOrEmpty(result.Summary))
             {
-                return new ProviderTransientDetection(
-                    ProviderTransientKind.InfraTransport,
-                    Signature,
-                    "the CLI reported the requested --model did not resolve and substituted "
-                    + "another; the turn was aborted and is retried so only the configured "
-                    + "model is ever billed");
+                return null;
             }
 
-            return null;
+            var matched = HasEnvelopeMismatch(result.Stdout, framed: result.StdoutIsEnvelopeFramed)
+                || HasStderrFallbackMarker(result.Stderr);
+            if (!matched)
+                return null;
+
+            if (DevinAuthSignals.HasAuthSignal(
+                    result.Stderr, result.Stdout, result.Summary, unauthorizedPatterns))
+            {
+                return null;
+            }
+
+            return new ProviderTransientDetection(
+                ProviderTransientKind.InfraTransport,
+                Signature,
+                "the CLI reported the requested --model did not resolve and substituted "
+                + "another; the turn was aborted and is retried so only the configured "
+                + "model is ever billed");
         }
         catch (Exception)
         {
@@ -77,26 +94,60 @@ internal static class DevinModelMismatchDetector
         }
     }
 
-    private static bool HasMismatchSignal(string? text)
+    /// <summary>
+    /// Framed-capture envelope scan: a <c>model_mismatch</c> terminal
+    /// envelope, or the stderr WARN phrase inside a verified
+    /// <c>codeybox.stderr</c> envelope's <c>text</c> field. Never scans
+    /// envelope payload fields or unframed text — those are
+    /// agent-influenceable.
+    /// </summary>
+    private static bool HasEnvelopeMismatch(string? stdout, bool framed)
     {
-        if (string.IsNullOrEmpty(text))
+        if (!framed || string.IsNullOrEmpty(stdout))
             return false;
 
         try
         {
-            var bounded = text.Length > ProviderTransientMatcher.MaxScannedChars
-                ? text[^ProviderTransientMatcher.MaxScannedChars..]
-                : text;
-
-            var examined = 0;
-            foreach (var envelope in DevinAcpEnvelope.Enumerate(bounded))
+            foreach (var envelope in DevinAcpEnvelope.EnumerateBounded(stdout))
             {
-                if (++examined > MaxEnvelopesExamined)
-                    break;
-                if (string.Equals(envelope.Event, DevinAcpEnvelope.EventModelMismatch, StringComparison.Ordinal))
+                if (envelope.Type == DevinAcpEnvelope.EnvelopeType
+                    && string.Equals(envelope.Event, DevinAcpEnvelope.EventModelMismatch, StringComparison.Ordinal))
+                {
                     return true;
-            }
+                }
 
+                if (envelope.Type == CliAgentRunnerBase.StderrEnvelopeType
+                    && CliAgentRunnerBase.TryReadStderrEnvelope(envelope.Root, out var stderrText)
+                    && stderrText?.Contains(StderrFallbackMarker, StringComparison.Ordinal) == true)
+                {
+                    return true;
+                }
+            }
+        }
+        catch (Exception)
+        {
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Raw-stderr fallback for the WARN phrase: stderr is the provider's
+    /// own diagnostic channel on every capture shape (print-mode stderr,
+    /// pre-relay shim noise, and — on framed runs — the stream the exec
+    /// wrapper pins off stdout). Bounded to the last
+    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars.
+    /// </summary>
+    private static bool HasStderrFallbackMarker(string? stderr)
+    {
+        if (string.IsNullOrEmpty(stderr))
+            return false;
+
+        try
+        {
+            var bounded = stderr.Length > ProviderTransientMatcher.MaxScannedChars
+                ? stderr[^ProviderTransientMatcher.MaxScannedChars..]
+                : stderr;
             return bounded.Contains(StderrFallbackMarker, StringComparison.Ordinal);
         }
         catch (Exception)

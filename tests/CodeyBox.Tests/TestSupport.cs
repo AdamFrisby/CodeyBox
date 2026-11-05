@@ -70,6 +70,27 @@ internal static class TestSupport
             projects,
             NullLogger<WorkItemTerminalTransition>.Instance);
 
+    /// <summary>
+    /// Builds an <see cref="AgentResult"/> stamped
+    /// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — the provenance the
+    /// runner sets for shim-framed captures. Envelope-structure transient
+    /// signatures (devin.acp terminal envelopes, codeybox.stderr relay
+    /// lines) only match on this shape; unframed captures are agent/model
+    /// text and must never be parsed as envelopes.
+    /// </summary>
+    public static AgentResult EnvelopeFramedAgentResult(
+        string? stderr = null,
+        string? stdout = null,
+        string? summary = null)
+        => new(
+            Success: false,
+            Summary: summary ?? "agent exited 2",
+            Stdout: stdout,
+            Stderr: stderr)
+        {
+            StdoutIsEnvelopeFramed = true,
+        };
+
     public static async Task<string> CreateSeedRepoAsync(string root, string name = "seed")
     {
         var seed = Path.Combine(root, name + "-" + Guid.NewGuid().ToString("N")[..8]);
