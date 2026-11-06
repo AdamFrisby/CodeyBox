@@ -97,6 +97,22 @@ public sealed class IncusSandboxProvider :
     /// </summary>
     internal const string BakeExtraRuncmdProgressGuestPath = "/run/codeybox-bake-runcmd-index";
     private const int ExtraRuncmdLogSnippetCharacters = 200;
+    private const int BakeCauseMaxCharacters = 1024;
+    // The guest file is one decimal index. Stdout fits that line; stderr is
+    // capped so a failed cat cannot buffer an unbounded guest stream.
+    private const int ExtraRuncmdProgressMaxStdoutBytes = 64;
+    private const int ExtraRuncmdProgressMaxStderrBytes = 1024;
+    /// <summary>
+    /// How many exception wrappers bake-cause collection and bake-timeout
+    /// classification follow. One bound so a timeout nested in an aggregate
+    /// is classified the same way its message is collected.
+    /// </summary>
+    private const int BakeCauseWalkMaxDepth = 4;
+    // Operator hint stored on the timeout exception, which is the bake cause
+    // queue status and notifications already display. Notifications must not
+    // restate the Incus option name themselves.
+    private const string BakeProvisioningTimeoutRemediation =
+        "Raise CodeyBox:Incus:BakeProvisioningTimeout (it is read at the start of the next bake) or fix the ExtraRuncmd line named in the failure; provisioning retries automatically.";
 
     private readonly Func<IncusSandboxOptions> _optionsAccessor;
     private readonly ILogger<IncusSandboxProvider> _log;
@@ -561,17 +577,18 @@ public sealed class IncusSandboxProvider :
     }
 
     /// <summary>
-    /// Re-shapes a transient Incus infrastructure fault — a liveness timeout
-    /// (guest-agent readiness or a CLI operation deadline that tripped under
-    /// concurrent boot load) or an allowlisted transient error signature
-    /// (incusd DB/storage deadline, teardown unmount race, unverifiable guest
-    /// control-file cleanup) — into a
+    /// Re-shapes a transient Incus infrastructure fault into a
     /// <see cref="SandboxProvisioningDeferredException"/> so the recovery stack
-    /// re-enqueues the work item as RETRYABLE transient infrastructure. Without
-    /// this the raw exception would reach the orchestrator's catch-all and be
-    /// stamped as an unclassified failure and parked for an operator instead
-    /// of auto-retried. Returns <c>null</c> for any non-transient failure,
-    /// which is rethrown unchanged.
+    /// re-enqueues the work item as retryable instead of parking it as an
+    /// unclassified failure. Branch order is load-bearing:
+    /// <see cref="IncusBaselineBakeTimeoutException"/> is first and is published
+    /// as <c>incus-baseline-bake-timeout</c>. That type subclasses
+    /// <see cref="IncusTransientTimeoutException"/>, so dropping this branch
+    /// would publish a bake deadline as <c>incus-liveness-timeout</c>. The
+    /// liveness branch is the remaining CLI and guest-agent deadlines. An
+    /// allowlisted signature (incusd DB/storage deadline, teardown unmount
+    /// race, unverifiable guest control-file cleanup) is last. Returns
+    /// <c>null</c> for any non-transient failure, which is rethrown unchanged.
     /// </summary>
     internal static SandboxProvisioningDeferredException? TryBuildTransientProvisioningDeferral(
         Exception ex,
@@ -637,17 +654,7 @@ public sealed class IncusSandboxProvider :
         return null;
     }
 
-    private static string SingleLineDetail(Exception ex)
-    {
-        const int maxChars = 1024;
-        var message = ex.Message ?? string.Empty;
-        if (message.Length > maxChars)
-            message = message.Substring(0, maxChars);
-        var builder = new System.Text.StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
+    private static string SingleLineDetail(Exception ex) => SingleLineText(ex.Message);
 
     private async Task<ISandbox> AdoptRetainedSandboxAsync(
         SandboxSpec spec,
@@ -1918,9 +1925,8 @@ public sealed class IncusSandboxProvider :
         return SingleLineText(prefix + combined);
     }
 
-    private static string SingleLineText(string? value)
+    private static string SingleLineText(string? value, int maxChars = BakeCauseMaxCharacters)
     {
-        const int maxChars = 1024;
         var message = value ?? string.Empty;
         if (message.Length > maxChars)
             message = message.Substring(0, maxChars);
@@ -1932,7 +1938,7 @@ public sealed class IncusSandboxProvider :
 
     private static void CollectBakeCauseMessages(Exception ex, List<string> parts, int depth)
     {
-        if (depth > 4 || parts.Count >= 3)
+        if (depth > BakeCauseWalkMaxDepth || parts.Count >= 3)
             return;
         if (!string.IsNullOrWhiteSpace(ex.Message))
         {
@@ -2018,7 +2024,7 @@ public sealed class IncusSandboxProvider :
 
     private static bool IsBaselineBakeTimeout(Exception ex, int depth)
     {
-        if (depth >= 6)
+        if (depth > BakeCauseWalkMaxDepth)
             return false;
         if (ex is IncusBaselineBakeTimeoutException)
             return true;
@@ -2029,6 +2035,9 @@ public sealed class IncusSandboxProvider :
                 if (IsBaselineBakeTimeout(inner, depth + 1))
                     return true;
             }
+
+            // InnerException on an aggregate is the first inner, already visited.
+            return false;
         }
 
         return ex.InnerException is { } innerException
@@ -2508,8 +2517,8 @@ public sealed class IncusSandboxProvider :
                 options.OperationTimeout,
                 ct,
                 heavyOperation: false,
-                maxStdoutBytes: 64,
-                maxStderrBytes: 1024).ConfigureAwait(false);
+                maxStdoutBytes: ExtraRuncmdProgressMaxStdoutBytes,
+                maxStderrBytes: ExtraRuncmdProgressMaxStderrBytes).ConfigureAwait(false);
             if (!result.Success || result.StdoutLimitExceeded)
                 return null;
             return TryParseExtraRuncmdProgressIndex(result.Stdout, commandCount);
@@ -2523,6 +2532,7 @@ public sealed class IncusSandboxProvider :
             // The bake has already missed its deadline. A failure while reading
             // the progress file must not replace that timeout with a secondary fault.
             _log.LogWarning(
+                ex,
                 "Incus baseline bake timed out but the ExtraRuncmd progress file could not be read ({ExceptionType})",
                 ex.GetType().Name);
             return null;
@@ -2547,7 +2557,7 @@ public sealed class IncusSandboxProvider :
         if (zeroBasedIndex is not int index || (uint)index >= (uint)count)
         {
             return new ExtraRuncmdTimeoutReport(
-                $"Incus baseline bake timing out after {seconds.ToString(CultureInfo.InvariantCulture)}s during ExtraRuncmd; the running line could not be read.",
+                $"Incus baseline bake timing out after {seconds.ToString(CultureInfo.InvariantCulture)}s during ExtraRuncmd; the running line could not be read. {BakeProvisioningTimeoutRemediation}",
                 seconds,
                 null,
                 count,
@@ -2557,7 +2567,7 @@ public sealed class IncusSandboxProvider :
         var snippet = SanitizeExtraRuncmdSnippet(commands[index]);
         var lineNumber = index + 1;
         return new ExtraRuncmdTimeoutReport(
-            $"Incus baseline bake timing out after {seconds.ToString(CultureInfo.InvariantCulture)}s while running ExtraRuncmd line {lineNumber.ToString(CultureInfo.InvariantCulture)} of {count.ToString(CultureInfo.InvariantCulture)}: {snippet}",
+            $"Incus baseline bake timing out after {seconds.ToString(CultureInfo.InvariantCulture)}s while running ExtraRuncmd line {lineNumber.ToString(CultureInfo.InvariantCulture)} of {count.ToString(CultureInfo.InvariantCulture)}: {snippet} {BakeProvisioningTimeoutRemediation}",
             seconds,
             lineNumber,
             count,
@@ -2572,9 +2582,12 @@ public sealed class IncusSandboxProvider :
         var newline = text.IndexOfAny(['\r', '\n']);
         if (newline >= 0)
             text = text[..newline].Trim();
-        if (text.Length == 0 || text.Length > 3)
-            return null;
-        if (!int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+        // commandCount is the legal range, and operators cannot configure more
+        // commands than IncusSandboxOptions.MaximumExtraRuncmdCount. A separate
+        // digit-length cap would reject a later increase of that maximum.
+        // int.TryParse already rejects overflow.
+        if (text.Length == 0
+            || !int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
             return null;
         if ((uint)index >= (uint)commandCount)
             return null;
@@ -2583,336 +2596,14 @@ public sealed class IncusSandboxProvider :
 
     private static string SanitizeExtraRuncmdSnippet(string command)
     {
-        // This snippet is the bake-timeout exception message, and that message is
-        // copied into the provisioning-deferral detail (webhook), the baseline-blocked
-        // cause (queue status and notifications), and the bake-failure log property.
-        // Known token shapes are not enough: assignment values and URL userinfo are
-        // credentials in operator ExtraRuncmd lines and must be gone before the text
-        // is stored on the exception.
-        var redacted = SensitiveDataRedactionEnricher.RedactText(command);
-        redacted = StripEmbeddedUrlUserInfo(redacted);
-        redacted = RedactShellCredentialArguments(redacted);
-        var builder = new System.Text.StringBuilder(Math.Min(redacted.Length, ExtraRuncmdLogSnippetCharacters));
-        foreach (var c in redacted)
-        {
-            if (builder.Length == ExtraRuncmdLogSnippetCharacters)
-                break;
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        }
-        var snippet = builder.ToString().Trim();
+        // This snippet is copied into the bake-timeout exception, then into the
+        // provisioning-deferral detail (webhook), the baseline-blocked cause
+        // (queue status and notifications), and the bake-failure log property.
+        // ShellCommandRedactor removes URL userinfo and credential arguments
+        // before that text is stored. SingleLineText folds controls and caps
+        // the length with the same helper the bake cause uses.
+        var snippet = SingleLineText(ShellCommandRedactor.Redact(command), ExtraRuncmdLogSnippetCharacters);
         return snippet.Length == 0 ? "(empty)" : snippet;
-    }
-
-    /// <summary>
-    /// Replaces URL userinfo (<c>scheme://user:secret@host</c>) in a command.
-    /// The last <c>@</c> in the authority is the separator, so a password that
-    /// itself contains <c>@</c> is removed with the userinfo rather than left
-    /// in front of the host. Non-URL text, including <c>git@host:path</c>, is unchanged.
-    /// </summary>
-    private static string StripEmbeddedUrlUserInfo(string text)
-    {
-        var builder = new System.Text.StringBuilder(text.Length);
-        var index = 0;
-        while (index < text.Length)
-        {
-            var scheme = FindUrlSchemeStart(text, index);
-            if (scheme < 0)
-            {
-                builder.Append(text, index, text.Length - index);
-                break;
-            }
-
-            builder.Append(text, index, scheme - index);
-            var separator = text.IndexOf("://", scheme, StringComparison.Ordinal);
-            builder.Append(text, scheme, separator + 3 - scheme);
-            var authorityStart = separator + 3;
-            var authorityEnd = authorityStart;
-            while (authorityEnd < text.Length && !IsUrlAuthorityEnd(text[authorityEnd]))
-                authorityEnd++;
-            var at = -1;
-            for (var i = authorityEnd - 1; i >= authorityStart; i--)
-            {
-                if (text[i] == '@')
-                {
-                    at = i;
-                    break;
-                }
-            }
-
-            if (at >= authorityStart)
-            {
-                builder.Append("***@");
-                builder.Append(text, at + 1, authorityEnd - (at + 1));
-            }
-            else
-            {
-                builder.Append(text, authorityStart, authorityEnd - authorityStart);
-            }
-
-            index = authorityEnd;
-        }
-
-        return builder.ToString();
-    }
-
-    private static int FindUrlSchemeStart(string text, int start)
-    {
-        var index = start;
-        while (index < text.Length)
-        {
-            var separator = text.IndexOf("://", index, StringComparison.Ordinal);
-            if (separator < 0)
-                return -1;
-            var scheme = separator;
-            while (scheme > start && IsUrlSchemeChar(text[scheme - 1]))
-                scheme--;
-            if (scheme < separator
-                && char.IsLetter(text[scheme])
-                && (scheme == start || !IsUrlSchemeChar(text[scheme - 1])))
-                return scheme;
-            index = separator + 3;
-        }
-
-        return -1;
-    }
-
-    private static bool IsUrlSchemeChar(char c) =>
-        char.IsAsciiLetterOrDigit(c) || c is '+' or '-' or '.';
-
-    private static bool IsUrlAuthorityEnd(char c) =>
-        c is '/' or '?' or '#' or '"' or '\'' or '|' or ';' or '&' or '<' or '>' or '(' or ')' or '`'
-        || char.IsWhiteSpace(c);
-
-    // Curl basic-auth flags. Matching is exact, or an '=' immediately after the
-    // flag, so --user-agent is not treated as --user.
-    private static readonly string[] BasicAuthFlagNames = ["--proxy-user", "--user", "-U", "-u"];
-    private static readonly string[] AttachedUserFlagNames = ["-U", "-u"];
-
-    private static string RedactShellCredentialArguments(string text)
-    {
-        var builder = new System.Text.StringBuilder(text.Length);
-        var index = 0;
-        while (index < text.Length)
-        {
-            if (char.IsWhiteSpace(text[index]))
-            {
-                builder.Append(text[index]);
-                index++;
-                continue;
-            }
-
-            if (!TryReadShellWord(text, index, out var word))
-                break;
-            if (IsBasicAuthFlag(word.Text))
-            {
-                builder.Append(text, word.Start, word.End - word.Start);
-                index = AppendFollowingShellValueRedacted(text, word.End, builder);
-                continue;
-            }
-
-            if (TrySplitBasicAuthAssignment(word.Text, out var flag))
-            {
-                builder.Append(flag).Append("=***");
-                index = word.End;
-                continue;
-            }
-
-            // curl accepts `-uuser:password` as one token. Require a colon in the
-            // attached value so a token such as `-update` is left unchanged.
-            if (TrySplitAttachedUserFlag(word.Text, out flag))
-            {
-                builder.Append(flag).Append(" ***");
-                index = word.End;
-                continue;
-            }
-
-            // RedactText stops at the first colon on a line, so `https:` hides a
-            // later token=value in the same command. Re-check each shell word.
-            if (TryRedactSensitiveAssignment(word.Text, out var redactedAssignment))
-            {
-                builder.Append(redactedAssignment);
-                index = word.End;
-                continue;
-            }
-
-            // npm `config set //registry/:_authToken <value>` is a sensitive key
-            // and a following word, not key=value.
-            if (SensitiveDataRedactionEnricher.IsSensitiveAssignmentKey(word.Text))
-            {
-                builder.Append(text, word.Start, word.End - word.Start);
-                index = AppendFollowingShellValueRedacted(text, word.End, builder);
-                continue;
-            }
-
-            builder.Append(text, word.Start, word.End - word.Start);
-            index = word.End;
-        }
-
-        return builder.ToString();
-    }
-
-    private static int AppendFollowingShellValueRedacted(string text, int index, System.Text.StringBuilder builder)
-    {
-        var afterKey = index;
-        while (index < text.Length && char.IsWhiteSpace(text[index]))
-        {
-            builder.Append(text[index]);
-            index++;
-        }
-
-        if (index == afterKey || index >= text.Length)
-            return index;
-        if (!TryReadShellWord(text, index, out var value))
-            return index;
-        builder.Append("***");
-        return value.End;
-    }
-
-    private static bool IsBasicAuthFlag(string word)
-    {
-        foreach (var flag in BasicAuthFlagNames)
-        {
-            if (string.Equals(word, flag, StringComparison.Ordinal))
-                return true;
-        }
-
-        return false;
-    }
-
-    private static bool TrySplitBasicAuthAssignment(string word, out string flag)
-    {
-        foreach (var candidate in BasicAuthFlagNames)
-        {
-            if (word.Length > candidate.Length
-                && word[candidate.Length] == '='
-                && word.StartsWith(candidate, StringComparison.Ordinal))
-            {
-                flag = candidate;
-                return true;
-            }
-        }
-
-        flag = "";
-        return false;
-    }
-
-    private static bool TryRedactSensitiveAssignment(string word, out string redacted)
-    {
-        var schemeUrl = word.Contains("://", StringComparison.Ordinal);
-        if (word.IndexOf('=') < 0 && (schemeUrl || word.IndexOf(':') < 0))
-        {
-            redacted = "";
-            return false;
-        }
-
-        var builder = new System.Text.StringBuilder(word.Length);
-        var index = 0;
-        var changed = false;
-        while (index < word.Length)
-        {
-            var equals = word.IndexOf('=', index);
-            var colon = schemeUrl ? -1 : word.IndexOf(':', index);
-            int separator;
-            if (equals < 0)
-                separator = colon;
-            else if (colon < 0)
-                separator = equals;
-            else
-                separator = Math.Min(equals, colon);
-            if (separator < 0)
-            {
-                builder.Append(word, index, word.Length - index);
-                break;
-            }
-
-            var keyStart = separator;
-            while (keyStart > index && IsAssignmentKeyChar(word[keyStart - 1]))
-                keyStart--;
-            var key = word[keyStart..separator];
-            if (key.Length > 0 && SensitiveDataRedactionEnricher.IsSensitiveAssignmentKey(key))
-            {
-                builder.Append(word, index, separator + 1 - index);
-                builder.Append("***");
-                changed = true;
-                index = separator + 1;
-                // Query strings separate pairs with '&'. Any other assignment value
-                // runs to the end of the shell word, so a value that itself contains
-                // '&' is not left behind the marker.
-                if (word[separator] == '=' && (schemeUrl || word.Contains('?')))
-                {
-                    while (index < word.Length && word[index] != '&')
-                        index++;
-                }
-                else
-                {
-                    index = word.Length;
-                }
-
-                continue;
-            }
-
-            builder.Append(word, index, separator + 1 - index);
-            index = separator + 1;
-        }
-
-        redacted = changed ? builder.ToString() : "";
-        return changed;
-    }
-
-    private static bool IsAssignmentKeyChar(char c) =>
-        char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '-';
-
-    private static bool TrySplitAttachedUserFlag(string word, out string flag)
-    {
-        foreach (var candidate in AttachedUserFlagNames)
-        {
-            if (word.Length > candidate.Length + 1
-                && word.StartsWith(candidate, StringComparison.Ordinal)
-                && word.IndexOf(':', candidate.Length) > candidate.Length)
-            {
-                flag = candidate;
-                return true;
-            }
-        }
-
-        flag = "";
-        return false;
-    }
-
-    private readonly struct ShellWord(int start, int end, string text)
-    {
-        public int Start { get; } = start;
-        public int End { get; } = end;
-        public string Text { get; } = text;
-    }
-
-    private static bool TryReadShellWord(string text, int index, out ShellWord word)
-    {
-        if (index >= text.Length || char.IsWhiteSpace(text[index]))
-        {
-            word = new ShellWord(index, index, "");
-            return false;
-        }
-
-        var start = index;
-        if (text[index] is '"' or '\'')
-        {
-            var quote = text[index];
-            index++;
-            var contentStart = index;
-            while (index < text.Length && text[index] != quote)
-                index++;
-            var content = text.Substring(contentStart, index - contentStart);
-            if (index < text.Length)
-                index++;
-            word = new ShellWord(start, index, content);
-            return true;
-        }
-
-        while (index < text.Length && !char.IsWhiteSpace(text[index]))
-            index++;
-        word = new ShellWord(start, index, text.Substring(start, index - start));
-        return true;
     }
 
     private async Task RunProvisioningWithPrivateWorkspaceAsync(

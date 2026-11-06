@@ -2016,6 +2016,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     [InlineData("-1", 2, null)]
     [InlineData("nope", 2, null)]
     [InlineData("007", 8, 7)]
+    [InlineData("1000", 1001, 1000)]
     public void TryParseExtraRuncmdProgressIndex_AcceptsOnlyInRangeIndexes(string? stdout, int commandCount, int? expected)
     {
         Assert.Equal(expected, IncusSandboxProvider.TryParseExtraRuncmdProgressIndex(stdout, commandCount));
@@ -2023,44 +2024,96 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
 
     [Theory]
     [InlineData(
-        "curl -fsSL -u builder:s3cret https://user:token@registry.example/install.sh",
+        "curl -fsSL -u builder:pass https://user:pass@registry.example/install.sh",
         "registry.example",
-        "s3cret|builder:s3cret|user:token|token@")]
+        "builder:pass|user:pass|pass@")]
     [InlineData(
-        "curl -fsSL -ubuilder:s3cret https://user:p@ssword1@private.example/install.sh",
+        "curl -fsSL -ubuilder:pass https://user:p@ss@private.example/install.sh",
         "private.example",
-        "s3cret|p@ssword1|ssword1|user:p")]
+        "builder:pass|p@ss|ss@|user:p")]
     [InlineData(
-        "curl --user=builder:s3cret https://example.invalid/install.sh",
+        "curl --user=builder:pass https://example.invalid/install.sh",
         "example.invalid",
-        "s3cret|builder:s3cret")]
+        "builder:pass")]
     [InlineData(
-        "curl --user builder:s3cret https://example.invalid/install.sh",
+        "curl --user builder:pass https://example.invalid/install.sh",
         "example.invalid",
-        "s3cret|builder:s3cret")]
+        "builder:pass")]
     [InlineData(
-        "curl -u \"builder:s3cret\" https://example.invalid/install.sh",
+        "curl -u \"builder:pass\" https://example.invalid/install.sh",
         "example.invalid",
-        "s3cret|builder:s3cret")]
+        "builder:pass")]
     [InlineData(
-        "curl \"https://example.invalid/install.sh?token=s3cret&x=1\"",
+        "curl \"https://example.invalid/install.sh?token=pass&x=1\"",
         "x=1",
-        "s3cret")]
+        "=pass")]
     [InlineData(
-        "npm config set //registry.npmjs.org/:_authToken npm_SuperSecretValue99",
+        "npm config set //registry.npmjs.org/:_authToken npm_token",
         "_authToken",
-        "npm_SuperSecretValue99")]
+        "npm_token")]
     [InlineData(
-        "npm config set //registry.npmjs.org/:_authToken=npm_SuperSecretValue99",
+        "npm config set //registry.npmjs.org/:_authToken=npm_token",
         "_authToken=",
-        "npm_SuperSecretValue99")]
+        "npm_token")]
     [InlineData(
-        "export NPM_TOKEN=npm_SuperSecretValue99 && echo builder:name",
+        "export NPM_TOKEN=npm_token && echo builder:name",
         "NPM_TOKEN=",
-        "npm_SuperSecretValue99")]
+        "npm_token")]
+    [InlineData(
+        "curl https://example.invalid/install.sh && export NPM_TOKEN=npm_token",
+        "NPM_TOKEN=",
+        "npm_token")]
+    [InlineData(
+        "curl \"https://user:p'ass@registry.example/install.sh\"",
+        "registry.example",
+        "p'ass")]
+    [InlineData(
+        "curl \"https://user:p&ss@registry.example/install.sh\"",
+        "registry.example",
+        "p&ss")]
+    [InlineData(
+        "curl https://user:p\\&ss@registry.example/install.sh",
+        "registry.example",
+        "p\\&ss|p&ss")]
+    [InlineData(
+        "curl -fsSLu builder:pass https://example.invalid/install.sh",
+        "example.invalid",
+        "builder:pass")]
+    [InlineData(
+        "curl -fsSLubuilder:pass https://example.invalid/install.sh",
+        "example.invalid",
+        "builder:pass")]
+    [InlineData(
+        "sh -c \"curl -u builder:pass https://example.invalid/install.sh\"",
+        "example.invalid",
+        "builder:pass")]
+    [InlineData(
+        "sh -c \"npm config set //registry.npmjs.org/:_authToken npm_token\"",
+        "_authToken",
+        "npm_token")]
+    [InlineData(
+        "docker login -u builder -p pass",
+        "docker login",
+        "builder|-p pass")]
+    [InlineData(
+        "npm config set //registry.npmjs.org/:_auth authvalue",
+        ":_auth",
+        "authvalue")]
+    [InlineData(
+        "npm config set //registry.npmjs.org/:_auth=authvalue",
+        ":_auth=",
+        "authvalue")]
+    [InlineData(
+        "\"--user\"builder:pass",
+        "--user",
+        "builder:pass")]
     [InlineData(
         "curl --user-agent CodeyBox https://example.invalid/install.sh",
         "CodeyBox",
+        "")]
+    [InlineData(
+        "curl -update archive",
+        "-update archive",
         "")]
     [InlineData(
         "git clone git@github.com:org/repo.git",
@@ -2104,7 +2157,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     [Fact]
     public async Task BakeExtraRuncmdTimeout_PublishesRedactedLineAndStillRunsTheCommand()
     {
-        const string secret = "builder:s3cret";
+        const string secret = "builder:pass";
         var stagingRoot = Path.Combine(_root, "bake-redact-staging");
         var time = new ControllableTimeProvider(new DateTimeOffset(2026, 11, 6, 3, 28, 0, TimeSpan.Zero));
         IncusSandboxOptions current = BaseOptions() with
@@ -2115,7 +2168,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             ExtraRuncmd =
             [
                 "echo first-finished",
-                "curl -fsSL -u builder:s3cret https://user:token@registry.example/install.sh",
+                "curl -fsSL -u builder:pass https://user:pass@registry.example/install.sh",
             ],
         };
         var shellStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2149,21 +2202,23 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => bake);
         Assert.Contains("registry.example", deferred.Detail, StringComparison.Ordinal);
         Assert.DoesNotContain(secret, deferred.Detail, StringComparison.Ordinal);
-        Assert.DoesNotContain("user:token", deferred.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("user:pass", deferred.Detail, StringComparison.Ordinal);
         Assert.DoesNotContain(secret, deferred.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("user:pass", deferred.ToString(), StringComparison.Ordinal);
         var blocked = provider.GetProvisioningBlockedStatus();
         Assert.NotNull(blocked);
         Assert.DoesNotContain(secret, blocked!.LastBakeCause, StringComparison.Ordinal);
-        Assert.DoesNotContain("user:token", blocked.LastBakeCause, StringComparison.Ordinal);
+        Assert.DoesNotContain("user:pass", blocked.LastBakeCause, StringComparison.Ordinal);
+        Assert.Contains("CodeyBox:Incus:BakeProvisioningTimeout", blocked.LastBakeCause, StringComparison.Ordinal);
         Assert.Contains("registry.example", blocked.DescribeOperatorReason(), StringComparison.Ordinal);
         Assert.All(log.Lines, line =>
         {
             Assert.DoesNotContain(secret, line.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain("user:token", line.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("user:pass", line.Message, StringComparison.Ordinal);
             if (line.Exception is not null)
             {
                 Assert.DoesNotContain(secret, line.Exception.ToString(), StringComparison.Ordinal);
-                Assert.DoesNotContain("user:token", line.Exception.ToString(), StringComparison.Ordinal);
+                Assert.DoesNotContain("user:pass", line.Exception.ToString(), StringComparison.Ordinal);
             }
         });
         var failureLog = Assert.Single(
@@ -2174,7 +2229,57 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             runner.Invocations,
             invocation => invocation.Stdin?.Contains(IncusSandboxProvider.BakeExtraRuncmdProgressGuestPath, StringComparison.Ordinal) == true);
         Assert.Contains(secret, shell.Stdin, StringComparison.Ordinal);
-        Assert.Contains("user:token@", shell.Stdin, StringComparison.Ordinal);
+        Assert.Contains("user:pass@", shell.Stdin, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BakeExtraRuncmdTimeout_LogsProgressReadFailureWithoutReplacingTheTimeout()
+    {
+        var stagingRoot = Path.Combine(_root, "bake-progress-read-staging");
+        var time = new ControllableTimeProvider(new DateTimeOffset(2026, 11, 6, 3, 28, 0, TimeSpan.Zero));
+        IncusSandboxOptions current = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            CloudInitTimeout = TimeSpan.FromSeconds(1),
+            BakeProvisioningTimeout = TimeSpan.FromSeconds(30),
+            ExtraRuncmd = ["echo still-running"],
+        };
+        var shellStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            onProvisioningShell: (_, ct) =>
+            {
+                shellStarted.TrySetResult();
+                return HangUntilCancelled(ct);
+            },
+            onBakeRuncmdProgress: _ => Task.FromException<ProcessRunResult>(new IOException("progress-cat-failed")));
+        var log = new ListLogger<IncusSandboxProvider>();
+        var provider = new IncusSandboxProvider(
+            () => current,
+            log,
+            timings: null,
+            runner,
+            timeProvider: time,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var bake = provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = current.DefaultImage,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        });
+        await shellStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        time.Advance(TimeSpan.FromSeconds(30));
+        await PumpAsync(bake);
+
+        var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => bake);
+        Assert.Equal(IncusBaselineBakeTimeoutException.ErrorClass, deferred.ErrorClass);
+        Assert.Contains("running line could not be read", deferred.Detail, StringComparison.Ordinal);
+        var progressLog = Assert.Single(
+            log.Lines,
+            line => line.Message.Contains("progress file could not be read", StringComparison.Ordinal));
+        Assert.NotNull(progressLog.Exception);
+        Assert.Contains("progress-cat-failed", progressLog.Exception!.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

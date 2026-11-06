@@ -118,3 +118,13 @@ e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQ
 # The current file uses repeated-digit placeholders; this entry covers the
 # pre-fix commit only.
 05547d9acc6f62e28df7282e0d715af53db4f045:tests/CodeyBox.Tests/DiscordInteractionParserTests.cs:discord-client-id:58
+# Synthetic curl basic-auth fixtures in the ExtraRuncmd redaction test
+# (tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs): placeholder
+# "builder:s3cret" used only to prove bake-timeout text drops credentials.
+# Never a live credential. The literals were replaced with the lower-entropy
+# "builder:pass"; these entries cover the pre-fix commit only.
+3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2026
+3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2030
+3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2034
+3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2038
+3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2118

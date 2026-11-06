@@ -162,7 +162,7 @@ public sealed class IncusBaselineBakeRecoveryTests : IDisposable
         var alert = Assert.Single(sent.Notifications);
         Assert.Equal(BaselineProvisioningBlockedCondition.ConditionId, alert.ConditionId);
         Assert.Equal(NotificationSeverity.Critical, alert.Severity);
-        Assert.Contains("no usable baseline; all provisioning blocked since", alert.Summary, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(blocked.DescribeOperatorReason(), alert.Summary);
         Assert.Contains(BakeCauseMarker, alert.Summary, StringComparison.Ordinal);
 
         // A success clears the alert without a restart.
@@ -280,7 +280,8 @@ public sealed class IncusBaselineBakeRecoveryTests : IDisposable
         var alert = new BaselineProvisioningBlockedNotificationBuilder(factory.Blocked)
             .Build(new DateTimeOffset(2026, 11, 6, 4, 1, 0, TimeSpan.Zero));
         Assert.Equal("Baseline bake timing out", alert.Title);
-        Assert.Contains("baseline bake timing out", alert.Summary, StringComparison.Ordinal);
+        Assert.Equal(factory.Blocked.Current!.DescribeOperatorReason(), alert.Summary);
+        Assert.DoesNotContain("CodeyBox:Incus:", alert.Body, StringComparison.Ordinal);
         var fields = alert.Fields;
         Assert.NotNull(fields);
         Assert.Equal(

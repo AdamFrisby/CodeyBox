@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
 using CodeyBox.Core;
@@ -20,9 +19,6 @@ namespace CodeyBox.Git;
 public sealed class LocalGitHost : IGitHost
 {
     private static readonly ConcurrentDictionary<string, RepositoryLockState> RepositoryLocks = new(StringComparer.Ordinal);
-    private static readonly Regex UrlUserInfoPattern = new(
-        @"(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/\s@]+@",
-        RegexOptions.CultureInvariant | RegexOptions.Compiled);
     // git update-ref treats an all-zero old oid as "create this ref only if it
     // does not already exist"; bare repos here use the normal 40-hex SHA-1 oid.
     private const string GitNullObjectId = "0000000000000000000000000000000000000000";
@@ -1098,140 +1094,140 @@ public sealed class LocalGitHost : IGitHost
         try
         {
 
-        var psi = new ProcessStartInfo
-        {
-            FileName = _opts.GitExecutable,
-            WorkingDirectory = path,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-        LocalGitInvocation.ApplyHostConfig(psi, _disabledHooksPath);
-        psi.ArgumentList.Add("ls-tree");
-        psi.ArgumentList.Add("-r");
-        psi.ArgumentList.Add("--name-only");
-        psi.ArgumentList.Add(treeish);
+            var psi = new ProcessStartInfo
+            {
+                FileName = _opts.GitExecutable,
+                WorkingDirectory = path,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            LocalGitInvocation.ApplyHostConfig(psi, _disabledHooksPath);
+            psi.ArgumentList.Add("ls-tree");
+            psi.ArgumentList.Add("-r");
+            psi.ArgumentList.Add("--name-only");
+            psi.ArgumentList.Add(treeish);
 
-        ILocalGitProcess? p = null;
-        for (var attempt = 1; ; attempt++)
-        {
-            p = _processFactory(psi);
+            ILocalGitProcess? p = null;
+            for (var attempt = 1; ; attempt++)
+            {
+                p = _processFactory(psi);
+                try
+                {
+                    p.Start();
+                    break;
+                }
+                catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
+                {
+                    p.Dispose();
+                    p = null;
+                    await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+                }
+                catch
+                {
+                    p.Dispose();
+                    throw;
+                }
+            }
+            using var _p = p;
+
+            var results = new List<string>(Math.Min(64, maxResults));
+            var capExceeded = false;
+            var scannedCapExceeded = false;
+            var scanned = 0;
+            var stderr = string.Empty;
+            var stderrLimitExceeded = false;
             try
             {
-                p.Start();
-                break;
-            }
-            catch (Win32Exception ex) when (attempt < GitStartTextFileBusyMaxAttempts && IsTextFileBusy(ex))
-            {
-                p.Dispose();
-                p = null;
-                await Task.Delay(GitStartTextFileBusyDelayStepMilliseconds * attempt, ct);
+                while (true)
+                {
+                    var line = await p.StandardOutput.ReadLineAsync(ct);
+                    if (line is null) break;
+                    var trimmed = line.Trim();
+                    if (trimmed.Length == 0) continue;
+                    scanned++;
+                    if (scanned > _opts.ListFilesEndingScannedPathCeiling)
+                    {
+                        scannedCapExceeded = true;
+                        break;
+                    }
+                    if (!EndsWithAnySuffix(trimmed, suffixes)) continue;
+                    if (results.Count >= maxResults)
+                    {
+                        capExceeded = true;
+                        break;
+                    }
+                    results.Add(trimmed);
+                }
             }
             catch
             {
-                p.Dispose();
+                // Read failure (cancellation, broken pipe, etc.): kill the child
+                // before propagating so the git process is not left wedged on
+                // its stdout pipe after we stop draining it. Without this, an
+                // interrupted ListFilesEndingWithAsync would leak the OS
+                // process: the finally block below only ran the kill on the
+                // cap-exceeded happy-path. Drain + WaitForExit happen in the
+                // finally below so the child is always reaped.
+                try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
                 throw;
             }
-        }
-        using var _p = p;
-
-        var results = new List<string>(Math.Min(64, maxResults));
-        var capExceeded = false;
-        var scannedCapExceeded = false;
-        var scanned = 0;
-        var stderr = string.Empty;
-        var stderrLimitExceeded = false;
-        try
-        {
-            while (true)
+            finally
             {
-                var line = await p.StandardOutput.ReadLineAsync(ct);
-                if (line is null) break;
-                var trimmed = line.Trim();
-                if (trimmed.Length == 0) continue;
-                scanned++;
-                if (scanned > _opts.ListFilesEndingScannedPathCeiling)
+                if (capExceeded || scannedCapExceeded)
                 {
-                    scannedCapExceeded = true;
-                    break;
+                    try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
                 }
-                if (!EndsWithAnySuffix(trimmed, suffixes)) continue;
-                if (results.Count >= maxResults)
+                // Always reap stderr + exit with CancellationToken.None so a
+                // cancelled caller does not skip the wait and leak the child.
+                try
                 {
-                    capExceeded = true;
-                    break;
+                    var stderrRead = await ReadGitOutputToLimitAsync(
+                        p.StandardError,
+                        _opts.GitCommandMaxOutputBytes,
+                        () =>
+                        {
+                            try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+                        },
+                        CancellationToken.None).ConfigureAwait(false);
+                    stderr = stderrRead.Text;
+                    stderrLimitExceeded = stderrRead.LimitExceeded;
                 }
-                results.Add(trimmed);
+                catch { /* best-effort */ }
+                try { await p.WaitForExitAsync(CancellationToken.None); }
+                catch { /* best-effort */ }
             }
-        }
-        catch
-        {
-            // Read failure (cancellation, broken pipe, etc.): kill the child
-            // before propagating so the git process is not left wedged on
-            // its stdout pipe after we stop draining it. Without this, an
-            // interrupted ListFilesEndingWithAsync would leak the OS
-            // process: the finally block below only ran the kill on the
-            // cap-exceeded happy-path. Drain + WaitForExit happen in the
-            // finally below so the child is always reaped.
-            try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
-            throw;
-        }
-        finally
-        {
-            if (capExceeded || scannedCapExceeded)
+
+            if (stderrLimitExceeded)
             {
-                try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
+                metricOutcome = "output_limit";
+                throw new InvalidOperationException(
+                    $"git ls-tree '{treeish}' stderr exceeded LocalGitHostOptions.GitCommandMaxOutputBytes={_opts.GitCommandMaxOutputBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
             }
-            // Always reap stderr + exit with CancellationToken.None so a
-            // cancelled caller does not skip the wait and leak the child.
-            try
+
+            if (scannedCapExceeded)
             {
-                var stderrRead = await ReadGitOutputToLimitAsync(
-                    p.StandardError,
-                    _opts.GitCommandMaxOutputBytes,
-                    () =>
-                    {
-                        try { p.Kill(entireProcessTree: true); } catch { /* best-effort */ }
-                    },
-                    CancellationToken.None).ConfigureAwait(false);
-                stderr = stderrRead.Text;
-                stderrLimitExceeded = stderrRead.LimitExceeded;
+                metricOutcome = "output_limit";
+                throw new InvalidOperationException(
+                    $"git ls-tree '{treeish}' scanned more than {_opts.ListFilesEndingScannedPathCeiling} paths without filling the match cap (tree too large to inspect safely)");
             }
-            catch { /* best-effort */ }
-            try { await p.WaitForExitAsync(CancellationToken.None); }
-            catch { /* best-effort */ }
-        }
 
-        if (stderrLimitExceeded)
-        {
-            metricOutcome = "output_limit";
-            throw new InvalidOperationException(
-                $"git ls-tree '{treeish}' stderr exceeded LocalGitHostOptions.GitCommandMaxOutputBytes={_opts.GitCommandMaxOutputBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
-        }
+            if (capExceeded)
+            {
+                metricOutcome = "output_limit";
+                throw new InvalidOperationException(
+                    $"git ls-tree '{treeish}' produced more than {maxResults} matching paths (output cap exceeded)");
+            }
 
-        if (scannedCapExceeded)
-        {
-            metricOutcome = "output_limit";
-            throw new InvalidOperationException(
-                $"git ls-tree '{treeish}' scanned more than {_opts.ListFilesEndingScannedPathCeiling} paths without filling the match cap (tree too large to inspect safely)");
-        }
+            if (p.ExitCode != 0)
+            {
+                metricOutcome = "exit_nonzero";
+                throw new InvalidOperationException($"git ls-tree '{treeish}' failed: {stderr}");
+            }
 
-        if (capExceeded)
-        {
-            metricOutcome = "output_limit";
-            throw new InvalidOperationException(
-                $"git ls-tree '{treeish}' produced more than {maxResults} matching paths (output cap exceeded)");
-        }
-
-        if (p.ExitCode != 0)
-        {
-            metricOutcome = "exit_nonzero";
-            throw new InvalidOperationException($"git ls-tree '{treeish}' failed: {stderr}");
-        }
-
-        metricOutcome = "success";
-        return results;
+            metricOutcome = "success";
+            return results;
         }
         catch (OperationCanceledException)
         {
@@ -1493,7 +1489,7 @@ public sealed class LocalGitHost : IGitHost
     }
 
     private static string ScrubCredentialMaterial(string value)
-        => UrlUserInfoPattern.Replace(RawOutputRedactor.Redact(value), "${scheme}***@");
+        => EmbeddedUrlUserInfo.Strip(RawOutputRedactor.Redact(value));
 
     private async Task ReconcileRejectedUpstreamPushAsync(
         string bareRepoPath,

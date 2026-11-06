@@ -59,13 +59,15 @@ public sealed class BaselineProvisioningBlockedNotificationBuilder : INotificati
         var title = timingOut
             ? "Baseline bake timing out"
             : "No usable baseline — all provisioning blocked";
-        var summary = timingOut
-            ? $"baseline bake timing out since {since}; last bake failure: {cause}"
-            : $"No usable baseline; all provisioning blocked since {since}; last bake failure: {cause}";
+        // Queue status and this alert share DescribeOperatorReason. Provider-specific
+        // remediation (the Incus timeout option, the ExtraRuncmd line) lives in the
+        // cause the provider stored, not in this view.
+        var summary = status?.DescribeOperatorReason()
+            ?? $"no usable baseline; all provisioning blocked since {since}; last bake failure: {cause}";
         var body = timingOut
             ? $"At {evaluatedAt:R}, the baseline bake is timing out since {since} " +
               $"({failures} consecutive bake failure(s)). Last bake failure: {cause}. " +
-              "Raise CodeyBox:Incus:BakeProvisioningTimeout (it is read at the start of the next bake) or fix the ExtraRuncmd line named in the failure; provisioning retries automatically."
+              "Provisioning retries automatically."
             : $"At {evaluatedAt:R}, no usable baseline exists and all sandbox provisioning is blocked since {since} " +
               $"({failures} consecutive bake failure(s)). Last bake failure: {cause}. " +
               "Fix the bake failure (see sandbox.provisioning_deferred events for the sanitized cause), then provisioning resumes automatically.";
