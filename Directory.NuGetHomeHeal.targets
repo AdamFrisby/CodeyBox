@@ -40,7 +40,8 @@
   <Target Name="CodeyBoxHealNuGetHome"
           Condition=" '$(OS)' != 'Windows_NT'
                       and '$(DesignTimeBuild)' != 'true'
-                      and Exists('$(CodeyBoxNuGetHomeHealScript)') ">
+                      and Exists('$(CodeyBoxNuGetHomeHealScript)')
+                      and '$(_CodeyBoxInSolution)' != 'true' ">
     <!-- The script never fails a `set -e` caller and returns 0 in every path, so
          the command always exits 0 and produces no warning under
          TreatWarningsAsErrors; the trailing `|| true` is belt-and-suspenders in

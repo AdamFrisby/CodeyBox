@@ -18,10 +18,10 @@
     redirects DOTNET_CLI_HOME to repository-local state so NuGet's proxy-cache
     initialization survives before compilation.
   -->
-  <Target Name="EnsureWritableNuGetUserSettings">
+  <Target Name="EnsureWritableNuGetUserSettings"
+          Condition="'$(OS)' != 'Windows_NT' and '$(_CodeyBoxInSolution)' != 'true'">
     <Exec
       Command="sh &quot;$(MSBuildThisFileDirectory)scripts/ensure-writable-nuget-home.sh&quot;"
-      Condition="'$(OS)' != 'Windows_NT'"
       IgnoreStandardErrorWarningFormat="true" />
   </Target>
 

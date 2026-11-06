@@ -45,6 +45,12 @@
 # on the root plus the descendant scan in _codeybox_secure_package_cache).
 # Anything else falls through to an owned fallback instead of being trusted
 # because it was writable.
+#
+# Storage owned by this uid with group write bits set is acceptable: on standard
+# Linux environments with user-private groups (default umask 002), directories
+# are created drwxrwxr-x where the group is the user's private group. This does
+# not widen co-tenant access; only foreign-owned or other-writable (o+w) trees
+# represent a real co-tenant risk.
 
 # === codeybox-shared-helpers: begin ===
 # Everything between the "codeybox-shared-helpers" sentinels is the head of
@@ -148,10 +154,9 @@ _codeybox_secure_dir() {
                 || [ "$_codeybox_stat_uid" = "0" ]; } || return 1
         fi
         case $_codeybox_stat_mode in
-            ?????w*|????????w*)
-                # Leaf rules stricter than anchor never tolerate
-                # group/other write bits; an anchor tolerates them only
-                # under the sticky bit.
+            ????????w*)
+                # Other-writable: leaf rules stricter than anchor never tolerate
+                # other write bits; an anchor tolerates them only under the sticky bit.
                 if [ "$_codeybox_sec_leaf" -eq 1 ] \
                     && [ "$_codeybox_sec_rule" != anchor ]; then
                     return 1
@@ -160,6 +165,20 @@ _codeybox_secure_dir() {
                     ?????????[tT]*) ;;
                     *) return 1 ;;
                 esac ;;
+            ?????w*)
+                # Group-writable: if owned by current uid, acceptable (user-private
+                # group / umask 002). Only foreign-owned (e.g. root) trees with group
+                # write bits are a co-tenant risk.
+                if [ "$_codeybox_stat_uid" != "$_codeybox_euid" ]; then
+                    if [ "$_codeybox_sec_leaf" -eq 1 ] \
+                        && [ "$_codeybox_sec_rule" != anchor ]; then
+                        return 1
+                    fi
+                    case $_codeybox_stat_mode in
+                        ?????????[tT]*) ;;
+                        *) return 1 ;;
+                    esac
+                fi ;;
         esac
         _codeybox_sec_leaf=0
         [ "$_codeybox_sec_walk" = "/" ] && break
@@ -372,8 +391,9 @@ _codeybox_secure_package_cache() {
                 # refuse it (any other marker is not an ACL). "." (SELinux
                 # context) and "@" (xattrs) do not widen DAC access.
                 if (n == 11 && substr(mode, 11, 1) !~ /^[.@]$/) { print; exit }
-                if (substr(mode, 6, 1) == "w" || substr(mode, 9, 1) == "w") { print; exit }
                 if ($3 + 0 != euid + 0 && $3 + 0 != 0) { print; exit }
+                if (substr(mode, 9, 1) == "w") { print; exit }
+                if ($3 + 0 != euid + 0 && substr(mode, 6, 1) == "w") { print; exit }
             }
             END { if (NR == 0) exit 1 }')" || return 1
     [ -z "$_codeybox_cache_bad" ] || return 1
@@ -731,7 +751,14 @@ _codeybox_seed_nuget_home() {
 }
 
 codeybox_heal_nuget_home() {
-    _codeybox_cli_home_env="${DOTNET_CLI_HOME:-${HOME:-}}"
+    if [ -n "${CODEYBOX_NUGET_HOME_UNDER_TEST:-}" ]; then
+        _codeybox_cli_home_env="$(dirname "${CODEYBOX_NUGET_HOME_UNDER_TEST%/}")"
+        HOME="$_codeybox_cli_home_env"
+        export HOME
+        unset DOTNET_CLI_HOME
+    else
+        _codeybox_cli_home_env="${DOTNET_CLI_HOME:-${HOME:-}}"
+    fi
     [ -n "$_codeybox_cli_home_env" ] || return 0
 
     # Admit the env-influenced cli home only as verified private per-user
@@ -774,29 +801,83 @@ codeybox_heal_nuget_home() {
         # The inherited per-user NuGet directory is not usable — e.g. an image
         # baked $HOME/.nuget owned by root, a planted link, or a consumed
         # .nuget/packages cache whose tree failed the shared whole-tree
-        # admission. The cli home is
-        # verified private storage above, so relocate the broken entry aside
-        # (preserving it, not deleting) and recreate a writable one, so EVERY
-        # later `dotnet` in this environment can write its per-user config —
-        # not just the current process, which a DOTNET_CLI_HOME override would
-        # be limited to. The -L arm matters: a dangling symlink reports -e
-        # false yet must still be moved aside, never created through.
-        _codeybox_quarantine="$_codeybox_nuget_root.codeybox-unwritable.$$"
-        if { [ ! -e "$_codeybox_nuget_root" ] && [ ! -L "$_codeybox_nuget_root" ]; } \
-            || mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
-            if _codeybox_ensure_nuget_home_usable \
-                "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
-                # Reuse the quarantined package cache and seed a readable user
-                # config so the next `dotnet`'s user-config *read* (the exact
-                # operation the broken home fails) succeeds and restore stays
-                # offline-safe. The seeder links the cache only when its WHOLE
-                # tree verifies as consumable storage — every descendant owned
-                # by this uid or root with no group/other write bits and no
-                # access-broadening ACL.
-                _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
-                    "$_codeybox_quarantine/packages"
-                return 0
+        # admission. The cli home is verified private storage above.
+        #
+        # Make the heal idempotent and race-free under parallel MSBuild:
+        # 1. Destructive repair (quarantine/rename) is skipped when
+        #    CODEYBOX_NO_DESTRUCTIVE_REPAIR=1 (e.g. from a per-project InitialTarget).
+        # 2. Quarantine runs at most once per build via a marker file under $TMPDIR.
+        # 3. An exclusive lock under $TMPDIR coordinates concurrent processes, so
+        #    a concurrent node never renames a directory another node may be reading.
+        # 4. Never create more than one quarantine directory per invocation.
+        if [ "${CODEYBOX_NO_DESTRUCTIVE_REPAIR:-0}" = "1" ]; then
+            : # Destructive repair disallowed; fall through to redirect
+        else
+            _codeybox_home_slug="$(printf '%s' "$_codeybox_cli_home" | tr -c '[:alnum:]' '_' | tail -c 64)"
+            _codeybox_quarantine_marker="${TMPDIR:-/tmp}/.codeybox-quarantine-${_codeybox_euid}-${_codeybox_home_slug}.done"
+            _codeybox_quarantine_lock="${TMPDIR:-/tmp}/.codeybox-quarantine-${_codeybox_euid}-${_codeybox_home_slug}.lock"
+
+            if [ -f "$_codeybox_quarantine_marker" ]; then
+                # Quarantine already ran in this build. If home is usable now, return 0;
+                # otherwise fall through to redirect without renaming again.
+                if _codeybox_ensure_nuget_home_usable \
+                    "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+                    rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                    return 0
+                fi
+            else
+                _codeybox_lock_acquired=0
+                _codeybox_lock_attempts=0
+                while [ "$_codeybox_lock_attempts" -lt 100 ]; do
+                    if mkdir "$_codeybox_quarantine_lock" 2>/dev/null; then
+                        _codeybox_lock_acquired=1
+                        break
+                    fi
+                    sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
+                    _codeybox_lock_attempts=$((_codeybox_lock_attempts + 1))
+                    if [ -f "$_codeybox_quarantine_marker" ]; then
+                        break
+                    fi
+                done
+
+                # Re-check under lock (or after waiting): another node may have already healed it.
+                if _codeybox_ensure_nuget_home_usable \
+                    "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+                    rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                    if [ "$_codeybox_lock_acquired" -eq 1 ]; then
+                        rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                    fi
+                    return 0
+                fi
+
+                if [ ! -f "$_codeybox_quarantine_marker" ]; then
+                    : > "$_codeybox_quarantine_marker" 2>/dev/null || true
+                    _codeybox_quarantine="$_codeybox_nuget_root.codeybox-unwritable.$$"
+                    _codeybox_quarantined=0
+                    if { [ ! -e "$_codeybox_nuget_root" ] && [ ! -L "$_codeybox_nuget_root" ]; }; then
+                        _codeybox_quarantined=1
+                    elif mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
+                        _codeybox_quarantined=1
+                        echo "nuget-home self-heal: quarantined unusable $_codeybox_nuget_root to $_codeybox_quarantine" >&2
+                    fi
+
+                    if [ "$_codeybox_quarantined" -eq 1 ]; then
+                        if _codeybox_ensure_nuget_home_usable \
+                            "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+                            rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                            _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
+                                "$_codeybox_quarantine/packages"
+                            if [ "$_codeybox_lock_acquired" -eq 1 ]; then
+                                rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                            fi
+                            return 0
+                        fi
+                    fi
+                fi
+
+                if [ "$_codeybox_lock_acquired" -eq 1 ]; then
+                    rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                fi
             fi
         fi
     fi

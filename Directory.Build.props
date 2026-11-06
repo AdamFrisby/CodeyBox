@@ -9,6 +9,10 @@
        two overlap harmlessly whenever DOTNET_CLI_HOME is unset. -->
   <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
+  <PropertyGroup Condition="'$(SolutionPath)' != '' and '$(SolutionPath)' != '*Undefined*'">
+    <_CodeyBoxInSolution>true</_CodeyBoxInSolution>
+  </PropertyGroup>
+
   <PropertyGroup>
     <!-- Direct project restores use the repository's declared package sources here.
          Directory.Solution.props supplies the same repository-relative property for

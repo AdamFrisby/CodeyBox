@@ -271,6 +271,160 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     }
 
     [Fact]
+    public async Task Script_UidOwnedGroupWritableTree_IsLeftInPlaceWithPackagesIntact()
+    {
+        var home = Path.Combine(_workspace, "arg-home-group-writable");
+        var nugetHome = Path.Combine(home, ".nuget");
+        var packages = Path.Combine(nugetHome, "packages", "pkg");
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+        Directory.CreateDirectory(packages);
+        Directory.CreateDirectory(nugetDir);
+        var marker = Path.Combine(packages, "marker.txt");
+        await File.WriteAllTextAsync(marker, "healthy-cache");
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(config, "<configuration/>");
+
+        // Simulate Linux umask 002: group-writable directory (0775) and files (0664)
+        // owned by the current UID.
+        var dirMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+        var fileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+            | UnixFileMode.OtherRead;
+
+        File.SetUnixFileMode(nugetHome, dirMode);
+        File.SetUnixFileMode(Path.Combine(nugetHome, "packages"), dirMode);
+        File.SetUnixFileMode(packages, dirMode);
+        File.SetUnixFileMode(nugetDir, dirMode);
+        File.SetUnixFileMode(marker, fileMode);
+        File.SetUnixFileMode(config, fileMode);
+
+        var (exit, output) = await RunScriptAsync(home, nugetHome);
+
+        Assert.Equal(0, exit);
+        Assert.Empty(AsideDirs(nugetHome));
+        Assert.True(File.Exists(marker), output);
+        Assert.Equal("healthy-cache", await File.ReadAllTextAsync(marker));
+        Assert.True(File.Exists(config));
+        Assert.False(
+            File.GetAttributes(Path.Combine(nugetHome, "packages")).HasFlag(FileAttributes.ReparsePoint),
+            "packages directory must not have been replaced by a symlink");
+    }
+
+    [Fact]
+    public async Task Script_ForeignOwnedTree_IsQuarantined()
+    {
+        // 1. Symlink pointing to a foreign root-owned system directory (/etc).
+        var homeLink = Path.Combine(_workspace, "arg-home-foreign-symlink");
+        Directory.CreateDirectory(homeLink);
+        var nugetHomeLink = Path.Combine(homeLink, ".nuget");
+        File.CreateSymbolicLink(nugetHomeLink, "/etc");
+
+        var (exitLink, outputLink) = await RunScriptAsync(homeLink, nugetHomeLink);
+        Assert.Equal(0, exitLink);
+        Assert.Single(AsideDirs(nugetHomeLink));
+        Assert.Contains("quarantined unusable", outputLink, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(Path.Combine(nugetHomeLink, "NuGet")));
+        Assert.False(
+            File.GetAttributes(nugetHomeLink).HasFlag(FileAttributes.ReparsePoint),
+            "recreated .nuget must be a real directory, not a symlink");
+
+        // 2. Unwritable / foreign-owned tree simulated via mode 0555.
+        if (!Environment.IsPrivilegedProcess)
+        {
+            var homeUnwritable = Path.Combine(_workspace, "arg-home-foreign-unwritable");
+            var nugetHomeUnwritable = Path.Combine(homeUnwritable, ".nuget");
+            Directory.CreateDirectory(nugetHomeUnwritable);
+            File.SetUnixFileMode(
+                nugetHomeUnwritable,
+                UnixFileMode.UserRead | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            try
+            {
+                var (exitUnwritable, outputUnwritable) = await RunScriptAsync(homeUnwritable, nugetHomeUnwritable);
+                Assert.Equal(0, exitUnwritable);
+                Assert.Single(AsideDirs(nugetHomeUnwritable));
+                Assert.Contains("quarantined unusable", outputUnwritable, StringComparison.Ordinal);
+                Assert.True(Directory.Exists(Path.Combine(nugetHomeUnwritable, "NuGet")));
+            }
+            finally
+            {
+                if (Directory.Exists(nugetHomeUnwritable))
+                {
+                    File.SetUnixFileMode(
+                        nugetHomeUnwritable,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Script_ConcurrentInvocations_ProduceAtMostOneQuarantine_AndNeverRemoveHealthyCache()
+    {
+        // Case 1: Unusable tree requiring quarantine. Multiple parallel invocations must coordinate
+        // via lock/marker so at most one quarantine directory is produced.
+        var homeBroken = Path.Combine(_workspace, "concurrent-broken");
+        Directory.CreateDirectory(homeBroken);
+        var nugetBroken = Path.Combine(homeBroken, ".nuget");
+        File.CreateSymbolicLink(nugetBroken, "/etc");
+
+        var tasksBroken = Enumerable.Range(0, 8)
+            .Select(_ => RunScriptAsync(homeBroken, nugetBroken))
+            .ToArray();
+        var resultsBroken = await Task.WhenAll(tasksBroken);
+
+        foreach (var (exit, _) in resultsBroken)
+            Assert.Equal(0, exit);
+
+        Assert.Single(AsideDirs(nugetBroken));
+        Assert.True(Directory.Exists(Path.Combine(nugetBroken, "NuGet")));
+        Assert.False(File.GetAttributes(nugetBroken).HasFlag(FileAttributes.ReparsePoint));
+
+        // Case 2: Healthy tree with umask 002 (group-writable). Multiple parallel invocations
+        // must never quarantine and never remove or replace the healthy cache.
+        var homeHealthy = Path.Combine(_workspace, "concurrent-healthy");
+        var nugetHealthy = Path.Combine(homeHealthy, ".nuget");
+        var packages = Path.Combine(nugetHealthy, "packages", "pkg");
+        var nugetDir = Path.Combine(nugetHealthy, "NuGet");
+        Directory.CreateDirectory(packages);
+        Directory.CreateDirectory(nugetDir);
+        var marker = Path.Combine(packages, "marker.txt");
+        await File.WriteAllTextAsync(marker, "healthy-concurrent-cache");
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(config, "<configuration/>");
+
+        var dirMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+        var fileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+            | UnixFileMode.OtherRead;
+
+        File.SetUnixFileMode(nugetHealthy, dirMode);
+        File.SetUnixFileMode(Path.Combine(nugetHealthy, "packages"), dirMode);
+        File.SetUnixFileMode(packages, dirMode);
+        File.SetUnixFileMode(nugetDir, dirMode);
+        File.SetUnixFileMode(marker, fileMode);
+        File.SetUnixFileMode(config, fileMode);
+
+        var tasksHealthy = Enumerable.Range(0, 8)
+            .Select(_ => RunScriptAsync(homeHealthy, nugetHealthy))
+            .ToArray();
+        var resultsHealthy = await Task.WhenAll(tasksHealthy);
+
+        foreach (var (exit, _) in resultsHealthy)
+            Assert.Equal(0, exit);
+
+        Assert.Empty(AsideDirs(nugetHealthy));
+        Assert.True(File.Exists(marker));
+        Assert.Equal("healthy-concurrent-cache", await File.ReadAllTextAsync(marker));
+        Assert.False(File.GetAttributes(Path.Combine(nugetHealthy, "packages")).HasFlag(FileAttributes.ReparsePoint));
+    }
+
+    [Fact]
     public async Task DirectoryBuildTargets_LetsRawDotnetRestore_WhenNuGetHomeIsNotWritable()
     {
         // End-to-end: the same fault the auditors hit (root-owned $HOME/.nuget)

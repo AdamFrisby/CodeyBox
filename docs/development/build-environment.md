@@ -35,21 +35,35 @@ That is the only committed-file hook early enough to matter, and CodeyBox runs
 two entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
 `Directory.Build.props`) dot-sources `scripts/nuget-home-heal.sh` against the
 effective cli home, and `Directory.Build.targets` runs
-`scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both
-delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
+`scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
 whose settings/runtime-dir repair is a fast-path no-op when the home is
 already usable (the only writes then are the settings dir's create-if-missing,
 a transient create-then-delete writability probe inside it, and the idempotent
 migration-marker seed, which may also materialize its candidate homes) and
-which never fails the build. "Usable" covers the consumed side too: a present
-`.nuget/packages` entry must pass the same whole-tree cache admission the
-cache-reuse paths apply, or the home is still healed. When `$HOME/.nuget`
-exists but is not usable — foreign-owned, unwritable, unreadable config, a
-planted link, or an unconsumable consumed cache — the
-heal relocates it aside — the build user owns `$HOME`, so the rename needs no
-root — recreates a writable private `$HOME/.nuget` with a seeded readable
-config, and preserves a trusted (uid- or root-owned) pre-baked `packages`
-cache by symlink.
+which never fails the build.
+
+Storage owned by the current user UID is acceptable regardless of group write
+bits: on standard Linux systems with user-private groups (default umask 002),
+directories are created `drwxrwxr-x`. This is safe because the group is private
+to the user; only foreign-owned or other-writable (`o+w`) trees represent a
+co-tenant risk.
+
+"Usable" covers the consumed side too: a present `.nuget/packages` entry must
+pass the whole-tree cache admission (uid-owned or root-owned without foreign or
+`o+w` write bits), or the home is still healed. When `$HOME/.nuget` exists but is
+not usable — foreign-owned, unwritable, unreadable config, a planted link, or an
+unconsumable consumed cache — the heal relocates it aside (preserving it as
+`~/.nuget.codeybox-unwritable.<pid>`), recreates a writable private
+`$HOME/.nuget` with a seeded readable config, and preserves a trusted
+(uid- or root-owned) pre-baked `packages` cache by symlink.
+
+Under parallel MSBuild, destructive repair is strictly race-free:
+1. In a solution build, repair is performed once at the solution level
+   (`Directory.Solution.props`) before restore dispatches to projects, so per-project
+   InitialTargets never run destructive renames during parallel restore/build.
+2. The quarantine path is guarded by an advisory lock and a completion marker under
+   `$TMPDIR`, ensuring at most one quarantine directory is created per build and
+   preventing concurrent nodes from renaming directories another node is reading.
 
 A `BeforeTargets="Restore"` target is *not* early enough: solution restore
 aborts during graph construction, before any project's `Restore` chain runs. Nor

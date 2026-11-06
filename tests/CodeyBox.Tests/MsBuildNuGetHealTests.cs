@@ -64,6 +64,84 @@ public sealed class MsBuildNuGetHealTests
         return null;
     }
 
+    private static async Task CreateProjectAsync(string projectDir, string healTargets)
+    {
+        Directory.CreateDirectory(projectDir);
+        await File.WriteAllTextAsync(
+            Path.Combine(projectDir, "proj.csproj"),
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+                <Nullable>enable</Nullable>
+              </PropertyGroup>
+            </Project>
+            """);
+        await File.WriteAllTextAsync(
+            Path.Combine(projectDir, "Class1.cs"),
+            "namespace Proj; public static class Class1 { public static int Value => 1; }\n");
+        var propsBody =
+            $"""
+            <Project InitialTargets="CodeyBoxHealNuGetHome">
+              <Import Project="{healTargets}" />
+            </Project>
+            """;
+        await File.WriteAllTextAsync(Path.Combine(projectDir, "Directory.Build.props"), propsBody);
+        var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+        await File.WriteAllTextAsync(
+            offlineConfig,
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                + "<configuration><packageSources><clear /></packageSources></configuration>\n");
+    }
+
+    private static Task<ProcessRunResult> RunDotnetBuildAsync(
+        string dotnetDir,
+        string targetPath,
+        string offlineConfig,
+        Dictionary<string, string> env)
+    {
+        return new DefaultProcessRunner().RunAsync(
+            [
+                Path.Combine(dotnetDir, "dotnet"),
+                "build",
+                targetPath,
+                "--configuration", "Debug",
+                "-nodeReuse:false",
+                "-p:UseSharedCompilation=false",
+                "-p:RestoreConfigFile=" + offlineConfig,
+            ],
+            null,
+            CancellationToken.None,
+            maxStdoutBytes: 1 << 20,
+            maxStderrBytes: 1 << 20,
+            environment: env);
+    }
+
+    private static Dictionary<string, string> CreateBuildEnv(
+        string dotnetDir,
+        string home,
+        string tmpDir,
+        string? nugetHomeUnderTest = null)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["HOME"] = home,
+            ["DOTNET_CLI_HOME"] = home,
+            ["PATH"] = dotnetDir + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ["TMPDIR"] = tmpDir,
+            ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
+            ["DOTNET_SKIP_FIRST_TIME_EXPERIENCE"] = "1",
+            ["DOTNET_NOLOGO"] = "1",
+            ["MSBUILDDISABLENODEREUSE"] = "1",
+            ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0",
+        };
+        if (nugetHomeUnderTest is not null)
+        {
+            env["CODEYBOX_NUGET_HOME_UNDER_TEST"] = nugetHomeUnderTest;
+        }
+        return env;
+    }
+
     [Fact]
     public async Task InitialTargetsHook_HealsUnreadableNuGetHome_ForPlainSolutionBuild()
     {
@@ -203,4 +281,199 @@ public sealed class MsBuildNuGetHealTests
             Directory.Delete(root, recursive: true);
         }
     }
+
+    [Fact]
+    public async Task MsBuild_UidOwnedGroupWritableTree_PreservedIntact()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-groupw-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var projectDir = Path.Combine(root, "proj");
+        var nugetHome = Path.Combine(home, ".nuget");
+        var packages = Path.Combine(nugetHome, "packages", "pkg");
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+
+        Directory.CreateDirectory(packages);
+        Directory.CreateDirectory(nugetDir);
+        var marker = Path.Combine(packages, "marker.txt");
+        await File.WriteAllTextAsync(marker, "cached");
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(config, "<configuration/>");
+
+        // Linux umask 002: group-writable tree owned by current UID
+        await ChmodAsync("0775", nugetHome);
+        await ChmodAsync("0775", Path.Combine(nugetHome, "packages"));
+        await ChmodAsync("0775", packages);
+        await ChmodAsync("0775", nugetDir);
+        await ChmodAsync("0664", marker);
+        await ChmodAsync("0664", config);
+
+        await CreateProjectAsync(projectDir, healTargets);
+        var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+
+        try
+        {
+            var env = CreateBuildEnv(dotnetDir, home, root, nugetHome);
+            var result = await RunDotnetBuildAsync(
+                dotnetDir,
+                Path.Combine(projectDir, "proj.csproj"),
+                offlineConfig,
+                env);
+
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(File.Exists(marker));
+            Assert.Equal("cached", await File.ReadAllTextAsync(marker));
+            Assert.False(
+                File.GetAttributes(Path.Combine(nugetHome, "packages")).HasFlag(FileAttributes.ReparsePoint),
+                "packages must not have been converted to a symlink");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task MsBuild_ForeignOwnedTree_IsQuarantined()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-foreign-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var projectDir = Path.Combine(root, "proj");
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(home);
+        // Point .nuget at a foreign root-owned system directory (/etc)
+        File.CreateSymbolicLink(nugetHome, "/etc");
+
+        await CreateProjectAsync(projectDir, healTargets);
+        var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+
+        try
+        {
+            var env = CreateBuildEnv(dotnetDir, home, root, nugetHome);
+            var result = await RunDotnetBuildAsync(
+                dotnetDir,
+                Path.Combine(projectDir, "proj.csproj"),
+                offlineConfig,
+                env);
+
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+            Assert.False(
+                File.GetAttributes(nugetHome).HasFlag(FileAttributes.ReparsePoint),
+                "recreated .nuget must be a real directory, not a symlink");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task MsBuild_ConcurrentInvocations_ProduceAtMostOneQuarantine_AndNeverRemoveHealthyCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-concurrent-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        var nugetHome = Path.Combine(home, ".nuget");
+
+        var proj1 = Path.Combine(root, "proj1");
+        var proj2 = Path.Combine(root, "proj2");
+        await CreateProjectAsync(proj1, healTargets);
+        await CreateProjectAsync(proj2, healTargets);
+        var offline1 = Path.Combine(proj1, "offline.nuget.config");
+        var offline2 = Path.Combine(proj2, "offline.nuget.config");
+
+        try
+        {
+            // Case 1: Unusable tree requiring quarantine. Two concurrent builds must
+            // coordinate so at most one quarantine directory is created.
+            File.CreateSymbolicLink(nugetHome, "/etc");
+            var envBroken = CreateBuildEnv(dotnetDir, home, root, nugetHome);
+
+            var t1Broken = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj1, "proj.csproj"), offline1, envBroken);
+            var t2Broken = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj2, "proj.csproj"), offline2, envBroken);
+            var resultsBroken = await Task.WhenAll(t1Broken, t2Broken);
+
+            Assert.True(resultsBroken[0].Success, resultsBroken[0].Stdout + resultsBroken[0].Stderr);
+            Assert.True(resultsBroken[1].Success, resultsBroken[1].Stdout + resultsBroken[1].Stderr);
+            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+
+            // Case 2: Healthy tree with umask 002. Concurrent builds must not quarantine
+            // and must leave cached packages intact.
+            var homeHealthy = Path.Combine(root, "home-healthy");
+            var nugetHealthy = Path.Combine(homeHealthy, ".nuget");
+            var packages = Path.Combine(nugetHealthy, "packages", "pkg");
+            var nugetDir = Path.Combine(nugetHealthy, "NuGet");
+            Directory.CreateDirectory(packages);
+            Directory.CreateDirectory(nugetDir);
+            var marker = Path.Combine(packages, "marker.txt");
+            await File.WriteAllTextAsync(marker, "concurrent-cache");
+            var config = Path.Combine(nugetDir, "NuGet.Config");
+            await File.WriteAllTextAsync(config, "<configuration/>");
+
+            await ChmodAsync("0775", nugetHealthy);
+            await ChmodAsync("0775", Path.Combine(nugetHealthy, "packages"));
+            await ChmodAsync("0775", packages);
+            await ChmodAsync("0775", nugetDir);
+            await ChmodAsync("0664", marker);
+            await ChmodAsync("0664", config);
+
+            var envHealthy = CreateBuildEnv(dotnetDir, homeHealthy, root, nugetHealthy);
+            var t1Healthy = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj1, "proj.csproj"), offline1, envHealthy);
+            var t2Healthy = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj2, "proj.csproj"), offline2, envHealthy);
+            var resultsHealthy = await Task.WhenAll(t1Healthy, t2Healthy);
+
+            Assert.True(resultsHealthy[0].Success, resultsHealthy[0].Stdout + resultsHealthy[0].Stderr);
+            Assert.True(resultsHealthy[1].Success, resultsHealthy[1].Stdout + resultsHealthy[1].Stderr);
+            Assert.Empty(Directory.GetDirectories(homeHealthy, ".nuget.codeybox-unwritable.*"));
+            Assert.True(File.Exists(marker));
+            Assert.Equal("concurrent-cache", await File.ReadAllTextAsync(marker));
+            Assert.False(
+                File.GetAttributes(Path.Combine(nugetHealthy, "packages")).HasFlag(FileAttributes.ReparsePoint),
+                "packages must not have been converted to a symlink");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
 }
+
