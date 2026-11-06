@@ -55,7 +55,10 @@ public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
                 RawOutput: agentResult.Stdout,
                 AgentStderr: agentResult.Stderr,
                 AgentSummary: agentResult.Summary,
-                AgentStdout: agentResult.Stdout);
+                AgentStdout: agentResult.Stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
+            };
 
         return await ReadVerdictAsync(sandbox, agentResult, ct);
     }
@@ -100,7 +103,10 @@ public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
                 RawOutput: agentResult.Stdout,
                 AgentStderr: agentResult.Stderr,
                 AgentSummary: agentResult.Summary,
-                AgentStdout: agentResult.Stdout);
+                AgentStdout: agentResult.Stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
+            };
 
         try
         {
@@ -118,7 +124,10 @@ public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
                 RawOutput: agentResult.Stdout,
                 AgentStderr: agentResult.Stderr,
                 AgentSummary: agentResult.Summary,
-                AgentStdout: agentResult.Stdout);
+                AgentStdout: agentResult.Stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
+            };
         }
         catch (JsonException ex)
         {
@@ -130,7 +139,10 @@ public sealed class OwaspAsvsDeepAuditor : IDeepAuditor
                 RawOutput: agentResult.Stdout,
                 AgentStderr: agentResult.Stderr,
                 AgentSummary: agentResult.Summary,
-                AgentStdout: agentResult.Stdout);
+                AgentStdout: agentResult.Stdout)
+            {
+                AgentStdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
+            };
         }
     }
 

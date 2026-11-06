@@ -48,14 +48,14 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
         new("insufficient credits", QuotaFailureKind.LimitReached),
         new("402 Payment Required", QuotaFailureKind.LimitReached),
         // Auth failures (verified: `Error: Not logged in.` on stderr, exit 1).
-        new("Not logged in", QuotaFailureKind.Unauthorized),
-        new("Devin needs authentication", QuotaFailureKind.Unauthorized),
-        new("Authentication required", QuotaFailureKind.Unauthorized),
-        new("run `devin auth login`", QuotaFailureKind.Unauthorized),
-        new("401 Unauthorized", QuotaFailureKind.Unauthorized),
+        // The Devin-owned auth vocabulary lives in DevinAuthSignals so the
+        // transient detectors' auth suppression consults the exact same set —
+        // including operator-configured Unauthorized extras — as this detector.
+        .. DevinAuthSignals.UnauthorizedPatterns,
     ];
 
     private readonly IReadOnlyList<QuotaFailurePattern> _patterns;
+    private readonly IReadOnlyList<QuotaFailurePattern> _unauthorizedPatterns;
 
     /// <summary>
     /// Constructs a detector with the built-in <see cref="DefaultPatterns"/>.
@@ -70,23 +70,22 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     /// </summary>
     public DevinQuotaFailureDetector(IEnumerable<QuotaFailurePattern>? additionalPatterns)
     {
-        if (additionalPatterns is null)
+        var extras = additionalPatterns?.Where(p => !string.IsNullOrEmpty(p.Pattern)).ToArray();
+        if (extras is null || extras.Length == 0)
         {
             _patterns = DefaultPatterns;
-            return;
         }
-
-        var extras = additionalPatterns.Where(p => !string.IsNullOrEmpty(p.Pattern)).ToArray();
-        if (extras.Length == 0)
+        else
         {
-            _patterns = DefaultPatterns;
-            return;
+            var combined = new List<QuotaFailurePattern>(DefaultPatterns.Count + extras.Length);
+            combined.AddRange(DefaultPatterns);
+            combined.AddRange(extras);
+            _patterns = combined;
         }
 
-        var combined = new List<QuotaFailurePattern>(DefaultPatterns.Count + extras.Length);
-        combined.AddRange(DefaultPatterns);
-        combined.AddRange(extras);
-        _patterns = combined;
+        _unauthorizedPatterns = _patterns
+            .Where(p => p.Kind == QuotaFailureKind.Unauthorized)
+            .ToArray();
     }
 
     public QuotaDetection? Detect(string? stderr, string? stdout)
@@ -117,12 +116,16 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     /// agent-neutral sets. The devin CLI wraps provider refusals in its own
     /// <c>Agent error: Client error: Protocol error (unimplemented)</c>
     /// envelope (verified), which is devin-shaped rather than
-    /// provider-relayed. The ACP startup transport failure
+    /// provider-relayed. The structured ACP signals are checked first:
+    /// the startup transport failure
     /// (<see cref="DevinTeamSettingsTimeoutDetector"/>: <c>fatal</c>
-    /// <c>session/new</c> team-settings fetch timeout, code -32603) is
-    /// checked first as a structured envelope — never a bare timeout or
-    /// code — so only that startup shape parks for transient retry.
-    /// Operator extras from
+    /// <c>session/new</c> team-settings fetch timeout, code -32603), the
+    /// model-substitution abort (<see cref="DevinModelMismatchDetector"/>:
+    /// <c>model_mismatch</c> — the CLI's <c>--model</c> fallback must retry,
+    /// never bill a substituted model), and a provider-declared retryable
+    /// turn error (<see cref="DevinRetryableTurnErrorDetector"/>:
+    /// <c>turn_error</c> with <c>cognition.ai/retryable</c>) — never a bare
+    /// timeout, code, or prose shape. Operator extras from
     /// <c>CodeyBox:ProviderTransientSignatures:devin</c> are appended at
     /// detect time via <see cref="ProviderTransientSignatureStore"/>.
     /// </summary>
@@ -138,16 +141,45 @@ public sealed class DevinQuotaFailureDetector : IAgentQuotaFailureDetector
     ];
 
     public ProviderTransientDetection? DetectProviderTransient(string? stderr, string? stdout, string? summary)
+        // The stream-shaped entry point carries no envelope provenance, so it
+        // is treated as an unframed capture: structured envelope signatures
+        // only match on results the runner stamped StdoutIsEnvelopeFramed
+        // (see the AgentResult overload below).
+        => DetectProviderTransient(new AgentResult(
+            Success: false,
+            Summary: summary ?? string.Empty,
+            Stdout: stdout,
+            Stderr: stderr));
+
+    /// <summary>
+    /// Result-shaped detection: the structured ACP detectors only trust
+    /// envelope structure when <see cref="AgentResult.StdoutIsEnvelopeFramed"/>
+    /// proves the shim owns the stream. The model-substitution WARN text is
+    /// matched only inside <c>codeybox.stderr</c> envelopes positioned before
+    /// the first turn-proof envelope while a strictly pre-prompt envelope
+    /// remains in the window (post-prompt fd 2 carries agent-controlled
+    /// tool stderr, and mid-turn-legal kinds prove nothing about which side
+    /// of the prompt the window sits on); raw stderr is never scanned for
+    /// it, and the shared signatures scan every stream as before.
+    /// </summary>
+    public ProviderTransientDetection? DetectProviderTransient(AgentResult result)
     {
         try
         {
-            if (DevinTeamSettingsTimeoutDetector.TryDetect(stderr, stdout, summary) is { } startupTransient)
+            if (DevinTeamSettingsTimeoutDetector.TryDetect(result, _unauthorizedPatterns) is { } startupTransient)
                 return startupTransient;
+
+            if (DevinModelMismatchDetector.TryDetect(result, _unauthorizedPatterns) is { } modelMismatch)
+                return modelMismatch;
+
+            if (DevinRetryableTurnErrorDetector.TryDetect(result, _unauthorizedPatterns) is { } retryableTurnError)
+                return retryableTurnError;
         }
         catch (Exception)
         {
         }
 
-        return ProviderTransientDetectorCore.Detect(Kind.Value, stderr, stdout, summary, DevinTransientSignatures);
+        return ProviderTransientDetectorCore.Detect(
+            Kind.Value, result.Stderr, result.Stdout, result.Summary, DevinTransientSignatures);
     }
 }

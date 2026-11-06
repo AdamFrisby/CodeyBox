@@ -22,15 +22,28 @@ namespace CodeyBox.Agents.Devin;
 /// -32603)</c>) is accepted as a secondary shape only when it carries the
 /// same stage, code, and message identity.</para>
 ///
-/// <para>Bounded: each input is truncated to the last
+/// <para>Bounded: the framed scan truncates to the last
 /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars (the fatal is
-/// the terminal line), at most <see cref="MaxLinesScanned"/> lines and
-/// <see cref="MaxEnvelopesExamined"/> envelopes are examined, and every
-/// evaluation is total (never throws). The returned detection carries only
-/// the fixed signature label — never raw agent output, which may contain
-/// secrets. An auth signal in the same capture suppresses the match so a
-/// genuine credential failure mixed with timeout chatter keeps its existing
-/// auth classification instead of being laundered into transient retries.</para>
+/// the terminal line) and last <see cref="MaxLinesScanned"/> lines, then
+/// examines the last <see cref="DevinAcpEnvelope.MaxEnvelopesExamined"/>
+/// devin.acp envelopes — every bound favours the tail the terminal
+/// signature lives on — and every evaluation is total (never throws). The
+/// returned detection
+/// carries only the fixed signature label — never raw agent output, which may
+/// contain secrets.</para>
+///
+/// <para>Provenance: the envelope scan runs only on
+/// <see cref="AgentResult.Stdout"/> when
+/// <see cref="AgentResult.StdoutIsEnvelopeFramed"/> — unframed stdout,
+/// stderr, and summary are agent/model text that could quote a forged
+/// envelope line. The shim-owned lifted diagnostic
+/// (<c>devin acp fatal during session/new: … (code -32603)</c>) is
+/// accepted as a secondary shape on raw stderr, and on summary only for
+/// framed captures (the runner's terminal-outcome projection is its one
+/// legitimate producer). An auth signal in the same capture suppresses the
+/// match so a genuine credential failure mixed with timeout chatter keeps
+/// its existing auth classification instead of being laundered into
+/// transient retries.</para>
 /// </summary>
 internal static class DevinTeamSettingsTimeoutDetector
 {
@@ -38,89 +51,18 @@ internal static class DevinTeamSettingsTimeoutDetector
     internal const string Signature = "devin-team-settings-timeout";
 
     private const int MaxLinesScanned = 2000;
-    private const int MaxEnvelopesExamined = 128;
 
-    internal static ProviderTransientDetection? TryDetect(string? stderr, string? stdout, string? summary)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
-                return null;
-
-            if (HasAuthSignal(stderr, stdout, summary))
-                return null;
-
-            if (HasStructuredTimeout(stderr) || HasStructuredTimeout(stdout) || HasStructuredTimeout(summary))
-                return new ProviderTransientDetection(
-                    ProviderTransientKind.InfraTransport,
-                    Signature,
-                    "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff");
-
-            if (HasLiftedFatalDiagnostic(stderr) || HasLiftedFatalDiagnostic(stdout) || HasLiftedFatalDiagnostic(summary))
-                return new ProviderTransientDetection(
-                    ProviderTransientKind.InfraTransport,
-                    Signature,
-                    "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff");
-
-            return null;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-    }
-
-    private static bool HasAuthSignal(string? stderr, string? stdout, string? summary)
-    {
-        try
-        {
-            if (!string.IsNullOrEmpty(stderr))
-            {
-                if (AgentFailureClassifier.ContainsAuthErrorPattern(stderr))
-                    return true;
-                if (AgentFailureClassifier.ContainsAuthRequiredPatternInStderr(stderr))
-                    return true;
-                if (IsDevinUnauthorized(stderr, null))
-                    return true;
-            }
-
-            if (!string.IsNullOrEmpty(stdout))
-            {
-                if (AgentFailureClassifier.ContainsAuthErrorPattern(stdout))
-                    return true;
-                if (AgentFailureClassifier.ContainsAuthRequiredPatternInStdout(stdout))
-                    return true;
-            }
-
-            if (!string.IsNullOrEmpty(summary) && AgentFailureClassifier.ContainsAuthErrorPattern(summary))
-                return true;
-        }
-        catch (Exception)
-        {
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Devin-owned auth shapes (<c>Not logged in</c>, <c>Authentication
-    /// required</c>, <c>401 Unauthorized</c> — the CLI's own status wording
-    /// from <see cref="DevinQuotaFailureDetector"/>) take precedence over the
-    /// startup-transport signature. Reuses the detector's quota/auth
-    /// vocabulary as the single source of truth instead of re-listing the
-    /// strings. Never throws.
-    /// </summary>
-    private static bool IsDevinUnauthorized(string? stderr, string? stdout)
-    {
-        try
-        {
-            return new DevinQuotaFailureDetector().Detect(stderr, stdout)?.Kind == QuotaFailureKind.Unauthorized;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
+    internal static ProviderTransientDetection? TryDetect(
+        AgentResult result,
+        IReadOnlyList<QuotaFailurePattern> unauthorizedPatterns)
+        => DevinTransientDetectionCore.TryMatch(
+            result,
+            unauthorizedPatterns,
+            Signature,
+            "devin ACP startup transport failure fetching team settings during session/new; retry the turn with backoff",
+            r => HasStructuredTimeout(r.StdoutIsEnvelopeFramed ? r.Stdout : null)
+                || HasLiftedFatalDiagnostic(r.Stderr)
+                || (r.StdoutIsEnvelopeFramed && HasLiftedFatalDiagnostic(r.Summary)));
 
     private static bool HasStructuredTimeout(string? text)
     {
@@ -151,11 +93,12 @@ internal static class DevinTeamSettingsTimeoutDetector
 
     private static bool HasStructuredTimeoutInText(string bounded)
     {
-        var examined = 0;
-        foreach (var envelope in DevinAcpEnvelope.Enumerate(bounded))
+        // The fatal envelope is terminal — the last devin.acp line — so the
+        // shared bounded scan examines the LAST MaxEnvelopesExamined
+        // envelopes of the char-bounded window (re-bounding is a no-op on
+        // the already-bounded input).
+        foreach (var envelope in DevinAcpEnvelope.EnumerateBounded(bounded))
         {
-            if (++examined > MaxEnvelopesExamined)
-                break;
             if (!string.Equals(envelope.Event, DevinAcpEnvelope.EventFatal, StringComparison.Ordinal))
                 continue;
             if (IsSessionNewTeamSettingsTimeout(envelope.Root))
@@ -261,8 +204,7 @@ internal static class DevinTeamSettingsTimeoutDetector
 
     private static string BoundInput(string text)
     {
-        const int max = ProviderTransientMatcher.MaxScannedChars;
-        var bounded = text.Length > max ? text[^max..] : text;
+        var bounded = ProviderTransientMatcher.BoundToScannedTail(text);
         if (CountLines(bounded) > MaxLinesScanned)
             bounded = TakeLastLines(bounded, MaxLinesScanned);
         return bounded;
@@ -387,9 +329,7 @@ internal static class DevinTeamSettingsTimeoutDetector
 
         try
         {
-            var bounded = text.Length > ProviderTransientMatcher.MaxScannedChars
-                ? text[^ProviderTransientMatcher.MaxScannedChars..]
-                : text;
+            var bounded = ProviderTransientMatcher.BoundToScannedTail(text);
             return bounded.Contains("devin acp fatal", StringComparison.OrdinalIgnoreCase)
                 && bounded.Contains("session/new", StringComparison.Ordinal)
                 && bounded.Contains("-32603", StringComparison.Ordinal)

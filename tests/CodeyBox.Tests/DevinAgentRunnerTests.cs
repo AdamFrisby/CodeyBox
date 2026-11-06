@@ -405,6 +405,54 @@ public sealed class DevinAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunTextOnlyAsync_VetoesSuccessfulRun_WhenStderrReportsModelSubstitution()
+    {
+        // Print mode has no structured active-model signal; the only
+        // observable substitution evidence is the CLI's stderr WARN. A
+        // successful `devin -p` carrying the full WARN shape is rejected —
+        // the substituted (possibly metered) output is never consumed —
+        // but the vetoed failure does NOT park for transient retry: its
+        // consumers run no provider-transient classification, so the call
+        // fails honestly.
+        var sandbox = new RecordingSandbox
+        {
+            TextOnlyStdout = "answer produced by the substituted model",
+            TextOnlyStderr = "chisel_server::acp: `devin acp --model` value "
+                + "did not resolve to an available model; falling back to your "
+                + "configured `agent.model` or the default",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunTextOnlyAsync("summarise", Cred(), sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.False(result.Success);
+        Assert.Contains("possible --model substitution", result.Summary, StringComparison.Ordinal);
+        Assert.Contains("did not resolve", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunTextOnlyAsync_ShortWarnPhraseAlone_DoesNotVeto()
+    {
+        // The veto keys on the FULL WARN shape: print-mode fd 2 is shared
+        // with agent-controlled tool subprocesses, so a bare "did not
+        // resolve to an available model" fragment (e.g. a tool error
+        // quoting the phrase, the exact `ls` forgery shape) must not
+        // convert a healthy success into a failure.
+        var sandbox = new RecordingSandbox
+        {
+            TextOnlyStdout = "the answer",
+            TextOnlyStderr = "ls: cannot access 'did not resolve to an "
+                + "available model': No such file or directory",
+        };
+        var runner = RunnerWithDefault();
+
+        var result = await runner.RunTextOnlyAsync("summarise", Cred(), sandbox: sandbox, workingDirectory: "/work");
+
+        Assert.True(result.Success);
+        Assert.Equal("the answer", result.Output);
+    }
+
+    [Fact]
     public async Task RunTextOnlyAsync_WithoutSandbox_FailsNamingSandboxRequirement()
     {
         var runner = RunnerWithDefault();
@@ -517,6 +565,9 @@ public sealed class DevinAgentRunnerTests
         public string DevinStdout { get; set; } = TurnCompleteStdout;
         public string DevinStderr { get; set; } = "stderr";
         public int AcpHelpExitCode { get; set; }
+        public int TextOnlyExitCode { get; set; }
+        public string TextOnlyStdout { get; set; } = "ok";
+        public string TextOnlyStderr { get; set; } = "";
 
         public string Id => "fake-devin";
         public List<SandboxExec> Execs { get; } = [];
@@ -540,6 +591,13 @@ public sealed class DevinAgentRunnerTests
                 && exec.Argv[2].Contains("cb_shim_b64", StringComparison.Ordinal))
             {
                 return Task.FromResult(new SandboxExecResult(DevinExitCode, DevinStdout, DevinStderr));
+            }
+            // The print-mode text-only exec stages its prompt through
+            // $cb_prompt (see DevinAgentRunner.PromptFileInvocation).
+            if (exec.Argv.Count == 3 && exec.Argv[0] == "bash"
+                && exec.Argv[2].Contains("cb_prompt=", StringComparison.Ordinal))
+            {
+                return Task.FromResult(new SandboxExecResult(TextOnlyExitCode, TextOnlyStdout, TextOnlyStderr));
             }
             return Task.FromResult(new SandboxExecResult(0, "ok", ""));
         }

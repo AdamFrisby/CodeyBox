@@ -347,6 +347,18 @@ public sealed record AgentResult(bool Success, string Summary, string? Stdout, s
     public bool OutputLimitExceeded { get; init; }
 
     /// <summary>
+    /// True when <see cref="Stdout"/> carries the agent runner's
+    /// envelope-framed contract rather than raw provider text — today only
+    /// the devin ACP shim's bounded NDJSON (<c>devin.acp</c> /
+    /// <c>codeybox.stderr</c> envelopes), set from
+    /// <see cref="AgentInvocation.StdoutIsEnvelopeFramed"/>. Envelope payload
+    /// fields are agent-influenceable, so consumers that classify or gate on
+    /// envelope structure must require this flag; unframed stdout is model
+    /// text and must never be parsed as envelopes.
+    /// </summary>
+    public bool StdoutIsEnvelopeFramed { get; init; }
+
+    /// <summary>
     /// Validated native CLI session identifier captured before a failed run.
     /// Orchestration may persist it and supply it through
     /// <see cref="AgentResumeContext.NativeSessionId"/> after the sandbox has

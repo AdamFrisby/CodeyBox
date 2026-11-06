@@ -159,6 +159,14 @@ public sealed record AgenticConflictResolverResult(
     public IAgentRunner? FailureRunner { get; init; }
     public AgentCredential? FailureCredential { get; init; }
     public AgentResult? FailureClassificationResult { get; init; }
+
+    /// <summary>
+    /// Envelope-framing provenance of the capture behind
+    /// <see cref="Stdout"/>/<see cref="Stderr"/> — mirrored from the
+    /// <see cref="AgentResult"/> that produced them so callers rebuilding an
+    /// <see cref="AgentResult"/> from this record do not silently drop it.
+    /// </summary>
+    public bool StdoutIsEnvelopeFramed { get; init; }
 }
 
 /// <summary>
@@ -442,7 +450,10 @@ public sealed class AgenticConflictResolver
                 false,
                 $"auth required: {authReason}",
                 resultForFailureClassification.Stdout,
-                resultForFailureClassification.Stderr);
+                resultForFailureClassification.Stderr)
+            {
+                StdoutIsEnvelopeFramed = resultForFailureClassification.StdoutIsEnvelopeFramed,
+            };
             lastVerificationError = $"auth required: {authReason}";
             // Auth/login prompts are infrastructure evidence, not a failed
             // merge edit. Keep fallback candidates from losing a global
@@ -759,7 +770,10 @@ public sealed class AgenticConflictResolver
                         Stdout: agentResult.Stdout,
                         Stderr: agentResult.Stderr,
                         LastAttemptedRunner: runner,
-                        AuthFailures: authFailures.ToArray());
+                        AuthFailures: authFailures.ToArray())
+                    {
+                        StdoutIsEnvelopeFramed = agentResult.StdoutIsEnvelopeFramed,
+                    };
                 }
 
                 lastVerificationError = verification.Reason;
@@ -833,6 +847,7 @@ public sealed class AgenticConflictResolver
             LastAttemptedRunner: lastAttemptedRunner,
             AuthFailures: authFailures.ToArray())
         {
+            StdoutIsEnvelopeFramed = lastAgentResult?.StdoutIsEnvelopeFramed ?? false,
             FailureRunner = transientFailureRunner ?? lastFailureRunner,
             FailureCredential = transientFailureCredential ?? lastFailureCredential,
             FailureClassificationResult = transientFailureClassificationResult ?? lastFailureClassificationResult,

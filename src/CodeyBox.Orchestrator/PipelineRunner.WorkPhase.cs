@@ -1821,11 +1821,7 @@ public sealed partial class PipelineRunner
             // handling below routes those to the infrastructure path.
             detection = failedResult.ExecutionUnavailable
                 ? null
-                : _quotaClassifier.DetectProviderTransient(
-                    runner.Kind,
-                    failedResult.Stderr,
-                    failedResult.Stdout,
-                    failedResult.Summary);
+                : _quotaClassifier.DetectProviderTransient(runner.Kind, failedResult);
         }
         catch (Exception)
         {
@@ -1887,11 +1883,7 @@ public sealed partial class PipelineRunner
             ProviderTransientDetection? nudgeDetection;
             try
             {
-                nudgeDetection = _quotaClassifier.DetectProviderTransient(
-                    runner.Kind,
-                    nudgeResult.Stderr,
-                    nudgeResult.Stdout,
-                    nudgeResult.Summary);
+                nudgeDetection = _quotaClassifier.DetectProviderTransient(runner.Kind, nudgeResult);
             }
             catch (Exception)
             {

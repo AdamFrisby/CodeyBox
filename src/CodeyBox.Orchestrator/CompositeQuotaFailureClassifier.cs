@@ -57,13 +57,34 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier, I
         string? stdout,
         string? summary = null)
     {
-        if (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout) && string.IsNullOrEmpty(summary))
+        // The stream-shaped entry point carries no envelope provenance, so
+        // it is treated as an unframed capture: detectors that need
+        // StdoutIsEnvelopeFramed only trust envelope structure on results
+        // the runner stamped (see the AgentResult overload below). The
+        // empty-input guard, detector lookup, and exception contract live
+        // once in that overload.
+        return DetectProviderTransient(agent, new AgentResult(
+            Success: false,
+            Summary: summary ?? string.Empty,
+            Stdout: stdout,
+            Stderr: stderr));
+    }
+
+    /// <summary>
+    /// Result-shaped dispatch: forwards <see cref="AgentResult.StdoutIsEnvelopeFramed"/>
+    /// so detectors can gate envelope-structure signatures on real shim
+    /// provenance. The stream-shaped overload above carries no provenance and
+    /// is treated as an unframed capture.
+    /// </summary>
+    public ProviderTransientDetection? DetectProviderTransient(AgentKind agent, AgentResult result)
+    {
+        if (string.IsNullOrEmpty(result.Stderr) && string.IsNullOrEmpty(result.Stdout) && string.IsNullOrEmpty(result.Summary))
             return null;
         try
         {
             if (!_detectors.TryGetValue(agent, out var detector))
                 return null;
-            return detector.DetectProviderTransient(stderr, stdout, summary);
+            return detector.DetectProviderTransient(result);
         }
         catch (Exception)
         {

@@ -87,14 +87,22 @@ public static class ProviderTransientMatcher
     /// <summary>Longest stream still scanned; longer inputs are truncated first.</summary>
     public const int MaxScannedChars = 64 * 1024;
 
+    /// <summary>
+    /// The single scanned-tail bound shared by every provider-transient
+    /// detector: keeps the LAST <see cref="MaxScannedChars"/> chars of
+    /// <paramref name="text"/>. Terminal diagnostics live at the end of a
+    /// captured stream, so the tail is the authoritative end to scan.
+    /// </summary>
+    public static string BoundToScannedTail(string text)
+        => text.Length > MaxScannedChars ? text[^MaxScannedChars..] : text;
+
     public static bool IsMatch(Regex pattern, string? text)
     {
         if (pattern is null || string.IsNullOrEmpty(text))
             return false;
         try
         {
-            var bounded = text.Length > MaxScannedChars ? text[^MaxScannedChars..] : text;
-            return pattern.IsMatch(bounded);
+            return pattern.IsMatch(BoundToScannedTail(text));
         }
         catch (RegexMatchTimeoutException)
         {

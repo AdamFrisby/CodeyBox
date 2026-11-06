@@ -65,6 +65,17 @@ public interface IQuotaFailureClassifier
         string? stderr,
         string? stdout,
         string? summary = null) => null;
+
+    /// <summary>
+    /// Result-shaped overload of
+    /// <see cref="DetectProviderTransient(AgentKind, string?, string?, string?)"/>.
+    /// Carries <see cref="AgentResult.StdoutIsEnvelopeFramed"/> so detectors
+    /// can gate envelope-structure signatures on real shim provenance; the
+    /// default delegates to the stream-shaped overload with no provenance.
+    /// Must never throw.
+    /// </summary>
+    ProviderTransientDetection? DetectProviderTransient(AgentKind agent, AgentResult result)
+        => DetectProviderTransient(agent, result.Stderr, result.Stdout, result.Summary);
 }
 
 /// <summary>

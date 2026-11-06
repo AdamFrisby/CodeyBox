@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.Json;
+using CodeyBox.Agents;
+using CodeyBox.Core;
 
 namespace CodeyBox.Agents.Devin;
 
@@ -45,6 +47,44 @@ internal static class DevinAcpEnvelope
     internal const string EventFatal = "fatal";
 
     /// <summary>
+    /// Emitted immediately after <c>session/prompt</c> is sent — the
+    /// boundary between the pre-prompt handshake (where fd-2 stderr is
+    /// still provider-authentic) and the running turn (where tool
+    /// subprocesses share fd 2 and their stderr is agent/model-controlled).
+    /// </summary>
+    internal const string EventPromptSent = "prompt_sent";
+
+    /// <summary>
+    /// Emitted once when <c>session/new</c> answers — a strictly pre-prompt
+    /// handshake event.
+    /// </summary>
+    internal const string EventSessionStarted = "session_started";
+
+    /// <summary>
+    /// Emitted once when <c>session/set_mode</c> answers — a strictly
+    /// pre-prompt handshake event.
+    /// </summary>
+    internal const string EventModeSet = "mode_set";
+
+    /// <summary>
+    /// Terminal event emitted when the shim detects the CLI substituted a
+    /// different model for the requested <c>--model</c> (stderr WARN, a
+    /// mismatched <c>models.currentModelId</c> in the session/new result,
+    /// or a category-"model" <c>config_option_update</c>) and aborts the
+    /// turn rather than bill a substituted model.
+    /// </summary>
+    internal const string EventModelMismatch = "model_mismatch";
+
+    /// <summary>
+    /// Permission-request auto-answers the shim emits while the turn runs —
+    /// post-<see cref="EventPromptSent"/> by construction, so they prove the
+    /// turn started even when <c>prompt_sent</c> itself scrolled out of a
+    /// retained tail.
+    /// </summary>
+    internal const string EventPermissionAutoGranted = "permission_auto_granted";
+    internal const string EventPermissionAutoCancelled = "permission_auto_cancelled";
+
+    /// <summary>
     /// The <c>sessionUpdate</c> discriminator values inside an
     /// <see cref="EventSessionUpdate"/> envelope's <c>update</c> object —
     /// the ACP notification kinds the stream parser folds into stream
@@ -56,6 +96,13 @@ internal static class DevinAcpEnvelope
     internal const string UpdateKindAgentMessageChunk = "agent_message_chunk";
 
     /// <summary>
+    /// The one <c>session/update</c> kind the ACP handshake itself produces
+    /// (the substitution guard reads a category-"model" option from it
+    /// before the first prompt). Every other kind reflects turn activity.
+    /// </summary>
+    internal const string UpdateKindConfigOptionUpdate = "config_option_update";
+
+    /// <summary>
     /// One parsed envelope: the <c>event</c> name plus a detached clone of
     /// the root element, so the value stays valid after enumeration moves
     /// on and the source <see cref="JsonDocument"/> is released.
@@ -63,12 +110,34 @@ internal static class DevinAcpEnvelope
     internal readonly record struct Envelope(string Event, JsonElement Root);
 
     /// <summary>
-    /// Enumerates the <c>devin.acp</c> envelopes in a captured stdout blob.
-    /// Never throws: blank lines, non-JSON lines, JSON that is not a
-    /// devin.acp envelope, and lines truncated mid-write are all skipped —
-    /// the capture may carry leading CLI noise or be cut by an output cap.
+    /// One parsed envelope line of ANY <c>type</c> tag: the type value, the
+    /// <c>event</c> name when present (null for typeless-event envelopes
+    /// such as <c>codeybox.stderr</c>), and a detached clone of the root
+    /// element. The typed view lets consumers distinguish shim-owned
+    /// <see cref="EnvelopeType"/> envelopes from host-injected
+    /// <see cref="CliAgentRunnerBase.StderrEnvelopeType"/> envelopes on the
+    /// same framed stream.
     /// </summary>
-    internal static IEnumerable<Envelope> Enumerate(string? stdout)
+    internal readonly record struct TypedEnvelope(string Type, string? Event, JsonElement Root);
+
+    /// <summary>
+    /// Upper bound on envelopes examined per provider-transient detection
+    /// pass — the last-N tail policy applied by <see cref="EnumerateBounded"/>
+    /// for detectors that scan only <c>devin.acp</c> envelopes. Detectors
+    /// that must see the interleaved typed stream (e.g. the
+    /// <c>codeybox.stderr</c> relay lines) use <see cref="EnumerateEnvelopes"/>
+    /// over the same char-bounded window instead and are bounded by
+    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> alone.
+    /// </summary>
+    internal const int MaxEnvelopesExamined = 128;
+
+    /// <summary>
+    /// Enumerates every typed envelope line in a captured stdout blob —
+    /// both <c>devin.acp</c> and <c>codeybox.stderr</c> lines. Never throws:
+    /// blank lines, non-JSON lines, JSON without a string <c>type</c>, and
+    /// lines truncated mid-write are all skipped.
+    /// </summary>
+    internal static IEnumerable<TypedEnvelope> EnumerateEnvelopes(string? stdout)
     {
         if (string.IsNullOrWhiteSpace(stdout))
             yield break;
@@ -85,15 +154,101 @@ internal static class DevinAcpEnvelope
             using (doc)
             {
                 var root = doc.RootElement;
-                if (IsEnvelope(root)
-                    && root.TryGetProperty(EventPropertyName, out var eventEl)
-                    && eventEl.ValueKind == JsonValueKind.String
-                    && eventEl.GetString() is { } eventName)
+                if (root.ValueKind != JsonValueKind.Object
+                    || !root.TryGetProperty("type", out var typeEl)
+                    || typeEl.ValueKind != JsonValueKind.String
+                    || typeEl.GetString() is not { } type)
                 {
-                    yield return new Envelope(eventName, root.Clone());
+                    continue;
                 }
+
+                string? eventName = null;
+                if (root.TryGetProperty(EventPropertyName, out var eventEl)
+                    && eventEl.ValueKind == JsonValueKind.String)
+                {
+                    eventName = eventEl.GetString();
+                }
+
+                yield return new TypedEnvelope(type, eventName, root.Clone());
             }
         }
+    }
+
+    /// <summary>
+    /// Enumerates the <c>devin.acp</c> envelopes in a captured stdout blob.
+    /// Never throws: blank lines, non-JSON lines, JSON that is not a
+    /// devin.acp envelope, and lines truncated mid-write are all skipped —
+    /// the capture may carry leading CLI noise or be cut by an output cap.
+    ///
+    /// <para>Enumeration stops after the first <c>turn_complete</c>
+    /// envelope: the shim exits immediately after emitting it, so any
+    /// <c>devin.acp</c> line positioned after it cannot be shim output — a
+    /// same-uid process can still append forged envelope lines to the exec
+    /// stdout pipe through <c>/proc/&lt;pid&gt;/fd</c> after the turn ends.
+    /// Consumers therefore never see post-terminal forged envelopes through
+    /// this enumerator (or through <see cref="EnumerateBounded"/>, which is
+    /// built on it).</para>
+    /// </summary>
+    internal static IEnumerable<Envelope> Enumerate(string? stdout)
+    {
+        foreach (var typed in EnumerateEnvelopes(stdout))
+        {
+            if (typed.Type == EnvelopeType && typed.Event is { } eventName)
+            {
+                yield return new Envelope(eventName, typed.Root);
+                if (string.Equals(eventName, EventTurnComplete, StringComparison.Ordinal))
+                    yield break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Bounded <c>devin.acp</c> envelope scan for provider-transient
+    /// detection: truncates the input to the last
+    /// <see cref="ProviderTransientMatcher.MaxScannedChars"/> chars and
+    /// yields the LAST <see cref="MaxEnvelopesExamined"/> devin.acp
+    /// envelopes of that window — the bound policy for detectors that scan
+    /// only <c>devin.acp</c> envelopes. Both bounds favour the tail because
+    /// the signatures they scan for (terminal <c>model_mismatch</c>/
+    /// <c>turn_error</c>/<c>fatal</c> envelopes) are the last lines of the
+    /// capture: a chatty turn — including <c>codeybox.stderr</c> relay lines
+    /// flushed after the terminal envelope — must not push the signature
+    /// out of the examined set. Non-devin.acp lines are parsed but never
+    /// counted against the envelope bound. Like <see cref="Enumerate"/>,
+    /// enumeration stops at <c>turn_complete</c> so post-terminal forged
+    /// lines cannot consume the examined set.
+    /// </summary>
+    internal static IEnumerable<Envelope> EnumerateBounded(string? stdout)
+    {
+        if (string.IsNullOrEmpty(stdout))
+            yield break;
+
+        var bounded = ProviderTransientMatcher.BoundToScannedTail(stdout);
+        foreach (var envelope in LastItems(Enumerate(bounded), MaxEnvelopesExamined))
+            yield return envelope;
+    }
+
+    /// <summary>
+    /// Buffers <paramref name="source"/> and yields only its last
+    /// <paramref name="count"/> items, in stream order. The buffer holds at
+    /// most <paramref name="count"/> items, so the bound is enforced
+    /// before buffering rather than after.
+    /// </summary>
+    internal static IEnumerable<T> LastItems<T>(IEnumerable<T> source, int count)
+    {
+        if (count <= 0)
+            yield break;
+
+        var tail = new Queue<T>(count + 1);
+        foreach (var item in source)
+        {
+            if (tail.Count == count)
+                tail.Dequeue();
+            tail.Enqueue(item);
+        }
+
+        while (tail.Count > 0)
+            yield return tail.Dequeue();
     }
 
     /// <summary>

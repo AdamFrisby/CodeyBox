@@ -1153,7 +1153,10 @@ public sealed partial class PipelineRunner
             Success: !IsLlmAgentExecutionFailure(result),
             Summary: result.AgentSummary ?? "agent failed",
             Stdout: result.AgentStdout,
-            Stderr: result.AgentStderr);
+            Stderr: result.AgentStderr)
+        {
+            StdoutIsEnvelopeFramed = result.AgentStdoutIsEnvelopeFramed,
+        };
 
     internal sealed class AgentAttemptTimeoutException : OperationCanceledException
     {

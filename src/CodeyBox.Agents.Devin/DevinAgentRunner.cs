@@ -54,6 +54,30 @@ namespace CodeyBox.Agents.Devin;
 /// picks the session model when no flag is passed — a dispatch must never
 /// drift off the configured model.</para>
 ///
+/// <para><b>Substitution guard.</b> The CLI itself substitutes a different
+/// model when the <c>--model</c> value does not resolve — it warns on
+/// stderr (<c>did not resolve to an available model; falling back to your
+/// configured `agent.model` or the default</c>) and runs the session
+/// anyway, on a possibly metered default (verified against devin
+/// 3000.11.1). The shim aborts with a <c>model_mismatch</c> terminal
+/// envelope at the earliest observable point whenever the active model is
+/// not the requested one — the structured signals
+/// (<c>session/new</c> <c>models.currentModelId</c>, category-"model"
+/// <c>config_option_update</c>) ride the session-id-pinned ACP wire and
+/// stay armed for the whole turn, while the stderr WARN text fallback is
+/// honoured only inside the pre-prompt window (after
+/// <c>session/prompt</c> fd 2 also carries tool-subprocess stderr the
+/// agent controls, so the marker phrase is no longer provider-authentic).
+/// The host classifies it as provider-transient so the item re-runs on
+/// the configured model. A <c>turn_error</c> the provider marked
+/// <c>cognition.ai/retryable</c> takes the same transient path. Print
+/// mode (<c>devin -p</c>) has no structured active-model signal, so
+/// <see cref="RejectSuccessfulTextOnlyResult"/> vetoes a successful exec
+/// whose stderr carries the full WARN phrase — a POSSIBLE substitution
+/// the caller must not consume (print-mode stderr is shared with
+/// agent-controlled tool subprocesses, so the cause stays unverified and
+/// the vetoed failure does not park for transient retry).</para>
+///
 /// <para><b>Prompt delivery.</b> The prompt travels on stdin after the
 /// base64 shim block and reaches the shim through the still-open descriptor
 /// 0 (<c>--prompt-file -</c>); it never enters argv, the environment, or a
@@ -73,11 +97,11 @@ namespace CodeyBox.Agents.Devin;
 /// <c>~/.local/share/devin/cli/sessions.db</c>; ACP advertises
 /// <c>loadSession</c> but the resume hook is not wired — a restored run
 /// re-dispatches fresh like the other file-state agents. Terminal failures
-/// surface either as shim <c>turn_error</c>/<c>fatal</c> envelopes
-/// (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines lifted by
-/// <see cref="DevinTerminalDiagnoser"/>; <see cref="RunAsync"/> lifts the
-/// first into <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline
-/// parks quota/auth failures instead of dead-lettering them.</para>
+/// surface either as shim <c>turn_error</c>/<c>model_mismatch</c>/<c>fatal</c>
+/// envelopes (<see cref="DevinAcpOutcome"/>) or as <c>Error: …</c> lines
+/// lifted by <see cref="DevinTerminalDiagnoser"/>; <see cref="RunAsync"/>
+/// lifts the first into <see cref="AgentResult.TerminalDiagnostic"/> so the
+/// pipeline parks quota/auth failures instead of dead-lettering them.</para>
 ///
 /// <para><b>Envelope provenance.</b> <c>devin.acp</c> lines are claimed by
 /// type tag. Emission-side hygiene closes the named injection vectors: the
@@ -87,7 +111,14 @@ namespace CodeyBox.Agents.Devin;
 /// log-file tee merges streams — and
 /// <c>AgentInvocation.StdoutIsEnvelopeFramed</c> pins the dispatch to the
 /// attached exec-pipe transport so no bearer credential exists in-VM that
-/// could POST forged bytes into the stream. What these mechanisms do NOT
+/// could POST forged bytes into the stream. The negotiated sessionId is
+/// validated inbound but never stamped into claimable envelopes: the
+/// stream is tee'd to an in-VM log readable by agent tools, so publishing
+/// it would hand a wire-pipe writer the session pin's key (a
+/// <c>/proc</c>-level read of the shim's pipe remains a documented
+/// residual). Envelope enumeration also stops at <c>turn_complete</c> —
+/// the shim's last envelope — so post-terminal forged lines cannot flip a
+/// completed run. What these mechanisms do NOT
 /// cover: a same-uid (root-capable) in-VM process can still write the exec
 /// stdout pipe through <c>/proc/&lt;pid&gt;/fd</c>, and a tool subprocess
 /// inheriting the agent's fd 1 can write the shim's ACP wire pipe — the
@@ -411,6 +442,43 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         return PromptFileInvocation(argv, prompt);
     }
 
+    /// <summary>
+    /// Print mode exposes no structured active-model signal, so the only
+    /// observable substitution evidence is the CLI's own stderr WARN —
+    /// when it fires outside <c>devin acp</c> at all (the phrase is
+    /// <c>chisel_server::acp</c>-scoped and may never appear here). fd 2 on
+    /// a <c>devin -p</c> exec is shared with tool-subprocess stderr even
+    /// under the read-only <c>auto</c> permission default, so the text is
+    /// agent-influenceable: the veto keys on the FULL WARN shape
+    /// (<see cref="DevinCliSignals.ModelFallbackStderrMarkerFull"/>) to
+    /// shrink the accidental-forgery window and reports only a POSSIBLE
+    /// substitution — it cannot verify the cause. A successful run
+    /// carrying it is rejected so the substituted (possibly metered)
+    /// output is never consumed as the answer. The vetoed
+    /// <see cref="TextOnlyAgentResult"/> failure does NOT park for
+    /// transient retry: its consumers (the advisory merge security
+    /// review) run no provider-transient classification, so the call
+    /// fails honestly — fail-closed for billing either way.
+    /// </summary>
+    protected override TextOnlyAgentResult? RejectSuccessfulTextOnlyResult(SandboxExecResult exec)
+    {
+        if (!exec.Stderr.Contains(
+                DevinCliSignals.ModelFallbackStderrMarkerFull,
+                StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        // exec.Stderr is non-nullable and the guard above required the
+        // marker phrase, so it is never empty here — pass it as the
+        // failure detail directly.
+        return new TextOnlyAgentResult(
+            false,
+            $"{Kind.Value} text-only call failed: stderr reported a possible --model substitution; the active model cannot be verified",
+            exec.Stdout,
+            exec.Stderr.Trim());
+    }
+
     public string? GetTextOnlyUnavailabilityReason(AgentCredential? credential)
         => GetSandboxSubscriptionTextOnlyUnavailabilityReason(
             credential,
@@ -497,20 +565,26 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// <summary>
     /// Maps the exec result through the shim's terminal outcome. Two failure
     /// surfaces exist: the shim reports protocol/turn failures as typed
-    /// terminal envelopes (<c>turn_error</c> / <c>fatal</c>), and the CLI
-    /// itself reports auth/startup failures on stderr as <c>Error: …</c>
-    /// lines (verified against devin 3000.11.1: "Error: Not logged in…"
-    /// exits nonzero before ACP starts). Whichever fired is lifted into
-    /// <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline can
-    /// classify it; without this a quota/auth give-up with no file changes
-    /// terminal-fails as "produced no changes".
+    /// terminal envelopes (<c>turn_error</c> / <c>model_mismatch</c> /
+    /// <c>fatal</c>), and the CLI itself reports auth/startup failures on
+    /// stderr as <c>Error: …</c> lines (verified against devin 3000.11.1:
+    /// "Error: Not logged in…" exits nonzero before ACP starts). Whichever
+    /// fired is lifted into <see cref="AgentResult.TerminalDiagnostic"/> so
+    /// the pipeline can classify it; without this a quota/auth give-up with
+    /// no file changes terminal-fails as "produced no changes".
     /// </summary>
     private static AgentResult PostProcessAcpResult(AgentResult result)
     {
         if (!string.IsNullOrEmpty(result.TerminalDiagnostic))
             return result;
 
-        var outcome = DevinAcpOutcome.Extract(result.Stdout);
+        // Envelope structure is trusted only on captures the runner stamped
+        // StdoutIsEnvelopeFramed: early-failure results can carry non-null
+        // Stdout (host-script output, prep diagnostics) that must never be
+        // envelope-parsed as shim evidence.
+        var outcome = result.StdoutIsEnvelopeFramed
+            ? DevinAcpOutcome.Extract(result.Stdout)
+            : new DevinAcpOutcome.Outcome(DevinAcpOutcome.TerminalEvent.None, null);
 
         // A zero exit without a turn_complete envelope is never a silent
         // success: either the run was cut short before the turn outcome was
@@ -518,8 +592,8 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         // shim DID report a terminal failure envelope, in which case the
         // summary must headline what the stream actually contained rather
         // than claim no outcome arrived. The flip runs before the diagnostic
-        // lift so a turn_error/fatal envelope can never keep Success=true
-        // even if the exec layer reported 0.
+        // lift so a turn_error/model_mismatch/fatal envelope can never keep
+        // Success=true even if the exec layer reported 0.
         if (result.Success && outcome.Event != DevinAcpOutcome.TerminalEvent.TurnComplete)
         {
             result = result with

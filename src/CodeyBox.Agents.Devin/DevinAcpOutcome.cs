@@ -7,9 +7,15 @@ namespace CodeyBox.Agents.Devin;
 /// <c>devin.acp</c> NDJSON stream. The shim emits exactly one terminal
 /// envelope per run — <c>turn_complete</c> (session/prompt answered with a
 /// stopReason), <c>turn_error</c> (the agent returned a JSON-RPC error for
-/// the prompt), or <c>fatal</c> (spawn/handshake/protocol failure,
+/// the prompt), <c>model_mismatch</c> (the CLI substituted a different
+/// model for the requested <c>--model</c>; the turn was aborted), or
+/// <c>fatal</c> (spawn/handshake/protocol failure,
 /// including a prompt result that carried no stopReason) — so the last
-/// terminal envelope found is authoritative.
+/// terminal envelope found is authoritative. Enumeration stops at
+/// <c>turn_complete</c> (<see cref="DevinAcpEnvelope.Enumerate"/>): the shim
+/// exits immediately after emitting it, so a terminal-looking envelope
+/// appended later on the wire is pipe-injected, never shim output, and must
+/// not flip a completed run to failure.
 ///
 /// <para>Used to lift a typed failure into
 /// <see cref="AgentResult.TerminalDiagnostic"/> (and to confirm a run that
@@ -34,6 +40,7 @@ internal static class DevinAcpOutcome
         TurnComplete,
         TurnError,
         Fatal,
+        ModelMismatch,
     }
 
     internal sealed record Outcome(TerminalEvent Event, string? Diagnostic);
@@ -60,6 +67,10 @@ internal static class DevinAcpOutcome
                 case DevinAcpEnvelope.EventTurnError:
                     lastEvent = TerminalEvent.TurnError;
                     lastDiagnostic = Describe("turn error", envelope.Root);
+                    break;
+                case DevinAcpEnvelope.EventModelMismatch:
+                    lastEvent = TerminalEvent.ModelMismatch;
+                    lastDiagnostic = Describe("model mismatch", envelope.Root);
                     break;
                 case DevinAcpEnvelope.EventFatal:
                     lastEvent = TerminalEvent.Fatal;
@@ -88,10 +99,18 @@ internal static class DevinAcpOutcome
             && codeEl.ValueKind is JsonValueKind.Number or JsonValueKind.String
             ? codeEl.ToString()
             : null;
+        // model_mismatch envelopes carry the signal discriminator
+        // (session/new | config_option_update | stderr-warn) — surface it so
+        // the diagnostic says WHICH check fired, not just that one did.
+        var via = root.TryGetProperty("via", out var viaEl)
+            && viaEl.ValueKind == JsonValueKind.String
+            ? viaEl.GetString()
+            : null;
+        var viaSuffix = via is null ? string.Empty : $" (via {via})";
 
         var text = stage is null
-            ? $"devin acp {prefix}: {message ?? "unknown"}"
-            : $"devin acp {prefix} during {stage}: {message ?? "unknown"}";
+            ? $"devin acp {prefix}{viaSuffix}: {message ?? "unknown"}"
+            : $"devin acp {prefix}{viaSuffix} during {stage}: {message ?? "unknown"}";
         if (code is not null)
             text += $" (code {code})";
         return DevinTerminalDiagnoser.TruncateDiagnostic(text);

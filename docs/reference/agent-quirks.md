@@ -456,6 +456,42 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   the first switches refused requests to other (paid) Devin models, the
   second would silently pick the session model when no `--model` flag is
   passed; neither may act on a dispatch.
+- The CLI also substitutes a different model when the `--model` value
+  does not resolve: it warns on stderr (`did not resolve to an available
+  model; falling back to your configured `agent.model` or the default`)
+  and proceeds on `agent.model`/the default — possibly metered. The shim
+  refuses the substitution: it aborts with a `model_mismatch` terminal
+  envelope (carrying `via` = `session/new`, `config_option_update`, or
+  `stderr-warn`, plus the observed `activeModel`) whenever the active
+  model is not the requested one. The structured signals
+  (`session/new` `models.currentModelId`, category-`"model"`
+  `config_option_update`) ride the session-id-pinned ACP wire and stay
+  armed for the whole turn — a mid-turn model drift aborts too. The
+  stderr WARN is honoured only inside the pre-prompt window: model
+  resolution precedes `session/prompt`, while after it fd 2 is shared
+  with tool subprocesses whose stderr the agent/model controls, so the
+  marker phrase is forgeable there (a tool error quoting it must never
+  abort a healthy run). The host classifies the abort
+  provider-transient so the item retries on the configured model instead
+  of terminal-failing — structured envelopes are only trusted on
+  captures the runner stamped envelope-framed
+  (`AgentResult.StdoutIsEnvelopeFramed`); unframed stdout/summary is
+  agent text and never parsed as envelopes. The WARN-text fallback
+  matches only verified `codeybox.stderr` envelope `text` fields that
+  precede the first turn-proof envelope in the bounded tail scan, and
+  only while the window still carries a strictly pre-prompt envelope
+  (`session_started`, `mode_set`, or a handshake-stage `fatal` — a
+  `prompt_sent`/`turn_*`/turn-scoped `session_update`/post-prompt
+  `fatal` envelope proves fd 2 was already agent-shared, mid-turn-legal
+  kinds like `notification`/`protocol_error`/`unhandled_request`/
+  `config_option_update` prove nothing either way, and a window with no
+  pre-prompt devin.acp envelope at all proves nothing); raw
+  stderr is never scanned for it. Envelopes positioned after
+  `turn_complete` are never shim output — the shim exits immediately —
+  so enumeration stops there and post-terminal forged lines cannot flip
+  a completed run or feed transient classification. A `turn_error` whose error `data`
+  carries `cognition.ai/retryable: true` is forwarded as
+  `"retryable": true` and parks on the same bounded path.
 - The prompt travels on stdin after the shim payload (MAX_ARG_STRLEN is
   128 KiB per argv element and rework prompts exceed it) and reaches the
   agent only as `session/prompt` JSON — never in argv, the environment,
@@ -467,8 +503,8 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   `O_WRONLY`, so delivered prompt bytes are agent-influenceable and must
   not be treated as operator-authentic (sudo defeats even a root-owned
   stdin sidecar — there is no in-VM fix).
-- Failure text surfaces either as shim `turn_error`/`fatal` envelopes
-  (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
+- Failure text surfaces either as shim `turn_error`/`model_mismatch`/`fatal`
+  envelopes (`DevinAcpOutcome` lifts them into `TerminalDiagnostic`) or as
   `Error: …` lines — the CLI prints them to stderr (verified: `Error: Not
   logged in` exits nonzero before the handshake), which the shim's stderr
   relay delivers inside `codeybox.stderr` envelopes;
@@ -494,7 +530,12 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   agent's fd 1 writes onto the shim's ACP wire pipe — the shim narrows the
   wire pipe with unguessable JSON-RPC request ids, session-id pinning on
   session-scoped frames, and flat-number-only usage bags, but the exec-pipe
-  leg has no in-VM fix. Envelope payloads are therefore agent-influenceable
+  leg has no in-VM fix. The negotiated sessionId is validated inbound but
+  never stamped into claimable envelopes — the stream is tee'd to an
+  in-VM log readable by agent tools, so publishing it would hand a
+  wire-pipe writer the pin's key (a `/proc`-level read of the shim's pipe
+  read-end remains a residual). Envelope payloads are therefore
+  agent-influenceable
   telemetry — usage, outcome, final text — never authoritative accounting.
   Usage counters specifically are never promoted to extracted token usage:
   `DevinCostExtractor` returns null and `DevinStreamParser` does not fold
@@ -503,7 +544,22 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
 - The text-only path (`RunTextOnlyAsync`) still uses
   `devin -p --respect-workspace-trust false` with no permission flag —
   the read-only `auto` default is the conservative shape for answering
-  questions on untrusted resolver input.
+  questions on untrusted resolver input. Print mode exposes no
+  structured active-model signal, so `DevinAgentRunner` vetoes a
+  successful `devin -p` exec whose stderr carries the full WARN shape
+  (`RejectSuccessfulTextOnlyResult`): the run is reported as a failure
+  and the substituted output is never consumed. Because print-mode fd 2
+  is shared with agent-controlled tool subprocesses, the veto keys on
+  the extended WARN phrase (short marker plus the `falling back to your
+  configured agent.model or the default` clause) and reports only a
+  POSSIBLE substitution — it cannot verify the cause. Honest residual:
+  the vetoed `TextOnlyAgentResult` failure does NOT park for transient
+  retry — its consumers (the advisory merge security review) run no
+  provider-transient classification, so the call fails terminally;
+  fail-closed for billing either way. Residual gap: the WARN is
+  `chisel_server::acp`-scoped and may never fire outside `devin acp` —
+  treat print-mode `--model` pinning as best-effort until the CLI
+  offers an equivalent signal.
 
 **Default model:** `claude-sonnet-5-medium` (verified live catalog variant;
 the documented examples `sonnet`/`opus`/`swe`/`fable` are also accepted

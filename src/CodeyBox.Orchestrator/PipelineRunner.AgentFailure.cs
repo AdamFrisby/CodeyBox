@@ -222,11 +222,7 @@ public sealed partial class PipelineRunner
     {
         try
         {
-            return _quotaClassifier.DetectProviderTransient(
-                agent,
-                result.Stderr,
-                result.Stdout,
-                result.Summary);
+            return _quotaClassifier.DetectProviderTransient(agent, result);
         }
         catch (Exception)
         {
