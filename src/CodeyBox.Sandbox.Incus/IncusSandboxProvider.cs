@@ -1978,6 +1978,23 @@ public sealed class IncusSandboxProvider :
     {
         var cause = BuildBakeCause(bakeFailure);
         var operation = ExtractIncusOperation(bakeFailure) ?? "baseline bake";
+        if (IsBaselineBakeTimeout(bakeFailure))
+        {
+            // The timeout message embeds the ExtraRuncmd line. ILogger renders
+            // Exception.ToString() beside the template, and the redaction enricher
+            // only rewrites string properties, so attaching the exception would
+            // publish that line a second time with no further scrub. {BakeCause}
+            // is the sanitized text and is a property.
+            _log.LogWarning(
+                "Incus baseline bake for {BaselineName} failed at {Operation}: {BakeCause}; candidate {CandidateName} will be cleaned up ({ExceptionType})",
+                baselineName,
+                operation,
+                cause,
+                candidateName,
+                bakeFailure.GetType().Name);
+            return;
+        }
+
         _log.LogWarning(
             bakeFailure,
             "Incus baseline bake for {BaselineName} failed at {Operation}: {BakeCause}; candidate {CandidateName} will be cleaned up",
@@ -2566,7 +2583,15 @@ public sealed class IncusSandboxProvider :
 
     private static string SanitizeExtraRuncmdSnippet(string command)
     {
-        var redacted = RawOutputRedactor.Redact(command);
+        // This snippet is the bake-timeout exception message, and that message is
+        // copied into the provisioning-deferral detail (webhook), the baseline-blocked
+        // cause (queue status and notifications), and the bake-failure log property.
+        // Known token shapes are not enough: assignment values and URL userinfo are
+        // credentials in operator ExtraRuncmd lines and must be gone before the text
+        // is stored on the exception.
+        var redacted = SensitiveDataRedactionEnricher.RedactText(command);
+        redacted = StripEmbeddedUrlUserInfo(redacted);
+        redacted = RedactShellCredentialArguments(redacted);
         var builder = new System.Text.StringBuilder(Math.Min(redacted.Length, ExtraRuncmdLogSnippetCharacters));
         foreach (var c in redacted)
         {
@@ -2576,6 +2601,318 @@ public sealed class IncusSandboxProvider :
         }
         var snippet = builder.ToString().Trim();
         return snippet.Length == 0 ? "(empty)" : snippet;
+    }
+
+    /// <summary>
+    /// Replaces URL userinfo (<c>scheme://user:secret@host</c>) in a command.
+    /// The last <c>@</c> in the authority is the separator, so a password that
+    /// itself contains <c>@</c> is removed with the userinfo rather than left
+    /// in front of the host. Non-URL text, including <c>git@host:path</c>, is unchanged.
+    /// </summary>
+    private static string StripEmbeddedUrlUserInfo(string text)
+    {
+        var builder = new System.Text.StringBuilder(text.Length);
+        var index = 0;
+        while (index < text.Length)
+        {
+            var scheme = FindUrlSchemeStart(text, index);
+            if (scheme < 0)
+            {
+                builder.Append(text, index, text.Length - index);
+                break;
+            }
+
+            builder.Append(text, index, scheme - index);
+            var separator = text.IndexOf("://", scheme, StringComparison.Ordinal);
+            builder.Append(text, scheme, separator + 3 - scheme);
+            var authorityStart = separator + 3;
+            var authorityEnd = authorityStart;
+            while (authorityEnd < text.Length && !IsUrlAuthorityEnd(text[authorityEnd]))
+                authorityEnd++;
+            var at = -1;
+            for (var i = authorityEnd - 1; i >= authorityStart; i--)
+            {
+                if (text[i] == '@')
+                {
+                    at = i;
+                    break;
+                }
+            }
+
+            if (at >= authorityStart)
+            {
+                builder.Append("***@");
+                builder.Append(text, at + 1, authorityEnd - (at + 1));
+            }
+            else
+            {
+                builder.Append(text, authorityStart, authorityEnd - authorityStart);
+            }
+
+            index = authorityEnd;
+        }
+
+        return builder.ToString();
+    }
+
+    private static int FindUrlSchemeStart(string text, int start)
+    {
+        var index = start;
+        while (index < text.Length)
+        {
+            var separator = text.IndexOf("://", index, StringComparison.Ordinal);
+            if (separator < 0)
+                return -1;
+            var scheme = separator;
+            while (scheme > start && IsUrlSchemeChar(text[scheme - 1]))
+                scheme--;
+            if (scheme < separator
+                && char.IsLetter(text[scheme])
+                && (scheme == start || !IsUrlSchemeChar(text[scheme - 1])))
+                return scheme;
+            index = separator + 3;
+        }
+
+        return -1;
+    }
+
+    private static bool IsUrlSchemeChar(char c) =>
+        char.IsAsciiLetterOrDigit(c) || c is '+' or '-' or '.';
+
+    private static bool IsUrlAuthorityEnd(char c) =>
+        c is '/' or '?' or '#' or '"' or '\'' or '|' or ';' or '&' or '<' or '>' or '(' or ')' or '`'
+        || char.IsWhiteSpace(c);
+
+    // Curl basic-auth flags. Matching is exact, or an '=' immediately after the
+    // flag, so --user-agent is not treated as --user.
+    private static readonly string[] BasicAuthFlagNames = ["--proxy-user", "--user", "-U", "-u"];
+    private static readonly string[] AttachedUserFlagNames = ["-U", "-u"];
+
+    private static string RedactShellCredentialArguments(string text)
+    {
+        var builder = new System.Text.StringBuilder(text.Length);
+        var index = 0;
+        while (index < text.Length)
+        {
+            if (char.IsWhiteSpace(text[index]))
+            {
+                builder.Append(text[index]);
+                index++;
+                continue;
+            }
+
+            if (!TryReadShellWord(text, index, out var word))
+                break;
+            if (IsBasicAuthFlag(word.Text))
+            {
+                builder.Append(text, word.Start, word.End - word.Start);
+                index = AppendFollowingShellValueRedacted(text, word.End, builder);
+                continue;
+            }
+
+            if (TrySplitBasicAuthAssignment(word.Text, out var flag))
+            {
+                builder.Append(flag).Append("=***");
+                index = word.End;
+                continue;
+            }
+
+            // curl accepts `-uuser:password` as one token. Require a colon in the
+            // attached value so a token such as `-update` is left unchanged.
+            if (TrySplitAttachedUserFlag(word.Text, out flag))
+            {
+                builder.Append(flag).Append(" ***");
+                index = word.End;
+                continue;
+            }
+
+            // RedactText stops at the first colon on a line, so `https:` hides a
+            // later token=value in the same command. Re-check each shell word.
+            if (TryRedactSensitiveAssignment(word.Text, out var redactedAssignment))
+            {
+                builder.Append(redactedAssignment);
+                index = word.End;
+                continue;
+            }
+
+            // npm `config set //registry/:_authToken <value>` is a sensitive key
+            // and a following word, not key=value.
+            if (SensitiveDataRedactionEnricher.IsSensitiveAssignmentKey(word.Text))
+            {
+                builder.Append(text, word.Start, word.End - word.Start);
+                index = AppendFollowingShellValueRedacted(text, word.End, builder);
+                continue;
+            }
+
+            builder.Append(text, word.Start, word.End - word.Start);
+            index = word.End;
+        }
+
+        return builder.ToString();
+    }
+
+    private static int AppendFollowingShellValueRedacted(string text, int index, System.Text.StringBuilder builder)
+    {
+        var afterKey = index;
+        while (index < text.Length && char.IsWhiteSpace(text[index]))
+        {
+            builder.Append(text[index]);
+            index++;
+        }
+
+        if (index == afterKey || index >= text.Length)
+            return index;
+        if (!TryReadShellWord(text, index, out var value))
+            return index;
+        builder.Append("***");
+        return value.End;
+    }
+
+    private static bool IsBasicAuthFlag(string word)
+    {
+        foreach (var flag in BasicAuthFlagNames)
+        {
+            if (string.Equals(word, flag, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool TrySplitBasicAuthAssignment(string word, out string flag)
+    {
+        foreach (var candidate in BasicAuthFlagNames)
+        {
+            if (word.Length > candidate.Length
+                && word[candidate.Length] == '='
+                && word.StartsWith(candidate, StringComparison.Ordinal))
+            {
+                flag = candidate;
+                return true;
+            }
+        }
+
+        flag = "";
+        return false;
+    }
+
+    private static bool TryRedactSensitiveAssignment(string word, out string redacted)
+    {
+        var schemeUrl = word.Contains("://", StringComparison.Ordinal);
+        if (word.IndexOf('=') < 0 && (schemeUrl || word.IndexOf(':') < 0))
+        {
+            redacted = "";
+            return false;
+        }
+
+        var builder = new System.Text.StringBuilder(word.Length);
+        var index = 0;
+        var changed = false;
+        while (index < word.Length)
+        {
+            var equals = word.IndexOf('=', index);
+            var colon = schemeUrl ? -1 : word.IndexOf(':', index);
+            int separator;
+            if (equals < 0)
+                separator = colon;
+            else if (colon < 0)
+                separator = equals;
+            else
+                separator = Math.Min(equals, colon);
+            if (separator < 0)
+            {
+                builder.Append(word, index, word.Length - index);
+                break;
+            }
+
+            var keyStart = separator;
+            while (keyStart > index && IsAssignmentKeyChar(word[keyStart - 1]))
+                keyStart--;
+            var key = word[keyStart..separator];
+            if (key.Length > 0 && SensitiveDataRedactionEnricher.IsSensitiveAssignmentKey(key))
+            {
+                builder.Append(word, index, separator + 1 - index);
+                builder.Append("***");
+                changed = true;
+                index = separator + 1;
+                // Query strings separate pairs with '&'. Any other assignment value
+                // runs to the end of the shell word, so a value that itself contains
+                // '&' is not left behind the marker.
+                if (word[separator] == '=' && (schemeUrl || word.Contains('?')))
+                {
+                    while (index < word.Length && word[index] != '&')
+                        index++;
+                }
+                else
+                {
+                    index = word.Length;
+                }
+
+                continue;
+            }
+
+            builder.Append(word, index, separator + 1 - index);
+            index = separator + 1;
+        }
+
+        redacted = changed ? builder.ToString() : "";
+        return changed;
+    }
+
+    private static bool IsAssignmentKeyChar(char c) =>
+        char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '-';
+
+    private static bool TrySplitAttachedUserFlag(string word, out string flag)
+    {
+        foreach (var candidate in AttachedUserFlagNames)
+        {
+            if (word.Length > candidate.Length + 1
+                && word.StartsWith(candidate, StringComparison.Ordinal)
+                && word.IndexOf(':', candidate.Length) > candidate.Length)
+            {
+                flag = candidate;
+                return true;
+            }
+        }
+
+        flag = "";
+        return false;
+    }
+
+    private readonly struct ShellWord(int start, int end, string text)
+    {
+        public int Start { get; } = start;
+        public int End { get; } = end;
+        public string Text { get; } = text;
+    }
+
+    private static bool TryReadShellWord(string text, int index, out ShellWord word)
+    {
+        if (index >= text.Length || char.IsWhiteSpace(text[index]))
+        {
+            word = new ShellWord(index, index, "");
+            return false;
+        }
+
+        var start = index;
+        if (text[index] is '"' or '\'')
+        {
+            var quote = text[index];
+            index++;
+            var contentStart = index;
+            while (index < text.Length && text[index] != quote)
+                index++;
+            var content = text.Substring(contentStart, index - contentStart);
+            if (index < text.Length)
+                index++;
+            word = new ShellWord(start, index, content);
+            return true;
+        }
+
+        while (index < text.Length && !char.IsWhiteSpace(text[index]))
+            index++;
+        word = new ShellWord(start, index, text.Substring(start, index - start));
+        return true;
     }
 
     private async Task RunProvisioningWithPrivateWorkspaceAsync(

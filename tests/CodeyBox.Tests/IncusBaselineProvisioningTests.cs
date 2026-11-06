@@ -2021,6 +2021,162 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         Assert.Equal(expected, IncusSandboxProvider.TryParseExtraRuncmdProgressIndex(stdout, commandCount));
     }
 
+    [Theory]
+    [InlineData(
+        "curl -fsSL -u builder:s3cret https://user:token@registry.example/install.sh",
+        "registry.example",
+        "s3cret|builder:s3cret|user:token|token@")]
+    [InlineData(
+        "curl -fsSL -ubuilder:s3cret https://user:p@ssword1@private.example/install.sh",
+        "private.example",
+        "s3cret|p@ssword1|ssword1|user:p")]
+    [InlineData(
+        "curl --user=builder:s3cret https://example.invalid/install.sh",
+        "example.invalid",
+        "s3cret|builder:s3cret")]
+    [InlineData(
+        "curl --user builder:s3cret https://example.invalid/install.sh",
+        "example.invalid",
+        "s3cret|builder:s3cret")]
+    [InlineData(
+        "curl -u \"builder:s3cret\" https://example.invalid/install.sh",
+        "example.invalid",
+        "s3cret|builder:s3cret")]
+    [InlineData(
+        "curl \"https://example.invalid/install.sh?token=s3cret&x=1\"",
+        "x=1",
+        "s3cret")]
+    [InlineData(
+        "npm config set //registry.npmjs.org/:_authToken npm_SuperSecretValue99",
+        "_authToken",
+        "npm_SuperSecretValue99")]
+    [InlineData(
+        "npm config set //registry.npmjs.org/:_authToken=npm_SuperSecretValue99",
+        "_authToken=",
+        "npm_SuperSecretValue99")]
+    [InlineData(
+        "export NPM_TOKEN=npm_SuperSecretValue99 && echo builder:name",
+        "NPM_TOKEN=",
+        "npm_SuperSecretValue99")]
+    [InlineData(
+        "curl --user-agent CodeyBox https://example.invalid/install.sh",
+        "CodeyBox",
+        "")]
+    [InlineData(
+        "git clone git@github.com:org/repo.git",
+        "git@github.com:org/repo.git",
+        "")]
+    public void DescribeExtraRuncmdTimeout_StripsCredentialsBeforeTheyArePublished(
+        string command,
+        string kept,
+        string secrets)
+    {
+        var report = IncusSandboxProvider.DescribeExtraRuncmdTimeout(
+            [command],
+            0,
+            TimeSpan.FromSeconds(30));
+        Assert.Contains(kept, report.Command, StringComparison.Ordinal);
+        Assert.Contains(kept, report.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\n', report.Command);
+        var timeout = new IncusBaselineBakeTimeoutException(
+            report.Message,
+            new TimeoutException("deadline"));
+        var deferred = IncusSandboxProvider.TryBuildTransientProvisioningDeferral(
+            timeout,
+            new IncusSandboxOptions());
+        Assert.NotNull(deferred);
+        Assert.Equal(report.Message, deferred!.Detail);
+        var cause = IncusSandboxProvider.BuildBakeCause(timeout);
+        if (secrets.Length == 0)
+            return;
+        foreach (var secret in secrets.Split('|', StringSplitOptions.RemoveEmptyEntries))
+        {
+            Assert.DoesNotContain(secret, report.Command, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, report.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, deferred.Detail, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, deferred.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, deferred.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, cause, StringComparison.Ordinal);
+            Assert.DoesNotContain(secret, timeout.ToString(), StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task BakeExtraRuncmdTimeout_PublishesRedactedLineAndStillRunsTheCommand()
+    {
+        const string secret = "builder:s3cret";
+        var stagingRoot = Path.Combine(_root, "bake-redact-staging");
+        var time = new ControllableTimeProvider(new DateTimeOffset(2026, 11, 6, 3, 28, 0, TimeSpan.Zero));
+        IncusSandboxOptions current = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            CloudInitTimeout = TimeSpan.FromSeconds(1),
+            BakeProvisioningTimeout = TimeSpan.FromSeconds(30),
+            ExtraRuncmd =
+            [
+                "echo first-finished",
+                "curl -fsSL -u builder:s3cret https://user:token@registry.example/install.sh",
+            ],
+        };
+        var shellStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            onProvisioningShell: (_, ct) =>
+            {
+                shellStarted.TrySetResult();
+                return HangUntilCancelled(ct);
+            },
+            onBakeRuncmdProgress: _ => Task.FromResult(new ProcessRunResult(0, "1\n", string.Empty)));
+        var log = new ListLogger<IncusSandboxProvider>();
+        var provider = new IncusSandboxProvider(
+            () => current,
+            log,
+            timings: null,
+            runner,
+            timeProvider: time,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var bake = provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = current.DefaultImage,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        });
+        await shellStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        time.Advance(TimeSpan.FromSeconds(30));
+        await PumpAsync(bake);
+
+        var deferred = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() => bake);
+        Assert.Contains("registry.example", deferred.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, deferred.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("user:token", deferred.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, deferred.ToString(), StringComparison.Ordinal);
+        var blocked = provider.GetProvisioningBlockedStatus();
+        Assert.NotNull(blocked);
+        Assert.DoesNotContain(secret, blocked!.LastBakeCause, StringComparison.Ordinal);
+        Assert.DoesNotContain("user:token", blocked.LastBakeCause, StringComparison.Ordinal);
+        Assert.Contains("registry.example", blocked.DescribeOperatorReason(), StringComparison.Ordinal);
+        Assert.All(log.Lines, line =>
+        {
+            Assert.DoesNotContain(secret, line.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("user:token", line.Message, StringComparison.Ordinal);
+            if (line.Exception is not null)
+            {
+                Assert.DoesNotContain(secret, line.Exception.ToString(), StringComparison.Ordinal);
+                Assert.DoesNotContain("user:token", line.Exception.ToString(), StringComparison.Ordinal);
+            }
+        });
+        var failureLog = Assert.Single(
+            log.Lines,
+            line => line.Message.Contains("will be cleaned up", StringComparison.Ordinal));
+        Assert.Null(failureLog.Exception);
+        var shell = Assert.Single(
+            runner.Invocations,
+            invocation => invocation.Stdin?.Contains(IncusSandboxProvider.BakeExtraRuncmdProgressGuestPath, StringComparison.Ordinal) == true);
+        Assert.Contains(secret, shell.Stdin, StringComparison.Ordinal);
+        Assert.Contains("user:token@", shell.Stdin, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void ExecutableFingerprinting_UsesTheProvisioningDeadline()
     {
@@ -2211,7 +2367,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
 
     private sealed class ListLogger<T> : ILogger<T>
     {
-        public List<(LogLevel Level, string Message)> Lines { get; } = [];
+        public List<(LogLevel Level, string Message, Exception? Exception)> Lines { get; } = [];
 
         IDisposable? ILogger.BeginScope<TState>(TState state) => null;
 
@@ -2224,7 +2380,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             Exception? exception,
             Func<TState, Exception?, string> formatter)
         {
-            Lines.Add((logLevel, formatter(state, exception)));
+            Lines.Add((logLevel, formatter(state, exception), exception));
         }
     }
 
