@@ -2119,6 +2119,50 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         "git clone git@github.com:org/repo.git",
         "git@github.com:org/repo.git",
         "")]
+    [InlineData(
+        "curl \"https://user:my pass@host/repo\"",
+        "host/repo",
+        "my pass|user:my")]
+    [InlineData(
+        "curl \"https://user:\"'p&ss'\"@host/repo\"",
+        "host/repo",
+        "p&ss")]
+    [InlineData(
+        "curl -fsSL https://example.invalid/install.sh -H \"Authorization: Basic dXNlcjpwYXNz\"",
+        "example.invalid",
+        "dXNlcjpwYXNz")]
+    [InlineData(
+        "curl https://example.invalid/install.sh --header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y",
+        "example.invalid",
+        "eyJhbGciOiJIUzI1NiJ9.x.y")]
+    [InlineData(
+        "curl https://example.invalid/install.sh -H X-Api-Key: supersecret",
+        "example.invalid",
+        "supersecret")]
+    [InlineData(
+        "curl https://example.invalid/install.sh Password: supersecret",
+        "example.invalid",
+        "supersecret")]
+    [InlineData(
+        "mysql -pdbS3cret",
+        "mysql",
+        "dbS3cret")]
+    [InlineData(
+        "docker login -ps3cret",
+        "docker login",
+        "s3cret")]
+    [InlineData(
+        "curl -fp s3cret https://example.invalid/api",
+        "example.invalid",
+        "s3cret")]
+    [InlineData(
+        "curl --oauth2-bearer s3cret https://example.invalid/api",
+        "example.invalid",
+        "s3cret")]
+    [InlineData(
+        "curl --oauth2-bearer=s3cret https://example.invalid/api",
+        "example.invalid",
+        "s3cret")]
     public void DescribeExtraRuncmdTimeout_StripsCredentialsBeforeTheyArePublished(
         string command,
         string kept,

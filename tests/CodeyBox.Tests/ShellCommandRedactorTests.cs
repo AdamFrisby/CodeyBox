@@ -78,6 +78,63 @@ public sealed class ShellCommandRedactorTests
         "curl --user-agent CodeyBox https://example.invalid/install.sh")]
     [InlineData("curl -update archive", "curl -update archive")]
     [InlineData("git clone git@github.com:org/repo.git", "git clone git@github.com:org/repo.git")]
+    [InlineData(
+        "curl \"https://user:my pass@host/repo\"",
+        "curl \"https://***@host/repo\"")]
+    [InlineData(
+        "curl 'https://user:my pass@host/repo'",
+        "curl 'https://***@host/repo'")]
+    [InlineData(
+        "curl \"https://user:\"'p&ss'\"@host/repo\"",
+        "curl \"https://***@host/repo\"")]
+    [InlineData(
+        "curl https://user:\"p&ss\"@host/repo",
+        "curl https://***@host/repo")]
+    [InlineData(
+        "curl \"https://user:my secret@host/repo\" extra",
+        "curl \"https://***@host/repo\" extra")]
+    [InlineData("echo \"hello\"'world'", "echo \"hello\"'world'")]
+    [InlineData(
+        "curl -fsSL https://example.invalid/install.sh -H \"Authorization: Basic dXNlcjpwYXNz\"",
+        "curl -fsSL https://example.invalid/install.sh -H \"Authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/install.sh -H \"Authorization:\" Bearer s3cret",
+        "curl https://example.invalid/install.sh -H \"Authorization:\" *** ***")]
+    [InlineData(
+        "curl https://example.invalid/install.sh -H \"Authorization: Basic\" dXNlcjpwYXNz",
+        "curl https://example.invalid/install.sh -H \"Authorization: ***\" ***")]
+    [InlineData(
+        "curl https://example.invalid/install.sh Authorization:Basic dXNlcjpwYXNz",
+        "curl https://example.invalid/install.sh Authorization:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/install.sh --header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y extra",
+        "curl https://example.invalid/install.sh --header Authorization: *** *** extra")]
+    [InlineData(
+        "curl https://example.invalid/install.sh -H \"Authorization:Bearer\" dXNlcjpwYXNz",
+        "curl https://example.invalid/install.sh -H \"Authorization:***\" ***")]
+    [InlineData(
+        "curl https://example.invalid/install.sh -H X-Api-Key: supersecret",
+        "curl https://example.invalid/install.sh -H X-Api-Key: ***")]
+    [InlineData(
+        "curl https://example.invalid/install.sh Password: supersecret extra",
+        "curl https://example.invalid/install.sh Password: *** extra")]
+    [InlineData("mysql -ppassword dbname", "mysql -p *** dbname")]
+    [InlineData("docker login -ps3cret registry.example", "docker login -p *** registry.example")]
+    [InlineData(
+        "curl -fp s3cret https://example.invalid/api",
+        "curl -fp *** https://example.invalid/api")]
+    [InlineData(
+        "curl -ps3cret https://example.invalid/api",
+        "curl -p *** https://example.invalid/api")]
+    [InlineData(
+        "curl -fps3cret https://example.invalid/api",
+        "curl -fp *** https://example.invalid/api")]
+    [InlineData(
+        "curl --oauth2-bearer s3cret https://example.invalid/api",
+        "curl --oauth2-bearer *** https://example.invalid/api")]
+    [InlineData(
+        "curl --oauth2-bearer=s3cret https://example.invalid/api",
+        "curl --oauth2-bearer=*** https://example.invalid/api")]
     public void Redact_RemovesShellCredentials(string command, string expected)
     {
         var redacted = ShellCommandRedactor.Redact(command);
@@ -94,5 +151,18 @@ public sealed class ShellCommandRedactorTests
         Assert.Equal("", ShellCommandRedactor.Redact(""));
         Assert.Equal("", EmbeddedUrlUserInfo.Strip(null));
         Assert.Equal("", EmbeddedUrlUserInfo.StripToken(null));
+    }
+
+    [Fact]
+    public void Redact_StripsSpacedUserInfoAtTheQuoteDepthCap()
+    {
+        var command = "https://user:my pass@host/repo";
+        for (var i = 0; i <= ShellCommandRedactor.MaxQuotedCommandDepth; i++)
+            command = "\"" + command.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+
+        var redacted = ShellCommandRedactor.Redact(command);
+        Assert.DoesNotContain("my pass", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("user:my", redacted, StringComparison.Ordinal);
+        Assert.Contains("https://***@host/repo", redacted, StringComparison.Ordinal);
     }
 }
