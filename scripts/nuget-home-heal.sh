@@ -804,80 +804,78 @@ codeybox_heal_nuget_home() {
         # admission. The cli home is verified private storage above.
         #
         # Make the heal idempotent and race-free under parallel MSBuild:
-        # 1. Destructive repair (quarantine/rename) is skipped when
-        #    CODEYBOX_NO_DESTRUCTIVE_REPAIR=1 (e.g. from a per-project InitialTarget).
-        # 2. Quarantine runs at most once per build via a marker file under $TMPDIR.
-        # 3. An exclusive lock under $TMPDIR coordinates concurrent processes, so
+        # 1. Per-project InitialTargets are suppressed via _CodeyBoxInSolution in
+        #    MSBuild during solution builds, so destructive repair runs at most
+        #    once at the solution level before restore.
+        # 2. Quarantine runs at most once per build via a marker file in private storage.
+        # 3. An exclusive lock in private storage coordinates concurrent processes, so
         #    a concurrent node never renames a directory another node may be reading.
         # 4. Never create more than one quarantine directory per invocation.
-        if [ "${CODEYBOX_NO_DESTRUCTIVE_REPAIR:-0}" = "1" ]; then
-            : # Destructive repair disallowed; fall through to redirect
+        _codeybox_quarantine_marker="$_codeybox_cli_home/.codeybox-quarantine.done"
+        _codeybox_quarantine_lock="$_codeybox_cli_home/.codeybox-quarantine.lock"
+
+        if [ -f "$_codeybox_quarantine_marker" ]; then
+            # Quarantine already ran in this build. If home is usable now, return 0;
+            # otherwise fall through to redirect without renaming again.
+            if _codeybox_ensure_nuget_home_usable \
+                "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+                rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                return 0
+            fi
         else
-            _codeybox_home_slug="$(printf '%s' "$_codeybox_cli_home" | tr -c '[:alnum:]' '_' | tail -c 64)"
-            _codeybox_quarantine_marker="${TMPDIR:-/tmp}/.codeybox-quarantine-${_codeybox_euid}-${_codeybox_home_slug}.done"
-            _codeybox_quarantine_lock="${TMPDIR:-/tmp}/.codeybox-quarantine-${_codeybox_euid}-${_codeybox_home_slug}.lock"
-
-            if [ -f "$_codeybox_quarantine_marker" ]; then
-                # Quarantine already ran in this build. If home is usable now, return 0;
-                # otherwise fall through to redirect without renaming again.
-                if _codeybox_ensure_nuget_home_usable \
-                    "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                    rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
-                    return 0
+            _codeybox_lock_acquired=0
+            _codeybox_lock_attempts=0
+            _codeybox_lock_max_attempts=100
+            while [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_max_attempts" ]; do
+                if mkdir "$_codeybox_quarantine_lock" 2>/dev/null; then
+                    _codeybox_lock_acquired=1
+                    break
                 fi
-            else
-                _codeybox_lock_acquired=0
-                _codeybox_lock_attempts=0
-                while [ "$_codeybox_lock_attempts" -lt 100 ]; do
-                    if mkdir "$_codeybox_quarantine_lock" 2>/dev/null; then
-                        _codeybox_lock_acquired=1
-                        break
-                    fi
-                    sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
-                    _codeybox_lock_attempts=$((_codeybox_lock_attempts + 1))
-                    if [ -f "$_codeybox_quarantine_marker" ]; then
-                        break
-                    fi
-                done
-
-                # Re-check under lock (or after waiting): another node may have already healed it.
-                if _codeybox_ensure_nuget_home_usable \
-                    "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                    rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
-                    if [ "$_codeybox_lock_acquired" -eq 1 ]; then
-                        rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
-                    fi
-                    return 0
+                sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
+                _codeybox_lock_attempts=$((_codeybox_lock_attempts + 1))
+                if [ -f "$_codeybox_quarantine_marker" ]; then
+                    break
                 fi
+            done
 
-                if [ ! -f "$_codeybox_quarantine_marker" ]; then
-                    : > "$_codeybox_quarantine_marker" 2>/dev/null || true
-                    _codeybox_quarantine="$_codeybox_nuget_root.codeybox-unwritable.$$"
-                    _codeybox_quarantined=0
-                    if { [ ! -e "$_codeybox_nuget_root" ] && [ ! -L "$_codeybox_nuget_root" ]; }; then
-                        _codeybox_quarantined=1
-                    elif mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
-                        _codeybox_quarantined=1
-                        echo "nuget-home self-heal: quarantined unusable $_codeybox_nuget_root to $_codeybox_quarantine" >&2
-                    fi
-
-                    if [ "$_codeybox_quarantined" -eq 1 ]; then
-                        if _codeybox_ensure_nuget_home_usable \
-                            "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                            rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
-                            _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
-                                "$_codeybox_quarantine/packages"
-                            if [ "$_codeybox_lock_acquired" -eq 1 ]; then
-                                rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
-                            fi
-                            return 0
-                        fi
-                    fi
-                fi
-
+            # Re-check under lock (or after waiting): another node may have already healed it.
+            if _codeybox_ensure_nuget_home_usable \
+                "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+                rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
                 if [ "$_codeybox_lock_acquired" -eq 1 ]; then
                     rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
                 fi
+                return 0
+            fi
+
+            if [ "$_codeybox_lock_acquired" -eq 1 ] && [ ! -f "$_codeybox_quarantine_marker" ]; then
+                _codeybox_quarantine="$_codeybox_nuget_root.codeybox-unwritable.$$"
+                _codeybox_quarantined=0
+                if { [ ! -e "$_codeybox_nuget_root" ] && [ ! -L "$_codeybox_nuget_root" ]; }; then
+                    _codeybox_quarantined=1
+                elif mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
+                    _codeybox_quarantined=1
+                    echo "nuget-home self-heal: quarantined unusable $_codeybox_nuget_root to $_codeybox_quarantine" >&2
+                fi
+
+                if [ "$_codeybox_quarantined" -eq 1 ]; then
+                    if _codeybox_ensure_nuget_home_usable \
+                        "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+                        rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                        _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
+                            "$_codeybox_quarantine/packages"
+                        : > "$_codeybox_quarantine_marker" 2>/dev/null || true
+                        if [ "$_codeybox_lock_acquired" -eq 1 ]; then
+                            rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                        fi
+                        return 0
+                    fi
+                fi
+                : > "$_codeybox_quarantine_marker" 2>/dev/null || true
+            fi
+
+            if [ "$_codeybox_lock_acquired" -eq 1 ]; then
+                rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
             fi
         fi
     fi

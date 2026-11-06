@@ -61,9 +61,10 @@ Under parallel MSBuild, destructive repair is strictly race-free:
 1. In a solution build, repair is performed once at the solution level
    (`Directory.Solution.props`) before restore dispatches to projects, so per-project
    InitialTargets never run destructive renames during parallel restore/build.
-2. The quarantine path is guarded by an advisory lock and a completion marker under
-   `$TMPDIR`, ensuring at most one quarantine directory is created per build and
-   preventing concurrent nodes from renaming directories another node is reading.
+2. The quarantine path is guarded by an advisory lock and a completion marker in
+   verified private user storage (`$DOTNET_CLI_HOME` / `$HOME`), ensuring at most one
+   quarantine directory is created per build and preventing concurrent nodes from
+   renaming directories another node is reading.
 
 A `BeforeTargets="Restore"` target is *not* early enough: solution restore
 aborts during graph construction, before any project's `Restore` chain runs. Nor

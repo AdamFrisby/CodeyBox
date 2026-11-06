@@ -41,6 +41,21 @@ public sealed class MsBuildNuGetHealTests
         Assert.True(result.Success, result.Stderr);
     }
 
+    private static async Task SetUmask002PermissionsAsync(
+        string nugetHome,
+        string packages,
+        string nugetDir,
+        string marker,
+        string config)
+    {
+        await ChmodAsync("0775", nugetHome);
+        await ChmodAsync("0775", Path.Combine(nugetHome, "packages"));
+        await ChmodAsync("0775", packages);
+        await ChmodAsync("0775", nugetDir);
+        await ChmodAsync("0664", marker);
+        await ChmodAsync("0664", config);
+    }
+
     // Locate a `dotnet` host to drive the fixture build with. Prefer the host
     // running this test (the same SDK the gates use), then DOTNET_ROOT, then PATH.
     // Returns null only when none resolves, so the test skips rather than
@@ -123,10 +138,22 @@ public sealed class MsBuildNuGetHealTests
         string tmpDir,
         string? nugetHomeUnderTest = null)
     {
+        // Seed NuGet's applied-migration marker under the test home: without it,
+        // dotnet CLI first-use takes the "NuGet-Migrations" named mutex before
+        // MSBuild starts, which fails under concurrent first-run execution.
+        var markerDir = Path.Combine(home, ".local", "share", "NuGet", "Migrations");
+        Directory.CreateDirectory(markerDir);
+        var markerPath = Path.Combine(markerDir, "1");
+        if (!File.Exists(markerPath))
+        {
+            File.WriteAllText(markerPath, string.Empty);
+        }
+
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["HOME"] = home,
             ["DOTNET_CLI_HOME"] = home,
+            ["XDG_RUNTIME_DIR"] = home,
             ["PATH"] = dotnetDir + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             ["TMPDIR"] = tmpDir,
             ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
@@ -312,12 +339,7 @@ public sealed class MsBuildNuGetHealTests
         await File.WriteAllTextAsync(config, "<configuration/>");
 
         // Linux umask 002: group-writable tree owned by current UID
-        await ChmodAsync("0775", nugetHome);
-        await ChmodAsync("0775", Path.Combine(nugetHome, "packages"));
-        await ChmodAsync("0775", packages);
-        await ChmodAsync("0775", nugetDir);
-        await ChmodAsync("0664", marker);
-        await ChmodAsync("0664", config);
+        await SetUmask002PermissionsAsync(nugetHome, packages, nugetDir, marker, config);
 
         await CreateProjectAsync(projectDir, healTargets);
         var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
@@ -449,12 +471,7 @@ public sealed class MsBuildNuGetHealTests
             var config = Path.Combine(nugetDir, "NuGet.Config");
             await File.WriteAllTextAsync(config, "<configuration/>");
 
-            await ChmodAsync("0775", nugetHealthy);
-            await ChmodAsync("0775", Path.Combine(nugetHealthy, "packages"));
-            await ChmodAsync("0775", packages);
-            await ChmodAsync("0775", nugetDir);
-            await ChmodAsync("0664", marker);
-            await ChmodAsync("0664", config);
+            await SetUmask002PermissionsAsync(nugetHealthy, packages, nugetDir, marker, config);
 
             var envHealthy = CreateBuildEnv(dotnetDir, homeHealthy, root, nugetHealthy);
             var t1Healthy = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj1, "proj.csproj"), offline1, envHealthy);
