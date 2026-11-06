@@ -27,6 +27,19 @@ public sealed class IncusSandboxOptionsTests
     }
 
     [Fact]
+    public void Validate_RejectsNonPositiveBakeProvisioningTimeout()
+    {
+        var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions
+        {
+            BakeProvisioningTimeout = TimeSpan.Zero,
+        });
+
+        Assert.Contains(
+            errors,
+            error => error.StartsWith("BakeProvisioningTimeout", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Validate_RejectsMaxReadinessPollIntervalBelowBase()
     {
         var errors = IncusSandboxOptions.Validate(new IncusSandboxOptions

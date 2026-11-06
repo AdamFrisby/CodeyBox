@@ -1448,7 +1448,8 @@ internal static class WorkItemEndpoints
                     lastFailureAt = blocked.LastFailureAt,
                     consecutiveFailures = blocked.ConsecutiveFailures,
                     lastBakeCause = blocked.LastBakeCause,
-                    reason = $"no usable baseline; all provisioning blocked since {blocked.BlockedSince:R}; last bake failure: {blocked.LastBakeCause}",
+                    condition = blocked.Condition,
+                    reason = blocked.DescribeOperatorReason(),
                 }
                 : null,
             refactorGates = refactorGates.Select(g => new

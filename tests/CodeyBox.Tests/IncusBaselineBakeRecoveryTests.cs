@@ -153,6 +153,7 @@ public sealed class IncusBaselineBakeRecoveryTests : IDisposable
         var blocked = provider.GetProvisioningBlockedStatus();
         Assert.NotNull(blocked);
         Assert.Equal(3, blocked!.ConsecutiveFailures);
+        Assert.Equal(BaselineProvisioningBlockedStatus.BakeFailedCondition, blocked.Condition);
         Assert.True(blocked.BlockedSince <= blocked.LastFailureAt);
         Assert.Contains(BakeCauseMarker, blocked.LastBakeCause, StringComparison.Ordinal);
 
@@ -246,8 +247,45 @@ public sealed class IncusBaselineBakeRecoveryTests : IDisposable
             Assert.Equal(JsonValueKind.Object, blocked.ValueKind);
             Assert.Contains("boom-cause-9", blocked.GetProperty("lastBakeCause").GetString(), StringComparison.Ordinal);
             Assert.Contains("no usable baseline", blocked.GetProperty("reason").GetString(), StringComparison.Ordinal);
+            Assert.Equal(
+                BaselineProvisioningBlockedStatus.BakeFailedCondition,
+                blocked.GetProperty("condition").GetString());
             Assert.Equal(4, blocked.GetProperty("consecutiveFailures").GetInt32());
         }
+
+        factory.Blocked.Current = new BaselineProvisioningBlockedStatus
+        {
+            BlockedSince = new DateTimeOffset(2026, 11, 6, 3, 28, 0, TimeSpan.Zero),
+            Provider = "incus",
+            BaselineName = "cb-incus-baseline-internet-only-headless-7be66f65e0c3",
+            LastBakeCause = "baseline bake timing out after 300s while running ExtraRuncmd line 4 of 6: curl -fsSL https://example.invalid/cursor",
+            ConsecutiveFailures = 2,
+            LastFailureAt = new DateTimeOffset(2026, 11, 6, 4, 0, 0, TimeSpan.Zero),
+            Condition = BaselineProvisioningBlockedStatus.BakeTimingOutCondition,
+        };
+        using (var timingOut = await client.GetAsync("/queue/status"))
+        {
+            Assert.Equal(HttpStatusCode.OK, timingOut.StatusCode);
+            using var doc = JsonDocument.Parse(await timingOut.Content.ReadAsStringAsync());
+            var blocked = doc.RootElement.GetProperty("provisioningBlocked");
+            Assert.Equal(
+                BaselineProvisioningBlockedStatus.BakeTimingOutCondition,
+                blocked.GetProperty("condition").GetString());
+            Assert.StartsWith(
+                "baseline bake timing out",
+                blocked.GetProperty("reason").GetString(),
+                StringComparison.Ordinal);
+        }
+
+        var alert = new BaselineProvisioningBlockedNotificationBuilder(factory.Blocked)
+            .Build(new DateTimeOffset(2026, 11, 6, 4, 1, 0, TimeSpan.Zero));
+        Assert.Equal("Baseline bake timing out", alert.Title);
+        Assert.Contains("baseline bake timing out", alert.Summary, StringComparison.Ordinal);
+        var fields = alert.Fields;
+        Assert.NotNull(fields);
+        Assert.Equal(
+            BaselineProvisioningBlockedStatus.BakeTimingOutCondition,
+            fields["condition"]);
 
         factory.Blocked.Current = null;
         using (var resp = await client.GetAsync("/queue/status"))

@@ -49,14 +49,32 @@ public sealed class BaselineProvisioningBlockedNotificationBuilder : INotificati
         var since = status?.BlockedSince.ToString("R") ?? evaluatedAt.ToString("R");
         var cause = string.IsNullOrWhiteSpace(status?.LastBakeCause) ? "(unknown bake failure)" : status!.LastBakeCause;
         var failures = status?.ConsecutiveFailures.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "1";
+        var timingOut = string.Equals(
+            status?.Condition,
+            BaselineProvisioningBlockedStatus.BakeTimingOutCondition,
+            StringComparison.Ordinal);
+        var condition = timingOut
+            ? BaselineProvisioningBlockedStatus.BakeTimingOutCondition
+            : BaselineProvisioningBlockedStatus.BakeFailedCondition;
+        var title = timingOut
+            ? "Baseline bake timing out"
+            : "No usable baseline — all provisioning blocked";
+        var summary = timingOut
+            ? $"baseline bake timing out since {since}; last bake failure: {cause}"
+            : $"No usable baseline; all provisioning blocked since {since}; last bake failure: {cause}";
+        var body = timingOut
+            ? $"At {evaluatedAt:R}, the baseline bake is timing out since {since} " +
+              $"({failures} consecutive bake failure(s)). Last bake failure: {cause}. " +
+              "Raise CodeyBox:Incus:BakeProvisioningTimeout (it is read at the start of the next bake) or fix the ExtraRuncmd line named in the failure; provisioning retries automatically."
+            : $"At {evaluatedAt:R}, no usable baseline exists and all sandbox provisioning is blocked since {since} " +
+              $"({failures} consecutive bake failure(s)). Last bake failure: {cause}. " +
+              "Fix the bake failure (see sandbox.provisioning_deferred events for the sanitized cause), then provisioning resumes automatically.";
         return new Notification
         {
             ConditionId = BaselineProvisioningBlockedCondition.ConditionId,
-            Title = "No usable baseline — all provisioning blocked",
-            Summary = $"No usable baseline; all provisioning blocked since {since}; last bake failure: {cause}",
-            Body = $"At {evaluatedAt:R}, no usable baseline exists and all sandbox provisioning is blocked since {since} " +
-                   $"({failures} consecutive bake failure(s)). Last bake failure: {cause}. " +
-                   "Fix the bake failure (see sandbox.provisioning_deferred events for the sanitized cause), then provisioning resumes automatically.",
+            Title = title,
+            Summary = summary,
+            Body = body,
             Severity = NotificationSeverity.Critical,
             Timestamp = evaluatedAt,
             Fields = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -64,6 +82,7 @@ public sealed class BaselineProvisioningBlockedNotificationBuilder : INotificati
                 ["blockedSince"] = since,
                 ["consecutiveFailures"] = failures,
                 ["lastBakeCause"] = cause,
+                ["condition"] = condition,
                 ["provider"] = status?.Provider ?? "unknown",
                 ["baseline"] = status?.BaselineName ?? "unknown",
             },
