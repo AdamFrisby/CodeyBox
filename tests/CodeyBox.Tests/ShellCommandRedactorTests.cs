@@ -1,3 +1,4 @@
+using System.Text;
 using CodeyBox.Core;
 
 namespace CodeyBox.Tests;
@@ -113,11 +114,65 @@ public sealed class ShellCommandRedactorTests
         "curl https://example.invalid/install.sh -H \"Authorization:Bearer\" dXNlcjpwYXNz",
         "curl https://example.invalid/install.sh -H \"Authorization:***\" ***")]
     [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: Token s3cret\" kept",
+        "curl https://example.invalid/api -H \"Authorization: *** ***\" kept")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"authorization: token s3cret\"",
+        "curl https://example.invalid/api -H \"authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: Bot bot-secret\"",
+        "curl https://example.invalid/api -H \"Authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: OAuth oauth-secret\"",
+        "curl https://example.invalid/api -H \"Authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: DPoP dpop-secret\"",
+        "curl https://example.invalid/api -H \"Authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: AWS4-HMAC-SHA256 Credential=localkey\"",
+        "curl https://example.invalid/api -H \"Authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: NotAListedScheme s3cret\" kept",
+        "curl https://example.invalid/api -H \"Authorization: *** ***\" kept")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Proxy-Authorization: Token s3cret\"",
+        "curl https://example.invalid/api -H \"Proxy-Authorization: *** ***\"")]
+    [InlineData(
+        "curl https://example.invalid/api Authorization:Token s3cret",
+        "curl https://example.invalid/api Authorization:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/api Authorization:NotAListedScheme s3cret kept",
+        "curl https://example.invalid/api Authorization:*** *** kept")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: Token\" s3cret",
+        "curl https://example.invalid/api -H \"Authorization: ***\" ***")]
+    [InlineData(
+        "curl https://example.invalid/api X-Api-Key:Bearer s3cret",
+        "curl https://example.invalid/api X-Api-Key:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/api X-Api-Key:Token s3cret",
+        "curl https://example.invalid/api X-Api-Key:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/api X-Api-Key:Bot bot-secret",
+        "curl https://example.invalid/api X-Api-Key:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/api X-Api-Key:OAuth oauth-secret",
+        "curl https://example.invalid/api X-Api-Key:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/api X-Api-Key:DPoP dpop-secret",
+        "curl https://example.invalid/api X-Api-Key:*** ***")]
+    [InlineData(
+        "curl https://example.invalid/api X-Api-Key:AWS4-HMAC-SHA256 localkey",
+        "curl https://example.invalid/api X-Api-Key:*** ***")]
+    [InlineData(
         "curl https://example.invalid/install.sh -H X-Api-Key: supersecret",
         "curl https://example.invalid/install.sh -H X-Api-Key: ***")]
     [InlineData(
-        "curl https://example.invalid/install.sh Password: supersecret extra",
-        "curl https://example.invalid/install.sh Password: *** extra")]
+        "curl https://example.invalid/install.sh Password: supersecret extra kept",
+        "curl https://example.invalid/install.sh Password: *** *** kept")]
+    [InlineData(
+        "curl https://example.invalid/api && export MY_AUTHORIZATION=s3cret extra",
+        "curl https://example.invalid/api && export MY_AUTHORIZATION=*** extra")]
     [InlineData("mysql -ppassword dbname", "mysql -p *** dbname")]
     [InlineData("docker login -ps3cret registry.example", "docker login -p *** registry.example")]
     [InlineData(
@@ -154,7 +209,7 @@ public sealed class ShellCommandRedactorTests
     }
 
     [Fact]
-    public void Redact_StripsSpacedUserInfoAtTheQuoteDepthCap()
+    public void Redact_StripsSpacedUserInfoInsideDeeplyEscapedQuotes()
     {
         var command = "https://user:my pass@host/repo";
         for (var i = 0; i <= ShellCommandRedactor.MaxQuotedCommandDepth; i++)
@@ -164,5 +219,60 @@ public sealed class ShellCommandRedactorTests
         Assert.DoesNotContain("my pass", redacted, StringComparison.Ordinal);
         Assert.DoesNotContain("user:my", redacted, StringComparison.Ordinal);
         Assert.Contains("https://***@host/repo", redacted, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Redact_RedactsAuthorizationSchemeInsideNestedQuotesBelowTheCap()
+    {
+        var command = "curl https://example.invalid/api -H " + NestQuotes(
+            "Authorization: Token s3cret",
+            ShellCommandRedactor.MaxQuotedCommandDepth);
+
+        var redacted = ShellCommandRedactor.Redact(command);
+        Assert.Contains("Authorization:", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("s3cret", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("Token", redacted, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Redact_OmitsUnparsedQuoteBodyAtTheDepthCap()
+    {
+        // One more quote than the redactor will open. Escaping only '"'
+        // does not add a parser level once backslashes accumulate, so the
+        // nest has to round-trip the characters the shell decoder consumes.
+        var command = "curl https://example.invalid/api -H " + NestQuotes(
+            "Authorization: Token s3cret",
+            ShellCommandRedactor.MaxQuotedCommandDepth + 1);
+
+        var redacted = ShellCommandRedactor.Redact(command);
+        Assert.Contains("example.invalid", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("s3cret", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("Token", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain("Authorization:", redacted, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Wraps <paramref name="text"/> in <paramref name="layers"/> double-quoted
+    /// shells. Backslash, quote, and the other POSIX double-quote escapes are
+    /// encoded so each layer is a real quote the redactor opens.
+    /// </summary>
+    private static string NestQuotes(string text, int layers)
+    {
+        for (var i = 0; i < layers; i++)
+        {
+            var builder = new StringBuilder(text.Length + 8);
+            builder.Append('"');
+            foreach (var c in text)
+            {
+                if (c is '\\' or '"' or '$' or '`' or '\n')
+                    builder.Append('\\');
+                builder.Append(c);
+            }
+
+            builder.Append('"');
+            text = builder.ToString();
+        }
+
+        return text;
     }
 }

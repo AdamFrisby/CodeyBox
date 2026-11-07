@@ -2136,6 +2136,18 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         "example.invalid",
         "eyJhbGciOiJIUzI1NiJ9.x.y")]
     [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: Token s3cret\"",
+        "example.invalid",
+        "s3cret")]
+    [InlineData(
+        "curl https://example.invalid/api -H \"Authorization: NotAListedScheme s3cret\"",
+        "example.invalid",
+        "s3cret|NotAListedScheme")]
+    [InlineData(
+        "curl https://example.invalid/api Authorization:NotAListedScheme s3cret",
+        "example.invalid",
+        "s3cret|NotAListedScheme")]
+    [InlineData(
         "curl https://example.invalid/install.sh -H X-Api-Key: supersecret",
         "example.invalid",
         "supersecret")]

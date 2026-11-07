@@ -18,17 +18,21 @@ namespace CodeyBox.Core;
 /// is removed from that decoded word with
 /// <see cref="EmbeddedUrlUserInfo.StripToken"/> before the word is scanned
 /// again, so a space or a sub-delimiter inside a password stays inside the
-/// userinfo. A sensitive key with no in-word value redacts the following
-/// word, and one more when that word is an HTTP auth scheme. Quoted text is
-/// the same command language and is scrubbed with the same rules, bounded by
-/// <see cref="MaxQuotedCommandDepth"/>.
+/// userinfo. A sensitive key with no in-word value redacts the next word
+/// and the word after it: the first may be an auth scheme whose name is not
+/// a closed list, and stopping after a recognized scheme left the credential
+/// in the line. A colon value on an Authorization header is that scheme
+/// even when the name is unknown. Quoted text is the same command language
+/// and is scrubbed with the same rules, bounded by
+/// <see cref="MaxQuotedCommandDepth"/>. At that cap the unparsed body is
+/// replaced so a nested secret is not copied through.
 /// </remarks>
 public static class ShellCommandRedactor
 {
     /// <summary>
-    /// Quote nesting this redactor will open. Deeper quotes still have URL
-    /// userinfo stripped with <see cref="EmbeddedUrlUserInfo.StripToken"/>,
-    /// and the unparsed remainder is kept.
+    /// Quote nesting this redactor will open. A deeper quote is not parsed.
+    /// Its body is replaced with <c>***</c> rather than copied, so a secret
+    /// past this depth cannot reach an operator-visible message.
     /// </summary>
     public const int MaxQuotedCommandDepth = 8;
 
@@ -45,12 +49,31 @@ public static class ShellCommandRedactor
         "-p",
     ];
 
+    // Exact scheme tokens. Authorization headers do not consult this list;
+    // a colon value there always consumes the next word. The list still
+    // matters for other sensitive keys whose value is a known scheme
+    // (X-Api-Key:Bearer secret).
+    private static readonly string[] HttpAuthSchemes =
+    [
+        "Basic",
+        "Bearer",
+        "Digest",
+        "Negotiate",
+        "NTLM",
+        "Token",
+        "Bot",
+        "OAuth",
+        "DPoP",
+        "AWS4-HMAC-SHA256",
+    ];
+
     /// <summary>
     /// Redacts URL userinfo, credential flags (including an attached <c>-p</c>
     /// and <c>--oauth2-bearer</c>), npm <c>_auth</c> values, and sensitive
     /// assignments in <paramref name="command"/>. A sensitive key with no
-    /// in-word value redacts the next word, plus one more when that word is
-    /// an HTTP auth scheme.
+    /// in-word value redacts the next two words. An Authorization header
+    /// also redacts the word after an in-word scheme, whether or not that
+    /// scheme is one of the known names.
     /// </summary>
     public static string Redact(string? command)
     {
@@ -121,26 +144,38 @@ public static class ShellCommandRedactor
 
     private static int AppendQuotedWord(string text, ShellWord word, StringBuilder builder, int depth)
     {
-        // Strip userinfo on the decoded word before the inner scan. A quoted
-        // password may contain spaces; splitting first would separate that
-        // password from the '@' that closes userinfo. At the depth cap the
-        // inside of the quote is not parsed, but userinfo is still removed.
-        var stripped = EmbeddedUrlUserInfo.StripToken(word.Decoded);
-        var inner = depth >= MaxQuotedCommandDepth
-            ? stripped
-            : RedactWords(stripped, depth + 1);
-        if (string.Equals(inner, word.Decoded, StringComparison.Ordinal))
-            builder.Append(text, word.Start, word.End - word.Start);
-        else if (word.Quote != '\0')
-            builder.Append(Quote(inner, word.Quote));
+        if (depth >= MaxQuotedCommandDepth)
+        {
+            // Another quote level would pass the cap. Userinfo stripping
+            // alone leaves an unparsed secret in place when it finds no
+            // userinfo, and re-emitting the original slice then publishes
+            // that secret. Omit the body.
+            if (word.Quote != '\0')
+                builder.Append(Quote("***", word.Quote));
+            else
+                builder.Append("***");
+        }
         else
-            builder.Append(inner);
+        {
+            // Strip userinfo on the decoded word before the inner scan. A
+            // quoted password may contain spaces; splitting first would
+            // separate that password from the '@' that closes userinfo.
+            var stripped = EmbeddedUrlUserInfo.StripToken(word.Decoded);
+            var inner = RedactWords(stripped, depth + 1);
+            if (string.Equals(inner, word.Decoded, StringComparison.Ordinal))
+                builder.Append(text, word.Start, word.End - word.Start);
+            else if (word.Quote != '\0')
+                builder.Append(Quote(inner, word.Quote));
+            else
+                builder.Append(inner);
+        }
 
         // Following-word checks use the raw decoded word, not the scrubbed
         // body. A spaceless word containing a sensitive fragment (NPM_TOKEN)
         // still consumes the next word outside this quote. Whitespace means
         // the quote is a script; those words are handled by the inner scan
-        // below the depth cap.
+        // below the depth cap. At the cap the body is already omitted; a
+        // bare key still blanks the words that follow the quote.
         var outside = OutsideHeaderSecretNeed(word.Decoded);
         if (outside == OutsideHeaderNeed.SchemeAndSecret)
             return AppendFollowingHeaderValue(text, word.End, builder, schemeAlreadyConsumed: false);
@@ -160,10 +195,14 @@ public static class ShellCommandRedactor
         StringBuilder builder,
         bool schemeAlreadyConsumed)
     {
+        // The next word is the secret, or an auth scheme followed by the
+        // secret. Scheme names are an open set (Token, Bot, DPoP, and
+        // names this process has not seen). Blank the following word too
+        // whenever one is present, instead of trusting a fixed list.
         if (!schemeAlreadyConsumed)
         {
-            index = AppendRedactedFollowingWord(text, index, builder, out var scheme);
-            if (scheme is null || !IsHttpAuthScheme(scheme))
+            index = AppendRedactedFollowingWord(text, index, builder, out var first);
+            if (first is null)
                 return index;
         }
 
@@ -354,8 +393,9 @@ public static class ShellCommandRedactor
     /// <summary>
     /// A sensitive key whose secret is a following shell word. The key may
     /// stand alone (<c>Authorization</c>, <c>Password:</c>) or already contain
-    /// only an auth scheme (<c>Authorization:Bearer</c>). An in-word secret
-    /// that is not a scheme is left for <see cref="TryRedactSensitiveAssignment"/>.
+    /// a scheme (<c>Authorization:Bearer</c>, or any colon value on an
+    /// Authorization header). An in-word secret that is not a scheme on
+    /// some other key is left for <see cref="TryRedactSensitiveAssignment"/>.
     /// </summary>
     private static bool TryGetPendingHeaderSecret(string word, out int separatorEnd, out bool schemeEmbedded)
     {
@@ -394,11 +434,19 @@ public static class ShellCommandRedactor
         separatorEnd = separator + 1;
         if (value.Length == 0)
             return true;
-        if (!IsHttpAuthScheme(value))
-            return false;
 
-        schemeEmbedded = true;
-        return true;
+        // Authorization:Bearer still has the credential in the next word.
+        // Any colon value on an Authorization header is treated as the
+        // scheme, so an unrecognized name cannot leave that credential.
+        // Other keys do this only for a known scheme; a non-scheme value
+        // is the secret and is redacted in the word.
+        if (IsHttpAuthScheme(value) || (word[separator] == ':' && IsAuthorizationHeaderKey(key)))
+        {
+            schemeEmbedded = true;
+            return true;
+        }
+
+        return false;
     }
 
     private static bool TryAppendPendingHeaderSecret(string text, ShellWord word, StringBuilder builder, out int end)
@@ -422,9 +470,10 @@ public static class ShellCommandRedactor
     }
 
     /// <summary>
-    /// The quoted word itself is only a sensitive key, or a key plus an auth
-    /// scheme, so the secret is the next word outside the quotes. A longer
-    /// quote already holds that secret and the inner scan redacts it.
+    /// The quoted word is a sensitive key, or a key plus one word. Words
+    /// after the quote are blanked, because that one word may be an
+    /// unrecognized scheme and the next word the credential. A longer quote
+    /// is a script; the inner scan redacts it below the depth cap.
     /// </summary>
     private static OutsideHeaderNeed OutsideHeaderSecretNeed(string decoded)
     {
@@ -440,17 +489,29 @@ public static class ShellCommandRedactor
             return parts.Length == 1 ? OutsideHeaderNeed.SecretOnly : OutsideHeaderNeed.None;
         if (parts.Length == 1)
             return OutsideHeaderNeed.SchemeAndSecret;
-        if (IsHttpAuthScheme(parts[1]))
-            return OutsideHeaderNeed.SecretOnly;
-        return OutsideHeaderNeed.None;
+        // The quote holds the key and one following word. That word may be
+        // the secret or an unrecognized scheme; blank the word outside too.
+        return OutsideHeaderNeed.SecretOnly;
     }
 
-    private static bool IsHttpAuthScheme(string word) =>
-        word.Equals("Basic", StringComparison.OrdinalIgnoreCase)
-        || word.Equals("Bearer", StringComparison.OrdinalIgnoreCase)
-        || word.Equals("Digest", StringComparison.OrdinalIgnoreCase)
-        || word.Equals("Negotiate", StringComparison.OrdinalIgnoreCase)
-        || word.Equals("NTLM", StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// HTTP <c>Authorization</c> and names that end with it
+    /// (<c>Proxy-Authorization</c>, <c>HTTP_AUTHORIZATION</c>). A colon
+    /// value on these keys is the scheme token, not a closed list.
+    /// </summary>
+    private static bool IsAuthorizationHeaderKey(string key) =>
+        key.EndsWith("Authorization", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsHttpAuthScheme(string word)
+    {
+        foreach (var scheme in HttpAuthSchemes)
+        {
+            if (word.Equals(scheme, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
 
     private static bool TryRedactSensitiveAssignment(string word, out string redacted)
     {
