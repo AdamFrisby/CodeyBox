@@ -628,16 +628,19 @@ public sealed partial class PipelineRunner
             current.Id, "transition-delegation-to-work-complete", ct, async transitionCt =>
             {
                 var latest = await _store.GetAsync(current.Id, transitionCt) ?? current;
-                var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
-                    latest.With(WorkItemState.WorkComplete) with
-                    {
-                        DelegationAttempts = latest.DelegationAttempts + 1,
-                        // The turn completed: the operator note served its
-                        // purpose in this turn's brief and must not leak into
-                        // a later one. A completed turn is not a failure, so
-                        // the delegation-failure flag is untouched.
-                        DelegationNote = null,
-                    },
+                var next = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
+                    WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                        latest.With(WorkItemState.WorkComplete) with
+                        {
+                            DelegationAttempts = latest.DelegationAttempts + 1,
+                            // The turn completed: the operator note served its
+                            // purpose in this turn's brief and must not leak into
+                            // a later one. A completed turn is not a failure, so
+                            // the delegation-failure flag is untouched.
+                            DelegationNote = null,
+                        },
+                        latest.State,
+                        WorkItemState.WorkComplete),
                     latest.State,
                     WorkItemState.WorkComplete);
                 await _store.UpdateAsync(next, transitionCt);

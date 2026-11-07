@@ -559,7 +559,7 @@ public sealed partial class PipelineRunner
 
             var auditVerdict = blocking.Count == 0 ? AuditVerdict.Pass : AuditVerdict.Fail;
             await PublishAuditCompletedAsync(item, project, iteration, auditVerdict, auditPhaseStart, ct);
-            await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+            await ResetProgressCountersAfterRealProgressEventAsync(
                 item.Id,
                 RecoveryProgressEvent.AuditVerdictProduced,
                 "audit-verdict-produced",
@@ -1201,7 +1201,7 @@ public sealed partial class PipelineRunner
     {
         await PublishIterationCompletedAsync(item, project, IterationPhase.Rework, reworkIterationNumber,
             repoId, workBranch, reworkStart, ct);
-        await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+        await ResetProgressCountersAfterRealProgressEventAsync(
             item.Id,
             RecoveryProgressEvent.AuditReworkCompleted,
             "audit-rework-completed",

@@ -925,6 +925,99 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal("approved", preserved.PlanReviewSummary);
     }
 
+    [Theory]
+    [InlineData(WorkItemState.PlanApproved)]
+    [InlineData(WorkItemState.WorkComplete)]
+    [InlineData(WorkItemState.AuditPassed)]
+    [InlineData(WorkItemState.Merged)]
+    [InlineData(WorkItemState.Done)]
+    public void ResetTransientRetryBudgetAfterRealProgress_ClearsWindowOnCompletionStates(WorkItemState toState)
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-50);
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            TransientRetryAttempts = 1,
+            TransientRetryFirstFailedAt = firstFailedAt,
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
+            item, fromState: WorkItemState.Auditing, toState: toState);
+
+        Assert.Equal(0, reset.TransientRetryAttempts);
+        Assert.Null(reset.TransientRetryFirstFailedAt);
+    }
+
+    [Theory]
+    [InlineData(WorkItemState.Queued)]
+    [InlineData(WorkItemState.Working)]
+    [InlineData(WorkItemState.Auditing)]
+    [InlineData(WorkItemState.Reworking)]
+    [InlineData(WorkItemState.Merging)]
+    [InlineData(WorkItemState.WaitingForTransientRetry)]
+    public void ResetTransientRetryBudgetAfterRealProgress_PreservesWindowWithoutProgress(WorkItemState toState)
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var item = MakeItem(WorkItemState.Queued) with
+        {
+            TransientRetryAttempts = 1,
+            TransientRetryFirstFailedAt = firstFailedAt,
+        };
+
+        var preserved = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
+            item, fromState: WorkItemState.Queued, toState: toState);
+
+        Assert.Equal(1, preserved.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, preserved.TransientRetryFirstFailedAt);
+    }
+
+    [Theory]
+    [InlineData(RecoveryProgressEvent.AuditVerdictProduced)]
+    [InlineData(RecoveryProgressEvent.AuditReworkCompleted)]
+    [InlineData(RecoveryProgressEvent.PostActReworkCompleted)]
+    [InlineData(RecoveryProgressEvent.ConflictReworkBranchAdvanced)]
+    public void ResetTransientRetryBudgetAfterRealProgressEvent_ClearsWindowOnProgressEvent(
+        RecoveryProgressEvent progressEvent)
+    {
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-40),
+        };
+
+        var reset = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgressEvent(item, progressEvent);
+
+        Assert.Equal(0, reset.TransientRetryAttempts);
+        Assert.Null(reset.TransientRetryFirstFailedAt);
+    }
+
+    [Fact]
+    public void ResetTransientRetryBudget_IsIdentityWhenWindowAlreadyEmpty()
+    {
+        var item = MakeItem(WorkItemState.Auditing);
+
+        Assert.Same(item, item.ResetTransientRetryBudget());
+    }
+
+    [Fact]
+    public void ResetTransientRetryBudget_PreservesParkSchedule()
+    {
+        var retryAt = DateTimeOffset.UtcNow.AddMinutes(2);
+        var item = MakeItem(WorkItemState.Auditing) with
+        {
+            TransientRetryAttempts = 1,
+            TransientRetryFirstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-3),
+            NextTransientRetryAt = retryAt,
+            TransientRetryFrom = "audit",
+        };
+
+        var reset = item.ResetTransientRetryBudget();
+
+        Assert.Equal(0, reset.TransientRetryAttempts);
+        Assert.Null(reset.TransientRetryFirstFailedAt);
+        Assert.Equal(retryAt, reset.NextTransientRetryAt);
+        Assert.Equal("audit", reset.TransientRetryFrom);
+    }
+
     private static WorkItem MakeItem(WorkItemState state) => new()
     {
         Id = WorkItemId.New(),

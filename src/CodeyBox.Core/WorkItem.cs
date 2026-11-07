@@ -194,7 +194,12 @@ public sealed record WorkItem
 
     /// <summary>
     /// First failure timestamp in the current transient transport retry series.
-    /// Used to cap total elapsed retry time across orchestrator restarts.
+    /// Starts a new window on every transient park; cleared when the retried
+    /// phase makes demonstrable progress (a retried agent/auditor run
+    /// completes or the item advances to a later phase), so productive work
+    /// between two unrelated blips never counts toward the elapsed cap.
+    /// Consecutive failures with no progress in between keep this stamp and
+    /// keep counting toward both caps.
     /// </summary>
     public DateTimeOffset? TransientRetryFirstFailedAt { get; init; }
 
@@ -925,6 +930,22 @@ public sealed record WorkItem
         BaselineImageRef is null || BaselineImageAgent == agent
             ? this
             : this with { BaselineImageRef = null, BaselineImageAgent = null };
+
+    /// <summary>
+    /// Returns a copy with the transient auto-retry budget window cleared: a
+    /// fresh <see cref="TransientRetryAttempts"/> count and no
+    /// <see cref="TransientRetryFirstFailedAt"/> stamp, so the next transient
+    /// park starts a new elapsed series. The park schedule itself
+    /// (<see cref="NextTransientRetryAt"/>, <see cref="TransientRetryFrom"/>)
+    /// is untouched: callers invoke this on demonstrable progress in an
+    /// active phase, where no retry is scheduled. Identity-preserving when
+    /// the window is already empty, so progress sites may apply it
+    /// unconditionally.
+    /// </summary>
+    public WorkItem ResetTransientRetryBudget() =>
+        TransientRetryAttempts == 0 && TransientRetryFirstFailedAt is null
+            ? this
+            : this with { TransientRetryAttempts = 0, TransientRetryFirstFailedAt = null };
 
     public WorkItem With(
         WorkItemState state,

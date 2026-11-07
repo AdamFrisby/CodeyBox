@@ -605,7 +605,7 @@ public sealed partial class PipelineRunner
             // re-check against the new work-branch tip. Refresh so the next
             // re-check sees any state mutations made by the rework path
             // (e.g. concurrent prompt edit captured by RunAgentPhaseAsync).
-            await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+            await ResetProgressCountersAfterRealProgressEventAsync(
                 item.Id,
                 RecoveryProgressEvent.PostActReworkCompleted,
                 "post-act-rework-completed",

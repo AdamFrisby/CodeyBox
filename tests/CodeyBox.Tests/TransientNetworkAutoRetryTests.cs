@@ -747,6 +747,128 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
+    public async Task SecondTransientAfterProgressAnd70Minutes_RetriesWithFreshWindow()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromMinutes(2),
+            MaxDelay = TimeSpan.FromMinutes(2),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem();
+        await fixture.Store.CreateAsync(item);
+
+        await fixture.Scheduler.NotifyTransientFailureAsync(item);
+
+        _time.Advance(TimeSpan.FromMinutes(1));
+        var parked = (await fixture.Store.GetAsync(item.Id))! with
+        {
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+        };
+        await fixture.Store.UpdateAsync(parked);
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(retried);
+        Assert.Equal(WorkItemState.Queued, retried!.State);
+        Assert.Equal(1, retried.TransientRetryAttempts);
+
+        // The retried attempt resumes the audit phase. Entering the running
+        // phase preserves the window (consecutive failures must keep
+        // counting), but the auditor run then produces a verdict — same-phase
+        // demonstrable progress persisted through the pipeline's
+        // progress-event path — which closes the window. Seventy minutes of
+        // productive work then elapse, past the original one-hour window.
+        var auditing = retried.With(WorkItemState.Auditing);
+        await fixture.Store.UpdateAsync(auditing);
+        var resumed = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(resumed);
+        Assert.Equal(1, resumed!.TransientRetryAttempts);
+        var progressed = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgressEvent(
+            resumed, RecoveryProgressEvent.AuditVerdictProduced);
+        await fixture.Store.UpdateAsync(progressed);
+        var cleared = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(cleared);
+        Assert.Equal(0, cleared!.TransientRetryAttempts);
+        Assert.Null(cleared.TransientRetryFirstFailedAt);
+        _time.Advance(TimeSpan.FromMinutes(70));
+
+        var failedAgain = cleared.With(
+            WorkItemState.WaitingForTransientRetry,
+            "Agent claude reported unrelated transient transport failure",
+            failureKind: "transient");
+        await fixture.Store.UpdateAsync(failedAgain);
+
+        await fixture.Scheduler.NotifyTransientFailureAsync(failedAgain);
+
+        var rescheduled = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(rescheduled);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, rescheduled!.State);
+        Assert.Equal("transient", rescheduled.FailureKind);
+        Assert.NotNull(rescheduled.NextTransientRetryAt);
+        Assert.Equal(_time.GetUtcNow(), rescheduled.TransientRetryFirstFailedAt);
+        Assert.Equal(0, rescheduled.TransientRetryAttempts);
+    }
+
+    [Fact]
+    public async Task RepeatedTransientsWithoutProgress_ExhaustViaAttemptsCap()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(1),
+            MaxDelay = TimeSpan.FromSeconds(1),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 3,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem();
+        await fixture.Store.CreateAsync(item);
+
+        // Three rapid park → retry cycles with no progress in between.
+        for (var cycle = 0; cycle < 3; cycle++)
+        {
+            var current = await fixture.Store.GetAsync(item.Id);
+            Assert.NotNull(current);
+            await fixture.Scheduler.NotifyTransientFailureAsync(current!);
+            var due = (await fixture.Store.GetAsync(item.Id))! with
+            {
+                NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            };
+            await fixture.Store.UpdateAsync(due);
+            await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+            var retried = await fixture.Store.GetAsync(item.Id);
+            Assert.NotNull(retried);
+            Assert.Equal(WorkItemState.Queued, retried!.State);
+            Assert.Equal(cycle + 1, retried.TransientRetryAttempts);
+
+            var failedAgain = retried.With(
+                WorkItemState.WaitingForTransientRetry,
+                $"Agent claude reported transient transport failure #{cycle + 2}",
+                failureKind: "transient");
+            await fixture.Store.UpdateAsync(failedAgain);
+            _time.Advance(TimeSpan.FromSeconds(1));
+        }
+
+        var currentFinal = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(currentFinal);
+        await fixture.Scheduler.NotifyTransientFailureAsync(currentFinal!);
+
+        var exhausted = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(exhausted);
+        Assert.Equal("transient-exhausted", exhausted!.FailureKind);
+        Assert.Equal(3, exhausted.TransientRetryAttempts);
+        Assert.Null(exhausted.NextTransientRetryAt);
+        Assert.Contains("attempts=3; max=3", exhausted.LastError);
+    }
+
+    [Fact]
     public async Task PeriodicSweep_DoesNotRetryFutureDueTransientFailure()
     {
         using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions

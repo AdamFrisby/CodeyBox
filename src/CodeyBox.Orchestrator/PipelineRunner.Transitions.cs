@@ -71,6 +71,18 @@ public sealed partial class PipelineRunner
                 current.With(state),
                 current.State,
                 state);
+            // A phase completion also closes the transient retry window: the
+            // next transient park starts a new elapsed series instead of
+            // inheriting wall-clock from an unrelated earlier blip.
+            // (WorkItem.With already drops the window for most completion
+            // targets; this enforces it uniformly for the preserved ones
+            // such as PlanApproved.) No-op for dispatch/running targets, so
+            // consecutive failures without progress keep counting toward
+            // both caps.
+            next = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
+                next,
+                current.State,
+                state);
             await _store.UpdateAsync(next, transitionCt);
             await EmitTransitionSideEffectsAsync(next, state, project, transitionCt);
         });
@@ -180,21 +192,33 @@ public sealed partial class PipelineRunner
         }
     }
 
-    private async Task ResetRecoveryAttemptsAfterRealProgressEventAsync(
+    /// <summary>
+    /// Persists durable in-phase progress: clears the dead-worker recovery
+    /// counters when the event matches the recovery source, and always
+    /// closes the transient auto-retry window (a produced audit verdict, a
+    /// completed rework turn, or an advanced conflict branch proves the
+    /// retried run did real work, so the next transient park starts a new
+    /// elapsed series). Both resets share one read-modify-write so neither
+    /// is lost to the other.
+    /// </summary>
+    private async Task ResetProgressCountersAfterRealProgressEventAsync(
         WorkItemId itemId,
         RecoveryProgressEvent progressEvent,
         string progressLabel,
         CancellationToken ct)
     {
-        await RunBoundedPostAgentAsync(itemId, $"reset-recovery-attempts-{progressLabel}", ct, async transitionCt =>
+        await RunBoundedPostAgentAsync(itemId, $"reset-progress-counters-{progressLabel}", ct, async transitionCt =>
         {
             var current = await _store.GetAsync(itemId, transitionCt);
-            if (current is null || current.RecoveryAttempts == 0)
+            if (current is null)
                 return;
 
             var next = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgressEvent(current, progressEvent);
+            next = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgressEvent(next, progressEvent);
             if (next.RecoveryAttempts == current.RecoveryAttempts
-                && next.RecoveryAttemptSourceState == current.RecoveryAttemptSourceState)
+                && next.RecoveryAttemptSourceState == current.RecoveryAttemptSourceState
+                && next.TransientRetryAttempts == current.TransientRetryAttempts
+                && next.TransientRetryFirstFailedAt == current.TransientRetryFirstFailedAt)
             {
                 return;
             }
