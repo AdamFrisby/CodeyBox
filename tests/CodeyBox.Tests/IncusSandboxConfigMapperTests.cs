@@ -549,6 +549,51 @@ public sealed class IncusSandboxConfigMapperTests
     }
 
     [Fact]
+    public void CodeyBoxOptions_BindsIncusBakeProvisioningTimeout()
+    {
+        Assert.Equal(TimeSpan.FromMinutes(20), IncusSandboxOptions.DefaultBakeProvisioningTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(20), new IncusSandboxConfig().BakeProvisioningTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(20), new IncusSandboxOptions().BakeProvisioningTimeout);
+        Assert.Equal(IncusSandboxOptions.DefaultVmStartTimeout, new IncusSandboxOptions().CloudInitTimeout);
+
+        var unset = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Incus:BinaryPath"] = "incus",
+            })
+            .Build()
+            .GetSection("CodeyBox")
+            .Get<CodeyBoxOptions>();
+        Assert.NotNull(unset);
+        Assert.Equal(TimeSpan.FromMinutes(20), unset.Incus.BakeProvisioningTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(5), unset.Incus.CloudInitTimeout);
+
+        var bound = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["CodeyBox:Incus:BakeProvisioningTimeout"] = "00:17:00",
+            })
+            .Build()
+            .GetSection("CodeyBox")
+            .Get<CodeyBoxOptions>();
+        Assert.NotNull(bound);
+        Assert.Equal(TimeSpan.FromMinutes(17), bound.Incus.BakeProvisioningTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(5), bound.Incus.CloudInitTimeout);
+
+        var options = CreateOptions();
+        options.Incus.BakeProvisioningTimeout = bound.Incus.BakeProvisioningTimeout;
+        var mapped = IncusSandboxConfigMapper.Build(options);
+        Assert.Equal(TimeSpan.FromMinutes(17), mapped.BakeProvisioningTimeout);
+        Assert.Equal(IncusSandboxOptions.DefaultVmStartTimeout, mapped.CloudInitTimeout);
+        Assert.Empty(IncusSandboxOptions.Validate(mapped with
+        {
+            ProjectName = "codeybox-tests",
+            StagingDirectory = null,
+            DiskGuard = null,
+        }));
+    }
+
+    [Fact]
     public void Build_MapsAgentExecTailKnobs()
     {
         var mapped = IncusSandboxConfigMapper.Build(CreateOptions());

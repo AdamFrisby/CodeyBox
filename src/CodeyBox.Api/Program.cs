@@ -5689,8 +5689,16 @@ namespace CodeyBox.Api
         /// <summary>Deadline for a graceful VM stop.</summary>
         public TimeSpan VmStopTimeout { get; set; } = Defaults.VmStopTimeout;
 
-        /// <summary>Deadline for cloud-init to finish inside a newly booted VM.</summary>
+        /// <summary>Deadline for cloud-init to finish inside a newly booted VM. Does not bound ExtraRuncmd.</summary>
         public TimeSpan CloudInitTimeout { get; set; } = Defaults.CloudInitTimeout;
+
+        /// <summary>
+        /// Deadline for the ExtraRuncmd provisioning script on a baseline bake
+        /// and on a full launch. Read live when that script starts, so an edit
+        /// applies to the next bake without a process restart. Independent of
+        /// <see cref="CloudInitTimeout"/> and <see cref="VmStartTimeout"/>.
+        /// </summary>
+        public TimeSpan BakeProvisioningTimeout { get; set; } = Defaults.BakeProvisioningTimeout;
 
         /// <summary>Deadline for a virtiofs mount to become usable in the guest.</summary>
         public TimeSpan MountReadyTimeout { get; set; } = Defaults.MountReadyTimeout;

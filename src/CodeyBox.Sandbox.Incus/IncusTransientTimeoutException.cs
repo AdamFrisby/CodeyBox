@@ -11,10 +11,12 @@ namespace CodeyBox.Sandbox.Incus;
 /// <para>
 /// Derives from <see cref="TimeoutException"/> so callers that only distinguish
 /// timeouts keep working; <see cref="Operation"/> names the incus subcommand or
-/// lifecycle step that hung so operators can see which call stalled.
+/// lifecycle step that hung so operators can see which call stalled. The type
+/// is unsealed so a baseline-bake deadline can stay in this family (and keep
+/// the transient retry) while carrying its own error class.
 /// </para>
 /// </summary>
-internal sealed class IncusTransientTimeoutException : TimeoutException
+internal class IncusTransientTimeoutException : TimeoutException
 {
     public IncusTransientTimeoutException(string operation, string message, Exception? innerException = null)
         : base(message, innerException)
@@ -29,4 +31,20 @@ internal sealed class IncusTransientTimeoutException : TimeoutException
     /// deadline elapsed. Never contains untrusted argument values.
     /// </summary>
     public string Operation { get; }
+}
+
+/// <summary>
+/// The baseline bake's ExtraRuncmd script exceeded
+/// <see cref="IncusSandboxOptions.BakeProvisioningTimeout"/>. Distinct from a
+/// guest-agent or generic CLI liveness timeout so operators can see a wedged
+/// bake instead of a boot-storm deferral.
+/// </summary>
+internal sealed class IncusBaselineBakeTimeoutException : IncusTransientTimeoutException
+{
+    public const string ErrorClass = "incus-baseline-bake-timeout";
+
+    public IncusBaselineBakeTimeoutException(string message, Exception innerException)
+        : base("baseline bake", message, innerException)
+    {
+    }
 }

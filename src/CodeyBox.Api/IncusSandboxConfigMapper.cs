@@ -63,6 +63,7 @@ internal static class IncusSandboxConfigMapper
             VmStartTimeout = incus.VmStartTimeout,
             VmStopTimeout = incus.VmStopTimeout,
             CloudInitTimeout = incus.CloudInitTimeout,
+            BakeProvisioningTimeout = incus.BakeProvisioningTimeout,
             MountReadyTimeout = incus.MountReadyTimeout,
             ReadinessPollInterval = incus.ReadinessPollInterval,
             MaxReadinessPollInterval = incus.MaxReadinessPollInterval,

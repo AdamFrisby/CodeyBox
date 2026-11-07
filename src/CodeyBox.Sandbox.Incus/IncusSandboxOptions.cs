@@ -16,6 +16,12 @@ public sealed record IncusSandboxOptions
     public static readonly TimeSpan DefaultExecTimeout = TimeSpan.FromHours(6);
     public static readonly TimeSpan DefaultImageProvisioningTimeout = TimeSpan.FromMinutes(30);
     public static readonly TimeSpan DefaultVmStartTimeout = TimeSpan.FromMinutes(5);
+    /// <summary>
+    /// Default deadline for one ExtraRuncmd provisioning script. Sized for a
+    /// real baseline bake (package installs plus agent CLIs), not for the
+    /// cloud-init wait.
+    /// </summary>
+    public static readonly TimeSpan DefaultBakeProvisioningTimeout = TimeSpan.FromMinutes(20);
     public static readonly TimeSpan DefaultVmStopTimeout = TimeSpan.FromMinutes(2);
     public static readonly TimeSpan DefaultReadinessPollInterval = TimeSpan.FromSeconds(1);
     public static readonly TimeSpan DefaultMaxReadinessPollInterval = TimeSpan.FromSeconds(5);
@@ -170,7 +176,20 @@ public sealed record IncusSandboxOptions
     public TimeSpan ImageProvisioningTimeout { get; init; } = DefaultImageProvisioningTimeout;
     public TimeSpan VmStartTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan VmStopTimeout { get; init; } = DefaultVmStopTimeout;
+    /// <summary>
+    /// Deadline for cloud-init to finish inside a newly booted VM.
+    /// Does not bound <see cref="ExtraRuncmd"/>; that script uses
+    /// <see cref="BakeProvisioningTimeout"/>.
+    /// </summary>
     public TimeSpan CloudInitTimeout { get; init; } = DefaultVmStartTimeout;
+    /// <summary>
+    /// Deadline for the ExtraRuncmd provisioning script on a baseline bake and
+    /// on a full launch. Read from the live options accessor when the script
+    /// starts, so an operator edit applies to the next bake without a process
+    /// restart. Independent of <see cref="CloudInitTimeout"/> and
+    /// <see cref="VmStartTimeout"/>.
+    /// </summary>
+    public TimeSpan BakeProvisioningTimeout { get; init; } = DefaultBakeProvisioningTimeout;
     public TimeSpan MountReadyTimeout { get; init; } = DefaultVmStartTimeout;
     public TimeSpan ReadinessPollInterval { get; init; } = DefaultReadinessPollInterval;
     /// <summary>
@@ -366,6 +385,7 @@ public sealed record IncusSandboxOptions
         RequirePositiveDuration(options.VmStartTimeout, nameof(VmStartTimeout), errors);
         RequirePositiveDuration(options.VmStopTimeout, nameof(VmStopTimeout), errors);
         RequirePositiveDuration(options.CloudInitTimeout, nameof(CloudInitTimeout), errors);
+        RequirePositiveDuration(options.BakeProvisioningTimeout, nameof(BakeProvisioningTimeout), errors);
         RequirePositiveDuration(options.MountReadyTimeout, nameof(MountReadyTimeout), errors);
         RequirePositiveDuration(options.ReadinessPollInterval, nameof(ReadinessPollInterval), errors);
         RequirePositiveDuration(options.MaxReadinessPollInterval, nameof(MaxReadinessPollInterval), errors);

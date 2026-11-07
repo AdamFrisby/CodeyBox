@@ -107,7 +107,10 @@ first-boot writes into a host directory.
 
 Generated cloud-init is sent to Incus through `user.user-data` over stdin.
 `ExtraRuncmd` is likewise executed as a bounded stdin script after cloud-init;
-it is never placed in process argv. Before the immutable `ready` snapshot is
+it is never placed in process argv. The script's deadline is
+`Incus:BakeProvisioningTimeout` (20 minutes by default), read again when the
+script starts so an edit applies without restarting. `CloudInitTimeout` bounds
+only the cloud-init wait. Before the immutable `ready` snapshot is
 created, the provider replaces user-data with an empty cloud config and runs
 `cloud-init clean --logs --machine-id`, preventing bake logs and first-boot
 state from entering every clone. `ExtraCloudInit` is still operator-visible

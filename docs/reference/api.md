@@ -1381,6 +1381,12 @@ Returns global queue pause state plus active refactor project gates.
 fresh same-project non-refactor starts so existing work can finish, and
 `locked` while the refactor itself is in flight.
 
+When baseline provisioning is blocked, `provisioningBlocked` is an object
+rather than null. `condition` is `baseline-bake-timeout` while the bake's
+`ExtraRuncmd` step is exceeding `Incus:BakeProvisioningTimeout` (the `reason`
+then starts with "baseline bake timing out"); other bake failures use
+`baseline-bake-failed`.
+
 ### `POST /projects/{id}/queue/pause`
 
 Manually pause work-item pickup for a single project. In-flight items continue to completion.

@@ -9,6 +9,15 @@ namespace CodeyBox.Core;
 /// </summary>
 public sealed record BaselineProvisioningBlockedStatus
 {
+    /// <summary>A bake failed for a reason other than the provisioning-script deadline.</summary>
+    public const string BakeFailedCondition = "baseline-bake-failed";
+
+    /// <summary>
+    /// The baseline bake's ExtraRuncmd script exceeded its provisioning deadline.
+    /// Operator-facing text for this condition is "baseline bake timing out".
+    /// </summary>
+    public const string BakeTimingOutCondition = "baseline-bake-timeout";
+
     /// <summary>When the current consecutive-failure streak started.</summary>
     public required DateTimeOffset BlockedSince { get; init; }
 
@@ -26,6 +35,21 @@ public sealed record BaselineProvisioningBlockedStatus
 
     /// <summary>When the most recent bake failure was observed.</summary>
     public required DateTimeOffset LastFailureAt { get; init; }
+
+    /// <summary>
+    /// Operator-facing condition id. <see cref="BakeTimingOutCondition"/> when
+    /// the bake's provisioning commands exceeded their deadline; otherwise
+    /// <see cref="BakeFailedCondition"/>.
+    /// </summary>
+    public string Condition { get; init; } = BakeFailedCondition;
+
+    /// <summary>
+    /// Single-line reason for queue status and other operator surfaces.
+    /// </summary>
+    public string DescribeOperatorReason() =>
+        string.Equals(Condition, BakeTimingOutCondition, StringComparison.Ordinal)
+            ? $"baseline bake timing out since {BlockedSince:R}; last bake failure: {LastBakeCause}"
+            : $"no usable baseline; all provisioning blocked since {BlockedSince:R}; last bake failure: {LastBakeCause}";
 }
 
 /// <summary>
@@ -55,30 +79,44 @@ public sealed class BaselineProvisioningBlockedTracker : IBaselineProvisioningBl
         DateTimeOffset FirstBlockedAt,
         DateTimeOffset LastFailureAt,
         string Provider,
-        string LastBakeCause);
+        string LastBakeCause,
+        string Condition);
 
     public BaselineProvisioningBlockedTracker(TimeProvider? timeProvider = null)
     {
         _time = timeProvider ?? TimeProvider.System;
     }
 
-    /// <summary>Records one bake failure for <paramref name="baselineName"/>.</summary>
-    public void RecordFailure(string provider, string baselineName, string bakeCause)
+    /// <summary>
+    /// Records one bake failure for <paramref name="baselineName"/>.
+    /// <paramref name="condition"/> is kept only when it is
+    /// <see cref="BaselineProvisioningBlockedStatus.BakeTimingOutCondition"/>;
+    /// every other value is stored as
+    /// <see cref="BaselineProvisioningBlockedStatus.BakeFailedCondition"/>.
+    /// </summary>
+    public void RecordFailure(string provider, string baselineName, string bakeCause, string? condition = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(provider);
         ArgumentException.ThrowIfNullOrWhiteSpace(baselineName);
         ArgumentException.ThrowIfNullOrWhiteSpace(bakeCause);
+        var recordedCondition = string.Equals(
+            condition,
+            BaselineProvisioningBlockedStatus.BakeTimingOutCondition,
+            StringComparison.Ordinal)
+            ? BaselineProvisioningBlockedStatus.BakeTimingOutCondition
+            : BaselineProvisioningBlockedStatus.BakeFailedCondition;
         var now = _time.GetUtcNow();
         _failures.AddOrUpdate(
             baselineName,
-            static (_, state) => new TrackerEntry(1, state.Now, state.Now, state.Provider, state.Cause),
+            static (_, state) => new TrackerEntry(1, state.Now, state.Now, state.Provider, state.Cause, state.Condition),
             static (_, existing, state) => new TrackerEntry(
                 existing.ConsecutiveFailures + 1,
                 existing.FirstBlockedAt == DateTimeOffset.MinValue ? state.Now : existing.FirstBlockedAt,
                 state.Now,
                 state.Provider,
-                state.Cause),
-            (Now: now, Provider: provider, Cause: bakeCause));
+                state.Cause,
+                state.Condition),
+            (Now: now, Provider: provider, Cause: bakeCause, Condition: recordedCondition));
     }
 
     /// <summary>Clears the failure streak for <paramref name="baselineName"/> (bake succeeded).</summary>
@@ -113,6 +151,7 @@ public sealed class BaselineProvisioningBlockedTracker : IBaselineProvisioningBl
             LastBakeCause = oldest.LastBakeCause,
             ConsecutiveFailures = oldest.ConsecutiveFailures,
             LastFailureAt = oldest.LastFailureAt,
+            Condition = oldest.Condition,
         };
     }
 }

@@ -126,6 +126,17 @@ public sealed class SensitiveDataRedactionEnricher : ILogEventEnricher
         });
     }
 
+    /// <summary>
+    /// True when <paramref name="key"/> is an assignment name whose value
+    /// <see cref="RedactText"/> blanks. The name contains a sensitive fragment
+    /// such as Token, Secret, Password, Authorization, ApiKey, or Credential.
+    /// Callers that see a shell word followed by a separate value (npm
+    /// <c>config set :_authToken VALUE</c>) use this because <see cref="RedactText"/>
+    /// only recognizes <c>key=value</c> and <c>key: value</c>.
+    /// </summary>
+    public static bool IsSensitiveAssignmentKey(string? key) =>
+        !string.IsNullOrEmpty(key) && IsSensitiveKey(key);
+
     private static bool IsSensitiveKey(string key) =>
         SensitiveKeyFragments.Any(f => key.Contains(f, StringComparison.OrdinalIgnoreCase))
         || SensitiveKeyFragments.Any(f => NormalizeKey(key).Contains(NormalizeKey(f), StringComparison.OrdinalIgnoreCase));

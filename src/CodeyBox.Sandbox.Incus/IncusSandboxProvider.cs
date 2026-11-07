@@ -90,6 +90,29 @@ public sealed class IncusSandboxProvider :
     internal const string SandboxKind = "sandbox";
     internal const string BaselineKind = "baseline";
     internal const string ReadySnapshot = "ready";
+    /// <summary>
+    /// Guest tmpfs path the ExtraRuncmd script updates before each command so a
+    /// deadline can name the line that was running. Not persisted in the
+    /// baseline snapshot.
+    /// </summary>
+    internal const string BakeExtraRuncmdProgressGuestPath = "/run/codeybox-bake-runcmd-index";
+    private const int ExtraRuncmdLogSnippetCharacters = 200;
+    private const int BakeCauseMaxCharacters = 1024;
+    // The guest file is one decimal index. Stdout fits that line; stderr is
+    // capped so a failed cat cannot buffer an unbounded guest stream.
+    private const int ExtraRuncmdProgressMaxStdoutBytes = 64;
+    private const int ExtraRuncmdProgressMaxStderrBytes = 1024;
+    /// <summary>
+    /// How many exception wrappers bake-cause collection and bake-timeout
+    /// classification follow. One bound so a timeout nested in an aggregate
+    /// is classified the same way its message is collected.
+    /// </summary>
+    private const int BakeCauseWalkMaxDepth = 4;
+    // Operator hint stored on the timeout exception, which is the bake cause
+    // queue status and notifications already display. Notifications must not
+    // restate the Incus option name themselves.
+    private const string BakeProvisioningTimeoutRemediation =
+        "Raise CodeyBox:Incus:BakeProvisioningTimeout (it is read at the start of the next bake) or fix the ExtraRuncmd line named in the failure; provisioning retries automatically.";
 
     private readonly Func<IncusSandboxOptions> _optionsAccessor;
     private readonly ILogger<IncusSandboxProvider> _log;
@@ -396,7 +419,7 @@ public sealed class IncusSandboxProvider :
             }
             if (!canUseBaseline)
             {
-                await RunExtraRuncmdAsync(options, name, ct).ConfigureAwait(false);
+                await RunExtraRuncmdAsync(options, name, ct, baselineBake: false).ConfigureAwait(false);
                 var launchSteps = launchFallbackPlan?.Steps
                     ?? throw new InvalidOperationException("A full-launch Incus VM requires a fallback provisioning plan.");
                 // Full-launch VMs provision executables without baseline
@@ -554,17 +577,18 @@ public sealed class IncusSandboxProvider :
     }
 
     /// <summary>
-    /// Re-shapes a transient Incus infrastructure fault — a liveness timeout
-    /// (guest-agent readiness or a CLI operation deadline that tripped under
-    /// concurrent boot load) or an allowlisted transient error signature
-    /// (incusd DB/storage deadline, teardown unmount race, unverifiable guest
-    /// control-file cleanup) — into a
+    /// Re-shapes a transient Incus infrastructure fault into a
     /// <see cref="SandboxProvisioningDeferredException"/> so the recovery stack
-    /// re-enqueues the work item as RETRYABLE transient infrastructure. Without
-    /// this the raw exception would reach the orchestrator's catch-all and be
-    /// stamped as an unclassified failure and parked for an operator instead
-    /// of auto-retried. Returns <c>null</c> for any non-transient failure,
-    /// which is rethrown unchanged.
+    /// re-enqueues the work item as retryable instead of parking it as an
+    /// unclassified failure. Branch order is load-bearing:
+    /// <see cref="IncusBaselineBakeTimeoutException"/> is first and is published
+    /// as <c>incus-baseline-bake-timeout</c>. That type subclasses
+    /// <see cref="IncusTransientTimeoutException"/>, so dropping this branch
+    /// would publish a bake deadline as <c>incus-liveness-timeout</c>. The
+    /// liveness branch is the remaining CLI and guest-agent deadlines. An
+    /// allowlisted signature (incusd DB/storage deadline, teardown unmount
+    /// race, unverifiable guest control-file cleanup) is last. Returns
+    /// <c>null</c> for any non-transient failure, which is rethrown unchanged.
     /// </summary>
     internal static SandboxProvisioningDeferredException? TryBuildTransientProvisioningDeferral(
         Exception ex,
@@ -572,6 +596,16 @@ public sealed class IncusSandboxProvider :
     {
         ArgumentNullException.ThrowIfNull(ex);
         ArgumentNullException.ThrowIfNull(options);
+        if (ex is IncusBaselineBakeTimeoutException bakeTimeout)
+        {
+            return new SandboxProvisioningDeferredException(
+                ProviderId,
+                bakeTimeout.Operation,
+                IncusBaselineBakeTimeoutException.ErrorClass,
+                bakeTimeout.Message,
+                options.ProvisioningRetryRecheckIn,
+                innerException: ex);
+        }
         if (ex is not IncusTransientTimeoutException transient)
         {
             var fault = IncusTransientInfrastructure.TryClassify(ex, options.TransientInfrastructureSignatures);
@@ -620,17 +654,7 @@ public sealed class IncusSandboxProvider :
         return null;
     }
 
-    private static string SingleLineDetail(Exception ex)
-    {
-        const int maxChars = 1024;
-        var message = ex.Message ?? string.Empty;
-        if (message.Length > maxChars)
-            message = message.Substring(0, maxChars);
-        var builder = new System.Text.StringBuilder(message.Length);
-        foreach (var c in message)
-            builder.Append(char.IsControl(c) ? ' ' : c);
-        return builder.ToString().Trim();
-    }
+    private static string SingleLineDetail(Exception ex) => SingleLineText(ex.Message);
 
     private async Task<ISandbox> AdoptRetainedSandboxAsync(
         SandboxSpec spec,
@@ -1665,7 +1689,7 @@ public sealed class IncusSandboxProvider :
                     [],
                     runCloudInit: true,
                     ct).ConfigureAwait(false);
-                await RunExtraRuncmdAsync(options, candidateName, ct).ConfigureAwait(false);
+                await RunExtraRuncmdAsync(options, candidateName, ct, baselineBake: true).ConfigureAwait(false);
                 await RunProvisioningWithPrivateWorkspaceAsync(
                     options,
                     candidateName,
@@ -1901,9 +1925,8 @@ public sealed class IncusSandboxProvider :
         return SingleLineText(prefix + combined);
     }
 
-    private static string SingleLineText(string? value)
+    private static string SingleLineText(string? value, int maxChars = BakeCauseMaxCharacters)
     {
-        const int maxChars = 1024;
         var message = value ?? string.Empty;
         if (message.Length > maxChars)
             message = message.Substring(0, maxChars);
@@ -1915,7 +1938,7 @@ public sealed class IncusSandboxProvider :
 
     private static void CollectBakeCauseMessages(Exception ex, List<string> parts, int depth)
     {
-        if (depth > 4 || parts.Count >= 3)
+        if (depth > BakeCauseWalkMaxDepth || parts.Count >= 3)
             return;
         if (!string.IsNullOrWhiteSpace(ex.Message))
         {
@@ -1961,6 +1984,23 @@ public sealed class IncusSandboxProvider :
     {
         var cause = BuildBakeCause(bakeFailure);
         var operation = ExtractIncusOperation(bakeFailure) ?? "baseline bake";
+        if (IsBaselineBakeTimeout(bakeFailure))
+        {
+            // The timeout message embeds the ExtraRuncmd line. ILogger renders
+            // Exception.ToString() beside the template, and the redaction enricher
+            // only rewrites string properties, so attaching the exception would
+            // publish that line a second time with no further scrub. {BakeCause}
+            // is the sanitized text and is a property.
+            _log.LogWarning(
+                "Incus baseline bake for {BaselineName} failed at {Operation}: {BakeCause}; candidate {CandidateName} will be cleaned up ({ExceptionType})",
+                baselineName,
+                operation,
+                cause,
+                candidateName,
+                bakeFailure.GetType().Name);
+            return;
+        }
+
         _log.LogWarning(
             bakeFailure,
             "Incus baseline bake for {BaselineName} failed at {Operation}: {BakeCause}; candidate {CandidateName} will be cleaned up",
@@ -1971,7 +2011,38 @@ public sealed class IncusSandboxProvider :
     }
 
     private void RecordBakeFailure(string baselineName, Exception bakeFailure) =>
-        _blockedTracker.RecordFailure(ProviderId, baselineName, BuildBakeCause(bakeFailure));
+        _blockedTracker.RecordFailure(
+            ProviderId,
+            baselineName,
+            BuildBakeCause(bakeFailure),
+            IsBaselineBakeTimeout(bakeFailure)
+                ? BaselineProvisioningBlockedStatus.BakeTimingOutCondition
+                : BaselineProvisioningBlockedStatus.BakeFailedCondition);
+
+    private static bool IsBaselineBakeTimeout(Exception ex) =>
+        IsBaselineBakeTimeout(ex, depth: 0);
+
+    private static bool IsBaselineBakeTimeout(Exception ex, int depth)
+    {
+        if (depth > BakeCauseWalkMaxDepth)
+            return false;
+        if (ex is IncusBaselineBakeTimeoutException)
+            return true;
+        if (ex is AggregateException aggregate)
+        {
+            foreach (var inner in aggregate.InnerExceptions)
+            {
+                if (IsBaselineBakeTimeout(inner, depth + 1))
+                    return true;
+            }
+
+            // InnerException on an aggregate is the first inner, already visited.
+            return false;
+        }
+
+        return ex.InnerException is { } innerException
+            && IsBaselineBakeTimeout(innerException, depth + 1);
+    }
 
     private void ClearBakeFailure(string baselineName) =>
         _blockedTracker.RecordSuccess(baselineName);
@@ -2361,25 +2432,178 @@ public sealed class IncusSandboxProvider :
     private async Task RunExtraRuncmdAsync(
         IncusSandboxOptions options,
         string name,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool baselineBake)
     {
         if (options.ExtraRuncmd.Count == 0)
             return;
-        var script = new System.Text.StringBuilder("set -eu\n");
-        foreach (var command in options.ExtraRuncmd)
+        // Commands stay on the operation snapshot: they are part of the
+        // baseline identity already hashed for this bake. The deadline is
+        // read again so an edit made after boot or cloud-init started still
+        // applies, instead of the value captured when the provider or the
+        // sandbox operation started.
+        var commands = options.ExtraRuncmd;
+        var script = BuildExtraRuncmdScript(commands);
+        var timeout = ReadLiveBakeProvisioningTimeout();
+        var started = _timeProvider.GetUtcNow();
+        try
         {
+            await _cli.RunCheckedAsync(
+                "run Incus provisioning commands",
+                options,
+                BuildRootExec(options, name, ["/bin/sh", "-s"]),
+                script,
+                timeout,
+                ct,
+                heavyOperation: false).ConfigureAwait(false);
+        }
+        catch (IncusTransientTimeoutException ex) when (baselineBake && !ct.IsCancellationRequested)
+        {
+            var elapsed = _timeProvider.GetUtcNow() - started;
+            var index = await TryReadExtraRuncmdProgressAsync(
+                options,
+                name,
+                commands.Count,
+                ct).ConfigureAwait(false);
+            var detail = DescribeExtraRuncmdTimeout(commands, index, elapsed);
+            _log.LogWarning(
+                "Incus baseline bake timing out after {ElapsedSeconds}s while running ExtraRuncmd line {LineNumber} of {LineCount}: {Command}",
+                detail.ElapsedSeconds,
+                detail.LineNumber?.ToString(CultureInfo.InvariantCulture) ?? "unknown",
+                detail.LineCount,
+                detail.Command);
+            throw new IncusBaselineBakeTimeoutException(detail.Message, ex);
+        }
+    }
+
+    private TimeSpan ReadLiveBakeProvisioningTimeout() =>
+        ReadValidatedOptions().BakeProvisioningTimeout;
+
+    private static string BuildExtraRuncmdScript(IReadOnlyList<string> commands)
+    {
+        var script = new System.Text.StringBuilder();
+        script.AppendLine("set -eu");
+        for (var i = 0; i < commands.Count; i++)
+        {
+            var command = commands[i];
             if (command.Contains('\0'))
                 throw new InvalidOperationException("Incus ExtraRuncmd cannot contain NUL.");
+            // The index is written before the command so a killed script still
+            // names the line that was in progress. The path is a fixed guest
+            // tmpfs file, not operator input.
+            script.Append("printf '%s\\n' '");
+            script.Append(i.ToString(CultureInfo.InvariantCulture));
+            script.Append("' > ");
+            script.AppendLine(BakeExtraRuncmdProgressGuestPath);
             script.AppendLine(command);
         }
-        await _cli.RunCheckedAsync(
-            "run Incus provisioning commands",
-            options,
-            BuildRootExec(options, name, ["/bin/sh", "-s"]),
-            script.ToString(),
-            options.CloudInitTimeout,
-            ct,
-            heavyOperation: false).ConfigureAwait(false);
+        return script.ToString();
+    }
+
+    private async Task<int?> TryReadExtraRuncmdProgressAsync(
+        IncusSandboxOptions options,
+        string name,
+        int commandCount,
+        CancellationToken ct)
+    {
+        if (commandCount <= 0)
+            return null;
+        try
+        {
+            var result = await _cli.RunAllowFailureAsync(
+                options,
+                BuildRootExec(options, name, ["cat", BakeExtraRuncmdProgressGuestPath]),
+                stdin: null,
+                options.OperationTimeout,
+                ct,
+                heavyOperation: false,
+                maxStdoutBytes: ExtraRuncmdProgressMaxStdoutBytes,
+                maxStderrBytes: ExtraRuncmdProgressMaxStderrBytes).ConfigureAwait(false);
+            if (!result.Success || result.StdoutLimitExceeded)
+                return null;
+            return TryParseExtraRuncmdProgressIndex(result.Stdout, commandCount);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // The bake has already missed its deadline. A failure while reading
+            // the progress file must not replace that timeout with a secondary fault.
+            _log.LogWarning(
+                ex,
+                "Incus baseline bake timed out but the ExtraRuncmd progress file could not be read ({ExceptionType})",
+                ex.GetType().Name);
+            return null;
+        }
+    }
+
+    internal readonly record struct ExtraRuncmdTimeoutReport(
+        string Message,
+        long ElapsedSeconds,
+        int? LineNumber,
+        int LineCount,
+        string Command);
+
+    internal static ExtraRuncmdTimeoutReport DescribeExtraRuncmdTimeout(
+        IReadOnlyList<string> commands,
+        int? zeroBasedIndex,
+        TimeSpan elapsed)
+    {
+        ArgumentNullException.ThrowIfNull(commands);
+        var seconds = elapsed < TimeSpan.Zero ? 0 : (long)elapsed.TotalSeconds;
+        var count = commands.Count;
+        if (zeroBasedIndex is not int index || (uint)index >= (uint)count)
+        {
+            return new ExtraRuncmdTimeoutReport(
+                $"Incus baseline bake timing out after {seconds.ToString(CultureInfo.InvariantCulture)}s during ExtraRuncmd; the running line could not be read. {BakeProvisioningTimeoutRemediation}",
+                seconds,
+                null,
+                count,
+                "(unreadable)");
+        }
+
+        var snippet = SanitizeExtraRuncmdSnippet(commands[index]);
+        var lineNumber = index + 1;
+        return new ExtraRuncmdTimeoutReport(
+            $"Incus baseline bake timing out after {seconds.ToString(CultureInfo.InvariantCulture)}s while running ExtraRuncmd line {lineNumber.ToString(CultureInfo.InvariantCulture)} of {count.ToString(CultureInfo.InvariantCulture)}: {snippet} {BakeProvisioningTimeoutRemediation}",
+            seconds,
+            lineNumber,
+            count,
+            snippet);
+    }
+
+    internal static int? TryParseExtraRuncmdProgressIndex(string? stdout, int commandCount)
+    {
+        if (commandCount <= 0 || string.IsNullOrWhiteSpace(stdout))
+            return null;
+        var text = stdout.Trim();
+        var newline = text.IndexOfAny(['\r', '\n']);
+        if (newline >= 0)
+            text = text[..newline].Trim();
+        // commandCount is the legal range, and operators cannot configure more
+        // commands than IncusSandboxOptions.MaximumExtraRuncmdCount. A separate
+        // digit-length cap would reject a later increase of that maximum.
+        // int.TryParse already rejects overflow.
+        if (text.Length == 0
+            || !int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+            return null;
+        if ((uint)index >= (uint)commandCount)
+            return null;
+        return index;
+    }
+
+    private static string SanitizeExtraRuncmdSnippet(string command)
+    {
+        // This snippet is copied into the bake-timeout exception, then into the
+        // provisioning-deferral detail (webhook), the baseline-blocked cause
+        // (queue status and notifications), and the bake-failure log property.
+        // ShellCommandRedactor removes URL userinfo and credential arguments
+        // before that text is stored. SingleLineText folds controls and caps
+        // the length with the same helper the bake cause uses.
+        var snippet = SingleLineText(ShellCommandRedactor.Redact(command), ExtraRuncmdLogSnippetCharacters);
+        return snippet.Length == 0 ? "(empty)" : snippet;
     }
 
     private async Task RunProvisioningWithPrivateWorkspaceAsync(
