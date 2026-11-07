@@ -41,6 +41,19 @@ public static class WorkItemFailureKinds
     public const string OutputBound = "output-bound";
 
     /// <summary>
+    /// A runner exhausted its bounded same-session continuations after the
+    /// model hit its per-turn output-token ceiling mid-turn (structured
+    /// stop reason <c>max_tokens</c>; see
+    /// <see cref="OutputTokenLimit"/>). The agent was cut off by a provider
+    /// ceiling — not declining to work — so this is terminally distinct
+    /// from an empty diff: downstream classifiers must never misreport it
+    /// as a generic "produced no changes" failure. Not infra-shaped: the
+    /// pipeline and the agent are healthy; retrying the same input cannot
+    /// fit either, only a task that fits the ceiling can succeed.
+    /// </summary>
+    public const string OutputLimitExhausted = "output-limit-exhausted";
+
+    /// <summary>
     /// Upstream push blocked by the owned-branch lease guard: either a third
     /// party pushed to the CodeyBox-owned work branch (lease mismatch) or the
     /// remote diverged from an unrecorded prior push. Retrying the same input

@@ -41,6 +41,7 @@ internal static class DevinAcpOutcome
         TurnError,
         Fatal,
         ModelMismatch,
+        OutputLimitExhausted,
     }
 
     internal sealed record Outcome(TerminalEvent Event, string? Diagnostic);
@@ -75,6 +76,10 @@ internal static class DevinAcpOutcome
                 case DevinAcpEnvelope.EventFatal:
                     lastEvent = TerminalEvent.Fatal;
                     lastDiagnostic = Describe("fatal", envelope.Root);
+                    break;
+                case DevinAcpEnvelope.EventOutputLimitExhausted:
+                    lastEvent = TerminalEvent.OutputLimitExhausted;
+                    lastDiagnostic = Describe("output-token limit exhausted", envelope.Root);
                     break;
             }
         }

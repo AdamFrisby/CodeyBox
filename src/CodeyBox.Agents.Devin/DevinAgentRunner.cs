@@ -157,6 +157,7 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         "devin credentials",
         MaterialiseFromSandboxEnvironmentWhenCredentialMissing: true);
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly DevinOptionsAccessor? _options;
 
     public DevinAgentRunner() : this(defaults: null) { }
 
@@ -167,8 +168,26 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// sourced from hot-reloadable config rather than a hardcoded literal.
     /// </param>
     public DevinAgentRunner(AgentDefaultsSnapshot? defaults)
+        : this(defaults, options: null)
+    {
+    }
+
+    /// <param name="defaults">
+    /// Live snapshot of per-agent default model IDs (see
+    /// <see cref="AgentDefaultsSnapshot"/>). Supplies the <c>--model</c> value
+    /// when a caller does not pass an explicit model, so the dispatch model is
+    /// sourced from hot-reloadable config rather than a hardcoded literal.
+    /// </param>
+    /// <param name="options">
+    /// Resolver for the hot-reloadable <see cref="DevinOptions"/> (bound
+    /// under <c>CodeyBox:Devin</c>). Read on every dispatch so an operator
+    /// edit lands on the next run without a restart. Null keeps the
+    /// <see cref="OutputTokenLimit.DefaultMaxContinuations"/> default.
+    /// </param>
+    public DevinAgentRunner(AgentDefaultsSnapshot? defaults, DevinOptionsAccessor? options)
     {
         _defaults = defaults;
+        _options = options;
     }
 
     public override AgentKind Kind => AgentKind.Devin;
@@ -266,7 +285,12 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         _ = captureStructuredStream;
 
         return new AgentInvocation(
-            ["bash", "-c", BuildAcpDispatchScript(AcpShimArgs(Binary, EffectiveModelId(modelId), FullAutonomyAcpMode))],
+            ["bash", "-c", BuildAcpDispatchScript(AcpShimArgs(
+                Binary,
+                EffectiveModelId(modelId),
+                FullAutonomyAcpMode,
+                MaxTokenContinuations,
+                ProviderTransientRetryPolicy.BuildTruncationContinuePrompt(phase: null)))],
             Stdin: DevinAcpShim.BuildDispatchStdin(prompt),
             StdoutIsEnvelopeFramed: true);
     }
@@ -288,14 +312,49 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         => !string.IsNullOrEmpty(modelId) ? modelId : DefaultModelId;
 
     /// <summary>
+    /// Bounded same-session continuations the shim may send after
+    /// output-limit stops before giving up: the hot-reloadable
+    /// <c>CodeyBox:Devin:MaxTokenContinuations</c> value clamped through
+    /// <see cref="OutputTokenLimit.ClampContinuations"/>. Read on every
+    /// dispatch so an operator edit lands on the next run.
+    /// </summary>
+    public int MaxTokenContinuations
+    {
+        get
+        {
+            try
+            {
+                return OutputTokenLimit.ClampContinuations(
+                    _options?.Invoke()?.MaxTokenContinuations ?? OutputTokenLimit.DefaultMaxContinuations);
+            }
+            catch (Exception)
+            {
+                return OutputTokenLimit.DefaultMaxContinuations;
+            }
+        }
+    }
+
+    /// <summary>
     /// The shim argv (after the script body) for one ACP turn.
     /// <paramref name="modelId"/> is passed verbatim to
     /// <c>devin acp --model</c> — the configured swe-2 id, never a fallback;
     /// omit when null so the account server-side default applies.
     /// <paramref name="mode"/> is applied via <c>session/set_mode</c> before
     /// the prompt (<see cref="FullAutonomyAcpMode"/> for dispatches).
+    /// <paramref name="maxTokenContinuations"/> bounds the shim's
+    /// same-session re-prompts after a <c>max_tokens</c> stop; the
+    /// continuation text travels as <paramref name="continuationPrompt"/>
+    /// (the shared <see cref="ProviderTransientRetryPolicy"/>
+    /// truncation-continue wording) so the prompt vocabulary stays in one
+    /// place instead of drifting between the C# dispatch and the shim's
+    /// fallback default.
     /// </summary>
-    internal static IReadOnlyList<string> AcpShimArgs(string binary, string? modelId, string? mode)
+    internal static IReadOnlyList<string> AcpShimArgs(
+        string binary,
+        string? modelId,
+        string? mode,
+        int maxTokenContinuations = OutputTokenLimit.DefaultMaxContinuations,
+        string? continuationPrompt = null)
     {
         var args = new List<string> { "--binary", binary };
         if (!string.IsNullOrEmpty(modelId))
@@ -307,6 +366,13 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         {
             args.Add("--mode");
             args.Add(mode);
+        }
+        args.Add("--max-token-continuations");
+        args.Add(OutputTokenLimit.ClampContinuations(maxTokenContinuations).ToString());
+        if (!string.IsNullOrEmpty(continuationPrompt))
+        {
+            args.Add("--continuation-prompt");
+            args.Add(continuationPrompt);
         }
         return args;
     }
@@ -566,12 +632,20 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
     /// Maps the exec result through the shim's terminal outcome. Two failure
     /// surfaces exist: the shim reports protocol/turn failures as typed
     /// terminal envelopes (<c>turn_error</c> / <c>model_mismatch</c> /
-    /// <c>fatal</c>), and the CLI itself reports auth/startup failures on
-    /// stderr as <c>Error: …</c> lines (verified against devin 3000.11.1:
-    /// "Error: Not logged in…" exits nonzero before ACP starts). Whichever
-    /// fired is lifted into <see cref="AgentResult.TerminalDiagnostic"/> so
-    /// the pipeline can classify it; without this a quota/auth give-up with
-    /// no file changes terminal-fails as "produced no changes".
+    /// <c>fatal</c> / <c>output_limit_exhausted</c>), and the CLI itself
+    /// reports auth/startup failures on stderr as <c>Error: …</c> lines
+    /// (verified against devin 3000.11.1: "Error: Not logged in…" exits
+    /// nonzero before ACP starts). Whichever fired is lifted into
+    /// <see cref="AgentResult.TerminalDiagnostic"/> so the pipeline can
+    /// classify it; without this a quota/auth give-up with no file changes
+    /// terminal-fails as "produced no changes". An
+    /// <c>output_limit_exhausted</c> terminal additionally stamps
+    /// <see cref="AgentResult.OutputTokenLimitExhausted"/> so the pipeline
+    /// records the distinct output-limit-exhausted failure kind instead of
+    /// quota, transient, or no-changes — the shim already spent the
+    /// configured same-session continuation bound, so parking for retry
+    /// would only burn budget re-running a task that cannot fit the
+    /// ceiling.
     /// </summary>
     private static AgentResult PostProcessAcpResult(AgentResult result)
     {
@@ -606,7 +680,11 @@ public sealed class DevinAgentRunner : CliAgentRunnerBase, IAgentDefaultModelPro
         }
 
         if (outcome.Diagnostic is { } acpFailure)
-            return result with { TerminalDiagnostic = acpFailure };
+            return result with
+            {
+                TerminalDiagnostic = acpFailure,
+                OutputTokenLimitExhausted = outcome.Event == DevinAcpOutcome.TerminalEvent.OutputLimitExhausted,
+            };
 
         if (DevinTerminalDiagnoser.TryExtractTerminalError(result.Stderr, result.Stdout) is { } terminalError)
             return result with { TerminalDiagnostic = terminalError };

@@ -144,6 +144,14 @@ public static class ProviderTransientModelSignatures
 /// refusal (<c>response truncated (model hit max output token limit)</c>).
 /// Same exact-match discipline as
 /// <see cref="ProviderTransientTransportSignatures"/>.
+/// <para>The structured stop-reason shapes are owned by
+/// <see cref="OutputTokenLimit"/> (the single source of truth for the
+/// <c>max_tokens</c> vocabulary) and referenced here so every agent's
+/// detector recognises a JSON stop-reason truncation — Devin ACP
+/// <c>turn_complete</c> envelopes, Claude stream-json result lines,
+/// Codex/agy result events, cmd <c>run_end.result</c> — without per-agent
+/// special cases. They match only the exact JSON key/value shape, so model
+/// prose quoting the bare term never matches.</para>
 /// </summary>
 public static class ProviderTransientTruncationSignatures
 {
@@ -167,6 +175,12 @@ public static class ProviderTransientTruncationSignatures
                 RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant,
                 ProviderTransientMatcher.MatchTimeout),
             "output-token-limit"),
+        new(
+            OutputTokenLimit.StructuredSnakeCaseStopReason,
+            "stop-reason-max-tokens"),
+        new(
+            OutputTokenLimit.StructuredCamelCaseStopReason,
+            "stopReason-max-tokens"),
     ];
 
     /// <summary>

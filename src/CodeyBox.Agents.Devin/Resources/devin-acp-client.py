@@ -14,11 +14,21 @@ watchdog on long turns. Envelope shape:
 
 Events: session_started, prompt_sent, session_update, notification,
 permission_auto_granted, permission_auto_cancelled, unhandled_request,
-mode_set, turn_complete, turn_error, fatal, protocol_error,
-model_mismatch.
+mode_set, token_continuation, turn_complete, output_limit_exhausted,
+turn_error, fatal, protocol_error, model_mismatch.
 
-Exit status: 0 only after a session/prompt response carrying a stopReason;
-2 for any protocol, spawn, or turn-level failure.
+A session/prompt response with stopReason "max_tokens" never ends the run:
+it means the provider's per-turn output ceiling cut the turn off mid-task.
+While --max-token-continuations lasts, the shim records a
+token_continuation envelope and re-prompts the SAME session with
+--continuation-prompt, accumulating final text across the continuations;
+when the bound is exhausted it emits output_limit_exhausted and exits 2,
+so the host classifies the outcome as output-limit-exhausted rather than a
+normal finish with no changes.
+
+Exit status: 0 only after a session/prompt response carrying a stopReason
+other than "max_tokens"; 2 for any protocol, spawn, or turn-level failure
+(including an exhausted output-limit continuation bound).
 
 Stderr is NOT inherited into the exec channel: fd 2 is retargeted to a pipe
 drained by a relay thread that re-emits every line on stdout as a
@@ -88,6 +98,23 @@ MAX_PROMPT_BYTES = 32 * 1024 * 1024
 # cannot balloon the captured file.
 MAX_FINAL_TEXT_CHARS = 256 * 1024
 FINAL_TEXT_TRUNCATION_MARKER = "[...final text truncated]"
+
+# Fallback bound for same-session continuations after a turn_complete with
+# stopReason "max_tokens" (see run_turn). Production dispatches always pass
+# --max-token-continuations explicitly from the hot-reloadable runner
+# option; this default only covers direct shim invocations (probes).
+DEFAULT_MAX_TOKEN_CONTINUATIONS = 8
+
+# Fallback continuation prompt, mirroring the host-side shared wording
+# (ProviderTransientRetryPolicy.BuildTruncationContinuePrompt). Production
+# dispatches always pass --continuation-prompt explicitly so the wording
+# stays in one place; this default only covers direct shim invocations.
+DEFAULT_CONTINUATION_PROMPT = (
+    "Your previous turn was cut off because the model hit its maximum "
+    "output token limit, so the work is incomplete. Continue exactly "
+    "where you left off and finish the remaining work. Do not restart "
+    "from the beginning and do not repeat work that is already complete."
+)
 
 # devin 3000.11.1 `chisel_server::acp` stderr WARN emitted when the
 # `devin acp --model` value does not resolve against the CLI's model
@@ -418,10 +445,27 @@ def provider_retryable(error):
     return isinstance(data, dict) and data.get("cognition.ai/retryable") is True
 
 
-def run_turn(client, prompt, cwd, mode, requested_model, model_fallback):
+def run_turn(client, prompt, cwd, mode, requested_model, model_fallback,
+             max_token_continuations=DEFAULT_MAX_TOKEN_CONTINUATIONS,
+             continuation_prompt=DEFAULT_CONTINUATION_PROMPT):
     client.requested_model = requested_model
     final_text_parts = []
     final_text_chars = 0
+    # Same-session continuations spent after output-limit stops. Each
+    # continuation re-prompts the SAME session (the session id the handshake
+    # negotiated), so the model resumes its own transcript instead of
+    # restarting the task; every continuation is recorded as a
+    # token_continuation envelope. The bound is operator-configured
+    # (--max-token-continuations); a spent bound ends the run with an
+    # output_limit_exhausted terminal envelope (exit 2) instead of
+    # misreporting a cut-off turn as a normal finish.
+    try:
+        continuation_bound = max(0, int(max_token_continuations))
+    except (TypeError, ValueError):
+        continuation_bound = DEFAULT_MAX_TOKEN_CONTINUATIONS
+    continuations_used = 0
+    if not isinstance(continuation_prompt, str) or not continuation_prompt:
+        continuation_prompt = DEFAULT_CONTINUATION_PROMPT
 
     client.request("initialize", "initialize", {
         "protocolVersion": ACP_PROTOCOL_VERSION,
@@ -544,6 +588,43 @@ def run_turn(client, prompt, cwd, mode, requested_model, model_fallback):
                 # silent success.
                 emit("fatal", stage="session/prompt",
                      message="session/prompt result did not carry a stopReason")
+                return EXIT_TURN_FAILED
+            if stop_reason == "max_tokens":
+                # The provider's per-turn output ceiling cut the turn off
+                # mid-task: never a normal finish. While the continuation
+                # bound lasts, re-prompt the SAME session with the
+                # continuation prompt and keep accumulating the turn —
+                # final text, usage ticks, and tool activity all carry on
+                # in the session the handshake negotiated. The structured
+                # model-substitution guard stays armed (a mid-turn
+                # config_option_update still aborts); the stderr WARN watch
+                # correctly stays disarmed (prompt_sent is set: fd 2
+                # carries tool stderr now). No fallback grace wait: the
+                # model already resolved for this session.
+                if continuations_used < continuation_bound:
+                    if abort_model_substitution(client, model_fallback):
+                        return EXIT_TURN_FAILED
+                    continuations_used += 1
+                    emit("token_continuation",
+                         attempt=continuations_used,
+                         maxContinuations=continuation_bound,
+                         trigger="max_tokens")
+                    session_id = client.session_id
+                    client.request("prompt", "session/prompt", {
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": continuation_prompt}],
+                    })
+                    emit("prompt_sent",
+                         promptBytes=len(continuation_prompt.encode("utf-8")),
+                         continuationAttempt=continuations_used)
+                    continue
+                emit("output_limit_exhausted",
+                     attempts=continuations_used,
+                     maxContinuations=continuation_bound,
+                     message=("turn hit the per-turn output-token ceiling "
+                              "(stopReason max_tokens) and exhausted %d "
+                              "same-session continuations; work is incomplete"
+                              % continuation_bound))
                 return EXIT_TURN_FAILED
             emit("turn_complete",
                  stopReason=stop_reason,
@@ -722,6 +803,14 @@ def parse_args(argv):
                         help="Passed verbatim to `devin acp --model`; never a fallback")
     parser.add_argument("--mode", default=None,
                         help="ACP session mode applied via session/set_mode before the prompt")
+    parser.add_argument("--max-token-continuations", type=int,
+                        default=DEFAULT_MAX_TOKEN_CONTINUATIONS,
+                        help="Same-session re-prompts after a turn_complete with "
+                             "stopReason max_tokens before giving up with "
+                             "output_limit_exhausted (0 disables continuation)")
+    parser.add_argument("--continuation-prompt", default=DEFAULT_CONTINUATION_PROMPT,
+                        help="Prompt text sent in the same session to continue a "
+                             "turn cut off by the output-token ceiling")
     return parser.parse_args(argv)
 
 
@@ -807,7 +896,9 @@ def run(args, model_fallback=None):
     install_signal_handlers(proc)
     try:
         return run_turn(AcpClient(proc), prompt, cwd, args.mode,
-                        args.model, model_fallback)
+                        args.model, model_fallback,
+                        args.max_token_continuations,
+                        args.continuation_prompt)
     except BrokenPipeError:
         emit("fatal", stage="turn",
              message="devin acp closed its stdin before the turn completed")

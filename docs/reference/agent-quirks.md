@@ -486,8 +486,9 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   kinds like `notification`/`protocol_error`/`unhandled_request`/
   `config_option_update` prove nothing either way, and a window with no
   pre-prompt devin.acp envelope at all proves nothing); raw
-  stderr is never scanned for it. Envelopes positioned after
-  `turn_complete` are never shim output — the shim exits immediately —
+  stderr is never scanned for it. Envelopes positioned after a terminal
+  envelope (`turn_complete` / `output_limit_exhausted`) are never shim
+  output — the shim exits immediately —
   so enumeration stops there and post-terminal forged lines cannot flip
   a completed run or feed transient classification. A `turn_error` whose error `data`
   carries `cognition.ai/retryable: true` is forwarded as
@@ -510,6 +511,17 @@ shim rides argv (`python3 -I -c`, which also keeps the worktree off
   relay delivers inside `codeybox.stderr` envelopes;
   `DevinTerminalDiagnoser` unwraps and lifts the first such line as a
   fallback.
+- Output-token ceiling: a `session/prompt` response with stopReason
+  `max_tokens` is never a normal finish — the provider cut the turn off
+  mid-task (verified: a 128000-output-token turn ended the item as "no
+  changes"). While the hot-reloadable `CodeyBox:Devin:MaxTokenContinuations`
+  bound lasts (default 8, 0 disables), the shim records a
+  `token_continuation` envelope and re-prompts the SAME session with the
+  shared truncation-continuation wording, accumulating final text across
+  the continuations; a spent bound ends the run with an
+  `output_limit_exhausted` terminal envelope (exit 2), which the pipeline
+  classifies as the distinct `output-limit-exhausted` failure kind rather
+  than quota, transient, or "produced no changes".
 - Envelope provenance: `devin.acp` lines are claimed by their type tag, so
   nothing agent-controlled may reach the claimable stream as a bare line.
   The shim retargets its own fd 2 — inherited by the CLI and every tool

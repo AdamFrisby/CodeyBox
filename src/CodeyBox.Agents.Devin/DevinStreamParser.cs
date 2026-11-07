@@ -68,6 +68,7 @@ public sealed class DevinStreamParser : FlexibleAgentStreamParser
                 FinalText: eventName is DevinAcpEnvelope.EventTurnError
                         or DevinAcpEnvelope.EventFatal
                         or DevinAcpEnvelope.EventModelMismatch
+                        or DevinAcpEnvelope.EventOutputLimitExhausted
                     ? FirstString(root, "message")
                     : null,
                 IsRecognized: true),

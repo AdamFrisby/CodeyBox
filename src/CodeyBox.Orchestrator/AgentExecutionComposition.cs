@@ -125,6 +125,7 @@ public static class AgentExecutionComposition
         services.AddOptions<AntigravitySectionOptions>().Bind(configuration.GetSection("CodeyBox:Antigravity"));
         services.AddOptions<PrimeSectionOptions>().Bind(configuration.GetSection("CodeyBox:Prime"));
         services.AddOptions<CrockSandboxOptions>().Bind(configuration.GetSection("CodeyBox:Crock"));
+        services.AddOptions<DevinOptions>().Bind(configuration.GetSection("CodeyBox:Devin"));
         services.AddOptions<AgentStreamsOptions>().Bind(configuration.GetSection("CodeyBox:AgentStreams"));
         services.AddOptions<AgentStreamParserOptions>().Bind(configuration.GetSection("CodeyBox:AgentStreamAnalysis"));
     }
@@ -540,7 +541,8 @@ public static class AgentExecutionComposition
             sp.GetRequiredService<AgentDefaultsSnapshot>()));
         services.AddSingleton<IAgentRunner, CursorAgentRunner>();
         services.AddSingleton<IAgentRunner>(sp => new DevinAgentRunner(
-            sp.GetRequiredService<AgentDefaultsSnapshot>()));
+            sp.GetRequiredService<AgentDefaultsSnapshot>(),
+            () => sp.GetRequiredService<IOptionsMonitor<DevinOptions>>().CurrentValue));
         services.AddSingleton<IAgentRunner, OpencodeAgentRunner>();
         services.AddSingleton<IAgentRunner>(sp => new CavemanCodeAgentRunner(
             sp.GetRequiredService<AgentDefaultsSnapshot>()));

@@ -872,13 +872,44 @@ public sealed partial class PipelineRunner
             // but produces no useful diff — without this log, we have no
             // visibility into what the agent reasoned.
             LogAgentOutput(_log, runner.Kind, agentResult);
+            // Runner-reported output-token exhaustion (the model hit its
+            // per-turn ceiling and the runner's bounded same-session
+            // continuations were spent) is terminal with the distinct
+            // output-limit-exhausted kind — never quota, transient, or
+            // no-changes. The continuation budget is already spent, so this
+            // throws before the nudge path below (which would only burn
+            // budget re-running a task that cannot fit the ceiling) and
+            // before any diff evaluation.
+            if (agentResult.OutputTokenLimitExhausted)
+                throw new OutputTokenLimitExhaustedException(
+                    runner.Kind,
+                    agentPhase,
+                    BuildAgentFailureDetail(
+                        $"Agent {runner.Kind} exhausted its output-token continuations without completing the turn",
+                        agentResult,
+                        _opts.MaxFailureDetailBytes));
             // Output-truncation transients (the model hit its maximum output
             // token limit mid-turn) resume the same session with a bounded
             // "continue" nudge instead of failing outright: a nudged turn
             // that succeeds rejoins the normal success path below with the
             // work branch intact; otherwise the failure handling parks the
-            // checkpointed turn for bounded transient retry.
+            // checkpointed turn for bounded transient retry. Failed runs
+            // take this path on detector evidence; successful runs take it
+            // when the captured stream carries a structured output-limit
+            // stop shape (see OutputTokenLimit) — a turn the provider cut
+            // off is not a normal finish even when the CLI exited 0.
             if (!agentResult.Success)
+                agentResult = await TryTruncationContinueNudgesAsync(
+                    item,
+                    runner,
+                    sandbox,
+                    credential,
+                    sessionLifecycle,
+                    useClaudeSession,
+                    agentResult,
+                    agentPhase,
+                    ct);
+            else if (OutputTokenLimit.ContainsOutputLimitStopReason(agentResult.Stdout))
                 agentResult = await TryTruncationContinueNudgesAsync(
                     item,
                     runner,

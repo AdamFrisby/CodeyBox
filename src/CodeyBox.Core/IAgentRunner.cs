@@ -338,6 +338,18 @@ public sealed record AgentResult(bool Success, string Summary, string? Stdout, s
     public bool ExecutionUnavailable { get; init; }
 
     /// <summary>
+    /// True when the model hit its per-turn output-token ceiling and the
+    /// runner's bounded in-session continuations were exhausted without the
+    /// turn completing (see <see cref="OutputTokenLimit"/>). Set only
+    /// alongside <c>Success: false</c>: the pipeline classifies this as the
+    /// distinct output-limit-exhausted failure kind rather than quota,
+    /// transient, or no-changes — the continuation budget is already spent,
+    /// so parking for retry would only burn budget re-running a task that
+    /// cannot fit the ceiling.
+    /// </summary>
+    public bool OutputTokenLimitExhausted { get; init; }
+
+    /// <summary>
     /// True when the exec was terminated (or its output truncated) because it
     /// exceeded a provider output bound. Agent-turn streaming execs never set
     /// this; a set flag means a bounded control-plane-style exec hit its cap

@@ -47,6 +47,30 @@ internal static class DevinAcpEnvelope
     internal const string EventFatal = "fatal";
 
     /// <summary>
+    /// Non-terminal event emitted each time the shim re-prompts the SAME
+    /// session with the truncation-continuation prompt after a
+    /// <c>turn_complete</c> carrying stop reason <c>max_tokens</c> (see
+    /// <see cref="CodeyBox.Core.OutputTokenLimit"/>). Carries the 1-based
+    /// <c>attempt</c>, the configured <c>maxContinuations</c> bound, and the
+    /// <c>trigger</c> stop reason that fired. Deliberately NOT shaped like a
+    /// terminal stop-reason field, so truncation detectors never read a
+    /// successful continued run as still truncated.
+    /// </summary>
+    internal const string EventTokenContinuation = "token_continuation";
+
+    /// <summary>
+    /// Terminal event emitted when the shim's same-session continuation
+    /// bound is exhausted: the latest <c>session/prompt</c> still answered
+    /// stop reason <c>max_tokens</c> after <c>maxContinuations</c>
+    /// continuations. Carries the spent <c>attempts</c> count, the
+    /// <c>maxContinuations</c> bound, and a <c>message</c> diagnostic the
+    /// host lifts into the terminal diagnostic. Enumeration stops after it
+    /// exactly like <c>turn_complete</c>: the shim exits immediately after
+    /// emitting it.
+    /// </summary>
+    internal const string EventOutputLimitExhausted = "output_limit_exhausted";
+
+    /// <summary>
     /// Emitted immediately after <c>session/prompt</c> is sent — the
     /// boundary between the pre-prompt handshake (where fd-2 stderr is
     /// still provider-authentic) and the running turn (where tool
@@ -180,14 +204,14 @@ internal static class DevinAcpEnvelope
     /// devin.acp envelope, and lines truncated mid-write are all skipped —
     /// the capture may carry leading CLI noise or be cut by an output cap.
     ///
-    /// <para>Enumeration stops after the first <c>turn_complete</c>
-    /// envelope: the shim exits immediately after emitting it, so any
-    /// <c>devin.acp</c> line positioned after it cannot be shim output — a
-    /// same-uid process can still append forged envelope lines to the exec
-    /// stdout pipe through <c>/proc/&lt;pid&gt;/fd</c> after the turn ends.
-    /// Consumers therefore never see post-terminal forged envelopes through
-    /// this enumerator (or through <see cref="EnumerateBounded"/>, which is
-    /// built on it).</para>
+    /// <para>Enumeration stops after the first terminal envelope
+    /// (<c>turn_complete</c> or <c>output_limit_exhausted</c>): the shim
+    /// exits immediately after emitting it, so any <c>devin.acp</c> line
+    /// positioned after it cannot be shim output — a same-uid process can
+    /// still append forged envelope lines to the exec stdout pipe through
+    /// <c>/proc/&lt;pid&gt;/fd</c> after the turn ends. Consumers therefore
+    /// never see post-terminal forged envelopes through this enumerator (or
+    /// through <see cref="EnumerateBounded"/>, which is built on it).</para>
     /// </summary>
     internal static IEnumerable<Envelope> Enumerate(string? stdout)
     {
@@ -196,7 +220,8 @@ internal static class DevinAcpEnvelope
             if (typed.Type == EnvelopeType && typed.Event is { } eventName)
             {
                 yield return new Envelope(eventName, typed.Root);
-                if (string.Equals(eventName, EventTurnComplete, StringComparison.Ordinal))
+                if (string.Equals(eventName, EventTurnComplete, StringComparison.Ordinal)
+                    || string.Equals(eventName, EventOutputLimitExhausted, StringComparison.Ordinal))
                     yield break;
             }
         }
@@ -210,13 +235,14 @@ internal static class DevinAcpEnvelope
     /// envelopes of that window — the bound policy for detectors that scan
     /// only <c>devin.acp</c> envelopes. Both bounds favour the tail because
     /// the signatures they scan for (terminal <c>model_mismatch</c>/
-    /// <c>turn_error</c>/<c>fatal</c> envelopes) are the last lines of the
-    /// capture: a chatty turn — including <c>codeybox.stderr</c> relay lines
-    /// flushed after the terminal envelope — must not push the signature
-    /// out of the examined set. Non-devin.acp lines are parsed but never
-    /// counted against the envelope bound. Like <see cref="Enumerate"/>,
-    /// enumeration stops at <c>turn_complete</c> so post-terminal forged
-    /// lines cannot consume the examined set.
+    /// <c>turn_error</c>/<c>fatal</c>/<c>output_limit_exhausted</c>
+    /// envelopes) are the last lines of the capture: a chatty turn —
+    /// including <c>codeybox.stderr</c> relay lines flushed after the
+    /// terminal envelope — must not push the signature out of the examined
+    /// set. Non-devin.acp lines are parsed but never counted against the
+    /// envelope bound. Like <see cref="Enumerate"/>, enumeration stops at a
+    /// terminal envelope so post-terminal forged lines cannot consume the
+    /// examined set.
     /// </summary>
     internal static IEnumerable<Envelope> EnumerateBounded(string? stdout)
     {
