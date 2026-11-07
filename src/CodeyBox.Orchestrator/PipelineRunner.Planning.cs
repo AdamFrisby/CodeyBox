@@ -788,8 +788,11 @@ public sealed partial class PipelineRunner
         CancellationToken ct)
     {
         var updatedAt = DateTimeOffset.UtcNow;
-        var reviewed = WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
-            current.With(WorkItemState.PlanApproved),
+        var reviewed = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
+            WorkItemRecoveryPolicy.ResetRecoveryAttemptsAfterRealProgress(
+                current.With(WorkItemState.PlanApproved),
+                current.State,
+                WorkItemState.PlanApproved),
             current.State,
             WorkItemState.PlanApproved) with
         {

@@ -64,6 +64,51 @@ public static class WorkItemRecoveryPolicy
         return ClearRecoveryAttempts(item);
     }
 
+    /// <summary>
+    /// Clears the transient auto-retry budget window
+    /// (<see cref="WorkItem.TransientRetryAttempts"/> and
+    /// <see cref="WorkItem.TransientRetryFirstFailedAt"/>) once the retried
+    /// phase makes demonstrable progress: the item advances to a phase
+    /// completion (<c>WorkComplete</c>, <c>PlanApproved</c>,
+    /// <c>AuditPassed</c>, <c>Merged</c>, <c>Done</c>). Any such advance
+    /// proves the item is healthy again, so the next transient park starts a
+    /// new elapsed series instead of inheriting the old window's wall-clock.
+    /// Transitions that merely dispatch or run the retried attempt
+    /// (<c>Queued</c>, <c>Working</c>, <c>Auditing</c>, …) preserve the
+    /// window, so consecutive failures with no progress in between keep
+    /// counting toward both the attempts cap and the elapsed cap.
+    /// Identity-preserving when the window is already empty or the target is
+    /// not a completion, so progress sites may apply it unconditionally.
+    /// </summary>
+    public static WorkItem ResetTransientRetryBudgetAfterRealProgress(
+        WorkItem item,
+        WorkItemState fromState,
+        WorkItemState toState)
+    {
+        _ = fromState;
+        if (!IsRealProgressCompletionState(toState))
+            return item;
+
+        return item.ResetTransientRetryBudget();
+    }
+
+    /// <summary>
+    /// Event-level companion to
+    /// <see cref="ResetTransientRetryBudgetAfterRealProgress"/>: clears the
+    /// transient budget when a durable in-phase progress event lands (an
+    /// audit verdict is produced, a rework turn completes, or conflict rework
+    /// advances the branch). These events prove the retried run did real
+    /// work even when the item stays in the same phase, so — like the
+    /// phase-advance path — the next transient park starts a new window.
+    /// </summary>
+    public static WorkItem ResetTransientRetryBudgetAfterRealProgressEvent(
+        WorkItem item,
+        RecoveryProgressEvent progressEvent)
+    {
+        _ = progressEvent;
+        return item.ResetTransientRetryBudget();
+    }
+
     public static WorkItem ClearPlanFieldsIfQueued(WorkItem item)
     {
         if (item.State != WorkItemState.Queued)

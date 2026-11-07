@@ -298,7 +298,7 @@ public sealed partial class PipelineRunner
             return new ConflictReworkResult(false, parkMsg);
         }
 
-        await ResetRecoveryAttemptsAfterRealProgressEventAsync(
+        await ResetProgressCountersAfterRealProgressEventAsync(
             item.Id,
             RecoveryProgressEvent.ConflictReworkBranchAdvanced,
             "conflict-rework-branch-advanced",

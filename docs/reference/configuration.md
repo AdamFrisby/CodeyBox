@@ -981,8 +981,8 @@ build/test/quality failures are not retried.
 | `BaseDelay` | `00:00:30` (30 s) | First retry delay before jitter. |
 | `Multiplier` | `2.0` | Exponential backoff multiplier applied per retry attempt. |
 | `MaxDelay` | `00:15:00` (15 min) | Per-attempt backoff cap before jitter. |
-| `MaxAutoRetriesPerWorkItem` | `5` | Per-item cap. After this, the item remains `Failed` with `FailureKind="transient-exhausted"`. |
-| `MaxElapsedTime` | `01:00:00` (1 h) | Total elapsed cap for one transient retry series. A retry that would fire after this window is not scheduled. |
+| `MaxAutoRetriesPerWorkItem` | `5` | Consecutive-failure cap. After this many transient auto-retries with no progress in between, the item remains `Failed` with `FailureKind="transient-exhausted"`. |
+| `MaxElapsedTime` | `01:00:00` (1 h) | Elapsed cap for one consecutive transient retry series, measured from `TransientRetryFirstFailedAt`. A retry that would fire after this window is not scheduled. The window resets on demonstrable progress (see below), so it bounds one burst of consecutive failures — not wall-clock since the first-ever blip. |
 | `JitterMode` | `Full` | `None`, `Full`, or `Decorrelated`. Use jitter to spread retries during provider or ISP incidents. |
 
 `TransientRetryScheduler` persists `FailureKind="transient"`,
@@ -992,6 +992,20 @@ the shared `WorkItemRetrier` with auto-pick enabled, so items with prior work
 commits resume at audit instead of discarding the work branch. Quota retry
 remains owned by `QuotaRetryScheduler`; `IWorkItemAutoRetryScheduler` is only a
 small notification facade that delegates to the two policy schedulers.
+
+Budget-window resets: `TransientRetryFirstFailedAt`/`TransientRetryAttempts`
+measure one *consecutive* failure series, not lifetime wall-clock. The window
+resets once the retried phase makes demonstrable progress — a retried
+agent/auditor run completes (work completes, an audit verdict lands, a rework
+turn finishes, conflict rework advances the branch, a plan is approved) or the
+item advances to a later phase (`WorkComplete`, `PlanApproved`,
+`AuditPassed`, `Merged`, `Done`). A second, unrelated transient blip after
+productive work therefore starts a fresh window and retries normally, while
+repeated transients with no progress in between still exhaust via either cap.
+Implemented centrally in `WorkItemRecoveryPolicy`
+(`ResetTransientRetryBudgetAfterRealProgress*`, mirroring the dead-worker
+recovery-attempt resets) and applied on every pipeline phase transition and
+progress event.
 
 `CodeyBox:TransientNetworkFailurePatterns` appends extra classifier substrings
 without a rebuild. Built-in patterns deliberately avoid bare `timeout` so
