@@ -8,6 +8,13 @@
   <Import Project="$(MSBuildThisFileDirectory)Directory.NuGetHomeHeal.targets" />
 
   <PropertyGroup>
+    <!-- Marks THIS evaluation as the once-per-solution invocation: it is the
+         only level allowed to run the destructive quarantine. Required because
+         Directory.Build.props is also imported during solution evaluation and
+         sets _CodeyBoxInSolution (SolutionPath is non-empty there), which would
+         otherwise suppress the very target this file exists to run. Per-project
+         evaluations never import this file, so they never see the flag. -->
+    <_CodeyBoxNuGetHealSolutionLevel>true</_CodeyBoxNuGetHealSolutionLevel>
     <!-- Solution restore evaluates this before dispatching project restores, so
          the repository config is selected even when the solution is built from
          outside its directory. NuGet can still inspect user-level configuration. -->

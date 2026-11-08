@@ -80,7 +80,7 @@ public sealed class MsBuildNuGetHealTests
         return null;
     }
 
-    private static async Task CreateProjectAsync(string projectDir, string healTargets)
+    private static async Task CreateProjectAsync(string projectDir)
     {
         Directory.CreateDirectory(projectDir);
         await File.WriteAllTextAsync(
@@ -96,18 +96,32 @@ public sealed class MsBuildNuGetHealTests
         await File.WriteAllTextAsync(
             Path.Combine(projectDir, "Class1.cs"),
             "namespace Proj; public static class Class1 { public static int Value => 1; }\n");
-        var propsBody =
-            $"""
-            <Project InitialTargets="CodeyBoxHealNuGetHome">
-              <Import Project="{healTargets}" />
-            </Project>
-            """;
-        await File.WriteAllTextAsync(Path.Combine(projectDir, "Directory.Build.props"), propsBody);
         var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
         await File.WriteAllTextAsync(
             offlineConfig,
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
                 + "<configuration><packageSources><clear /></packageSources></configuration>\n");
+    }
+
+    // Write the fixture's Directory.Build.*/Directory.Solution.* files so the
+    // throwaway tree imports the repository's REAL heal wiring — the shared
+    // InitialTargets hook, the _CodeyBoxInSolution suppression, the
+    // _CodeyBoxNuGetHealSolutionLevel solution-level marker, the
+    // CODEYBOX_NUGET_HEAL_NO_QUARANTINE per-project mode, and the
+    // NuGetHomeGuard in-process redirect — rather than a hand-copied subset
+    // that could drift from what production builds actually evaluate.
+    private static async Task CreateBuildWiringAsync(string root, string repoRoot)
+    {
+        string Import(string repoFile) =>
+            $"<Project><Import Project=\"{repoRoot}/{repoFile}\" /></Project>\n";
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Directory.Build.props"), Import("Directory.Build.props"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Directory.Build.targets"), Import("Directory.Build.targets"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Directory.Solution.props"), Import("Directory.Solution.props"));
+        await File.WriteAllTextAsync(
+            Path.Combine(root, "Directory.Solution.targets"), Import("Directory.Solution.targets"));
     }
 
     private static Task<ProcessRunResult> RunDotnetBuildAsync(
@@ -181,7 +195,6 @@ public sealed class MsBuildNuGetHealTests
         var repoRoot = FindAncestorContaining(
             AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
         Assert.NotNull(repoRoot); // the heal targets file must exist for the gates to import it
-        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
 
         var dotnetDir = ResolveDotnetDirectory();
         if (dotnetDir is null)
@@ -194,42 +207,20 @@ public sealed class MsBuildNuGetHealTests
         Directory.CreateDirectory(projectDir);
         try
         {
-            // Throwaway solution + project. Both the solution- and project-level
-            // props hook the shared heal target via InitialTargets and import the
-            // repository's real targets file, so this exercises the exact wiring
-            // the gates rely on. The project references no packages, so restore is
+            // Throwaway solution + project wired to the repository's REAL
+            // Directory.Build.*/Directory.Solution.* files, so this exercises
+            // the exact solution-level InitialTargets hook, the
+            // _CodeyBoxInSolution per-project suppression, and the
+            // _CodeyBoxNuGetHealSolutionLevel destructive-repair marker the
+            // gates rely on. The project references no packages, so restore is
             // offline once the home is healed.
-            await File.WriteAllTextAsync(
-                Path.Combine(projectDir, "proj.csproj"),
-                """
-                <Project Sdk="Microsoft.NET.Sdk">
-                  <PropertyGroup>
-                    <TargetFramework>net10.0</TargetFramework>
-                    <Nullable>enable</Nullable>
-                  </PropertyGroup>
-                </Project>
-                """);
-            await File.WriteAllTextAsync(
-                Path.Combine(projectDir, "Class1.cs"),
-                "namespace Proj; public static class Class1 { public static int Value => 1; }\n");
-
-            var propsBody =
-                $"""
-                <Project InitialTargets="CodeyBoxHealNuGetHome">
-                  <Import Project="{healTargets}" />
-                </Project>
-                """;
-            await File.WriteAllTextAsync(Path.Combine(root, "Directory.Build.props"), propsBody);
-            await File.WriteAllTextAsync(Path.Combine(root, "Directory.Solution.props"), propsBody);
+            await CreateProjectAsync(projectDir);
+            await CreateBuildWiringAsync(root, repoRoot!);
 
             // Cleared package sources keep restore fully offline and deterministic:
             // the bare project needs no packages, so an empty source list suffices
             // and guarantees the test never touches the network.
-            var offlineConfig = Path.Combine(root, "offline.nuget.config");
-            await File.WriteAllTextAsync(
-                offlineConfig,
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-                    + "<configuration><packageSources><clear /></packageSources></configuration>\n");
+            var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
 
             await File.WriteAllTextAsync(
                 Path.Combine(root, "app.slnx"),
@@ -293,8 +284,14 @@ public sealed class MsBuildNuGetHealTests
             // before NuGet's user-config read; without it restore aborts unauthorized.
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
+            // The quarantine notice must reach the operator: the solution-level
+            // hook is the one place destructive repair runs, and its stderr is
+            // deliberately not suppressed.
+            Assert.Contains("quarantined unusable", result.Stdout + result.Stderr, StringComparison.Ordinal);
+
             // The broken tree is quarantined aside (preserved), not deleted, and a
-            // fresh writable per-user home replaced it.
+            // fresh writable per-user home replaced it — exactly once, because
+            // per-project hooks are suppressed during a solution build.
             Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
             var healedConfig = Path.Combine(home, ".nuget", "NuGet", "NuGet.Config");
             var seeded = await File.ReadAllTextAsync(healedConfig); // throws if still unreadable
@@ -319,7 +316,6 @@ public sealed class MsBuildNuGetHealTests
         var repoRoot = FindAncestorContaining(
             AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
         Assert.NotNull(repoRoot);
-        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
 
         var dotnetDir = ResolveDotnetDirectory();
         if (dotnetDir is null)
@@ -342,7 +338,8 @@ public sealed class MsBuildNuGetHealTests
         // Linux umask 002: group-writable tree owned by current UID
         await SetUmask002PermissionsAsync(nugetHome, packageDir, nugetDir, marker, config);
 
-        await CreateProjectAsync(projectDir, healTargets);
+        await CreateProjectAsync(projectDir);
+        await CreateBuildWiringAsync(root, repoRoot!);
         var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
 
         try
@@ -369,7 +366,7 @@ public sealed class MsBuildNuGetHealTests
     }
 
     [Fact]
-    public async Task MsBuild_UnusableTree_IsQuarantined()
+    public async Task MsBuild_PerProjectHook_NeverQuarantines_UnusableTree()
     {
         if (!OperatingSystem.IsLinux())
             return;
@@ -377,22 +374,28 @@ public sealed class MsBuildNuGetHealTests
         var repoRoot = FindAncestorContaining(
             AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
         Assert.NotNull(repoRoot);
-        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
 
         var dotnetDir = ResolveDotnetDirectory();
         if (dotnetDir is null)
             return;
 
-        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-foreign-{Guid.NewGuid():N}");
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-nondestruct-{Guid.NewGuid():N}");
         var home = Path.Combine(root, "home");
         var projectDir = Path.Combine(root, "proj");
         var nugetHome = Path.Combine(home, ".nuget");
         Directory.CreateDirectory(home);
-        // Point .nuget at a foreign root-owned system directory (/etc) —
-        // rejected as a symlink before ownership is inspected.
-        File.CreateSymbolicLink(nugetHome, "/etc");
+        // A present-but-unreadable inherited user config makes the home
+        // unusable — but the .nuget tree itself stays writable, so the
+        // in-process NuGetHomeGuard redirect (not a quarantine) is what lets
+        // the build proceed.
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+        Directory.CreateDirectory(nugetDir);
+        var poisonedConfig = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(poisonedConfig, "<configuration/>");
+        await ChmodAsync("000", poisonedConfig);
 
-        await CreateProjectAsync(projectDir, healTargets);
+        await CreateProjectAsync(projectDir);
+        await CreateBuildWiringAsync(root, repoRoot!);
         var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
 
         try
@@ -404,21 +407,23 @@ public sealed class MsBuildNuGetHealTests
                 offlineConfig,
                 env);
 
+            // The build succeeds through the NuGetHomeGuard DOTNET_CLI_HOME
+            // redirect — and the unusable tree is left EXACTLY as found: a
+            // per-project InitialTarget must never run the destructive
+            // quarantine (that is reserved for the once-per-solution hook).
             Assert.True(result.Success, result.Stdout + result.Stderr);
-            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
-            Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
-            Assert.False(
-                File.GetAttributes(nugetHome).HasFlag(FileAttributes.ReparsePoint),
-                "recreated .nuget must be a real directory, not a symlink");
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(File.Exists(poisonedConfig), "unusable .nuget must not be moved aside");
         }
         finally
         {
+            await ChmodAsync("644", poisonedConfig);
             Directory.Delete(root, recursive: true);
         }
     }
 
     [Fact]
-    public async Task MsBuild_ConcurrentInvocations_ProduceAtMostOneQuarantine_AndNeverRemoveHealthyCache()
+    public async Task MsBuild_ConcurrentPerProjectBuilds_NeverQuarantine_AndNeverRemoveHealthyCache()
     {
         if (!OperatingSystem.IsLinux())
             return;
@@ -426,7 +431,6 @@ public sealed class MsBuildNuGetHealTests
         var repoRoot = FindAncestorContaining(
             AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
         Assert.NotNull(repoRoot);
-        var healTargets = Path.Combine(repoRoot!, "Directory.NuGetHomeHeal.targets");
 
         var dotnetDir = ResolveDotnetDirectory();
         if (dotnetDir is null)
@@ -439,16 +443,24 @@ public sealed class MsBuildNuGetHealTests
 
         var proj1 = Path.Combine(root, "proj1");
         var proj2 = Path.Combine(root, "proj2");
-        await CreateProjectAsync(proj1, healTargets);
-        await CreateProjectAsync(proj2, healTargets);
+        await CreateProjectAsync(proj1);
+        await CreateProjectAsync(proj2);
+        await CreateBuildWiringAsync(root, repoRoot!);
         var offline1 = Path.Combine(proj1, "offline.nuget.config");
         var offline2 = Path.Combine(proj2, "offline.nuget.config");
 
         try
         {
-            // Case 1: Unusable tree requiring quarantine. Two concurrent builds must
-            // coordinate so at most one quarantine directory is created.
-            File.CreateSymbolicLink(nugetHome, "/etc");
+            // Case 1: Unusable tree (present-but-unreadable inherited user
+            // config). Two concurrent PER-PROJECT builds must never quarantine —
+            // destructive repair is reserved for the once-per-solution hook —
+            // so both heal through the NuGetHomeGuard redirect and the broken
+            // tree stays exactly as found.
+            var brokenNugetDir = Path.Combine(nugetHome, "NuGet");
+            Directory.CreateDirectory(brokenNugetDir);
+            var poisonedConfig = Path.Combine(brokenNugetDir, "NuGet.Config");
+            await File.WriteAllTextAsync(poisonedConfig, "<configuration/>");
+            await ChmodAsync("000", poisonedConfig);
             var envBroken = CreateBuildEnv(dotnetDir, home, root, nugetHome);
 
             var t1Broken = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj1, "proj.csproj"), offline1, envBroken);
@@ -457,8 +469,9 @@ public sealed class MsBuildNuGetHealTests
 
             Assert.True(resultsBroken[0].Success, resultsBroken[0].Stdout + resultsBroken[0].Stderr);
             Assert.True(resultsBroken[1].Success, resultsBroken[1].Stdout + resultsBroken[1].Stderr);
-            Assert.Single(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
-            Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            Assert.True(File.Exists(poisonedConfig), "unusable .nuget must not be moved aside");
+            await ChmodAsync("644", poisonedConfig);
 
             // Case 2: Healthy tree with umask 002. Concurrent builds must not quarantine
             // and must leave cached packages intact.

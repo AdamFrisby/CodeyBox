@@ -324,9 +324,9 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
             File.GetAttributes(nugetHomeLink).HasFlag(FileAttributes.ReparsePoint),
             "recreated .nuget must be a real directory, not a symlink");
 
-        // 2. Unusable tree simulated via mode 0555 (still uid-owned — no
-        //    privileged chown is available to make a genuinely
-        //    foreign-owned fixture).
+        // 2. Unusable tree simulated via mode 0555 (uid-owned but unwritable —
+        //    foreign-OWNERSHIP is covered separately by
+        //    Script_ForeignOwnedTree_IsQuarantined).
         if (!Environment.IsPrivilegedProcess)
         {
             var homeUnwritable = Path.Combine(_workspace, "arg-home-foreign-unwritable");
@@ -355,6 +355,83 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
                 }
             }
         }
+    }
+
+    [Fact]
+    public async Task Script_NoQuarantineFlag_SkipsDestructiveRepair()
+    {
+        // CODEYBOX_NUGET_HEAL_NO_QUARANTINE is the contract the per-project
+        // MSBuild InitialTargets rely on: the shared recovery must leave an
+        // unusable .nuget untouched (no mv, no recreation) and take only the
+        // non-destructive redirect fallback.
+        var home = Path.Combine(_workspace, "arg-home-no-quarantine");
+        Directory.CreateDirectory(home);
+        var nugetHome = Path.Combine(home, ".nuget");
+        File.CreateSymbolicLink(nugetHome, "/etc");
+
+        var (exit, output) = await RunScriptAsync(
+            home, nugetHome,
+            new Dictionary<string, string> { ["CODEYBOX_NUGET_HEAL_NO_QUARANTINE"] = "1" });
+
+        Assert.Equal(0, exit);
+        Assert.Empty(AsideDirs(nugetHome));
+        Assert.True(
+            File.GetAttributes(nugetHome).HasFlag(FileAttributes.ReparsePoint),
+            "non-destructive mode must leave the unusable .nuget exactly as found");
+        Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Script_ForeignOwnedTree_IsQuarantined()
+    {
+        // A genuinely foreign-owned .nuget (uid != ours) is the co-tenant risk
+        // the ownership admission exists for: it must be quarantined aside and
+        // replaced, never trusted because it happens to be writable.
+        //
+        // Creating a foreign-owned fixture needs a real chown, which requires
+        // privilege. An unprivileged user-namespace fixture cannot substitute:
+        // without newuidmap (absent here, and no_new_privs blocks the setuid
+        // helpers anyway) a user namespace can only map the caller's own uid,
+        // so every file it creates still carries the same kuid the heal sees
+        // as its own — never a foreign one.
+        if (!Environment.IsPrivilegedProcess)
+            return;
+
+        var home = Path.Combine(_workspace, "arg-home-foreign-owned");
+        var nugetHome = Path.Combine(home, ".nuget");
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+        Directory.CreateDirectory(nugetDir);
+        await File.WriteAllTextAsync(Path.Combine(nugetDir, "NuGet.Config"), "<configuration/>");
+        var marker = Path.Combine(nugetHome, "packages-marker");
+        await File.WriteAllTextAsync(marker, "foreign-cache");
+
+        // nobody (uid/gid 65534) — a uid that is neither ours nor root.
+        await ChownAsync("65534:65534", nugetHome);
+
+        var (exit, output) = await RunScriptAsync(home, nugetHome);
+
+        Assert.Equal(0, exit);
+        Assert.Single(AsideDirs(nugetHome));
+        Assert.Contains("quarantined unusable", output, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+        Assert.False(
+            File.GetAttributes(nugetHome).HasFlag(FileAttributes.ReparsePoint),
+            "recreated .nuget must be a real directory, not a symlink");
+    }
+
+    private static async Task ChownAsync(string owner, string path)
+    {
+        var psi = new ProcessStartInfo("chown")
+        {
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add(owner);
+        psi.ArgumentList.Add(path);
+        using var proc = Process.Start(psi)!;
+        var stderr = await proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        Assert.True(proc.ExitCode == 0, $"chown {owner} {path} failed: {stderr}");
     }
 
     [Fact]
@@ -473,10 +550,16 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
 
         Assert.Equal(0, proc.ExitCode);
         Assert.DoesNotContain("Failed to read NuGet.Config", output, StringComparison.Ordinal);
-        Assert.True(Directory.Exists(Path.Combine(home, ".nuget", "NuGet")), output);
-        Assert.True(
-            new DirectoryInfo(Path.Combine(home, ".nuget")).UnixFileMode.HasFlag(UnixFileMode.UserWrite),
-            "Directory.Build.targets must leave a writable NuGet home");
+        // This is a NON-solution restore, so the per-project hook runs
+        // non-destructively (CODEYBOX_NUGET_HEAL_NO_QUARANTINE): it must NOT
+        // rename the unwritable .nuget aside — destructive repair is reserved
+        // for the once-per-solution hook. The build still succeeds because the
+        // in-process NuGetHomeGuard.targets redirect supplies a writable
+        // DOTNET_CLI_HOME for NuGet's user-config read.
+        Assert.Empty(AsideDirs(nugetHome));
+        Assert.False(
+            new DirectoryInfo(nugetHome).UnixFileMode.HasFlag(UnixFileMode.UserWrite),
+            "per-project hook must leave the unwritable .nuget untouched");
     }
 
     private static IReadOnlyList<string> AsideDirs(string nugetHome)
@@ -488,7 +571,8 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
             : [];
     }
 
-    private async Task<(int ExitCode, string Output)> RunScriptAsync(string home, string? nugetArg = null)
+    private async Task<(int ExitCode, string Output)> RunScriptAsync(
+        string home, string? nugetArg = null, IReadOnlyDictionary<string, string>? extraEnv = null)
     {
         var psi = new ProcessStartInfo("/bin/sh")
         {
@@ -504,6 +588,14 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         psi.Environment.Remove("CODEYBOX_NUGET_HOME_UNDER_TEST");
         if (nugetArg is not null)
             psi.Environment["CODEYBOX_NUGET_HOME_UNDER_TEST"] = nugetArg;
+        // Same for the non-destructive-mode flag: cleared so a value inherited
+        // from the test host cannot silently change what the fixture exercises.
+        psi.Environment.Remove("CODEYBOX_NUGET_HEAL_NO_QUARANTINE");
+        if (extraEnv is not null)
+        {
+            foreach (var (key, value) in extraEnv)
+                psi.Environment[key] = value;
+        }
         psi.Environment["TMPDIR"] = _workspace;
         // The fixture home must be authoritative: a stamped DOTNET_CLI_HOME or
         // runtime dir inherited from the test host would make the heal repair

@@ -30,7 +30,12 @@
 #
 # Invoked from Directory.Build.targets (InitialTargets) so every raw
 # `dotnet build` in this repository — including process:required-build and
-# csharp:build-WaE — self-heals on a misprovisioned image.
+# csharp:build-WaE — self-heals on a misprovisioned image. That per-project
+# hook exports CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1, which the shared recovery
+# honours by skipping the destructive quarantine — renaming .nuget aside is
+# reserved for the once-per-solution hook (Directory.NuGetHomeHeal.targets via
+# Directory.Solution.props); a non-solution build's unusable home is covered
+# by the in-process NuGetHomeGuard.targets redirect instead.
 set -u
 
 codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
