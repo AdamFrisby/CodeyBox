@@ -508,6 +508,12 @@ public sealed class ConfigReloadClassificationTests : IDisposable
             case nameof(PipelineTuningOptions.AutoMergeRaceRecoveryMaxAttempts):
                 opts.AutoMergeRaceRecoveryMaxAttempts += 100;
                 break;
+            case nameof(PipelineTuningOptions.AutoMergeSettleTimeout):
+                opts.AutoMergeSettleTimeout += TimeSpan.FromHours(1);
+                break;
+            case nameof(PipelineTuningOptions.AutoMergeSettlePollInterval):
+                opts.AutoMergeSettlePollInterval += TimeSpan.FromHours(1);
+                break;
             case nameof(PipelineTuningOptions.EnableSandboxReuse):
                 opts.EnableSandboxReuse = !opts.EnableSandboxReuse;
                 break;

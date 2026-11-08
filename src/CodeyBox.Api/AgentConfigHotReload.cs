@@ -1648,6 +1648,8 @@ public sealed class AgentConfigHotReload : IHostedService, IDisposable
                 opts.AgentSessionResumeMaxAttempts,
                 opts.MaxRetainedAgentTurnSandboxes,
                 opts.AutoMergeRaceRecoveryMaxAttempts,
+                AutoMergeSettleTimeoutSeconds = opts.AutoMergeSettleTimeout.TotalSeconds,
+                AutoMergeSettlePollIntervalSeconds = opts.AutoMergeSettlePollInterval.TotalSeconds,
                 opts.MergeLandingMaxAttempts,
                 opts.MergeGuardReworkMaxAttempts,
                 opts.MergeResultBuildVerificationEnabled,
