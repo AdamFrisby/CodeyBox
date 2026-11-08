@@ -43,14 +43,15 @@ public sealed class MsBuildNuGetHealTests
 
     private static async Task SetUmask002PermissionsAsync(
         string nugetHome,
-        string packages,
+        string packageDir,
         string nugetDir,
         string marker,
         string config)
     {
+        var packagesRoot = Path.Combine(nugetHome, "packages");
         await ChmodAsync(UnixUmask002Permissions.DirectoryMode, nugetHome);
-        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, Path.Combine(nugetHome, "packages"));
-        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, packages);
+        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, packagesRoot);
+        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, packageDir);
         await ChmodAsync(UnixUmask002Permissions.DirectoryMode, nugetDir);
         await ChmodAsync(UnixUmask002Permissions.FileMode, marker);
         await ChmodAsync(UnixUmask002Permissions.FileMode, config);
@@ -328,18 +329,18 @@ public sealed class MsBuildNuGetHealTests
         var home = Path.Combine(root, "home");
         var projectDir = Path.Combine(root, "proj");
         var nugetHome = Path.Combine(home, ".nuget");
-        var packages = Path.Combine(nugetHome, "packages", "pkg");
+        var packageDir = Path.Combine(nugetHome, "packages", "pkg");
         var nugetDir = Path.Combine(nugetHome, "NuGet");
 
-        Directory.CreateDirectory(packages);
+        Directory.CreateDirectory(packageDir);
         Directory.CreateDirectory(nugetDir);
-        var marker = Path.Combine(packages, "marker.txt");
+        var marker = Path.Combine(packageDir, "marker.txt");
         await File.WriteAllTextAsync(marker, "cached");
         var config = Path.Combine(nugetDir, "NuGet.Config");
         await File.WriteAllTextAsync(config, "<configuration/>");
 
         // Linux umask 002: group-writable tree owned by current UID
-        await SetUmask002PermissionsAsync(nugetHome, packages, nugetDir, marker, config);
+        await SetUmask002PermissionsAsync(nugetHome, packageDir, nugetDir, marker, config);
 
         await CreateProjectAsync(projectDir, healTargets);
         var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
@@ -368,7 +369,7 @@ public sealed class MsBuildNuGetHealTests
     }
 
     [Fact]
-    public async Task MsBuild_ForeignOwnedTree_IsQuarantined()
+    public async Task MsBuild_UnusableTree_IsQuarantined()
     {
         if (!OperatingSystem.IsLinux())
             return;
@@ -387,7 +388,8 @@ public sealed class MsBuildNuGetHealTests
         var projectDir = Path.Combine(root, "proj");
         var nugetHome = Path.Combine(home, ".nuget");
         Directory.CreateDirectory(home);
-        // Point .nuget at a foreign root-owned system directory (/etc)
+        // Point .nuget at a foreign root-owned system directory (/etc) —
+        // rejected as a symlink before ownership is inspected.
         File.CreateSymbolicLink(nugetHome, "/etc");
 
         await CreateProjectAsync(projectDir, healTargets);
@@ -462,16 +464,16 @@ public sealed class MsBuildNuGetHealTests
             // and must leave cached packages intact.
             var homeHealthy = Path.Combine(root, "home-healthy");
             var nugetHealthy = Path.Combine(homeHealthy, ".nuget");
-            var packages = Path.Combine(nugetHealthy, "packages", "pkg");
+            var packageDir = Path.Combine(nugetHealthy, "packages", "pkg");
             var nugetDir = Path.Combine(nugetHealthy, "NuGet");
-            Directory.CreateDirectory(packages);
+            Directory.CreateDirectory(packageDir);
             Directory.CreateDirectory(nugetDir);
-            var marker = Path.Combine(packages, "marker.txt");
+            var marker = Path.Combine(packageDir, "marker.txt");
             await File.WriteAllTextAsync(marker, "concurrent-cache");
             var config = Path.Combine(nugetDir, "NuGet.Config");
             await File.WriteAllTextAsync(config, "<configuration/>");
 
-            await SetUmask002PermissionsAsync(nugetHealthy, packages, nugetDir, marker, config);
+            await SetUmask002PermissionsAsync(nugetHealthy, packageDir, nugetDir, marker, config);
 
             var envHealthy = CreateBuildEnv(dotnetDir, homeHealthy, root, nugetHealthy);
             var t1Healthy = RunDotnetBuildAsync(dotnetDir, Path.Combine(proj1, "proj.csproj"), offline1, envHealthy);

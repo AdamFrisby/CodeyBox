@@ -48,13 +48,18 @@ migration-marker seed, which may also materialize its candidate homes) and
 which never fails the build.
 
 Group write bits are tolerated only on entries owned by the current user UID
-whose group is provably private to that account: the group's member list must
-name nobody but possibly the user, and no other account may hold the gid as
-its primary group. On standard Linux systems with user-private groups (default
-umask 002), directories are created `drwxrwxr-x` under exactly such a group.
-A uid-owned directory in a *shared* group (`users`, `staff`, an LDAP/AD
-group), any foreign-owned group-writable entry, and every other-writable
-(`o+w`) entry are still rejected as co-tenant-writable.
+whose group is provably private to that account: the gid must be one the
+account itself holds (`id -G`), EVERY group-db entry for it (all `getent
+group` matches plus `/etc/group`) must name no members but possibly the
+user, and no other account may hold the gid as its primary group — with the
+whole proof requiring NSS enumeration via `getent`, so platforms or
+topologies where groups/accounts cannot be enumerated (macOS, musl, broken
+NSS) fail closed and treat group-write as co-tenant-writable. On standard
+Linux systems with user-private groups (default umask 002), directories are
+created `drwxrwxr-x` under exactly such a group. A uid-owned directory in a
+*shared* group (`users`, `staff`, an LDAP/AD group), any foreign-owned
+group-writable entry, and every other-writable (`o+w`) entry are still
+rejected as co-tenant-writable.
 
 "Usable" covers the consumed side too: a present `.nuget/packages` entry must
 pass the whole-tree cache admission (uid-owned or root-owned, never
@@ -71,7 +76,9 @@ Under parallel MSBuild, destructive repair is strictly race-free:
    (`Directory.Solution.props`) before restore dispatches to projects, so per-project
    InitialTargets never run destructive renames during parallel restore/build.
 2. The quarantine path is guarded by an advisory lock (a `mkdir` lock whose
-   owner pid is recorded and reaped once dead) and a completion marker in
+   owner pid is recorded and reaped once dead; a lock whose pid was never
+   recorded — e.g. the holder was killed mid-acquire — is reaped by age) and
+   a completion marker in
    verified private user storage (`$DOTNET_CLI_HOME` / `$HOME`). The marker
    suppresses repeat renames only while the home stays unusable — it is
    removed as soon as a usable home is observed again, so a later breakage

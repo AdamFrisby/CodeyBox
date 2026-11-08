@@ -51,13 +51,15 @@
 # because it was writable.
 #
 # Group write bits are tolerated ONLY on entries owned by this uid whose group
-# is provably private to this account — the group carries no members other
-# than possibly this user and no OTHER account holds it as a primary group
-# (_codeybox_group_is_private). That is the standard Linux user-private-group
-# shape (default umask 002 creates drwxrwxr-x dirs); it does not widen
-# co-tenant access. A uid-owned directory in a SHARED group (users, staff, an
-# LDAP/AD group), any foreign-owned group-writable entry, and every
-# other-writable (o+w) entry remain rejected.
+# is provably private to this account — a gid this account actually holds
+# (`id -G`) whose EVERY group-db entry names no members other than possibly
+# this user and which no OTHER account holds as a primary group, with the
+# whole proof requiring NSS enumeration via getent (unverifiable topologies
+# fail closed) — see _codeybox_group_is_private. That is the standard Linux
+# user-private-group shape (default umask 002 creates drwxrwxr-x dirs); it
+# does not widen co-tenant access. A uid-owned directory in a SHARED group
+# (users, staff, an LDAP/AD group), any foreign-owned group-writable entry,
+# and every other-writable (o+w) entry remain rejected.
 
 # === codeybox-shared-helpers: begin ===
 # Everything between the "codeybox-shared-helpers" sentinels is the head of
@@ -84,7 +86,6 @@ _codeybox_repo_home_leaf=".dotnet-cli-home"
 # this file's parsed value — so a NuGet layout change moves both together.
 _codeybox_nuget_migrations_marker=".local/share/NuGet/Migrations"
 _codeybox_euid="$(id -u)"
-_codeybox_egid="$(id -g 2>/dev/null)"
 _codeybox_login_name="$(id -un 2>/dev/null)"
 
 # Populate _codeybox_stat_mode (the "drwxr-xr-x" field), _codeybox_stat_uid
@@ -112,29 +113,47 @@ _codeybox_lstat_dir() {
 # lookup.
 _codeybox_pg_gid=
 _codeybox_pg_verdict=
-# The passwd db is dumped once per process — `getent passwd` resolves every
-# account through NSS (LDAP/AD included); /etc/passwd is the fallback where
-# getent does not exist (macOS).
+# The process's own group set (`id -G`) and the passwd db are each resolved
+# once per process — both go through NSS (LDAP/AD included), with /etc/passwd
+# unioned in for a nsswitch that skips the files db.
+_codeybox_group_set=
+_codeybox_group_set_dumped=0
 _codeybox_passwd_dump=
 _codeybox_passwd_dumped=0
 
-# Return 0 when gid $1 is provably PRIVATE to this account — no other account
-# can carry it in its group set, so group-write on storage bearing it grants
-# no co-tenant access. Two independent proofs are required:
+# Return 0 when gid $1 is provably PRIVATE to this account — group-write on
+# storage bearing it grants no co-tenant access. Every proof must hold, and
+# anything unverifiable fails closed:
 #
-#   1. Member list: the group's member field (getent group through NSS, with
-#      /etc/group as fallback) names nobody but possibly this login. A shared
-#      group (`users`, `staff`, an LDAP/AD group) lists other members.
-#   2. Primary gid: no OTHER passwd entry holds $1 as its primary gid — the
+#   0. Held gid: $1 must appear in THIS process's own group set (`id -G`,
+#      resolved through NSS). A gid we do not ourselves belong to can never
+#      be "our" private group — its privacy would rest entirely on proving
+#      a negative about accounts (and user-side supplementary memberships)
+#      we cannot enumerate.
+#   1. NSS enumeration: `getent` must exist. Without it (macOS, musl) only
+#      /etc/group and /etc/passwd are visible while directory-service
+#      (OpenDirectory/AD/LDAP) groups and accounts are invisible — both
+#      proofs below would pass for a genuinely shared group, so the verdict
+#      is "not private".
+#   2. Member list: EVERY group-db entry carrying $1 — every line
+#      `getent group` returns plus every matching /etc/group line — must
+#      name nobody in its member field but possibly this login. Multiple
+#      entries may legally share one gid; inspecting only the first would
+#      let a second entry's foreign members slip through.
+#   3. Primary gid: no OTHER passwd entry holds $1 as its primary gid — the
 #      classic failure mode where a group member list is empty yet every
 #      local account shares the gid (e.g. macOS `staff`).
 #
-# A gid with no group entry anywhere has no declared members, which is fine;
-# but an EMPTY passwd db means the second proof cannot run, so the verdict
-# fails closed. Anything unverifiable is "not private": group-write is then
-# rejected exactly like a foreign-owned entry.
+# Residual, documented rather than claimed away: a co-tenant holding $1 as a
+# supplementary group through a user-side directory-service membership that
+# no group entry reports is not enumerable portably. Proof 0 bounds that
+# residue to gids this account actually belongs to — the umask-002 /
+# user-private-group shape this carve-out exists for.
 _codeybox_group_is_private() {
     [ -n "${1:-}" ] || return 1
+    case $1 in
+        *[!0-9]*) return 1 ;;
+    esac
     if [ "$1" = "${_codeybox_pg_gid:-}" ]; then
         [ "${_codeybox_pg_verdict:-}" = "yes" ]
         return
@@ -142,43 +161,54 @@ _codeybox_group_is_private() {
     _codeybox_pg_gid=$1
     _codeybox_pg_verdict=no
 
-    _codeybox_gp_line=
-    if command -v getent >/dev/null 2>&1; then
-        _codeybox_gp_line="$(getent group "$1" 2>/dev/null | head -n 1)"
+    # Proof 0 — the gid must be one this account actually holds. `id -G`
+    # prints the full group set (primary + supplementary) through NSS; an
+    # empty or failed dump cannot prove membership, so it fails closed.
+    if [ "$_codeybox_group_set_dumped" != "1" ]; then
+        _codeybox_group_set="$(id -G 2>/dev/null)"
+        _codeybox_group_set_dumped=1
     fi
-    if [ -z "$_codeybox_gp_line" ] && [ -f /etc/group ]; then
-        _codeybox_gp_line="$(awk -F: -v g="$1" '$3 == g { print; exit }' \
-            /etc/group 2>/dev/null)"
-    fi
-    if [ -n "$_codeybox_gp_line" ]; then
-        # The member list is the field after the last ':'; entries are
-        # comma-separated login names. Every member must be this login —
-        # an empty list passes, anything else (including members we cannot
-        # name ourselves to compare against) fails closed.
-        _codeybox_gp_members="${_codeybox_gp_line##*:}"
-        if [ -n "$_codeybox_gp_members" ]; then
-            # One member per line, spaces stripped; grep -vxF prints every
-            # line that is NOT exactly this login — any output is a foreign
-            # member. An empty _codeybox_login_name can never match, so
-            # unverifiable memberships fail closed.
-            _codeybox_gp_foreign="$(printf '%s' "$_codeybox_gp_members" \
-                | tr -d ' ' | tr ',' '\n' \
-                | grep -vxF -e "${_codeybox_login_name:-.codeybox-no-such-login}" \
-                    2>/dev/null)"
-            [ -z "$_codeybox_gp_foreign" ] || return 1
-        fi
-    fi
+    [ -n "$_codeybox_group_set" ] || return 1
+    printf '%s\n' "$_codeybox_group_set" | tr ' ' '\n' \
+        | grep -qxF "$1" 2>/dev/null || return 1
 
+    # Proof 1 — NSS enumeration is mandatory; see the header above.
+    command -v getent >/dev/null 2>&1 || return 1
+
+    # Proof 2 — member list across EVERY entry for this gid. getent group
+    # returns all NSS matches; /etc/group is scanned as well so a files-db
+    # entry nsswitch skipped cannot hide members. The member list is the
+    # field after the last ':' of each entry; entries are comma-separated
+    # login names. Every member of every entry must be this login — empty
+    # lists pass, anything else (including members we cannot name ourselves
+    # to compare against) fails closed.
+    _codeybox_gp_entries="$(getent group "$1" 2>/dev/null)"
+    if [ -f /etc/group ]; then
+        _codeybox_gp_entries="$_codeybox_gp_entries
+$(awk -F: -v g="$1" '$3 == g' /etc/group 2>/dev/null)"
+    fi
+    _codeybox_gp_foreign="$(printf '%s\n' "$_codeybox_gp_entries" \
+        | awk -F: 'NF { print $NF }' \
+        | tr ',' '\n' | tr -d ' ' \
+        | grep -v '^$' \
+        | grep -vxF -e "${_codeybox_login_name:-.codeybox-no-such-login}" \
+            2>/dev/null)"
+    [ -z "$_codeybox_gp_foreign" ] || return 1
+
+    # Proof 3 — no OTHER account (uid != ours) holds $1 as its PRIMARY gid.
+    # getent passwd resolves every account through NSS; /etc/passwd is
+    # unioned in so a nsswitch without the files db cannot hide a local
+    # account. An empty getent dump means the account db cannot be
+    # enumerated at all — fail closed rather than skip the proof.
     if [ "$_codeybox_passwd_dumped" != "1" ]; then
         _codeybox_passwd_dump="$(getent passwd 2>/dev/null)"
-        if [ -z "$_codeybox_passwd_dump" ] && [ -f /etc/passwd ]; then
-            _codeybox_passwd_dump="$(cat /etc/passwd 2>/dev/null)"
+        [ -n "$_codeybox_passwd_dump" ] || return 1
+        if [ -f /etc/passwd ]; then
+            _codeybox_passwd_dump="$_codeybox_passwd_dump
+$(cat /etc/passwd 2>/dev/null)"
         fi
         _codeybox_passwd_dumped=1
     fi
-    [ -n "$_codeybox_passwd_dump" ] || return 1
-    # Another account (uid != ours) whose PRIMARY gid is $1 shares every
-    # group-writable file bearing it, member list or not.
     if printf '%s\n' "$_codeybox_passwd_dump" | awk -F: \
         -v g="$1" -v u="$_codeybox_euid" \
         '$4 == g && $3 != u { found = 1 } END { exit(found ? 0 : 1) }'; then
@@ -204,10 +234,12 @@ _codeybox_group_is_private() {
 #   trusted — like private but root ownership is admitted too, for data we
 #             only CONSUME read-only (an image-baked package cache); the
 #             platform's root is already trusted, a third uid is not.
-#   anchor  — owned by this uid or root, with group/other-writable tolerated
-#             only under the sticky bit (the /tmp rule: co-tenants may add
-#             entries but can never rename or replace ours) or — for
-#             uid-owned entries — a provably private group. Also the rule
+#   anchor  — owned by this uid or root. Other-writable is tolerated only
+#             under the sticky bit (the /tmp rule: co-tenants may add
+#             entries but can never rename or replace ours). Group-writable
+#             is tolerated under the sticky bit OR — for uid-owned entries
+#             — a provably private group (_codeybox_group_is_private); a
+#             private group does NOT excuse other-writable. Also the rule
 #             applied to every ANCESTOR of the leaf, so nothing along the
 #             chain can be swapped out after these checks.
 # $3 "writable" additionally requires the leaf be writable by this user.
@@ -438,9 +470,9 @@ _codeybox_cache_scan_limit=500000
 # Print the canonical path of package-cache candidate $1 only when the WHOLE
 # tree is consumable storage — the root canonicalizes under the "trusted"
 # rule AND every descendant is owned by this uid or root, never
-# other-writable, group-writable only on uid-owned entries whose gid is one
-# of the verified-private gids below, and no ACL broadening access beyond
-# what the mode bits show.
+# other-writable, group-writable only on uid-owned entries whose gid is
+# provably private (_codeybox_group_is_private), and no ACL broadening
+# access beyond what the mode bits show.
 # Verifying the root alone would admit a co-tenant-writable or foreign-owned
 # subtree, and NuGet consumes extracted entries as-is: a present
 # .nupkg.metadata skips re-extraction, and a package's build/.props/.targets
@@ -464,21 +496,24 @@ _codeybox_secure_package_cache() {
         || return 1
     # Group-write inside the tree is admitted only for uid-owned entries
     # whose gid is provably private (_codeybox_group_is_private). The awk
-    # scan below cannot run that lookup per entry, so it is resolved once
-    # here for the two gids a cache realistically carries — the root's own
-    # gid (setgid inheritance) and this process's egid (normal creation).
-    # Any other group-writable descendant fails the scan closed and the
-    # cache is simply not consumed.
-    _codeybox_cache_gid_a=-1
-    _codeybox_cache_gid_b=-1
-    _codeybox_lstat_dir "$_codeybox_cache_root" || return 1
-    if _codeybox_group_is_private "$_codeybox_stat_gid"; then
-        _codeybox_cache_gid_a="$_codeybox_stat_gid"
-    fi
-    if [ -n "$_codeybox_egid" ] \
-        && _codeybox_group_is_private "$_codeybox_egid"; then
-        _codeybox_cache_gid_b="$_codeybox_egid"
-    fi
+    # scan below cannot run that lookup per entry, so EVERY DISTINCT gid a
+    # uid-owned group-writable descendant carries is resolved once here —
+    # the root's own gid (setgid inheritance) and this process's egid
+    # (normal creation) are merely the common cases, not the only admissible
+    # ones. Any group-writable descendant whose gid fails the proof fails
+    # the scan closed and the cache is simply not consumed.
+    _codeybox_cache_private_gids=
+    _codeybox_cache_gid_candidates="$(find -L "$_codeybox_cache_root" \
+        -exec ls -ldnL {} + 2>/dev/null \
+        | awk -v euid="$_codeybox_euid" \
+            '$3 + 0 == euid + 0 && substr($1, 6, 1) == "w" { print $4 }' \
+        | sort -u)"
+    for _codeybox_cache_gid in $_codeybox_cache_gid_candidates; do
+        if _codeybox_group_is_private "$_codeybox_cache_gid"; then
+            _codeybox_cache_private_gids="${_codeybox_cache_private_gids}${_codeybox_cache_gid}
+"
+        fi
+    done
     # `set --` word-splits the (possibly space-padded) wc output so the count
     # is a bare number on every wc dialect. An existing dir always
     # enumerates at least itself, so a zero count means find could not scan
@@ -496,8 +531,8 @@ _codeybox_secure_package_cache() {
     _codeybox_cache_bad="$(find -L "$_codeybox_cache_root" \
             -exec ls -ldnL {} + 2>&1 \
         | awk -v euid="$_codeybox_euid" \
-            -v gid_a="$_codeybox_cache_gid_a" \
-            -v gid_b="$_codeybox_cache_gid_b" '
+            -v pg="$_codeybox_cache_private_gids" '
+            BEGIN { pgset = "\n" pg "\n" }
             {
                 mode = $1
                 n = length(mode)
@@ -518,10 +553,12 @@ _codeybox_secure_package_cache() {
                 if (substr(mode, 9, 1) == "w") { print; exit }
                 # Group-write: only a uid-owned entry whose gid was proven
                 # private above may carry it — a shared-group or foreign
-                # group-write bit is co-tenant access and fails closed.
+                # group-write bit is co-tenant access and fails closed. The
+                # newline-delimited pgset membership test cannot be fooled by
+                # a gid that is a numeric prefix of another.
                 if (substr(mode, 6, 1) == "w" \
                     && !($3 + 0 == euid + 0 \
-                        && ($4 + 0 == gid_a + 0 || $4 + 0 == gid_b + 0))) {
+                        && index(pgset, "\n" $4 "\n") > 0)) {
                     print; exit
                 }
             }
@@ -895,6 +932,79 @@ _codeybox_release_quarantine_lock() {
     return 0
 }
 
+# The usable-check every branch of codeybox_heal_nuget_home repeats: run the
+# shared ensure with the "trusted" admission (an unwritable .nuget can still
+# be quarantined aside, so its writability is left for the check's own mkdir
+# probe — the exec preamble uses "trusted writable" because it cannot
+# recreate in place) and remove the writability probe on success. Reads
+# $_codeybox_cli_home and $_codeybox_nuget_probe; returns the ensure verdict.
+_codeybox_cli_home_usable() {
+    if _codeybox_ensure_nuget_home_usable \
+        "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
+        rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+# Try to take the quarantine lock, retrying for a bounded budget — fast
+# retries first, then a capped 1s backoff — before giving up so the caller
+# can defer to the redirect fallback. Always returns 0; the outcome is
+# _codeybox_lock_acquired. Reads $_codeybox_quarantine_lock and
+# $_codeybox_quarantine_marker.
+#
+# Stale-lock recovery: reap a lock whose recorded pid no longer exists. A
+# lock with a missing/garbage pid file is normally a holder mid-acquire —
+# but a holder killed in the mkdir→pid-write window leaves it pidless
+# forever, so it is reaped only once the lock dir is provably older than
+# that window could ever be (the pid write is immediate; `-mmin +1` means
+# roughly a minute old or more). And a lock whose pid cannot be recorded at
+# acquisition is released on the spot rather than left unreapable. A wrong
+# reap is still safe: the usable re-check under the lock and the atomic mv
+# bound the damage to at most one quarantine directory.
+_codeybox_acquire_quarantine_lock() {
+    _codeybox_lock_acquired=0
+    _codeybox_lock_attempts=0
+    _codeybox_lock_max_attempts=100
+    _codeybox_lock_fast_attempts=10
+    while [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_max_attempts" ]; do
+        if mkdir "$_codeybox_quarantine_lock" 2>/dev/null; then
+            if printf '%s\n' "$$" \
+                > "$_codeybox_quarantine_lock/pid" 2>/dev/null; then
+                _codeybox_lock_acquired=1
+            else
+                rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+            fi
+            break
+        fi
+        _codeybox_lock_pid="$(cat "$_codeybox_quarantine_lock/pid" \
+            2>/dev/null)"
+        case $_codeybox_lock_pid in
+            ''|*[!0-9]*)
+                if find "$_codeybox_quarantine_lock" -maxdepth 0 -mmin +1 \
+                        2>/dev/null | grep -q .; then
+                    rm -f "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
+                    rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                fi ;;
+            *)
+                if ! kill -0 "$_codeybox_lock_pid" 2>/dev/null; then
+                    rm -f "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
+                    rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                fi ;;
+        esac
+        if [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_fast_attempts" ]; then
+            sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
+        else
+            sleep 1 2>/dev/null || true
+        fi
+        _codeybox_lock_attempts=$((_codeybox_lock_attempts + 1))
+        if [ -f "$_codeybox_quarantine_marker" ]; then
+            break
+        fi
+    done
+    return 0
+}
+
 codeybox_heal_nuget_home() {
     if [ -n "${CODEYBOX_NUGET_HOME_UNDER_TEST:-}" ]; then
         _codeybox_cli_home_env="$(dirname "${CODEYBOX_NUGET_HOME_UNDER_TEST%/}")"
@@ -940,9 +1050,7 @@ codeybox_heal_nuget_home() {
         # shared check's own mkdir probe to discover. The exec preamble runs
         # the same check with "trusted writable" because it cannot recreate
         # the directory in place.
-        if _codeybox_ensure_nuget_home_usable \
-            "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-            rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+        if _codeybox_cli_home_usable; then
             # A usable home means any earlier quarantine episode is over:
             # drop the marker so a LATER breakage quarantines afresh rather
             # than being suppressed by a stale marker forever.
@@ -967,7 +1075,8 @@ codeybox_heal_nuget_home() {
         # 3. An exclusive lock in private storage coordinates concurrent
         #    processes, so a concurrent node never renames a directory another
         #    node may be reading; a holder killed mid-quarantine leaves a stale
-        #    lock that is reaped once its recorded pid is gone.
+        #    lock that _codeybox_acquire_quarantine_lock reaps — by recorded
+        #    pid when present, by age when the pid was never written.
         # 4. Never create more than one quarantine directory per invocation.
         if [ -f "$_codeybox_quarantine_marker" ]; then
             # Quarantine already ran for this unusable home. If the home
@@ -976,58 +1085,15 @@ codeybox_heal_nuget_home() {
             # unusable the rename is suppressed and the redirect fallback
             # below applies — the marker carries no build identity, so it
             # must never outlive the broken state it recorded.
-            if _codeybox_ensure_nuget_home_usable \
-                "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+            if _codeybox_cli_home_usable; then
                 rm -f "$_codeybox_quarantine_marker" 2>/dev/null || true
                 return 0
             fi
         else
-            _codeybox_lock_acquired=0
-            _codeybox_lock_attempts=0
-            # Named bounds: ~10s of coordination budget — fast retries first,
-            # then a capped 1s backoff — before deferring to the redirect.
-            _codeybox_lock_max_attempts=100
-            _codeybox_lock_fast_attempts=10
-            while [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_max_attempts" ]; do
-                if mkdir "$_codeybox_quarantine_lock" 2>/dev/null; then
-                    # Record the owner pid so a killed holder's lock can be
-                    # reaped instead of stalling every later heal.
-                    printf '%s\n' "$$" \
-                        > "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
-                    _codeybox_lock_acquired=1
-                    break
-                fi
-                # Stale-lock recovery: reap only a lock that names a pid which
-                # no longer exists. A missing/garbage pid file means the holder
-                # is mid-acquire — leave it alone. A wrong reap is still safe:
-                # the re-check under the lock and the atomic mv bound the
-                # damage to at most one quarantine directory.
-                _codeybox_lock_pid="$(cat "$_codeybox_quarantine_lock/pid" \
-                    2>/dev/null)"
-                case $_codeybox_lock_pid in
-                    ''|*[!0-9]*) ;;
-                    *)
-                        if ! kill -0 "$_codeybox_lock_pid" 2>/dev/null; then
-                            rm -f "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
-                            rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
-                        fi ;;
-                esac
-                if [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_fast_attempts" ]; then
-                    sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
-                else
-                    sleep 1 2>/dev/null || true
-                fi
-                _codeybox_lock_attempts=$((_codeybox_lock_attempts + 1))
-                if [ -f "$_codeybox_quarantine_marker" ]; then
-                    break
-                fi
-            done
+            _codeybox_acquire_quarantine_lock
 
             # Re-check under lock (or after waiting): another node may have already healed it.
-            if _codeybox_ensure_nuget_home_usable \
-                "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+            if _codeybox_cli_home_usable; then
                 _codeybox_release_quarantine_lock
                 return 0
             fi
@@ -1043,9 +1109,7 @@ codeybox_heal_nuget_home() {
                 fi
 
                 if [ "$_codeybox_quarantined" -eq 1 ]; then
-                    if _codeybox_ensure_nuget_home_usable \
-                        "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
-                        rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                    if _codeybox_cli_home_usable; then
                         _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
                             "$_codeybox_quarantine/packages"
                         : > "$_codeybox_quarantine_marker" 2>/dev/null || true

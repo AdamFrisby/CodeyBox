@@ -56,8 +56,9 @@ internal static class RequiredBuildScript
 
         # TMPDIR is launch-env input like every other directory this script
         # trusts: admit it only as a writable "anchor" (the /tmp rule — owned
-        # by this uid or root, group/other-writable tolerated only under the
-        # sticky bit or a provably private group) before the mktemp creates below. In a non-sticky
+        # by this uid or root; other-writable tolerated only under the sticky
+        # bit, group-writable under the sticky bit or — for uid-owned entries
+        # — a provably private group) before the mktemp creates below. In a non-sticky
         # co-tenant-writable dir the owner could swap a just-created file or
         # dir for a symlink, turning the `>`/`sort -o` writes below — plus
         # the capture variant's binlog writes — into a create/truncate at

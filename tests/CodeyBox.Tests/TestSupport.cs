@@ -46,6 +46,20 @@ internal static class TestSupport
             : argv;
 
     /// <summary>
+    /// True when <paramref name="exec"/> is the exact tool-presence probe argv
+    /// the auditors emit — <c>sh -c 'command -v "$1" &gt;/dev/null 2&gt;&amp;1' sh
+    /// &lt;tool&gt;</c> (see ExternalToolAuditorBase / ShellCommandAuditor). The
+    /// five-element shape has ONE definition here so per-test copies cannot
+    /// drift when the probe argv changes.
+    /// </summary>
+    public static bool IsToolPresenceProbe(SandboxExec exec) =>
+        exec.Argv.Count == 5 &&
+        exec.Argv[0] == "sh" &&
+        exec.Argv[1] == "-c" &&
+        exec.Argv[2] == "command -v \"$1\" >/dev/null 2>&1" &&
+        exec.Argv[3] == "sh";
+
+    /// <summary>
     /// Numeric uid of the current user via <c>id -u</c>, for tests that assert
     /// on the uid-stamped per-user fallback dirs
     /// (<see cref="NuGetHomeSelfHeal.WritableHomeLeaf"/>) the NuGet-home heal

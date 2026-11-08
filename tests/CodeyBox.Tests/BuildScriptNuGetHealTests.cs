@@ -1020,6 +1020,45 @@ public sealed class BuildScriptNuGetHealTests
         }
     }
 
+    // The group-privacy proof behind the umask-002 carve-out must fail
+    // CLOSED: a gid this account does not itself hold (`id -G`) can never be
+    // "our" private group, no matter what the group/passwd dbs say — that
+    // is what keeps a co-tenant-held gid from being admitted on the strength
+    // of an incomplete member enumeration. Pin both directions directly.
+    [Fact]
+    public async Task HealScript_GroupIsPrivate_RequiresHeldGid()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        Directory.CreateDirectory(home);
+        try
+        {
+            var result = await RunHealShellAsync(
+                NewHealEnv(root, home),
+                "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && "
+                + "{ _codeybox_group_is_private \"$(id -g)\" "
+                + "  && echo EGID=private || echo EGID=shared; } && "
+                + "{ _codeybox_group_is_private 999999 "
+                + "  && echo STRANGER=private || echo STRANGER=refused; }",
+                root, HealScriptRepoRoot());
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            // The process's own egid is the gid every umask-002 fixture
+            // relies on; if the environment cannot prove it private the
+            // group-writable fixtures above would fail too.
+            Assert.Contains("EGID=private", lines);
+            Assert.Contains("STRANGER=refused", lines);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     // Regression: a directory that grants execute without read is unlistable
     // to find, so its children escaped the old discarded-stderr scan while
     // remaining consumable by NuGet through a constructed path — a tampered

@@ -47,9 +47,9 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     {
         var home = Path.Combine(_workspace, "home");
         var nugetHome = Path.Combine(home, ".nuget");
-        var packages = Path.Combine(nugetHome, "packages", "newtonsoft.json");
-        Directory.CreateDirectory(packages);
-        File.WriteAllText(Path.Combine(packages, "marker.txt"), "cached");
+        var packageDir = Path.Combine(nugetHome, "packages", "newtonsoft.json");
+        Directory.CreateDirectory(packageDir);
+        File.WriteAllText(Path.Combine(packageDir, "marker.txt"), "cached");
         // Simulate the baked image: parent not writable by the build user.
         File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute
             | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
@@ -275,11 +275,11 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     {
         var home = Path.Combine(_workspace, "arg-home-group-writable");
         var nugetHome = Path.Combine(home, ".nuget");
-        var packages = Path.Combine(nugetHome, "packages", "pkg");
+        var packageDir = Path.Combine(nugetHome, "packages", "pkg");
         var nugetDir = Path.Combine(nugetHome, "NuGet");
-        Directory.CreateDirectory(packages);
+        Directory.CreateDirectory(packageDir);
         Directory.CreateDirectory(nugetDir);
-        var marker = Path.Combine(packages, "marker.txt");
+        var marker = Path.Combine(packageDir, "marker.txt");
         await File.WriteAllTextAsync(marker, "healthy-cache");
         var config = Path.Combine(nugetDir, "NuGet.Config");
         await File.WriteAllTextAsync(config, "<configuration/>");
@@ -288,7 +288,7 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         // owned by the current UID.
         File.SetUnixFileMode(nugetHome, UnixUmask002Permissions.Directory);
         File.SetUnixFileMode(Path.Combine(nugetHome, "packages"), UnixUmask002Permissions.Directory);
-        File.SetUnixFileMode(packages, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(packageDir, UnixUmask002Permissions.Directory);
         File.SetUnixFileMode(nugetDir, UnixUmask002Permissions.Directory);
         File.SetUnixFileMode(marker, UnixUmask002Permissions.File);
         File.SetUnixFileMode(config, UnixUmask002Permissions.File);
@@ -306,9 +306,10 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     }
 
     [Fact]
-    public async Task Script_ForeignOwnedTree_IsQuarantined()
+    public async Task Script_UnusableTree_IsQuarantined()
     {
-        // 1. Symlink pointing to a foreign root-owned system directory (/etc).
+        // 1. .nuget symlinked at a foreign root-owned system directory (/etc) —
+        //    rejected as a link before ownership is even inspected.
         var homeLink = Path.Combine(_workspace, "arg-home-foreign-symlink");
         Directory.CreateDirectory(homeLink);
         var nugetHomeLink = Path.Combine(homeLink, ".nuget");
@@ -323,7 +324,9 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
             File.GetAttributes(nugetHomeLink).HasFlag(FileAttributes.ReparsePoint),
             "recreated .nuget must be a real directory, not a symlink");
 
-        // 2. Unwritable / foreign-owned tree simulated via mode 0555.
+        // 2. Unusable tree simulated via mode 0555 (still uid-owned — no
+        //    privileged chown is available to make a genuinely
+        //    foreign-owned fixture).
         if (!Environment.IsPrivilegedProcess)
         {
             var homeUnwritable = Path.Combine(_workspace, "arg-home-foreign-unwritable");
@@ -380,18 +383,18 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         // must never quarantine and never remove or replace the healthy cache.
         var homeHealthy = Path.Combine(_workspace, "concurrent-healthy");
         var nugetHealthy = Path.Combine(homeHealthy, ".nuget");
-        var packages = Path.Combine(nugetHealthy, "packages", "pkg");
+        var packageDir = Path.Combine(nugetHealthy, "packages", "pkg");
         var nugetDir = Path.Combine(nugetHealthy, "NuGet");
-        Directory.CreateDirectory(packages);
+        Directory.CreateDirectory(packageDir);
         Directory.CreateDirectory(nugetDir);
-        var marker = Path.Combine(packages, "marker.txt");
+        var marker = Path.Combine(packageDir, "marker.txt");
         await File.WriteAllTextAsync(marker, "healthy-concurrent-cache");
         var config = Path.Combine(nugetDir, "NuGet.Config");
         await File.WriteAllTextAsync(config, "<configuration/>");
 
         File.SetUnixFileMode(nugetHealthy, UnixUmask002Permissions.Directory);
         File.SetUnixFileMode(Path.Combine(nugetHealthy, "packages"), UnixUmask002Permissions.Directory);
-        File.SetUnixFileMode(packages, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(packageDir, UnixUmask002Permissions.Directory);
         File.SetUnixFileMode(nugetDir, UnixUmask002Permissions.Directory);
         File.SetUnixFileMode(marker, UnixUmask002Permissions.File);
         File.SetUnixFileMode(config, UnixUmask002Permissions.File);
