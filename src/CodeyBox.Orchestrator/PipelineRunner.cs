@@ -1445,6 +1445,30 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 phase: "mechanical-edit",
                 agent: null);
         }
+        catch (OutputTokenLimitExhaustedException ex)
+        {
+            // The runner already spent its bounded same-session
+            // continuations against the provider's per-turn output ceiling:
+            // the agent was cut off mid-task, not declining to work. Fail
+            // terminally with the distinct output-limit-exhausted kind so
+            // the outcome is never misreported as quota, transient, or
+            // "produced no changes". Never a transient park (the budget is
+            // spent) and never quota fallback (the ceiling is a property of
+            // the task's fit, not the agent choice).
+            _log.LogWarning(
+                "Work item {Id} hit output-token exhaustion: agent={Agent} phase={Phase} error={Error}",
+                item.Id,
+                ex.Agent.Value,
+                ex.Phase ?? "(unknown)",
+                ex.Message);
+            await TransitionFailed(
+                item,
+                ex.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.OutputLimitExhausted,
+                agent: ex.Agent);
+        }
         catch (TerminalQuotaError ex)
         {
             // Quota rejection is never a terminal Failure: the agent (or a peer

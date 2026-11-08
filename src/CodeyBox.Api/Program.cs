@@ -6448,6 +6448,15 @@ namespace CodeyBox.Api
         /// </summary>
         public VibeOptions Vibe { get; set; } = new();
 
+        /// <summary>
+        /// Devin (<c>devin</c>) runner settings, notably the bounded
+        /// same-session continuation count after an output-limit
+        /// (<c>max_tokens</c>) turn stop. Bound from
+        /// <c>CodeyBox:Devin</c>. Hot-reloadable through
+        /// <c>IOptionsMonitor</c>.
+        /// </summary>
+        public DevinOptions Devin { get; set; } = new();
+
         public int UpstreamPushMaxAttempts { get; set; } = 5;
         public int UpstreamPushBackoffSeconds { get; set; } = 15;
 

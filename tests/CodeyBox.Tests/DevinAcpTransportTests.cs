@@ -71,6 +71,15 @@ public sealed class DevinAcpTransportTests
     ///   session/prompt. Structured signals ride the session-pinned ACP
     ///   wire, so unlike the stderr WARN they stay armed for the whole
     ///   turn: the shim must still abort with model_mismatch.</item>
+    ///   <item><c>max_tokens_then_complete</c> — answers the FIRST
+    ///   session/prompt with stopReason <c>max_tokens</c> (the real
+    ///   provider-ceiling shape, with the production usage counters), then
+    ///   answers the continuation prompt with end_turn. The shim must send
+    ///   exactly one same-session continuation and succeed.</item>
+    ///   <item><c>always_max_tokens</c> — answers EVERY session/prompt
+    ///   with stopReason <c>max_tokens</c>. The shim must re-prompt up to
+    ///   the configured bound, then end the run with
+    ///   <c>output_limit_exhausted</c> and a nonzero exit.</item>
     /// </list>
     /// When FAKE_GATE is set, the peer blocks after emitting its progress
     /// notifications until the gate file exists — letting the test prove
@@ -104,6 +113,7 @@ public sealed class DevinAcpTransportTests
             sys.exit(1)
 
         sid = "fake-session-1"
+        prompt_count = 0
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -151,6 +161,7 @@ public sealed class DevinAcpTransportTests
                 send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
             elif method == "session/prompt":
                 rec({"prompt": msg.get("params")})
+                prompt_count += 1
                 if behavior == "late_stderr_warn":
                     # Post-prompt fd 2 is shared with tool subprocesses —
                     # the agent controls it, so the marker phrase here is
@@ -211,6 +222,15 @@ public sealed class DevinAcpTransportTests
                 if behavior == "turn_error":
                     send({"jsonrpc": "2.0", "id": msg["id"],
                           "error": {"code": -32001, "message": "synthetic turn failure"}})
+                elif behavior == "always_max_tokens" or (
+                        behavior == "max_tokens_then_complete" and prompt_count == 1):
+                    # The real provider-ceiling shape: the model hit its
+                    # per-turn output-token ceiling mid-task (production
+                    # counters from the incident snapshot).
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                          "stopReason": "max_tokens",
+                          "usage": {"totalTokens": 214372, "inputTokens": 86372,
+                                   "outputTokens": 128000}}})
                 elif behavior == "retryable_turn_error":
                     # The real incident shape: the backend rejected the
                     # substituted model and marked the error retryable.
@@ -853,6 +873,133 @@ public sealed class DevinAcpTransportTests
         Assert.NotEqual(0, proc.ExitCode);
         Assert.Contains("missing devin acp shim terminator", stderr, StringComparison.Ordinal);
         Assert.DoesNotContain("devin.acp", stdout, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_FakeAcpPeer_MaxTokensThenComplete_ContinuesSameSessionExactlyOnce()
+    {
+        // The provider cut the first turn off with stopReason max_tokens
+        // mid-task: the shim must NOT end the run there. It records one
+        // token_continuation envelope, re-prompts the SAME session with the
+        // shared truncation-continuation wording, and the completed
+        // continuation yields a successful run.
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox ACP test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("python3"), "python3 is required for the devin acp shim.");
+
+        using var temp = new TemporaryDir("codeybox-devin-acp-");
+        var (binDir, recordPath) = WriteFakeDevin(temp.Path);
+        await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "max_tokens_then_complete");
+
+        var runner = new DevinAgentRunner();
+        Assert.Equal(
+            OutputTokenLimit.DefaultMaxContinuations,
+            runner.MaxTokenContinuations);
+        Assert.Contains(
+            DevinAgentRunner.AcpShimArgs(
+                DevinAgentRunner.DefaultBinary,
+                ConfiguredModel,
+                DevinAgentRunner.FullAutonomyAcpMode,
+                runner.MaxTokenContinuations,
+                ProviderTransientRetryPolicy.BuildTruncationContinuePrompt(phase: null)),
+            args => args == "--max-token-continuations");
+        var streamed = new StringBuilder();
+        var result = await runner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, Prompt, credential: null,
+            modelId: ConfiguredModel,
+            stdoutChunkCallback: chunk => { lock (streamed) streamed.Append(chunk); });
+
+        Assert.True(result.Success, $"expected success after continuation; stderr={result.Stderr}");
+        Assert.False(result.OutputTokenLimitExhausted, "a completed continuation must not carry the exhaustion marker");
+
+        var streamText = streamed.ToString();
+        Assert.Contains("\"token_continuation\"", streamText, StringComparison.Ordinal);
+        Assert.DoesNotContain("output_limit_exhausted", streamText, StringComparison.Ordinal);
+        Assert.Equal(
+            DevinAcpOutcome.TerminalEvent.TurnComplete,
+            DevinAcpOutcome.Extract(streamText).Event);
+
+        // Exactly two prompts reached the peer: the dispatch prompt and one
+        // continuation, both against the same negotiated session.
+        var prompts = ReadRecords(recordPath).Where(r => r.Contains("\"prompt\"")).ToList();
+        Assert.Equal(2, prompts.Count);
+        using (var first = JsonDocument.Parse(prompts[0]))
+        using (var second = JsonDocument.Parse(prompts[1]))
+        {
+            var firstParams = first.RootElement.GetProperty("prompt");
+            var secondParams = second.RootElement.GetProperty("prompt");
+            Assert.Equal(
+                firstParams.GetProperty("sessionId").GetString(),
+                secondParams.GetProperty("sessionId").GetString());
+            Assert.Equal(
+                Prompt,
+                firstParams.GetProperty("prompt")[0].GetProperty("text").GetString());
+            var continuationText = secondParams.GetProperty("prompt")[0].GetProperty("text").GetString();
+            Assert.Equal(
+                ProviderTransientRetryPolicy.BuildTruncationContinuePrompt(phase: null),
+                continuationText);
+            Assert.DoesNotContain(Prompt, continuationText, StringComparison.Ordinal);
+        }
+
+        // The dispatch bound travels the runner's shim argv (the fake peer
+        // only sees the `devin acp` argv, not the shim's — the bounded
+        // prompt count above proves the shim honoured it end to end).
+        var shimArgs = DevinAgentRunner.AcpShimArgs(
+            DevinAgentRunner.DefaultBinary,
+            ConfiguredModel,
+            DevinAgentRunner.FullAutonomyAcpMode,
+            runner.MaxTokenContinuations,
+            ProviderTransientRetryPolicy.BuildTruncationContinuePrompt(phase: null));
+        var boundIndex = Assert.Single(
+            shimArgs
+                .Select((value, index) => (value, index))
+                .Where(entry => entry.value == "--max-token-continuations")
+                .Select(entry => entry.index));
+        Assert.Equal(
+            OutputTokenLimit.DefaultMaxContinuations.ToString(),
+            shimArgs[boundIndex + 1]);
+    }
+
+    [SkippableFact]
+    public async Task RunAsync_FakeAcpPeer_AlwaysMaxTokens_ExhaustsBoundWithDistinctClassification()
+    {
+        // Every turn ends at the provider's output ceiling: the shim must
+        // re-prompt up to the configured bound (2 here, so 3 prompts total),
+        // then end the run with output_limit_exhausted and a nonzero exit —
+        // classified as the distinct output-limit-exhausted outcome, never
+        // quota, transient, or "produced no changes".
+        Skip.If(OperatingSystem.IsWindows(), "ProcessSandbox ACP test requires Unix exec semantics.");
+        Skip.IfNot(HasCommand("python3"), "python3 is required for the devin acp shim.");
+
+        using var temp = new TemporaryDir("codeybox-devin-acp-");
+        var (binDir, recordPath) = WriteFakeDevin(temp.Path);
+        await using var sandbox = await CreateSandboxAsync(binDir, temp.Path, "always_max_tokens");
+
+        var runner = new DevinAgentRunner(
+            defaults: null,
+            options: () => new DevinOptions { MaxTokenContinuations = 2 });
+        Assert.Equal(2, runner.MaxTokenContinuations);
+        var streamed = new StringBuilder();
+        var result = await runner.RunAsync(
+            sandbox, SandboxConventions.WorkDir, Prompt, credential: null,
+            modelId: ConfiguredModel,
+            stdoutChunkCallback: chunk => { lock (streamed) streamed.Append(chunk); });
+
+        Assert.False(result.Success, "an exhausted continuation bound must fail the run");
+        Assert.True(result.OutputTokenLimitExhausted, "exhaustion must stamp the typed marker");
+        Assert.NotNull(result.TerminalDiagnostic);
+        Assert.Contains("exhausted 2 same-session continuations", result.TerminalDiagnostic, StringComparison.Ordinal);
+
+        var streamText = streamed.ToString();
+        var outcome = DevinAcpOutcome.Extract(streamText);
+        Assert.Equal(DevinAcpOutcome.TerminalEvent.OutputLimitExhausted, outcome.Event);
+        Assert.Contains("\"token_continuation\"", streamText, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"turn_complete\"", streamText, StringComparison.Ordinal);
+
+        // Initial prompt plus exactly the 2 configured continuations: the
+        // bounded prompt count proves the runner-passed bound reached the
+        // shim (the shim fallback default would have sent 9 prompts).
+        var prompts = ReadRecords(recordPath).Where(r => r.Contains("\"prompt\"")).ToList();
+        Assert.Equal(3, prompts.Count);
     }
 
     private static (string BinDir, string RecordPath) WriteFakeDevin(string root)
