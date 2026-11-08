@@ -11,12 +11,15 @@
 # scripts/nuget-home-heal.sh — the same recovery build.sh, the audit gates,
 # and the sibling InitialTargets hook all dot-source — so writability is
 # never mistaken for ownership: an existing .nuget is admitted only as
-# canonical storage owned by this uid or root with no co-tenant write bits;
-# a foreign-owned, co-tenant-writable, or symlinked entry is quarantined
+# canonical storage owned by this uid or root with no co-tenant write bits
+# (group-write tolerated only on uid-owned entries whose group is provably
+# private to this account); a foreign-owned, co-tenant-writable, or
+# symlinked entry is quarantined
 # aside; a fresh private settings dir is created with a readable seeded
 # config; and the package cache is relinked only when its WHOLE tree
 # verifies as consumable storage — every descendant owned by this uid or
-# root with no group/other write bits and no access-broadening ACL.
+# root, never other-writable, and group-writable only under a provably
+# private group, with no access-broadening ACL.
 #
 # When $HOME itself cannot be repaired in place, no in-place fix exists —
 # the DOTNET_CLI_HOME redirect (the NuGetHomeSelfHeal preamble wrapping
@@ -58,6 +61,13 @@ codeybox_home_before="${HOME:-}"
 # private home, seeded config and markers — persist for every later exec.
 . "$codeybox_heal_script" || true
 if [ -n "${DOTNET_CLI_HOME:-}" ]; then
-    echo "ensure-writable-nuget-home: cannot repair ${codeybox_home_before:-<unset>}/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
+    codeybox_home_shown="${codeybox_home_before:-<unset>}"
+    # HOME is launch-env input: strip control characters before it reaches
+    # operator/CI logs. The helper lives in the dot-sourced recovery; fall
+    # back to the raw value only if that source somehow did not define it.
+    if command -v _codeybox_strip_ctrl >/dev/null 2>&1; then
+        codeybox_home_shown="$(_codeybox_strip_ctrl "$codeybox_home_shown")"
+    fi
+    echo "ensure-writable-nuget-home: cannot repair $codeybox_home_shown/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
 fi
 exit 0

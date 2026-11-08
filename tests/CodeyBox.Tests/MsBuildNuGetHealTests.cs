@@ -48,12 +48,12 @@ public sealed class MsBuildNuGetHealTests
         string marker,
         string config)
     {
-        await ChmodAsync("0775", nugetHome);
-        await ChmodAsync("0775", Path.Combine(nugetHome, "packages"));
-        await ChmodAsync("0775", packages);
-        await ChmodAsync("0775", nugetDir);
-        await ChmodAsync("0664", marker);
-        await ChmodAsync("0664", config);
+        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, nugetHome);
+        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, Path.Combine(nugetHome, "packages"));
+        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, packages);
+        await ChmodAsync(UnixUmask002Permissions.DirectoryMode, nugetDir);
+        await ChmodAsync(UnixUmask002Permissions.FileMode, marker);
+        await ChmodAsync(UnixUmask002Permissions.FileMode, config);
     }
 
     // Locate a `dotnet` host to drive the fixture build with. Prefer the host

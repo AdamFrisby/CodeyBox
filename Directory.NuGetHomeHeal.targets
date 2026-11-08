@@ -10,13 +10,18 @@
     package is restored. NuGet performs that user-config read during restore, so
     the home must be repaired on disk before restore runs.
 
-    This is wired through `InitialTargets` (see Directory.Build.props /
-    Directory.Solution.props), which MSBuild runs at the very start of every
-    invocation — verified to execute BEFORE NuGet's user-config read, at both the
-    solution and the individual-project level. It therefore heals a plain
-    `dotnet build` / `dotnet test` / `dotnet build <solution>` with no wrapper
-    script, environment override, or orchestrator change: the exact commands the
-    build/test gates invoke directly.
+    This is wired through `InitialTargets`. At solution level it is imported by
+    `Directory.Solution.props`, so it runs once before the solution restore
+    dispatches per-project work — the only point early enough to matter, and
+    early enough to execute BEFORE NuGet's user-config read. During a solution
+    build the per-project evaluations suppress this same target via
+    `_CodeyBoxInSolution` (set in `Directory.Build.props`), so destructive
+    repair never runs once-per-project in parallel; for non-solution builds
+    (`dotnet build foo.csproj`, `dotnet test`) the project-level import in
+    `Directory.Build.props` runs it instead. Either way a plain `dotnet build`
+    / `dotnet test` / `dotnet build <solution>` heals itself with no wrapper
+    script, environment override, or orchestrator change: the exact commands
+    the build/test gates invoke directly.
 
     The repair itself is the single source of truth in scripts/nuget-home-heal.sh
     (also dot-sourced by build.sh and the orchestrator's audit gates). The

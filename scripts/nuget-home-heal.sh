@@ -27,9 +27,13 @@
 # this rather than re-implementing the recovery.
 #
 # It is ALSO run from MSBuild via an InitialTargets hook (see
-# Directory.NuGetHomeHeal.targets, wired into Directory.Build.props and
-# Directory.Solution.props). InitialTargets fires at the very start of every
-# MSBuild invocation, before NuGet's user-config read, so a plain `dotnet build`
+# Directory.NuGetHomeHeal.targets, wired into Directory.Build.props,
+# Directory.Solution.props and Directory.Build.targets). InitialTargets fires
+# at the very start of MSBuild evaluation, before NuGet's user-config read —
+# once per solution via Directory.Solution.props, and per project via
+# Directory.Build.props/targets only OUTSIDE solution builds (the per-project
+# hooks are suppressed by _CodeyBoxInSolution so destructive repair never runs
+# once-per-project in parallel) — so a plain `dotnet build`
 # / `dotnet test` / `dotnet build <solution>` heals itself without any wrapper
 # script or orchestrator change — verified before both solution- and
 # project-level restore. That MSBuild path relies only on the on-disk repair (an
@@ -46,11 +50,14 @@
 # Anything else falls through to an owned fallback instead of being trusted
 # because it was writable.
 #
-# Storage owned by this uid with group write bits set is acceptable: on standard
-# Linux environments with user-private groups (default umask 002), directories
-# are created drwxrwxr-x where the group is the user's private group. This does
-# not widen co-tenant access; only foreign-owned or other-writable (o+w) trees
-# represent a real co-tenant risk.
+# Group write bits are tolerated ONLY on entries owned by this uid whose group
+# is provably private to this account — the group carries no members other
+# than possibly this user and no OTHER account holds it as a primary group
+# (_codeybox_group_is_private). That is the standard Linux user-private-group
+# shape (default umask 002 creates drwxrwxr-x dirs); it does not widen
+# co-tenant access. A uid-owned directory in a SHARED group (users, staff, an
+# LDAP/AD group), any foreign-owned group-writable entry, and every
+# other-writable (o+w) entry remain rejected.
 
 # === codeybox-shared-helpers: begin ===
 # Everything between the "codeybox-shared-helpers" sentinels is the head of
@@ -77,14 +84,17 @@ _codeybox_repo_home_leaf=".dotnet-cli-home"
 # this file's parsed value — so a NuGet layout change moves both together.
 _codeybox_nuget_migrations_marker=".local/share/NuGet/Migrations"
 _codeybox_euid="$(id -u)"
+_codeybox_egid="$(id -g 2>/dev/null)"
+_codeybox_login_name="$(id -un 2>/dev/null)"
 
-# Populate _codeybox_stat_mode (the "drwxr-xr-x" field) and _codeybox_stat_uid
-# (numeric owner uid) for directory $1 from a single `ls -ldn` lstat — the two
-# attributes the ownership checks below need, without relying on find(1)
-# option dialects (-perm / -uid spellings differ across GNU, BSD, and busybox).
-# Fails when $1 is not a directory — including a symlink, which reports mode
-# "l...": callers canonicalize first, so a link seen here is a mid-check swap
-# and must not be treated as the verified directory.
+# Populate _codeybox_stat_mode (the "drwxr-xr-x" field), _codeybox_stat_uid
+# (numeric owner uid) and _codeybox_stat_gid (numeric group gid) for directory
+# $1 from a single `ls -ldn` lstat — the attributes the ownership checks below
+# need, without relying on find(1) option dialects (-perm / -uid spellings
+# differ across GNU, BSD, and busybox). Fails when $1 is not a directory —
+# including a symlink, which reports mode "l...": callers canonicalize first,
+# so a link seen here is a mid-check swap and must not be treated as the
+# verified directory.
 _codeybox_lstat_dir() {
     set -- $(ls -ldn "$1" 2>/dev/null)
     case ${1:-} in
@@ -93,17 +103,101 @@ _codeybox_lstat_dir() {
     esac
     _codeybox_stat_mode=$1
     _codeybox_stat_uid=${3:-}
-    [ -n "$_codeybox_stat_uid" ]
+    _codeybox_stat_gid=${4:-}
+    [ -n "$_codeybox_stat_uid" ] && [ -n "$_codeybox_stat_gid" ]
+}
+
+# Single-entry memo for _codeybox_group_is_private: directory walks revisit
+# the same handful of gids, and each verdict costs a group-db and passwd-db
+# lookup.
+_codeybox_pg_gid=
+_codeybox_pg_verdict=
+# The passwd db is dumped once per process — `getent passwd` resolves every
+# account through NSS (LDAP/AD included); /etc/passwd is the fallback where
+# getent does not exist (macOS).
+_codeybox_passwd_dump=
+_codeybox_passwd_dumped=0
+
+# Return 0 when gid $1 is provably PRIVATE to this account — no other account
+# can carry it in its group set, so group-write on storage bearing it grants
+# no co-tenant access. Two independent proofs are required:
+#
+#   1. Member list: the group's member field (getent group through NSS, with
+#      /etc/group as fallback) names nobody but possibly this login. A shared
+#      group (`users`, `staff`, an LDAP/AD group) lists other members.
+#   2. Primary gid: no OTHER passwd entry holds $1 as its primary gid — the
+#      classic failure mode where a group member list is empty yet every
+#      local account shares the gid (e.g. macOS `staff`).
+#
+# A gid with no group entry anywhere has no declared members, which is fine;
+# but an EMPTY passwd db means the second proof cannot run, so the verdict
+# fails closed. Anything unverifiable is "not private": group-write is then
+# rejected exactly like a foreign-owned entry.
+_codeybox_group_is_private() {
+    [ -n "${1:-}" ] || return 1
+    if [ "$1" = "${_codeybox_pg_gid:-}" ]; then
+        [ "${_codeybox_pg_verdict:-}" = "yes" ]
+        return
+    fi
+    _codeybox_pg_gid=$1
+    _codeybox_pg_verdict=no
+
+    _codeybox_gp_line=
+    if command -v getent >/dev/null 2>&1; then
+        _codeybox_gp_line="$(getent group "$1" 2>/dev/null | head -n 1)"
+    fi
+    if [ -z "$_codeybox_gp_line" ] && [ -f /etc/group ]; then
+        _codeybox_gp_line="$(awk -F: -v g="$1" '$3 == g { print; exit }' \
+            /etc/group 2>/dev/null)"
+    fi
+    if [ -n "$_codeybox_gp_line" ]; then
+        # The member list is the field after the last ':'; entries are
+        # comma-separated login names. Every member must be this login —
+        # an empty list passes, anything else (including members we cannot
+        # name ourselves to compare against) fails closed.
+        _codeybox_gp_members="${_codeybox_gp_line##*:}"
+        if [ -n "$_codeybox_gp_members" ]; then
+            # One member per line, spaces stripped; grep -vxF prints every
+            # line that is NOT exactly this login — any output is a foreign
+            # member. An empty _codeybox_login_name can never match, so
+            # unverifiable memberships fail closed.
+            _codeybox_gp_foreign="$(printf '%s' "$_codeybox_gp_members" \
+                | tr -d ' ' | tr ',' '\n' \
+                | grep -vxF -e "${_codeybox_login_name:-.codeybox-no-such-login}" \
+                    2>/dev/null)"
+            [ -z "$_codeybox_gp_foreign" ] || return 1
+        fi
+    fi
+
+    if [ "$_codeybox_passwd_dumped" != "1" ]; then
+        _codeybox_passwd_dump="$(getent passwd 2>/dev/null)"
+        if [ -z "$_codeybox_passwd_dump" ] && [ -f /etc/passwd ]; then
+            _codeybox_passwd_dump="$(cat /etc/passwd 2>/dev/null)"
+        fi
+        _codeybox_passwd_dumped=1
+    fi
+    [ -n "$_codeybox_passwd_dump" ] || return 1
+    # Another account (uid != ours) whose PRIMARY gid is $1 shares every
+    # group-writable file bearing it, member list or not.
+    if printf '%s\n' "$_codeybox_passwd_dump" | awk -F: \
+        -v g="$1" -v u="$_codeybox_euid" \
+        '$4 == g && $3 != u { found = 1 } END { exit(found ? 0 : 1) }'; then
+        return 1
+    fi
+    _codeybox_pg_verdict=yes
+    return 0
 }
 
 # Canonicalize directory $1 (cd/pwd -P, so a planted or legitimate symlink
 # resolves to its real target) and print the resolved path when the whole
 # chain is safe to rely on. The leaf is judged by the rule named in $2:
 #
-#   private — owned by this uid and never group/other-writable. The only
-#             acceptable state for storage we export (a healed HOME, the
-#             user-scoped mutex dir), probe-write into, or seed under: a
-#             merely-writable foreign dir — a co-tenant 777 dir, or a
+#   private — owned by this uid, never other-writable, and group-writable
+#             only when the group is provably private to this account
+#             (_codeybox_group_is_private). The only acceptable state for
+#             storage we export (a healed HOME, the user-scoped mutex dir),
+#             probe-write into, or seed under: a merely-writable foreign dir —
+#             a co-tenant 777 dir, a uid-owned dir in a shared group, or a
 #             stamped path resolving through a planted symlink into one —
 #             otherwise leaves the NuGet.Config every restore reads, and the
 #             writes below, inside attacker-controlled storage.
@@ -112,7 +206,8 @@ _codeybox_lstat_dir() {
 #             platform's root is already trusted, a third uid is not.
 #   anchor  — owned by this uid or root, with group/other-writable tolerated
 #             only under the sticky bit (the /tmp rule: co-tenants may add
-#             entries but can never rename or replace ours). Also the rule
+#             entries but can never rename or replace ours) or — for
+#             uid-owned entries — a provably private group. Also the rule
 #             applied to every ANCESTOR of the leaf, so nothing along the
 #             chain can be swapped out after these checks.
 # $3 "writable" additionally requires the leaf be writable by this user.
@@ -166,10 +261,14 @@ _codeybox_secure_dir() {
                     *) return 1 ;;
                 esac ;;
             ?????w*)
-                # Group-writable: if owned by current uid, acceptable (user-private
-                # group / umask 002). Only foreign-owned (e.g. root) trees with group
-                # write bits are a co-tenant risk.
-                if [ "$_codeybox_stat_uid" != "$_codeybox_euid" ]; then
+                # Group-writable: tolerated only when the group is provably
+                # private to this account — the umask-002 / user-private-group
+                # shape. A uid-owned dir in a SHARED group is just as
+                # co-tenant-writable as a foreign-owned one, so it is judged
+                # by the same rule: leaf rules reject it, an anchor tolerates
+                # it only under the sticky bit.
+                if [ "$_codeybox_stat_uid" != "$_codeybox_euid" ] \
+                    || ! _codeybox_group_is_private "$_codeybox_stat_gid"; then
                     if [ "$_codeybox_sec_leaf" -eq 1 ] \
                         && [ "$_codeybox_sec_rule" != anchor ]; then
                         return 1
@@ -197,7 +296,9 @@ _codeybox_secure_dir() {
 # after the parent verifies as a writable anchor, then by ONE `mkdir -m 700`
 # — never -p — so the new dir is born owned by this uid with no writable
 # window for a co-tenant plant. $2 "writable" additionally requires the leaf
-# be writable by us.
+# be writable by us. ("Private" here includes the private-group carve-out: a
+# uid-owned group-writable dir is admitted only when its gid is provably
+# private to this account.)
 _codeybox_adopt_dir() {
     [ -n "${1:-}" ] || return 1
     if [ -e "$1" ] || [ -L "$1" ]; then
@@ -221,8 +322,9 @@ _codeybox_adopt_dir() {
 # runtime-dir fallbacks; returns nonzero when no candidate could be obtained.
 # $1, when non-empty, is the preferred candidate (the possibly just-redirected
 # DOTNET_CLI_HOME). Every candidate is adopted only as verified private
-# storage (canonicalized, owned by this uid, writable, not
-# group/other-writable, under a safe ancestor chain) — DOTNET_CLI_HOME is
+# storage (canonicalized, owned by this uid, writable, never other-writable,
+# group-writable only under a provably private group, under a safe ancestor
+# chain) — DOTNET_CLI_HOME is
 # environment input, and a co-tenant- or work-branch-planted symlink, a
 # foreign-owned dir, or a squatted predictable path must not redirect the
 # seeding below and dotnet's user-scoped mutex/runtime storage into
@@ -335,8 +437,10 @@ _codeybox_cache_scan_limit=500000
 
 # Print the canonical path of package-cache candidate $1 only when the WHOLE
 # tree is consumable storage — the root canonicalizes under the "trusted"
-# rule AND every descendant is owned by this uid or root with no group/other
-# write bits and no ACL broadening access beyond what the mode bits show.
+# rule AND every descendant is owned by this uid or root, never
+# other-writable, group-writable only on uid-owned entries whose gid is one
+# of the verified-private gids below, and no ACL broadening access beyond
+# what the mode bits show.
 # Verifying the root alone would admit a co-tenant-writable or foreign-owned
 # subtree, and NuGet consumes extracted entries as-is: a present
 # .nupkg.metadata skips re-extraction, and a package's build/.props/.targets
@@ -358,6 +462,23 @@ _codeybox_cache_scan_limit=500000
 _codeybox_secure_package_cache() {
     _codeybox_cache_root="$(_codeybox_secure_dir "${1:-}" trusted)" \
         || return 1
+    # Group-write inside the tree is admitted only for uid-owned entries
+    # whose gid is provably private (_codeybox_group_is_private). The awk
+    # scan below cannot run that lookup per entry, so it is resolved once
+    # here for the two gids a cache realistically carries — the root's own
+    # gid (setgid inheritance) and this process's egid (normal creation).
+    # Any other group-writable descendant fails the scan closed and the
+    # cache is simply not consumed.
+    _codeybox_cache_gid_a=-1
+    _codeybox_cache_gid_b=-1
+    _codeybox_lstat_dir "$_codeybox_cache_root" || return 1
+    if _codeybox_group_is_private "$_codeybox_stat_gid"; then
+        _codeybox_cache_gid_a="$_codeybox_stat_gid"
+    fi
+    if [ -n "$_codeybox_egid" ] \
+        && _codeybox_group_is_private "$_codeybox_egid"; then
+        _codeybox_cache_gid_b="$_codeybox_egid"
+    fi
     # `set --` word-splits the (possibly space-padded) wc output so the count
     # is a bare number on every wc dialect. An existing dir always
     # enumerates at least itself, so a zero count means find could not scan
@@ -374,7 +495,9 @@ _codeybox_secure_package_cache() {
     fi
     _codeybox_cache_bad="$(find -L "$_codeybox_cache_root" \
             -exec ls -ldnL {} + 2>&1 \
-        | awk -v euid="$_codeybox_euid" '
+        | awk -v euid="$_codeybox_euid" \
+            -v gid_a="$_codeybox_cache_gid_a" \
+            -v gid_b="$_codeybox_cache_gid_b" '
             {
                 mode = $1
                 n = length(mode)
@@ -393,7 +516,14 @@ _codeybox_secure_package_cache() {
                 if (n == 11 && substr(mode, 11, 1) !~ /^[.@]$/) { print; exit }
                 if ($3 + 0 != euid + 0 && $3 + 0 != 0) { print; exit }
                 if (substr(mode, 9, 1) == "w") { print; exit }
-                if ($3 + 0 != euid + 0 && substr(mode, 6, 1) == "w") { print; exit }
+                # Group-write: only a uid-owned entry whose gid was proven
+                # private above may carry it — a shared-group or foreign
+                # group-write bit is co-tenant access and fails closed.
+                if (substr(mode, 6, 1) == "w" \
+                    && !($3 + 0 == euid + 0 \
+                        && ($4 + 0 == gid_a + 0 || $4 + 0 == gid_b + 0))) {
+                    print; exit
+                }
             }
             END { if (NR == 0) exit 1 }')" || return 1
     [ -z "$_codeybox_cache_bad" ] || return 1
@@ -433,7 +563,8 @@ _codeybox_reuse_nuget_packages() {
 #
 # HOME / XDG_RUNTIME_DIR are launch-env input, so "usable" means the full
 # "private" rule — canonicalized, owned by this uid, writable, never
-# group/other-writable, under a safe ancestor chain — not merely -d/-w.
+# other-writable, group-writable only under a provably private group, under a
+# safe ancestor chain — not merely -d/-w.
 # Verified values are re-exported under their canonical path so a symlinked
 # env value cannot be retargeted after the check; an unusable variable is
 # pinned to one shared pick — the (possibly just-healed) DOTNET_CLI_HOME,
@@ -554,7 +685,8 @@ _codeybox_unset_home_env() {
 # through symlinked intermediate components and `: >` writes through a symlink
 # leaf. Every candidate is therefore admitted only as verified private
 # per-user storage — canonicalized, owned by this uid, writable, never
-# group/other-writable, under a safe ancestor chain (the same
+# other-writable, group-writable only under a provably private group, under a
+# safe ancestor chain (the same
 # _codeybox_secure_dir check every other admission in this file uses, so a
 # co-tenant cannot swap a marker-tree component for a symlink between the
 # checks and the write) — each Migrations-tree component is then created level
@@ -692,7 +824,8 @@ codeybox_seed_nuget_migration_state() {
 # in-place and DOTNET_CLI_HOME-redirect recovery paths so both stay offline-safe.
 # A merely-existing $2 is not enough: it is consumed only when its WHOLE tree
 # verifies as trusted storage (canonical root owned by this uid or root, and
-# every descendant owned by this uid or root with no group/other write bits —
+# every descendant owned by this uid or root, never other-writable,
+# group-writable only on uid-owned entries whose gid is provably private —
 # see _codeybox_secure_package_cache) — a co-tenant-controlled cache is
 # refused.
 _codeybox_seed_nuget_home() {
@@ -713,8 +846,9 @@ _codeybox_seed_nuget_home() {
     # .nupkg.metadata marker and skips extraction), so a read-only inherited
     # cache satisfies every restore; a writable one additionally lets NuGet add
     # packages the baseline lacks. But readable is not trustworthy: only a
-    # cache whose WHOLE TREE is owned by this uid or root with no group/other
-    # write bits may be consumed — the root check alone would admit a
+    # cache whose WHOLE TREE is owned by this uid or root, never
+    # other-writable, and group-writable only on uid-owned entries whose gid
+    # is provably private may be consumed — the root check alone would admit a
     # co-tenant-writable or foreign-owned descendant, and a tampered extracted
     # entry's build/.props/.targets run attacker code in the gate build.
     _codeybox_seed_cache=
@@ -750,6 +884,17 @@ _codeybox_seed_nuget_home() {
     fi
 }
 
+# Release the quarantine lock acquired in codeybox_heal_nuget_home: drop the
+# owner-pid file first (the lock dir is only empty once it is gone), then the
+# dir itself. Best-effort — a failed release leaves a stale lock the next
+# invocation's pid check reaps.
+_codeybox_release_quarantine_lock() {
+    [ "${_codeybox_lock_acquired:-0}" -eq 1 ] || return 0
+    rm -f "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
+    rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+    return 0
+}
+
 codeybox_heal_nuget_home() {
     if [ -n "${CODEYBOX_NUGET_HOME_UNDER_TEST:-}" ]; then
         _codeybox_cli_home_env="$(dirname "${CODEYBOX_NUGET_HOME_UNDER_TEST%/}")"
@@ -764,7 +909,8 @@ codeybox_heal_nuget_home() {
     # Admit the env-influenced cli home only as verified private per-user
     # storage BEFORE any write beneath it: canonicalized so a planted or
     # legitimate symlink resolves to the real directory, owned by this uid,
-    # writable, and never group/other-writable — a merely-writable foreign dir
+    # writable, never other-writable, and group-writable only under a
+    # provably private group — a merely-writable foreign dir
     # would otherwise keep the NuGet.Config every restore reads, the
     # writability probe, and the quarantine writes below inside
     # co-tenant-controlled storage. A missing leaf is materialized only under
@@ -786,6 +932,8 @@ codeybox_heal_nuget_home() {
         fi
         _codeybox_nuget_root="$_codeybox_cli_home/.nuget"
         _codeybox_nuget_probe="$_codeybox_nuget_root/NuGet/.codeybox-writable-probe"
+        _codeybox_quarantine_marker="$_codeybox_cli_home/.codeybox-quarantine.done"
+        _codeybox_quarantine_lock="$_codeybox_cli_home/.codeybox-quarantine.lock"
 
         # "trusted" — not "trusted writable": an unwritable .nuget can still
         # be quarantined aside below, so its writability is left for the
@@ -795,6 +943,10 @@ codeybox_heal_nuget_home() {
         if _codeybox_ensure_nuget_home_usable \
             "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
             rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+            # A usable home means any earlier quarantine episode is over:
+            # drop the marker so a LATER breakage quarantines afresh rather
+            # than being suppressed by a stale marker forever.
+            rm -f "$_codeybox_quarantine_marker" 2>/dev/null || true
             return 0
         fi
 
@@ -807,31 +959,65 @@ codeybox_heal_nuget_home() {
         # 1. Per-project InitialTargets are suppressed via _CodeyBoxInSolution in
         #    MSBuild during solution builds, so destructive repair runs at most
         #    once at the solution level before restore.
-        # 2. Quarantine runs at most once per build via a marker file in private storage.
-        # 3. An exclusive lock in private storage coordinates concurrent processes, so
-        #    a concurrent node never renames a directory another node may be reading.
+        # 2. Quarantine runs at most once per unusable-home EPISODE via a marker
+        #    file in private storage: the marker suppresses repeat renames only
+        #    while the home stays unusable, and is removed as soon as a usable
+        #    home is observed again — so a LATER breakage quarantines afresh
+        #    rather than being suppressed forever.
+        # 3. An exclusive lock in private storage coordinates concurrent
+        #    processes, so a concurrent node never renames a directory another
+        #    node may be reading; a holder killed mid-quarantine leaves a stale
+        #    lock that is reaped once its recorded pid is gone.
         # 4. Never create more than one quarantine directory per invocation.
-        _codeybox_quarantine_marker="$_codeybox_cli_home/.codeybox-quarantine.done"
-        _codeybox_quarantine_lock="$_codeybox_cli_home/.codeybox-quarantine.lock"
-
         if [ -f "$_codeybox_quarantine_marker" ]; then
-            # Quarantine already ran in this build. If home is usable now, return 0;
-            # otherwise fall through to redirect without renaming again.
+            # Quarantine already ran for this unusable home. If the home
+            # verifies usable again the episode is over: drop the marker so a
+            # later breakage can quarantine afresh, then done. While it stays
+            # unusable the rename is suppressed and the redirect fallback
+            # below applies — the marker carries no build identity, so it
+            # must never outlive the broken state it recorded.
             if _codeybox_ensure_nuget_home_usable \
                 "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
                 rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
+                rm -f "$_codeybox_quarantine_marker" 2>/dev/null || true
                 return 0
             fi
         else
             _codeybox_lock_acquired=0
             _codeybox_lock_attempts=0
+            # Named bounds: ~10s of coordination budget — fast retries first,
+            # then a capped 1s backoff — before deferring to the redirect.
             _codeybox_lock_max_attempts=100
+            _codeybox_lock_fast_attempts=10
             while [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_max_attempts" ]; do
                 if mkdir "$_codeybox_quarantine_lock" 2>/dev/null; then
+                    # Record the owner pid so a killed holder's lock can be
+                    # reaped instead of stalling every later heal.
+                    printf '%s\n' "$$" \
+                        > "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
                     _codeybox_lock_acquired=1
                     break
                 fi
-                sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
+                # Stale-lock recovery: reap only a lock that names a pid which
+                # no longer exists. A missing/garbage pid file means the holder
+                # is mid-acquire — leave it alone. A wrong reap is still safe:
+                # the re-check under the lock and the atomic mv bound the
+                # damage to at most one quarantine directory.
+                _codeybox_lock_pid="$(cat "$_codeybox_quarantine_lock/pid" \
+                    2>/dev/null)"
+                case $_codeybox_lock_pid in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        if ! kill -0 "$_codeybox_lock_pid" 2>/dev/null; then
+                            rm -f "$_codeybox_quarantine_lock/pid" 2>/dev/null || true
+                            rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
+                        fi ;;
+                esac
+                if [ "$_codeybox_lock_attempts" -lt "$_codeybox_lock_fast_attempts" ]; then
+                    sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || true
+                else
+                    sleep 1 2>/dev/null || true
+                fi
                 _codeybox_lock_attempts=$((_codeybox_lock_attempts + 1))
                 if [ -f "$_codeybox_quarantine_marker" ]; then
                     break
@@ -842,9 +1028,7 @@ codeybox_heal_nuget_home() {
             if _codeybox_ensure_nuget_home_usable \
                 "$_codeybox_cli_home" trusted "" "$_codeybox_nuget_probe" >/dev/null; then
                 rm -f "$_codeybox_nuget_probe" 2>/dev/null || true
-                if [ "$_codeybox_lock_acquired" -eq 1 ]; then
-                    rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
-                fi
+                _codeybox_release_quarantine_lock
                 return 0
             fi
 
@@ -855,7 +1039,7 @@ codeybox_heal_nuget_home() {
                     _codeybox_quarantined=1
                 elif mv "$_codeybox_nuget_root" "$_codeybox_quarantine" 2>/dev/null; then
                     _codeybox_quarantined=1
-                    echo "nuget-home self-heal: quarantined unusable $_codeybox_nuget_root to $_codeybox_quarantine" >&2
+                    echo "nuget-home self-heal: quarantined unusable $(_codeybox_strip_ctrl "$_codeybox_nuget_root") to $(_codeybox_strip_ctrl "$_codeybox_quarantine")" >&2
                 fi
 
                 if [ "$_codeybox_quarantined" -eq 1 ]; then
@@ -865,9 +1049,7 @@ codeybox_heal_nuget_home() {
                         _codeybox_seed_nuget_home "$_codeybox_nuget_root/NuGet" \
                             "$_codeybox_quarantine/packages"
                         : > "$_codeybox_quarantine_marker" 2>/dev/null || true
-                        if [ "$_codeybox_lock_acquired" -eq 1 ]; then
-                            rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
-                        fi
+                        _codeybox_release_quarantine_lock
                         return 0
                     fi
                     # The broken tree is already renamed aside (or was absent):
@@ -878,15 +1060,13 @@ codeybox_heal_nuget_home() {
                 fi
                 # When the rename itself failed the broken tree is still in
                 # place: leave the marker unset so a later invocation can retry
-                # the quarantine instead of being suppressed forever — for the
-                # MSBuild InitialTargets caller the DOTNET_CLI_HOME redirect
-                # cannot propagate back to dotnet, so skipping the rename would
+                # the quarantine instead of being suppressed — for the MSBuild
+                # InitialTargets caller the DOTNET_CLI_HOME redirect cannot
+                # propagate back to dotnet, so skipping the rename would
                 # strand the home unusable on every later build.
             fi
 
-            if [ "$_codeybox_lock_acquired" -eq 1 ]; then
-                rmdir "$_codeybox_quarantine_lock" 2>/dev/null || true
-            fi
+            _codeybox_release_quarantine_lock
         fi
     fi
 

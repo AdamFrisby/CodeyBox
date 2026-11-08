@@ -10,7 +10,9 @@
     Repair that environmental fault before any project targets run so auditors
     that invoke `dotnet` directly (process:required-build, csharp:build-WaE)
     succeed without depending on DOTNET_CLI_HOME redirects in the host
-    orchestrator binary. See scripts/ensure-writable-nuget-home.sh and
+    orchestrator binary. Like the sibling heal hook, this per-project target is
+    suppressed during solution builds ($(_CodeyBoxInSolution)) where the
+    once-per-solution hook does the repair. See scripts/ensure-writable-nuget-home.sh and
     docs/development/build-environment.md.
 
     NuGetHomeGuard.targets (imported above) supplies an in-process backstop:

@@ -29,28 +29,37 @@ each test DLL path as an "invalid argument".
 ### In-repo self-heal: MSBuild `InitialTargets`
 
 MSBuild aggregates `InitialTargets` from the imported
-`Directory.Build.props`/`.targets` and runs them at the very start of every
-project evaluation — before restore resolves the NuGet user-settings directory.
-That is the only committed-file hook early enough to matter, and CodeyBox runs
-two entry points through it: `Directory.NuGetHomeHeal.targets` (imported by
-`Directory.Build.props`) dot-sources `scripts/nuget-home-heal.sh` against the
-effective cli home, and `Directory.Build.targets` runs
-`scripts/ensure-writable-nuget-home.sh` for the `$HOME`-based home. Both delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
+`Directory.Build.props`/`.targets` and runs them at the very start of project
+evaluation — before restore resolves the NuGet user-settings directory.
+That is the only committed-file hook early enough to matter. The heal is
+wired at two levels so destructive repair never runs once-per-project in
+parallel: `Directory.Solution.props` imports `Directory.NuGetHomeHeal.targets`
+for a once-per-solution run before restore dispatches to projects, while the
+per-project hooks in `Directory.Build.props` (the same shared target, resolving
+`${DOTNET_CLI_HOME:-$HOME}`) and `Directory.Build.targets`
+(`scripts/ensure-writable-nuget-home.sh`, always resolving `$HOME`) are
+suppressed during solution builds via `_CodeyBoxInSolution` and serve
+non-solution invocations (`dotnet build foo.csproj`, `dotnet test`). All paths
+delegate the repair to the shared `scripts/nuget-home-heal.sh` recovery —
 whose settings/runtime-dir repair is a fast-path no-op when the home is
 already usable (the only writes then are the settings dir's create-if-missing,
 a transient create-then-delete writability probe inside it, and the idempotent
 migration-marker seed, which may also materialize its candidate homes) and
 which never fails the build.
 
-Storage owned by the current user UID is acceptable regardless of group write
-bits: on standard Linux systems with user-private groups (default umask 002),
-directories are created `drwxrwxr-x`. This is safe because the group is private
-to the user; only foreign-owned or other-writable (`o+w`) trees represent a
-co-tenant risk.
+Group write bits are tolerated only on entries owned by the current user UID
+whose group is provably private to that account: the group's member list must
+name nobody but possibly the user, and no other account may hold the gid as
+its primary group. On standard Linux systems with user-private groups (default
+umask 002), directories are created `drwxrwxr-x` under exactly such a group.
+A uid-owned directory in a *shared* group (`users`, `staff`, an LDAP/AD
+group), any foreign-owned group-writable entry, and every other-writable
+(`o+w`) entry are still rejected as co-tenant-writable.
 
 "Usable" covers the consumed side too: a present `.nuget/packages` entry must
-pass the whole-tree cache admission (uid-owned or root-owned without foreign or
-`o+w` write bits), or the home is still healed. When `$HOME/.nuget` exists but is
+pass the whole-tree cache admission (uid-owned or root-owned, never
+other-writable, group-writable only under a provably private group), or the
+home is still healed. When `$HOME/.nuget` exists but is
 not usable — foreign-owned, unwritable, unreadable config, a planted link, or an
 unconsumable consumed cache — the heal relocates it aside (preserving it as
 `~/.nuget.codeybox-unwritable.<pid>`), recreates a writable private
@@ -61,10 +70,14 @@ Under parallel MSBuild, destructive repair is strictly race-free:
 1. In a solution build, repair is performed once at the solution level
    (`Directory.Solution.props`) before restore dispatches to projects, so per-project
    InitialTargets never run destructive renames during parallel restore/build.
-2. The quarantine path is guarded by an advisory lock and a completion marker in
-   verified private user storage (`$DOTNET_CLI_HOME` / `$HOME`), ensuring at most one
-   quarantine directory is created per build and preventing concurrent nodes from
-   renaming directories another node is reading.
+2. The quarantine path is guarded by an advisory lock (a `mkdir` lock whose
+   owner pid is recorded and reaped once dead) and a completion marker in
+   verified private user storage (`$DOTNET_CLI_HOME` / `$HOME`). The marker
+   suppresses repeat renames only while the home stays unusable — it is
+   removed as soon as a usable home is observed again, so a later breakage
+   quarantines afresh instead of being suppressed forever. At most one
+   quarantine directory is created per invocation, and concurrent nodes never
+   rename a directory another node may be reading.
 
 A `BeforeTargets="Restore"` target is *not* early enough: solution restore
 aborts during graph construction, before any project's `Restore` chain runs. Nor

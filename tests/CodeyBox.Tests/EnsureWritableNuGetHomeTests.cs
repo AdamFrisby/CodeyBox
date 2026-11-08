@@ -286,19 +286,12 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
 
         // Simulate Linux umask 002: group-writable directory (0775) and files (0664)
         // owned by the current UID.
-        var dirMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
-            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
-        var fileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
-            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
-            | UnixFileMode.OtherRead;
-
-        File.SetUnixFileMode(nugetHome, dirMode);
-        File.SetUnixFileMode(Path.Combine(nugetHome, "packages"), dirMode);
-        File.SetUnixFileMode(packages, dirMode);
-        File.SetUnixFileMode(nugetDir, dirMode);
-        File.SetUnixFileMode(marker, fileMode);
-        File.SetUnixFileMode(config, fileMode);
+        File.SetUnixFileMode(nugetHome, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(Path.Combine(nugetHome, "packages"), UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(packages, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(nugetDir, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(marker, UnixUmask002Permissions.File);
+        File.SetUnixFileMode(config, UnixUmask002Permissions.File);
 
         var (exit, output) = await RunScriptAsync(home, nugetHome);
 
@@ -396,19 +389,12 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         var config = Path.Combine(nugetDir, "NuGet.Config");
         await File.WriteAllTextAsync(config, "<configuration/>");
 
-        var dirMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
-            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
-        var fileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
-            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
-            | UnixFileMode.OtherRead;
-
-        File.SetUnixFileMode(nugetHealthy, dirMode);
-        File.SetUnixFileMode(Path.Combine(nugetHealthy, "packages"), dirMode);
-        File.SetUnixFileMode(packages, dirMode);
-        File.SetUnixFileMode(nugetDir, dirMode);
-        File.SetUnixFileMode(marker, fileMode);
-        File.SetUnixFileMode(config, fileMode);
+        File.SetUnixFileMode(nugetHealthy, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(Path.Combine(nugetHealthy, "packages"), UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(packages, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(nugetDir, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(marker, UnixUmask002Permissions.File);
+        File.SetUnixFileMode(config, UnixUmask002Permissions.File);
 
         var tasksHealthy = Enumerable.Range(0, 8)
             .Select(_ => RunScriptAsync(homeHealthy, nugetHealthy))
@@ -545,4 +531,25 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         }
         throw new InvalidOperationException("Could not locate repository root from test base directory.");
     }
+}
+
+/// <summary>
+/// Shared umask-002 fixture permissions (directories 0775, files 0664) used to
+/// simulate the standard Linux user-private-group layout across the NuGet-home
+/// heal tests, so the simulated modes cannot drift between fixtures.
+/// </summary>
+internal static class UnixUmask002Permissions
+{
+    internal const string DirectoryMode = "0775";
+    internal const string FileMode = "0664";
+
+    internal static readonly UnixFileMode Directory =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+        | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+
+    internal static readonly UnixFileMode File =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite
+        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+        | UnixFileMode.OtherRead;
 }

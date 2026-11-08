@@ -3,7 +3,12 @@
   <!-- Heal an unwritable inherited per-user NuGet home before restore reads it.
        InitialTargets runs this at the start of every project MSBuild invocation,
        before NuGet's user-config read; the target lives in one shared file so the
-       solution- and project-level hooks stay identical. This hook resolves
+       solution- and project-level hooks stay identical. During a SOLUTION build
+       this per-project hook is suppressed (_CodeyBoxInSolution below) and the
+       once-per-solution hook in Directory.Solution.props does the repair instead,
+       so destructive quarantine never runs once-per-project in parallel; outside
+       a solution build this hook is the only one and runs per project.
+       This hook resolves
        ${DOTNET_CLI_HOME:-$HOME}; the sibling hook in Directory.Build.targets
        (scripts/ensure-writable-nuget-home.sh) always resolves $HOME, so the
        two overlap harmlessly whenever DOTNET_CLI_HOME is unset. -->

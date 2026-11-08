@@ -57,7 +57,7 @@ internal static class RequiredBuildScript
         # TMPDIR is launch-env input like every other directory this script
         # trusts: admit it only as a writable "anchor" (the /tmp rule — owned
         # by this uid or root, group/other-writable tolerated only under the
-        # sticky bit) before the mktemp creates below. In a non-sticky
+        # sticky bit or a provably private group) before the mktemp creates below. In a non-sticky
         # co-tenant-writable dir the owner could swap a just-created file or
         # dir for a symlink, turning the `>`/`sort -o` writes below — plus
         # the capture variant's binlog writes — into a create/truncate at
@@ -142,7 +142,8 @@ internal static class RequiredBuildScript
         # cache (read access is sufficient — restore never writes to an
         # already-extracted package) so offline/pinned images keep working —
         # but only when its WHOLE tree verifies as consumable storage (every
-        # descendant owned by this uid or root, never group/other-writable):
+        # descendant owned by this uid or root, never other-writable,
+        # group-writable only under a provably private group):
         # a foreign-controlled or co-tenant-writable entry satisfies package
         # installs with planted or tampered extracted content. The helper is
         # defined by the self-heal preamble composed ahead of this fragment.

@@ -77,7 +77,8 @@ public static class NuGetHomeSelfHeal
     /// package cache) while different principals never collide on one predictable
     /// path. That shared per-user dir is reused only when it verifies as
     /// "private" storage — canonicalized, owned by the current uid, writable,
-    /// never group/other-writable (no ACL-broadened access either), under an
+    /// never other-writable and group-writable only under a provably private
+    /// group (no ACL-broadened access either), under an
     /// anchor-checked ancestor chain; otherwise the preamble falls back to a
     /// private <c>mktemp</c> dir (<c>{leaf}.XXXXXX</c>) so a squatted or
     /// root-left directory in a world-writable temp cannot make the healed
@@ -132,7 +133,8 @@ public static class NuGetHomeSelfHeal
     /// fragment. "Usable" is deliberately stronger than "-d &amp;&amp; -w": the
     /// env values are untrusted input, so every admitted directory is
     /// canonicalized (cd/pwd -P) and required to be owned by this uid and never
-    /// group/other-writable, under an ancestor chain a co-tenant cannot swap —
+    /// other-writable — group-write admitted only when the group is provably
+    /// private to this account — under an ancestor chain a co-tenant cannot swap —
     /// a merely-writable foreign dir must never hold the NuGet.Config every
     /// restore reads or dotnet's user-scoped mutex storage.</para>
     ///
