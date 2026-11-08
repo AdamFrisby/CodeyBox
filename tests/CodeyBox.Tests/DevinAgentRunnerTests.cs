@@ -71,9 +71,19 @@ public sealed class DevinAgentRunnerTests
 
         await runner.RunAsync(sandbox, "/work", "do the thing", Cred());
 
+        // The dispatch pins the truncation-continuation bound and wording:
+        // the shim re-prompts the SAME session after a max_tokens stop, so
+        // the bound (--max-token-continuations, hot-reloadable
+        // CodeyBox:Devin:MaxTokenContinuations, default 8) and the shared
+        // continuation wording travel in argv. The wording is sourced from
+        // its single source of truth rather than duplicated here; it holds
+        // no single quotes, so the '...' wrap matches ShellQuoting.Quote.
+        var continuationPrompt = ProviderTransientRetryPolicy.BuildTruncationContinuePrompt(phase: null);
+
         Assert.Equal(
             $"python3 -I -c \"$cb_shim\" --prompt-file - '--binary' 'devin' "
-            + $"'--model' '{ConfiguredModel}' '--mode' 'bypass'",
+            + $"'--model' '{ConfiguredModel}' '--mode' 'bypass' "
+            + $"'--max-token-continuations' '8' '--continuation-prompt' '{continuationPrompt}'",
             DevinCommandLine(sandbox));
     }
 
