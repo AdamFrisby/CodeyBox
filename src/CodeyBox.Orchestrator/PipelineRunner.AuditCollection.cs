@@ -963,6 +963,15 @@ public sealed partial class PipelineRunner
                             run.Runner,
                             ToAgentResultForAuditFailureClassification(run.Result),
                             "audit");
+                        // A CLI that does not know the requested model fails
+                        // deterministically: the same model against the same
+                        // baked CLI fails identically in a fresh sandbox, so
+                        // the retry below is skipped and the item surfaces
+                        // immediately as a configuration fault (not a finding,
+                        // not an infrastructure flap). This is the stale
+                        // baseline-pin shape: an old baked CLI paired with a
+                        // model only the new CLI lists.
+                        ThrowIfUnknownModelAgentFailure(run, pair.Member?.ModelId);
                         _log.LogWarning(
                             "LLM auditor {Auditor} agent execution failed; retrying once in a fresh sandbox",
                             run.Auditor.Name);
@@ -993,6 +1002,7 @@ public sealed partial class PipelineRunner
                             run.Runner,
                             ToAgentResultForAuditFailureClassification(run.Result),
                             "audit");
+                        ThrowIfUnknownModelAgentFailure(run, pair.Member?.ModelId);
                         var summary = run.Result.AgentSummary ?? run.Result.AgentStderr ?? "agent execution failed";
                         throw new AuditUnavailableException(
                             $"LLM auditor '{run.Auditor.Name}' could not run: agent execution failed after one retry ({SingleLineSummary(summary)})");

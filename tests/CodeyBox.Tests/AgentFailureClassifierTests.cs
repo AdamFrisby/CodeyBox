@@ -69,6 +69,91 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
+    /// <summary>
+    /// A CLI that does not know the requested model (stale baked CLI after a
+    /// model upgrade) must classify as configuration/infrastructure — never as
+    /// a quota flap, a transient, or a normal failure that the retry and
+    /// fallback chains would burn budget on.
+    /// </summary>
+    [Theory]
+    [InlineData("Error: unknown model 'gemini-4-argon-high'")]
+    [InlineData("unsupported model: gemini-4-argon-high")]
+    [InlineData("Invalid model 'gemini-4-argon-high' for this CLI version")]
+    [InlineData("model 'gemini-4-argon-high' not found in the model list")]
+    [InlineData("E1108 printmode.go:123] unknown --model flag value 'gemini-4-argon-high'")]
+    [InlineData("Failed to override models: large model \"openrouter/no-such-model-xyz\" not found.")]
+    public void UnknownModelPatterns_Classified_AsInfrastructure(string snippet)
+    {
+        var c = AgentFailureClassifier.Classify(snippet, null, "agent exited 1");
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+        Assert.Contains("does not know the requested model", c.Reason);
+    }
+
+    [Fact]
+    public void UnknownModel_InStdout_Classified_AsInfrastructure()
+    {
+        var c = AgentFailureClassifier.Classify(stderr: "", stdout: "Error: no such model 'x'");
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    [Fact]
+    public void UnknownModel_BeatsQuota_WhenBothPresent()
+    {
+        // A deterministic config refusal must not be parked for a quota reset
+        // that can never clear it.
+        var c = AgentFailureClassifier.Classify(
+            "Error: unknown model 'x'\nAPI Error: 429 rate limited");
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    /// <summary>
+    /// Model prose must never trip the unknown-model detector: review output
+    /// and task narration mention models constantly.
+    /// </summary>
+    [Theory]
+    [InlineData("the model failed to compile the project")]
+    [InlineData("model output was empty; retrying")]
+    [InlineData("switched to a smaller model for this subtask")]
+    [InlineData("modeling the failure as a transient")]
+    public void ModelProse_NotClassified_AsUnknownModel(string snippet)
+    {
+        Assert.False(AgentFailureClassifier.IsUnknownModelFailure(stderr: snippet, stdout: null));
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    /// <summary>
+    /// A provider-side refusal that echoes the requested id must not trip the
+    /// unknown-model detector just because the id itself contains an error
+    /// word (<c>unknown-xyz</c> contains "unknown"). Regression test for the
+    /// UAT guard <c>PipelineFailsGenuineCopilotFailureAsOther</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("Error: model 'unknown-xyz' is not served by the provider endpoint")]
+    [InlineData("Error: model \"invalid-abc\" is not available in this region")]
+    [InlineData("model 'unsupported-1' timed out after 30s")]
+    [InlineData("--model unknown-xyz failed with exit 1")]
+    public void ModelIdContainingErrorWord_NotClassified_AsUnknownModel(string snippet)
+    {
+        Assert.False(AgentFailureClassifier.IsUnknownModelFailure(stderr: snippet, stdout: null));
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.NotEqual(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
+    /// <summary>
+    /// The anchored refusal still fires when the error word sits outside the
+    /// quoted id, including the apostrophe in "doesn't".
+    /// </summary>
+    [Theory]
+    [InlineData("Error: model 'gemini-4-argon-high' doesn't exist in this CLI")]
+    [InlineData("model 'foo' is unknown to this version")]
+    public void AnchoredRefusal_OutsideQuotedId_Classified_AsInfrastructure(string snippet)
+    {
+        Assert.True(AgentFailureClassifier.IsUnknownModelFailure(stderr: snippet, stdout: null));
+        var c = AgentFailureClassifier.Classify(stderr: snippet);
+        Assert.Equal(AgentFailureKind.Infrastructure, c.Kind);
+    }
+
     [Theory]
     [InlineData("API Error: 401 Unauthorized")]
     [InlineData("API Error: 403")]

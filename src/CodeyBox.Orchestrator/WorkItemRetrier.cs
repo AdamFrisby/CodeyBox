@@ -715,7 +715,7 @@ public sealed class WorkItemRetrier
             item.BaselineImageAgent?.Value ?? "(unattributed)",
             current ?? "(unpinned)",
             dispatchAgent?.Value ?? "(unset)");
-        return item with { BaselineImageRef = null, BaselineImageAgent = null };
+        return item with { BaselineImageRef = null, BaselineImageAgent = null, BaselineImageModelId = null };
     }
 
     private static bool TryGetUsableAgentTurnCheckpoint(

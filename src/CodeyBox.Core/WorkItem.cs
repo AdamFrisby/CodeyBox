@@ -912,6 +912,18 @@ public sealed record WorkItem
     public AgentKind? BaselineImageAgent { get; init; }
 
     /// <summary>
+    /// The model id <see cref="BaselineImageRef"/> was resolved for (the
+    /// <see cref="AgentMembership.ModelId"/> the dispatching pickup routed to,
+    /// or null when the agent uses its own default). Persisted alongside the
+    /// pin so a later pickup can tell whether a toolchain-stale pin is still
+    /// serving its original model: a model upgrade on top of a CLI upgrade is
+    /// the combination that runs a model the baked CLI does not know, so the
+    /// stale-pin policy migrates exactly that case. Null when no pin is set
+    /// or when the pin predates model attribution (treated as changed).
+    /// </summary>
+    public string? BaselineImageModelId { get; init; }
+
+    /// <summary>
     /// Returns the baseline pin usable for a sandbox dispatched as
     /// <paramref name="agent"/>: the pinned ref when it was resolved for that
     /// agent kind, otherwise null so the provider resolves the baseline the
@@ -929,7 +941,7 @@ public sealed record WorkItem
     public WorkItem WithBaselinePinForAgent(AgentKind agent) =>
         BaselineImageRef is null || BaselineImageAgent == agent
             ? this
-            : this with { BaselineImageRef = null, BaselineImageAgent = null };
+            : this with { BaselineImageRef = null, BaselineImageAgent = null, BaselineImageModelId = null };
 
     /// <summary>
     /// Returns a copy with the transient auto-retry budget window cleared: a

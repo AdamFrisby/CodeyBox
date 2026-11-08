@@ -4542,7 +4542,8 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>(),
     dispatchLiveness: sp.GetRequiredService<DispatchItemLivenessTracker>(),
     hostTransientPause: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
-    baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>()));
+    baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>(),
+    stalePinOptions: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.BaselineStalePin));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
     sp => sp.GetRequiredService<OrchestratorService>());
 builder.Services.AddSingleton<IRefactorProjectGateStatusProvider>(
@@ -4857,7 +4858,8 @@ builder.Services.AddSingleton<BaselineMigrationService>(sp =>
         sp.GetRequiredService<IProjectRepository>(),
         sp.GetService<TimeProvider>() ?? TimeProvider.System,
         () => monitor.CurrentValue.BaselineMigration,
-        sp.GetRequiredService<ILogger<BaselineMigrationService>>());
+        sp.GetRequiredService<ILogger<BaselineMigrationService>>(),
+        () => monitor.CurrentValue.BaselineStalePin);
 });
 
 // --- Stale-base PR sweeper ---------------------------------------------------
@@ -6966,6 +6968,17 @@ namespace CodeyBox.Api
         /// clears. See <see cref="BaselineMigrationService"/>.
         /// </summary>
         public BaselineMigrationOptions BaselineMigration { get; set; } = new();
+
+        /// <summary>
+        /// Pickup-time stale-baseline-pin policy. When a work item's pinned
+        /// baseline was baked from different agent executable/toolchain inputs
+        /// than the live config resolves now, and the dispatch model has also
+        /// changed since the pin, the pickup clears the pin so the item
+        /// recomputes onto the current baseline (same outcome as a manual
+        /// migrate) instead of running a model the baked CLI may not know.
+        /// See <see cref="BaselineStalePinEvaluator"/>.
+        /// </summary>
+        public BaselineStalePinOptions BaselineStalePin { get; set; } = new();
 
         /// <summary>
         /// Stale-base PR sweeper configuration. Detects open CodeyBox-authored

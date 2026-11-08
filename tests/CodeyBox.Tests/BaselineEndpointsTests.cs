@@ -188,6 +188,56 @@ public sealed class BaselineEndpointsTests : IDisposable
         Assert.Equal(1, workItems.GetArrayLength());
         Assert.Equal(doneItem.Id.ToString(), workItems[0].GetProperty("id").GetString());
     }
+
+    /// <summary>
+    /// <c>pinConsistency</c> warns when a config change leaves in-flight items
+    /// on a stale toolchain: the fake resolver reports no live baseline, so a
+    /// scoped pin is stale and surfaces with its pinned model. The warning
+    /// points at the manual migrate — this is the signal that fires even when
+    /// the pickup-time auto-migration policy is disabled.
+    /// </summary>
+    [Fact]
+    public async Task GetBaselines_StalePin_SurfacesConsistencyWarning()
+    {
+        var pin = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-old");
+        var item = Sample("p", pin, WorkItemState.Working) with { BaselineImageModelId = "old-model" };
+        await _factory.WorkItemStore.CreateAsync(item);
+
+        await _factory.SweepAsync();
+
+        var resp = await _client.GetAsync("/baselines");
+        resp.EnsureSuccessStatusCode();
+
+        var consistency = (await resp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("pinConsistency");
+        Assert.Equal(1, consistency.GetProperty("scanned").GetInt32());
+        Assert.Equal(1, consistency.GetProperty("staleToolchain").GetInt32());
+        Assert.Equal(JsonValueKind.String, consistency.GetProperty("warning").ValueKind);
+        Assert.Contains("POST /baselines/migrate", consistency.GetProperty("warning").GetString());
+
+        var stale = Assert.Single(consistency.GetProperty("stalePins").EnumerateArray());
+        Assert.Equal(item.Id.ToString(), stale.GetProperty("id").GetString());
+        Assert.Equal(pin, stale.GetProperty("pinnedRef").GetString());
+        Assert.Equal("old-model", stale.GetProperty("pinnedModel").GetString());
+    }
+
+    /// <summary>
+    /// The dashboard summary carries the stale count and warning (no per-item
+    /// list), and reports a null warning when nothing is stale.
+    /// </summary>
+    [Fact]
+    public async Task GetAdminBaselineImages_SurfacesConsistencyCounts()
+    {
+        var pin = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-old");
+        await _factory.WorkItemStore.CreateAsync(Sample("p", pin, WorkItemState.Working));
+
+        var resp = await _client.GetAsync("/admin/baseline-images");
+        resp.EnsureSuccessStatusCode();
+
+        var consistency = (await resp.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("pinConsistency");
+        Assert.Equal(1, consistency.GetProperty("staleToolchain").GetInt32());
+        Assert.Equal(JsonValueKind.String, consistency.GetProperty("warning").ValueKind);
+        Assert.Equal(0, consistency.GetProperty("stalePins").GetArrayLength());
+    }
 }
 
 /// <summary>
@@ -229,6 +279,15 @@ internal sealed class BaselineApiFactory : WebApplicationFactory<Program>
                 ["CodeyBox:GitRootDirectory"] = Path.Combine(_scratch.DirectoryPath, "test-git"),
                 ["CodeyBox:AuditLog:Path"] = Path.Combine(_scratch.DirectoryPath, "test-bsl-log.json"),
                 ["CodeyBox:AuditLog:AuditPath"] = Path.Combine(_scratch.DirectoryPath, "test-bsl-audit.json"),
+                // Declare project "p" so the pin-consistency check (which
+                // resolves the live baseline per project) can construct the
+                // project repository even when the store holds items. Without
+                // this, the removal validator rejects the empty project list
+                // while items still reference "p".
+                ["CodeyBox:Projects:0:Id"] = "p",
+                ["CodeyBox:Projects:0:DisplayName"] = "Baseline API project",
+                ["CodeyBox:Projects:0:RepositoryUrl"] = "https://example.invalid/repo.git",
+                ["CodeyBox:Projects:0:NetworkProfiles:Work"] = "work",
             });
         });
         builder.ConfigureTestServices(services =>

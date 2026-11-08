@@ -1668,11 +1668,38 @@ Response: `200 OK`
 ```
 
 Inactive when the registered sandbox provider does not implement baseline
-imaging (process / bubblewrap) — the response is then `{ "baselines": [], "sweepEntries": 0 }`.
+imaging (process / bubblewrap) — the response is then `{ "baselines": [],
+"sweepEntries": 0, "pinConsistency": { …all-zero/null… } }`.
+
+Both baseline endpoints also return a `pinConsistency` object: the
+advisory check for pins whose baked baseline differs from the live config's
+(e.g. an agent CLI upgrade moved the baseline under in-flight items while
+their dispatch model also changed — a combination the baked CLI may not
+know). `warning` is `null` when nothing is stale; otherwise it names the
+count, the pickup-time auto-migration policy mode, and points at
+`POST /baselines/migrate`. `GET /baselines` embeds the per-item `stalePins`
+list; the dashboard summary reports counts only:
+
+```json
+{
+  "pinConsistency": {
+    "scanned": 5,
+    "staleToolchain": 2,
+    "truncated": false,
+    "warning": "2 pinned work item(s) are stale: … run POST /baselines/migrate to move them now.",
+    "stalePins": [
+      { "id": "0199…", "projectId": "p", "pinnedRef": "incus/tc-aaaa…/vm-old", "pinnedModel": "old-model", "liveRef": "incus/tc-bbbb…/vm-new" }
+    ]
+  }
+}
+```
 
 ### `GET /admin/baseline-images`
 
 Compact dashboard summary of the latest sweep. Counts only; no work-item IDs.
+Includes the `pinConsistency` counts and warning (no per-item list) so
+dashboards can alert when a config change leaves in-flight items on an
+inconsistent CLI/model combination.
 
 Response: `200 OK`
 
@@ -1684,7 +1711,8 @@ Response: `200 OK`
   "entries": [
     { "name": "cb-baseline-9c74f712aa85", "isLive": true, "ageInGraceMinutes": null },
     { "name": "cb-baseline-bc5b1542b6d6", "isLive": false, "ageInGraceMinutes": 240.0 }
-  ]
+  ],
+  "pinConsistency": { "scanned": 5, "staleToolchain": 0, "truncated": false, "warning": null, "stalePins": [] }
 }
 ```
 

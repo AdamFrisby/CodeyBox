@@ -101,7 +101,11 @@ internal static class BaselineEndpoints
     }
 
     /// <summary>
-    /// Returns the latest baseline image sweep with referencing work items.
+    /// Returns the latest baseline image sweep with referencing work items,
+    /// plus the pin-consistency check: pins whose baked toolchain differs from
+    /// the live config's (a config change moved the baseline under in-flight
+    /// items). <c>pinConsistency.warning</c> is null when nothing is stale;
+    /// otherwise it names the count and points at <c>POST /baselines/migrate</c>.
     /// Returned shape:
     /// <code>
     /// {
@@ -114,13 +118,19 @@ internal static class BaselineEndpoints
     ///       "workItems": [{"id":"…","title":"…","state":3}]
     ///     }
     ///   ],
-    ///   "sweepEntries": 12
+    ///   "sweepEntries": 12,
+    ///   "pinConsistency": {
+    ///     "scanned": 5, "staleToolchain": 2, "truncated": false,
+    ///     "warning": "…",
+    ///     "stalePins": [{"id":"…","projectId":"…","pinnedRef":"…","pinnedModel":"…","liveRef":"…"}]
+    ///   }
     /// }
     /// </code>
     /// </summary>
     private static async Task<IResult> GetBaselinesAsync(
         BaselineImageReaper reaper,
         IWorkItemStore store,
+        BaselineMigrationService migrator,
         CancellationToken ct)
     {
         var report = reaper.GetLatestReport();
@@ -148,14 +158,21 @@ internal static class BaselineEndpoints
         {
             baselines = entries,
             sweepEntries = report.Count,
+            pinConsistency = await BuildPinConsistencyAsync(migrator, includeItems: true, ct),
         });
     }
 
     /// <summary>
     /// Compact summary intended for fleet dashboards. Counts only — no work-
-    /// item identifiers — so it stays cheap to render frequently.
+    /// item identifiers — so it stays cheap to render frequently. Includes the
+    /// stale-toolchain pin count and warning so dashboards can alert when a
+    /// config change leaves in-flight items on an inconsistent CLI/model
+    /// combination.
     /// </summary>
-    private static IResult GetBaselineSummary(BaselineImageReaper reaper)
+    private static async Task<IResult> GetBaselineSummary(
+        BaselineImageReaper reaper,
+        BaselineMigrationService migrator,
+        CancellationToken ct)
     {
         var report = reaper.GetLatestReport();
         return Results.Ok(new
@@ -171,6 +188,30 @@ internal static class BaselineEndpoints
                     ? (double?)Math.Round(m, 1)
                     : null,
             }).ToArray(),
+            pinConsistency = await BuildPinConsistencyAsync(migrator, includeItems: false, ct),
         });
+    }
+
+    private static async Task<object> BuildPinConsistencyAsync(
+        BaselineMigrationService migrator, bool includeItems, CancellationToken ct)
+    {
+        var consistency = await migrator.CheckConsistencyAsync(ct);
+        return new
+        {
+            scanned = consistency.ScannedCount,
+            staleToolchain = consistency.StaleToolchainCount,
+            truncated = consistency.Truncated,
+            warning = consistency.Warning,
+            stalePins = includeItems
+                ? consistency.StalePins.Select(p => new
+                {
+                    id = p.Id.ToString(),
+                    projectId = p.ProjectId.Value,
+                    pinnedRef = p.PinnedRef,
+                    pinnedModel = p.PinnedModelId,
+                    liveRef = p.LiveRef,
+                }).ToArray()
+                : Array.Empty<object>(),
+        };
     }
 }

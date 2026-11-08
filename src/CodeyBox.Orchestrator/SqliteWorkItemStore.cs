@@ -383,6 +383,14 @@ public sealed class SqliteWorkItemStore :
             // Null for legacy pins (they are re-resolved rather than trusted).
             RunMigration("ALTER TABLE work_items ADD COLUMN baseline_image_agent TEXT;");
 
+            // Baseline-pin model attribution: the ModelId the pinned ref was
+            // resolved for. Lets a later pickup tell a toolchain-stale pin
+            // that still serves its original model (safe to keep) from one
+            // combined with a model upgrade (must migrate: the baked CLI may
+            // not know the new model). Null for legacy pins (treated as
+            // changed) and for default-model dispatches.
+            RunMigration("ALTER TABLE work_items ADD COLUMN baseline_image_model TEXT;");
+
             // Required-capability eligibility gate. Composes (AND) with min_model_score
             // during the transition window; min_model_score is slated for removal once
             // legacy items have migrated. Stored as a JSON array; default '[]' = open
@@ -1465,7 +1473,7 @@ public sealed class SqliteWorkItemStore :
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
-                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, merge_attempts, merge_retry_reason, baseline_image_ref, baseline_image_agent,
+                        cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, merge_attempts, merge_retry_reason, baseline_image_ref, baseline_image_agent, baseline_image_model,
                         required_capabilities_json,
                         job_type, check_spec_json, agent_control_json, check_verdict_json, origin_check_work_item_id,
                         re_check_verdicts_json, template_name, template_entry_index,
@@ -1486,7 +1494,7 @@ public sealed class SqliteWorkItemStore :
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
-                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $merge_attempts, $merge_retry_reason, $baseline_image_ref, $baseline_image_agent,
+                        $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $merge_attempts, $merge_retry_reason, $baseline_image_ref, $baseline_image_agent, $baseline_image_model,
                         $required_capabilities,
                         $job_type, $check_spec, $agent_control, $check_verdict, $origin_check,
                         $re_check_verdicts, $template_name, $template_entry_index,
@@ -1849,6 +1857,7 @@ public sealed class SqliteWorkItemStore :
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
                     baseline_image_agent = $baseline_image_agent,
+                    baseline_image_model = $baseline_image_model,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -1957,6 +1966,7 @@ public sealed class SqliteWorkItemStore :
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
                     baseline_image_agent = $baseline_image_agent,
+                    baseline_image_model = $baseline_image_model,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -2067,6 +2077,7 @@ public sealed class SqliteWorkItemStore :
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
                     baseline_image_agent = $baseline_image_agent,
+                    baseline_image_model = $baseline_image_model,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -2546,6 +2557,7 @@ public sealed class SqliteWorkItemStore :
                     terminal_failure_count = $terminal_failure_count,
                     baseline_image_ref = $baseline_image_ref,
                     baseline_image_agent = $baseline_image_agent,
+                    baseline_image_model = $baseline_image_model,
                     required_capabilities_json = $required_capabilities,
                     job_type = $job_type,
                     check_spec_json = $check_spec,
@@ -2992,6 +3004,7 @@ public sealed class SqliteWorkItemStore :
                         terminal_failure_count = $terminal_failure_count,
                         baseline_image_ref = $baseline_image_ref,
                         baseline_image_agent = $baseline_image_agent,
+                        baseline_image_model = $baseline_image_model,
                         required_capabilities_json = $required_capabilities,
                         job_type = $job_type,
                         check_spec_json = $check_spec,
@@ -3907,7 +3920,7 @@ public sealed class SqliteWorkItemStore :
         // NULL). The optional project/ref predicates use $param IS NULL to
         // mean "no constraint" so one prepared statement covers every scope.
         cmd.CommandText = $"""
-            SELECT id, project_id, state, baseline_image_ref FROM work_items
+            SELECT id, project_id, state, baseline_image_ref, baseline_image_agent, baseline_image_model FROM work_items
             WHERE baseline_image_ref IS NOT NULL
               AND state NOT IN ({TerminalStatesSqlList})
               AND ($pid IS NULL OR project_id = $pid)
@@ -3925,7 +3938,9 @@ public sealed class SqliteWorkItemStore :
                 WorkItemId.Parse(reader.GetString(0)),
                 new ProjectId(reader.GetString(1)),
                 (WorkItemState)reader.GetInt32(2),
-                reader.GetString(3)));
+                reader.GetString(3),
+                reader.IsDBNull(4) ? null : new AgentKind(reader.GetString(4)),
+                reader.IsDBNull(5) ? null : reader.GetString(5)));
         }
         return result;
     }
@@ -3981,7 +3996,7 @@ public sealed class SqliteWorkItemStore :
                 // no-op (idempotent).
                 cmd.CommandText = $"""
                     UPDATE work_items
-                    SET baseline_image_ref = NULL, baseline_image_agent = NULL, updated_at = $now
+                    SET baseline_image_ref = NULL, baseline_image_agent = NULL, baseline_image_model = NULL, updated_at = $now
                     WHERE baseline_image_ref IS NOT NULL
                       AND state NOT IN ({TerminalStatesSqlList})
                       AND id IN ({placeholders});
@@ -4669,6 +4684,7 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$merge_retry_reason", (object?)item.MergeRetryReason ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$baseline_image_ref", (object?)item.BaselineImageRef ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$baseline_image_agent", (object?)item.BaselineImageAgent?.Value ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$baseline_image_model", (object?)item.BaselineImageModelId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$required_capabilities",
             JsonSerializer.Serialize(item.RequiredCapabilities));
         cmd.Parameters.AddWithValue("$job_type", item.JobType.ToString());
@@ -4816,6 +4832,7 @@ public sealed class SqliteWorkItemStore :
         MergeRetryReason = ReadNullableString(r, "merge_retry_reason"),
         BaselineImageRef = ReadNullableString(r, "baseline_image_ref"),
         BaselineImageAgent = ReadNullableAgentKind(r, "baseline_image_agent"),
+        BaselineImageModelId = ReadNullableString(r, "baseline_image_model"),
         RequiredCapabilities = ReadRequiredCapabilities(r),
         JobType = ReadJobType(r),
         Check = ReadCheckSpec(r),
