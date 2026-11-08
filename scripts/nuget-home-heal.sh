@@ -870,8 +870,18 @@ codeybox_heal_nuget_home() {
                         fi
                         return 0
                     fi
+                    # The broken tree is already renamed aside (or was absent):
+                    # there is nothing left to quarantine, so mark the attempt
+                    # done even though recreating the home failed — that is the
+                    # redirect fallback's job now.
+                    : > "$_codeybox_quarantine_marker" 2>/dev/null || true
                 fi
-                : > "$_codeybox_quarantine_marker" 2>/dev/null || true
+                # When the rename itself failed the broken tree is still in
+                # place: leave the marker unset so a later invocation can retry
+                # the quarantine instead of being suppressed forever — for the
+                # MSBuild InitialTargets caller the DOTNET_CLI_HOME redirect
+                # cannot propagate back to dotnet, so skipping the rename would
+                # strand the home unusable on every later build.
             fi
 
             if [ "$_codeybox_lock_acquired" -eq 1 ]; then
