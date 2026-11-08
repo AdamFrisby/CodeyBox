@@ -760,8 +760,6 @@ public static class AgentFailureClassifier
     {
         "model '",
         "model \"",
-        "model '",
-        "model '",
         "model:",
         "model=",
         "--model",
@@ -813,18 +811,99 @@ public static class AgentFailureClassifier
     /// miss because the quoted id breaks the word adjacency. Requires BOTH an
     /// anchored model reference and an error word on the same line, so bare
     /// prose ("the model failed", "model output was empty") never matches.
+    /// The error word must sit OUTSIDE the quoted model id as a standalone
+    /// token: in <c>model 'unknown-xyz' is not served by the provider
+    /// endpoint</c> the word "unknown" is part of the id, not a CLI refusal,
+    /// so that provider-side failure must not classify as unknown-model.
     /// Returns the matched error word for reasons, else null.
     /// </summary>
     private static string? FindAnchoredModelRefusal(string line)
     {
         if (!ContainsAny(line, UnknownModelAnchors))
             return null;
+        var unquoted = StripQuotedSegments(line);
         for (var i = 0; i < UnknownModelErrorWords.Count; i++)
         {
-            if (line.Contains(UnknownModelErrorWords[i], StringComparison.OrdinalIgnoreCase))
+            if (ContainsTokenSequence(unquoted, UnknownModelErrorWords[i]))
                 return UnknownModelErrorWords[i];
         }
         return null;
+    }
+
+    /// <summary>
+    /// Blanks out paired single/double-quoted segments (typically the rejected
+    /// model id) so <see cref="FindAnchoredModelRefusal"/> cannot match an
+    /// error word that only occurs inside the id. An unmatched quote (for
+    /// example the apostrophe in "doesn't") leaves the rest of the line
+    /// untouched.
+    /// </summary>
+    private static string StripQuotedSegments(string line)
+    {
+        var chars = line.ToCharArray();
+        var i = 0;
+        while (i < chars.Length)
+        {
+            if (!IsQuoteChar(chars[i]))
+            {
+                i++;
+                continue;
+            }
+            var closer = IndexOfQuoteChar(chars, i + 1);
+            if (closer < 0)
+                break;
+            for (var j = i; j <= closer; j++)
+                chars[j] = ' ';
+            i = closer + 1;
+        }
+        return new string(chars);
+    }
+
+    private static bool IsQuoteChar(char ch) =>
+        ch == '\'' || ch == '"' || ch == '\u2018' || ch == '\u2019' || ch == '\u201C' || ch == '\u201D';
+
+    private static int IndexOfQuoteChar(char[] chars, int start)
+    {
+        for (var i = start; i < chars.Length; i++)
+        {
+            if (IsQuoteChar(chars[i]))
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Word-boundary punctuation stripped from token edges before matching.
+    /// Dashes, underscores, slashes, and dots are deliberately NOT stripped:
+    /// they join model-id parts (<c>unknown-xyz</c>), so trimming them would
+    /// reintroduce the false positive this guard exists to prevent.
+    /// </summary>
+    private static readonly char[] TokenEdgePunctuation =
+        ['.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '\'', '"', '\u2018', '\u2019', '\u201C', '\u201D', '`', '*'];
+
+    /// <summary>
+    /// Case-insensitive whole-token (or adjacent-token for multi-word phrases)
+    /// match, so <c>unknown-xyz</c> never matches the error word
+    /// <c>unknown</c> while <c>not found.</c> still matches <c>not found</c>.
+    /// </summary>
+    private static bool ContainsTokenSequence(string text, string word)
+    {
+        var tokens = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        var parts = word.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (var i = 0; i + parts.Length <= tokens.Length; i++)
+        {
+            var match = true;
+            for (var j = 0; j < parts.Length; j++)
+            {
+                if (!tokens[i + j].Trim(TokenEdgePunctuation).Equals(parts[j], StringComparison.OrdinalIgnoreCase))
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
