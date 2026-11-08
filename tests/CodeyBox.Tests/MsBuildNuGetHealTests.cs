@@ -138,18 +138,22 @@ public sealed class MsBuildNuGetHealTests
         string dotnetDir,
         string targetPath,
         string offlineConfig,
-        Dictionary<string, string> env)
+        Dictionary<string, string> env,
+        params string[] extraArguments)
     {
+        var argv = new List<string>
+        {
+            Path.Combine(dotnetDir, "dotnet"),
+            "build",
+            targetPath,
+            "--configuration", "Debug",
+            "-nodeReuse:false",
+            "-p:UseSharedCompilation=false",
+            "-p:RestoreConfigFile=" + offlineConfig,
+        };
+        argv.AddRange(extraArguments);
         return new DefaultProcessRunner().RunAsync(
-            [
-                Path.Combine(dotnetDir, "dotnet"),
-                "build",
-                targetPath,
-                "--configuration", "Debug",
-                "-nodeReuse:false",
-                "-p:UseSharedCompilation=false",
-                "-p:RestoreConfigFile=" + offlineConfig,
-            ],
+            argv,
             null,
             CancellationToken.None,
             maxStdoutBytes: 1 << 20,
@@ -174,6 +178,10 @@ public sealed class MsBuildNuGetHealTests
             File.WriteAllText(markerPath, string.Empty);
         }
 
+        // NuGet derives the per-user home from DOTNET_CLI_HOME, falling back
+        // to HOME; pin both to the fixture so nothing escapes to the real user
+        // profile. The MSBuild/Roslyn server flags keep node-reuse processes
+        // from outliving the fixture build and starving later timing tests.
         var env = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["HOME"] = home,
@@ -251,28 +259,7 @@ public sealed class MsBuildNuGetHealTests
             Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
             await File.WriteAllTextAsync(marker, "cached");
 
-            var env = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["HOME"] = home,
-                // NuGet derives the per-user home from DOTNET_CLI_HOME, falling back
-                // to HOME; pin both to the broken fixture so nothing escapes to the
-                // real user profile.
-                ["DOTNET_CLI_HOME"] = home,
-                ["PATH"] = dotnetDir + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                ["TMPDIR"] = root,
-                ["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1",
-                ["DOTNET_SKIP_FIRST_TIME_EXPERIENCE"] = "1",
-                ["DOTNET_NOLOGO"] = "1",
-                // A default `dotnet build` leaves persistent, CPU- and RAM-hungry
-                // MSBuild worker nodes plus a Roslyn VBCSCompiler server alive for
-                // minutes (node reuse). Because this collection runs in xUnit's
-                // sequential non-parallel phase alongside other timing-sensitive
-                // audit tests, those lingering servers would saturate the host and
-                // flake them. Disable every persistent server so the build spawns
-                // nothing that outlives it.
-                ["MSBUILDDISABLENODEREUSE"] = "1",
-                ["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0",
-            };
+            var env = CreateBuildEnv(dotnetDir, home, root);
 
             var result = await new DefaultProcessRunner().RunAsync(
                 [
@@ -584,6 +571,118 @@ public sealed class MsBuildNuGetHealTests
             Assert.False(
                 pinned.StartsWith(home + "/", StringComparison.Ordinal),
                 $"RestorePackagesPath must not resolve inside the rejected home, got '{pinned}'");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The POSIX guard must fail closed when it cannot obtain the heal
+    // script's verdict at all: the old readability-only fallback left the
+    // auto-pinned RestorePackagesPath on storage that was never admitted.
+    [Fact]
+    public async Task MsBuild_NonSolutionBuild_FailsClosed_WhenHealReportUnavailable()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-no-report-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var projectDir = Path.Combine(root, "proj");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(projectDir);
+        try
+        {
+            await CreateProjectAsync(projectDir);
+            await CreateBuildWiringAsync(root, repoRoot!);
+            var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+            var env = CreateBuildEnv(dotnetDir, home, root);
+
+            var result = await RunDotnetBuildAsync(
+                dotnetDir,
+                Path.Combine(projectDir, "proj.csproj"),
+                offlineConfig,
+                env,
+                "-p:_CodeyBoxNuGetHealScript=/nonexistent/nuget-home-heal.sh");
+
+            Assert.False(result.Success, result.Stdout + result.Stderr);
+            Assert.Contains(
+                "heal report unavailable",
+                result.Stdout + result.Stderr,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // A "failed" verdict means the heal could not prove ANY verified package
+    // cache — including the repository-local last resort. The guard must
+    // refuse the build rather than repoint RestorePackagesPath back at the
+    // rejected .nuget/packages tree.
+    [Fact]
+    public async Task MsBuild_NonSolutionBuild_FailsClosed_WhenHealCannotVerifyPackageCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-heal-failed-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var projectDir = Path.Combine(root, "proj");
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(projectDir);
+        Directory.CreateDirectory(outside);
+        File.CreateSymbolicLink(Path.Combine(home, ".nuget"), outside);
+        try
+        {
+            await CreateProjectAsync(projectDir);
+            await CreateBuildWiringAsync(root, repoRoot!);
+            var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+            var env = CreateBuildEnv(dotnetDir, home, root);
+            // TMPDIR must stay writable for MSBuild itself, but be storage the
+            // heal's anchor admission refuses (other-writable without sticky):
+            // the shared per-user dir and the mktemp fallback both resolve
+            // under it and fail verification, while the repository-local last
+            // resort below is outside writable storage too.
+            var untrustedTmp = Path.Combine(root, "untrusted-tmp");
+            Directory.CreateDirectory(untrustedTmp);
+            await ChmodAsync("777", untrustedTmp);
+            env["TMPDIR"] = untrustedTmp;
+
+            var result = await RunDotnetBuildAsync(
+                dotnetDir,
+                Path.Combine(projectDir, "proj.csproj"),
+                offlineConfig,
+                env,
+                "-p:_CodeyBoxRepositoryDotNetHome=/proc/codeybox-nuget-home");
+
+            Assert.False(result.Success, result.Stdout + result.Stderr);
+            Assert.Contains(
+                "could not materialize verified storage",
+                result.Stdout + result.Stderr,
+                StringComparison.Ordinal);
+            Assert.False(
+                File.Exists(Path.Combine(projectDir, "restore-packages-path.txt")),
+                "a failed heal verdict must stop the build before package consumption");
         }
         finally
         {

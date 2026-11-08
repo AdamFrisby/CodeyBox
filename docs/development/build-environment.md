@@ -53,8 +53,11 @@ quarantine and an unusable home is instead covered by the in-process
 `CODEYBOX_NUGET_HEAL_REPORT=1` and applies its machine-readable verdict
 inside the MSBuild process: it redirects `DOTNET_CLI_HOME`/`HOME` to
 verified storage and repoints the auto-pinned `RestorePackagesPath` at the
-same whole-tree-verified package cache the heal itself would use — an
-operator-supplied `RestorePackagesPath` is never overridden. Destructive repair
+exact package-cache path the heal verified (or the fresh path under the
+redirected private home) — an operator-supplied `RestorePackagesPath` is
+never overridden. If the report cannot be obtained, or the heal reports that
+no verified package cache exists, the build fails closed rather than falling
+back to config readability alone. Destructive repair
 that renames a directory is never performed from a per-project
 `InitialTarget`. All paths delegate the repair to the shared
 `scripts/nuget-home-heal.sh` recovery —
@@ -83,8 +86,11 @@ with enumeration disabled while keyed lookups still resolve — so the proof
 first requires that EVERY source configured for the `group` and `passwd`
 databases in `nsswitch.conf` is enumerable (`files`/`compat`/`db`/`nis`/
 `nisplus`/`yp`/`systemd` implement enumeration; `sss` is covered only when
-`enumerate = true` is proven for every domain it serves across
-`sssd.conf` + `sssd.conf.d` drop-ins; anything else — `ldap`, `winbind`,
+`enumerate = true` is proven for every domain it serves across the effective
+SSSD hierarchy — `/etc/sssd/sssd.conf` (or the vendor
+`/usr/etc/sssd/sssd.conf` when the system conf is absent) plus readable
+non-hidden `/etc/sssd/conf.d/*.conf` snippets; anything else — `ldap`,
+`winbind`,
 unknown — fails closed), unioned with the direct `/etc/*` reads. Platforms or
 topologies where groups/accounts cannot be enumerated or coverage cannot be
 proven (macOS, musl, `sss` without `enumerate = true`, non-enumerable NSS

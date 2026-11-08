@@ -1050,11 +1050,11 @@ public sealed class BuildScriptNuGetHealTests
                 + "  && echo EGID=private || echo EGID=shared; } && "
                 + "{ _codeybox_group_is_private 999999 "
                 + "  && echo STRANGER=private || echo STRANGER=refused; } && "
-                + "probe= && "
-                + "for g in 424242 424243 424244 424245 424246 424247 424248 424249; do "
-                + "  id -G | tr ' ' '\\n' | grep -qx \"$g\" && continue; "
-                + "  getent group \"$g\" 2>/dev/null | grep -q . && continue; "
-                + "  getent passwd 2>/dev/null | awk -F: -v g=\"$g\" '$4 == g { f = 1 } END { exit(f ? 0 : 1) }' && continue; "
+                + "probe= && i=1 && while [ \"$i\" -le 64 ]; do "
+                + "  g=$(( $(id -g) + 100000 + i )); "
+                + "  id -G | tr ' ' '\\n' | grep -qx \"$g\" && { i=$((i+1)); continue; }; "
+                + "  getent group \"$g\" 2>/dev/null | grep -q . && { i=$((i+1)); continue; }; "
+                + "  getent passwd 2>/dev/null | awk -F: -v g=\"$g\" '$4 == g { f = 1 } END { exit(f ? 0 : 1) }' && { i=$((i+1)); continue; }; "
                 + "  probe=$g; break; "
                 + "done; "
                 + "if [ -z \"$probe\" ]; then echo PROBE=skipped; else "
@@ -1109,11 +1109,16 @@ public sealed class BuildScriptNuGetHealTests
         var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
         var home = Path.Combine(root, "home");
         var fx = Path.Combine(root, "nss");
+        var confDir = Path.Combine(fx, "sssd", "conf.d");
         Directory.CreateDirectory(home);
-        Directory.CreateDirectory(Path.Combine(fx, "sssd", "sssd.conf.d"));
+        Directory.CreateDirectory(confDir);
         try
         {
-            async Task<string> ProbeAsync(string nsswitch, string? sssdConf, string? dropin)
+            async Task<string> ProbeAsync(
+                string nsswitch,
+                string? sssdConf,
+                string? dropin,
+                string? vendorConf = null)
             {
                 await File.WriteAllTextAsync(Path.Combine(fx, "nsswitch.conf"), nsswitch);
                 var confPath = Path.Combine(fx, "sssd", "sssd.conf");
@@ -1126,15 +1131,24 @@ public sealed class BuildScriptNuGetHealTests
                 {
                     await File.WriteAllTextAsync(confPath, sssdConf);
                 }
-                foreach (var stale in Directory.GetFiles(
-                    Path.Combine(fx, "sssd", "sssd.conf.d")))
+                var vendorPath = Path.Combine(fx, "sssd", "vendor-sssd.conf");
+                if (vendorConf is null)
+                {
+                    if (File.Exists(vendorPath))
+                        File.Delete(vendorPath);
+                }
+                else
+                {
+                    await File.WriteAllTextAsync(vendorPath, vendorConf);
+                }
+                foreach (var stale in Directory.GetFiles(confDir))
                 {
                     File.Delete(stale);
                 }
                 if (dropin is not null)
                 {
                     await File.WriteAllTextAsync(
-                        Path.Combine(fx, "sssd", "sssd.conf.d", "10-enum.conf"), dropin);
+                        Path.Combine(confDir, "10-enum.conf"), dropin);
                 }
 
                 var result = await RunHealShellAsync(
@@ -1142,7 +1156,8 @@ public sealed class BuildScriptNuGetHealTests
                     "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && "
                     + "_codeybox_nsswitch_conf=\"$3/nsswitch.conf\" && "
                     + "_codeybox_sssd_conf=\"$3/sssd/sssd.conf\" && "
-                    + "_codeybox_sssd_conf_d=\"$3/sssd/sssd.conf.d\" && "
+                    + "_codeybox_sssd_vendor_conf=\"$3/sssd/vendor-sssd.conf\" && "
+                    + "_codeybox_sssd_conf_d=\"$3/sssd/conf.d\" && "
                     + "_codeybox_pg_gid= && _codeybox_pg_verdict= && "
                     + "_codeybox_nss_enum_checked=0 && _codeybox_nss_enum_ok=0 && "
                     + "{ _codeybox_group_is_private \"$(id -g)\" "
@@ -1192,6 +1207,44 @@ public sealed class BuildScriptNuGetHealTests
                         + "[domain/a.com]\nenumerate = true\n"
                         + "[domain/b.com]\n",
                     null));
+
+            // With no system sssd.conf the vendor config applies, and the real
+            // conf.d snippets still merge over it.
+            Assert.Equal(
+                "G=refused",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n",
+                    null, null, SssdNoEnum));
+            Assert.Equal(
+                "G=private",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n",
+                    null,
+                    "[domain/example.com]\nenumerate = true\n",
+                    SssdNoEnum));
+
+            // A system conf masks the vendor file entirely.
+            Assert.Equal(
+                "G=private",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n",
+                    "[sssd]\ndomains = example.com\n"
+                        + "[domain/example.com]\nenumerate = true\n",
+                    null,
+                    SssdNoEnum));
+
+            // The retired sssd.conf.d spelling is not SSSD's snippet dir: an
+            // override planted there must not prove enumeration for a system
+            // conf that still has enumerate=false.
+            var wrongDropinDir = Path.Combine(fx, "sssd", "sssd.conf.d");
+            Directory.CreateDirectory(wrongDropinDir);
+            await File.WriteAllTextAsync(
+                Path.Combine(wrongDropinDir, "10-enum.conf"),
+                "[domain/example.com]\nenumerate = true\n");
+            Assert.Equal(
+                "G=refused",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n", SssdNoEnum, null));
         }
         finally
         {
@@ -1231,6 +1284,7 @@ public sealed class BuildScriptNuGetHealTests
             Assert.True(result.Success, result.Stdout + result.Stderr);
             var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             Assert.Contains("CODEYBOX_HEAL_VERDICT=usable", lines);
+            Assert.Contains("CODEYBOX_HEAL_NUGET_PACKAGES=", lines);
             Assert.Contains(lines, l => l.StartsWith("CODEYBOX_HEAL_HOME=", StringComparison.Ordinal)
                 && l.Length > "CODEYBOX_HEAL_HOME=".Length);
         }
@@ -1264,6 +1318,16 @@ public sealed class BuildScriptNuGetHealTests
             var cliHomePath = cliHome!["CODEYBOX_HEAL_DOTNET_CLI_HOME=".Length..];
             Assert.False(string.IsNullOrEmpty(cliHomePath));
             Assert.True(Directory.Exists(cliHomePath), "reported cli home must exist");
+            var packages = lines.FirstOrDefault(
+                l => l.StartsWith("CODEYBOX_HEAL_NUGET_PACKAGES=", StringComparison.Ordinal));
+            Assert.NotNull(packages);
+            var packagesPath = packages!["CODEYBOX_HEAL_NUGET_PACKAGES=".Length..];
+            Assert.Equal(
+                cliHomePath.TrimEnd('/') + "/.nuget/packages",
+                packagesPath);
+            Assert.False(
+                packagesPath.StartsWith(homeNoQ + "/", StringComparison.Ordinal),
+                "the rejected home's packages path must not be reported");
             Assert.Empty(Directory.GetDirectories(homeNoQ, ".nuget.codeybox-unwritable.*"));
             Assert.True(
                 File.GetAttributes(Path.Combine(homeNoQ, ".nuget")).HasFlag(FileAttributes.ReparsePoint),

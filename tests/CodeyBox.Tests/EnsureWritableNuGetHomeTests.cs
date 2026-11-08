@@ -382,6 +382,7 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     }
 
     [Fact]
+    [Trait("requires_privileged_process", "true")]
     public async Task Script_ForeignOwnedTree_IsQuarantined()
     {
         // A genuinely foreign-owned .nuget (uid != ours) is the co-tenant risk

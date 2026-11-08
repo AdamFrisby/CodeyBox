@@ -144,7 +144,8 @@ _codeybox_group_db="/etc/group"
 _codeybox_passwd_db="/etc/passwd"
 _codeybox_nsswitch_conf="/etc/nsswitch.conf"
 _codeybox_sssd_conf="/etc/sssd/sssd.conf"
-_codeybox_sssd_conf_d="/etc/sssd/sssd.conf.d"
+_codeybox_sssd_vendor_conf="/usr/etc/sssd/sssd.conf"
+_codeybox_sssd_conf_d="/etc/sssd/conf.d"
 # Memo for _codeybox_nss_enumeration_complete: "" unchecked, then 0/1.
 _codeybox_nss_enum_checked=0
 _codeybox_nss_enum_ok=0
@@ -187,36 +188,48 @@ _codeybox_nss_db_sources() {
 # can therefore hide group/passwd entries from a keyless getent dump, so
 # enumeration must be PROVEN: sssd serves the domains named in the [sssd]
 # `domains =` list plus every [domain/*] section, and every one of them must
-# carry `enumerate = true` in its own section. sssd.conf is read first, then
-# sssd.conf.d/*.conf in lexical order with later assignments winning — sssd's
-# own merge order (dotfile drop-ins are parsed too, so a hidden override
-# cannot sneak past). The `enumerate` option is per-domain only: an
-# [sssd]-section value is not honoured by sssd and is deliberately not
-# accepted. A missing main conf means sssd serves nothing at all, so nothing
-# can be hidden; an unreadable one fails closed.
+# carry `enumerate = true` in its own section.
+#
+# SSSD's config hierarchy is /etc/sssd/sssd.conf when present; otherwise the
+# vendor file /usr/etc/sssd/sssd.conf applies. In either case the readable
+# /etc/sssd/conf.d/*.conf snippets are merged afterwards in lexical order
+# with later assignments winning — hidden dotfiles are not snippets. The
+# `enumerate` option is per-domain only: an [sssd]-section value is not
+# honoured by sssd and is deliberately not accepted. No main or snippet
+# config means sssd serves nothing at all; an unreadable or unlistable
+# config fails closed because a partially-read config could hide a later
+# `enumerate = false`.
 _codeybox_sss_enumeration_proven() {
-    [ -f "$_codeybox_sssd_conf" ] || return 0
-    [ -r "$_codeybox_sssd_conf" ] || return 1
-    # Concatenate the configs in sssd's own read order — main conf, then
-    # conf.d drop-ins lexically (dotfile drop-ins included) — into one stream
-    # for the parser. Every file must cat cleanly: a partially-read config
-    # could hide a later `enumerate = false`, so any read failure fails
-    # closed. sssd runs as root and can read drop-ins this user cannot, so
-    # an unreadable drop-in is refused rather than skipped.
-    _codeybox_sss_text="$({
-        cat "$_codeybox_sssd_conf" || exit 1
-        if [ -d "$_codeybox_sssd_conf_d" ]; then
-            for _codeybox_sss_dropin in \
-                "$_codeybox_sssd_conf_d"/*.conf \
-                "$_codeybox_sssd_conf_d"/.[!.]*.conf; do
-                if [ -f "$_codeybox_sss_dropin" ]; then
-                    [ -r "$_codeybox_sss_dropin" ] || exit 1
-                    cat "$_codeybox_sss_dropin" || exit 1
-                fi
-            done
-        fi
-    })" || return 1
-    [ -n "$_codeybox_sss_text" ] || return 1
+    _codeybox_sss_main=
+    if [ -e "$_codeybox_sssd_conf" ] || [ -L "$_codeybox_sssd_conf" ]; then
+        [ -f "$_codeybox_sssd_conf" ] && [ -r "$_codeybox_sssd_conf" ] \
+            || return 1
+        _codeybox_sss_main="$_codeybox_sssd_conf"
+    elif [ -e "$_codeybox_sssd_vendor_conf" ] \
+        || [ -L "$_codeybox_sssd_vendor_conf" ]; then
+        [ -f "$_codeybox_sssd_vendor_conf" ] \
+            && [ -r "$_codeybox_sssd_vendor_conf" ] || return 1
+        _codeybox_sss_main="$_codeybox_sssd_vendor_conf"
+    fi
+
+    _codeybox_sss_text=
+    if [ -n "$_codeybox_sss_main" ]; then
+        _codeybox_sss_text="$(cat "$_codeybox_sss_main")" || return 1
+    fi
+    if [ -e "$_codeybox_sssd_conf_d" ] || [ -L "$_codeybox_sssd_conf_d" ]; then
+        [ -d "$_codeybox_sssd_conf_d" ] && [ -r "$_codeybox_sssd_conf_d" ] \
+            && [ -x "$_codeybox_sssd_conf_d" ] || return 1
+        for _codeybox_sss_dropin in "$_codeybox_sssd_conf_d"/*.conf; do
+            if [ -e "$_codeybox_sss_dropin" ] || [ -L "$_codeybox_sss_dropin" ]; then
+                [ -f "$_codeybox_sss_dropin" ] || continue
+                [ -r "$_codeybox_sss_dropin" ] || return 1
+                _codeybox_sss_drop="$(cat "$_codeybox_sss_dropin")" || return 1
+                _codeybox_sss_text="${_codeybox_sss_text}${_codeybox_sss_text:+
+}$_codeybox_sss_drop"
+            fi
+        done
+    fi
+    [ -n "$_codeybox_sss_text" ] || return 0
     printf '%s\n' "$_codeybox_sss_text" | awk '
         {
             line = $0
@@ -227,6 +240,7 @@ _codeybox_sss_enumeration_proven() {
             sub(/^[ \t]*\[/, "", section)
             sub(/\].*/, "", section)
             gsub(/[ \t]/, "", section)
+            section = tolower(section)
             in_sssd = (section == "sssd")
             curdom = ""
             if (section ~ /^domain\//) {
@@ -243,14 +257,14 @@ _codeybox_sss_enumeration_proven() {
             val = substr(line, eq + 1)
             gsub(/^[ \t]+|[ \t]+$/, "", key)
             gsub(/^[ \t]+|[ \t]+$/, "", val)
-            if (in_sssd && key == "domains") {
+            lk = tolower(key)
+            lv = tolower(val)
+            if (in_sssd && lk == "domains") {
                 m = split(val, parts, /[ \t,]+/)
                 for (i = 1; i <= m; i++)
                     if (parts[i] != "")
-                        doms[parts[i]] = 1
+                        doms[tolower(parts[i])] = 1
             } else if (curdom != "") {
-                lk = tolower(key)
-                lv = tolower(val)
                 if (lk == "enumerate")
                     enum[curdom] = \
                         (lv == "true" || lv == "yes" || lv == "on" || lv == "1") \
@@ -603,6 +617,25 @@ _codeybox_adopt_dir() {
     _codeybox_secure_dir "$1" private "${2:-}"
 }
 
+# Adopt a possibly-nested private-storage path one verified component at a
+# time. _codeybox_adopt_dir deliberately requires the parent to exist already;
+# the repository-local fallback home may sit under a not-yet-created .build
+# directory, so create each missing level through the same single-mkdir
+# admission rather than `mkdir -p` descending planted symlinks. Best-effort
+# like its callee: any unverifiable component refuses the whole path.
+_codeybox_adopt_dir_deep() {
+    [ -n "${1:-}" ] || return 1
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        _codeybox_adopt_dir "$1" "${2:-}"
+        return
+    fi
+    _codeybox_deep_parent="$(dirname "$1" 2>/dev/null)" || return 1
+    [ "$_codeybox_deep_parent" != "$1" ] || return 1
+    _codeybox_adopt_dir_deep "$_codeybox_deep_parent" "${2:-}" >/dev/null \
+        || return 1
+    _codeybox_adopt_dir "$1" "${2:-}"
+}
+
 # Print a writable per-user home dir for the heal's redirected-home and
 # runtime-dir fallbacks; returns nonzero when no candidate could be obtained.
 # $1, when non-empty, is the preferred candidate (the possibly just-redirected
@@ -615,9 +648,13 @@ _codeybox_adopt_dir() {
 # seeding below and dotnet's user-scoped mutex/runtime storage into
 # foreign-controlled directories. The shared per-user dir — kept shared so
 # one healed home, its seeded cache, and the mutex location are stable across
-# execs — is adopted under the same terms, else a private mktemp dir, itself
-# re-verified because TMPDIR is env input too. Shared verbatim into the C#
-# preamble (see the region sentinel above).
+# execs — is adopted under the same terms. CODEYBOX_NUGET_REPO_DOTNET_HOME is
+# the in-process MSBuild guard's verified repository-local last resort (it is
+# unset for every other caller); it is adopted through the deep variant so a
+# missing .build parent is created one verified component at a time. A
+# private mktemp dir is the final candidate, itself re-verified because
+# TMPDIR is env input too. Shared verbatim into the C# preamble (see the
+# region sentinel above).
 _codeybox_pick_user_dir() {
     _codeybox_pick="${1:-}"
     if [ -n "$_codeybox_pick" ]; then
@@ -628,6 +665,11 @@ _codeybox_pick_user_dir() {
         _codeybox_pick="${TMPDIR:-/tmp}/${_codeybox_home_leaf}-${_codeybox_euid}"
         _codeybox_pick="$(_codeybox_adopt_dir "$_codeybox_pick" writable)" \
             || _codeybox_pick=
+    fi
+    if [ -z "$_codeybox_pick" ] \
+        && [ -n "${CODEYBOX_NUGET_REPO_DOTNET_HOME:-}" ]; then
+        _codeybox_pick="$(_codeybox_adopt_dir_deep \
+            "$CODEYBOX_NUGET_REPO_DOTNET_HOME" writable)" || _codeybox_pick=
     fi
     if [ -z "$_codeybox_pick" ]; then
         _codeybox_pick="$(mktemp -d \
@@ -1512,15 +1554,28 @@ codeybox_seed_nuget_migration_state
 # non-destructive) and applies the reported DOTNET_CLI_HOME / HOME /
 # package-cache decision inside the MSBuild process itself. Values are
 # control-stripped so a crafted path cannot break the KEY=VALUE line format.
-# NUGET_PACKAGES is resolved through the same _codeybox_reuse_nuget_packages
-# admission the preamble uses, against the ORIGINAL env home's packages tree —
-# only when the home was not usable in place (a usable home's cache already
-# passed the identical whole-tree check inside the ensure).
+#
+# CODEYBOX_HEAL_NUGET_PACKAGES is the exact RestorePackagesPath the guard may
+# consume — never a reconstructed home + "/.nuget/packages" and never an
+# inherited NUGET_PACKAGES value (that env var is unverified input). For a
+# redirected home it is the original env home's packages tree only when that
+# tree itself passed _codeybox_secure_package_cache; otherwise it is the
+# redirected home's own packages path, which lives under storage the heal
+# just verified private. Usable and failed verdicts report an empty value:
+# usable keeps the already-admitted auto-pin, while failed must not repoint
+# NuGet at the rejected tree.
 if [ "${CODEYBOX_NUGET_HEAL_REPORT:-}" = "1" ]; then
-    if [ "${_codeybox_heal_verdict:-failed}" != "usable" ] \
-        && [ -n "${_codeybox_cli_home_env:-}" ]; then
-        _codeybox_reuse_nuget_packages \
-            "${_codeybox_cli_home_env%/}/.nuget/packages"
+    _codeybox_report_packages=
+    if [ "${_codeybox_heal_verdict:-failed}" = "redirected" ] \
+        && [ -n "${DOTNET_CLI_HOME:-}" ]; then
+        if [ -n "${_codeybox_cli_home_env:-}" ]; then
+            _codeybox_report_packages="$(_codeybox_secure_package_cache \
+                "${_codeybox_cli_home_env%/}/.nuget/packages")" \
+                || _codeybox_report_packages=
+        fi
+        if [ -z "$_codeybox_report_packages" ]; then
+            _codeybox_report_packages="${DOTNET_CLI_HOME%/}/.nuget/packages"
+        fi
     fi
     printf 'CODEYBOX_HEAL_VERDICT=%s\n' \
         "$(_codeybox_strip_ctrl "${_codeybox_heal_verdict:-failed}")"
@@ -1529,5 +1584,5 @@ if [ "${CODEYBOX_NUGET_HEAL_REPORT:-}" = "1" ]; then
     printf 'CODEYBOX_HEAL_HOME=%s\n' \
         "$(_codeybox_strip_ctrl "${HOME:-}")"
     printf 'CODEYBOX_HEAL_NUGET_PACKAGES=%s\n' \
-        "$(_codeybox_strip_ctrl "${NUGET_PACKAGES:-}")"
+        "$(_codeybox_strip_ctrl "$_codeybox_report_packages")"
 fi
