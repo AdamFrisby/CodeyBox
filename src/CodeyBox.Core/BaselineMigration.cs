@@ -17,12 +17,48 @@ public readonly record struct BaselineMigrationFilter(
 /// not in a terminal state — the candidate set for baseline migration. Carries
 /// only the fields the planner needs so the query can be served from the
 /// partial index on <c>baseline_image_ref</c> without hydrating full rows.
+/// <see cref="BaselineImageAgent"/> and <see cref="BaselineImageModelId"/> are
+/// the pin's attribution (null for legacy rows); the consistency check uses
+/// them to name the stale CLI/model combination, while the migration planner
+/// itself only compares refs.
 /// </summary>
 public sealed record BaselinePinnedWorkItem(
     WorkItemId Id,
     ProjectId ProjectId,
     WorkItemState State,
-    string BaselineImageRef);
+    string BaselineImageRef,
+    AgentKind? BaselineImageAgent = null,
+    string? BaselineImageModelId = null);
+
+/// <summary>
+/// One non-terminal pinned item whose baseline toolchain differs from the
+/// live config's — the CLI baked into its baseline is not the CLI a fresh
+/// pickup would provision. <see cref="PinnedModelId"/> is the model the pin
+/// was resolved for (null for legacy rows); when the dispatch model has also
+/// changed, the combination is inconsistent (the baked CLI may not know the
+/// model) and the pickup-time stale-pin policy migrates it automatically —
+/// otherwise it keeps running on its original baseline until a manual
+/// <c>POST /baselines/migrate</c>.
+/// </summary>
+public sealed record BaselineToolchainStalePin(
+    WorkItemId Id,
+    ProjectId ProjectId,
+    string PinnedRef,
+    string? PinnedModelId,
+    string? LiveRef);
+
+/// <summary>
+/// Outcome of the pin-consistency check: how many non-terminal pinned items
+/// were inspected and how many of them bake a stale toolchain.
+/// <see cref="Warning"/> is null when nothing is stale; otherwise it names the
+/// count, the pickup-time policy mode, and the remediation (manual migrate).
+/// </summary>
+public sealed record BaselinePinConsistencyReport(
+    int ScannedCount,
+    int StaleToolchainCount,
+    bool Truncated,
+    string? Warning,
+    IReadOnlyList<BaselineToolchainStalePin> StalePins);
 
 /// <summary>
 /// A ref that some migrated items will recompute onto at their next pickup,

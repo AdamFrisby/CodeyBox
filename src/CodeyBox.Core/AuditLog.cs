@@ -2012,6 +2012,30 @@ public static class AuditLog
                 scanned, migrated, alreadyCurrent, skippedTerminal, truncated, projectFilter ?? "", baselineFilter ?? "");
 
     /// <summary>
+    /// Emitted when a pickup automatically clears a toolchain-stale baseline
+    /// pin (same outcome as <c>POST /baselines/migrate</c>, applied to one
+    /// item). Records the stale ref, the live ref the item recomputed onto,
+    /// the policy reason, and the pinned vs dispatch models. The companion
+    /// <c>ILogger</c> warning carries the same fields for the text log.
+    /// </summary>
+    public static void BaselineStalePinAutoMigrated(
+        WorkItemId workItemId,
+        string? oldRef,
+        string? newRef,
+        string reason,
+        string? pinnedModel,
+        string? dispatchModel) =>
+        Audit("baseline.stale_pin_auto_migrated")
+            .Warning(
+                "Pickup auto-migrated stale baseline pin for work item {WorkItemId}: {OldRef} -> {NewRef} ({Reason}; pinned model '{PinnedModel}', dispatch model '{DispatchModel}')",
+                workItemId.ToString(),
+                oldRef ?? "(none)",
+                newRef ?? "(unpinned)",
+                reason,
+                pinnedModel ?? "(unattributed)",
+                dispatchModel ?? "(default)");
+
+    /// <summary>
     /// Emitted by <c>PipelineRunner</c> when a durable agent-turn checkpoint
     /// genuinely cannot be written (capture, commit, push, or store publish
     /// failed outside the bounded retained-sandbox fallback). No valid

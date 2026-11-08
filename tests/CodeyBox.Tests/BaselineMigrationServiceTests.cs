@@ -231,4 +231,102 @@ public sealed class BaselineMigrationServiceTests : IDisposable
 
         public Task DisposeBaselineImageAsync(string name, CancellationToken ct) => Task.CompletedTask;
     }
+
+    /// <summary>
+    /// The consistency check behind GET /baselines: a toolchain-stale pin is
+    /// reported with its pinned model and the live ref, while current pins
+    /// produce no warning.
+    /// </summary>
+    [Fact]
+    public async Task CheckConsistency_ReportsToolchainStalePins_WithModels()
+    {
+        var oldPin = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-old");
+        var live = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "bbbbbbbbbbbb", "vm-new");
+        var stale = Sample(oldPin) with { BaselineImageModelId = "old-model" };
+        var current = Sample(live) with { BaselineImageModelId = "new-model" };
+        await _store.CreateAsync(stale);
+        await _store.CreateAsync(current);
+        _resolver.Current = live;
+
+        var report = await _service.CheckConsistencyAsync();
+
+        Assert.Equal(2, report.ScannedCount);
+        Assert.Equal(1, report.StaleToolchainCount);
+        Assert.False(report.Truncated);
+        Assert.NotNull(report.Warning);
+        Assert.Contains("POST /baselines/migrate", report.Warning);
+        var pin = Assert.Single(report.StalePins);
+        Assert.Equal(stale.Id, pin.Id);
+        Assert.Equal(oldPin, pin.PinnedRef);
+        Assert.Equal("old-model", pin.PinnedModelId);
+        Assert.Equal(live, pin.LiveRef);
+    }
+
+    [Fact]
+    public async Task CheckConsistency_CleanBacklog_HasNoWarning()
+    {
+        var live = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "bbbbbbbbbbbb", "vm-new");
+        await _store.CreateAsync(Sample(live));
+        _resolver.Current = live;
+
+        var report = await _service.CheckConsistencyAsync();
+
+        Assert.Equal(0, report.StaleToolchainCount);
+        Assert.Null(report.Warning);
+        Assert.Empty(report.StalePins);
+    }
+
+    [Fact]
+    public async Task CheckConsistency_IsReadOnly()
+    {
+        var oldPin = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-old");
+        var item = Sample(oldPin);
+        await _store.CreateAsync(item);
+        _resolver.Current = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "bbbbbbbbbbbb", "vm-new");
+
+        await _service.CheckConsistencyAsync();
+
+        Assert.Equal(oldPin, (await _store.GetAsync(item.Id))!.BaselineImageRef);
+    }
+
+    [Theory]
+    [InlineData("", "incus/tc-aaaaaaaaaaaa/vm-1", false)] // empty pin: nothing to compare
+    public void IsToolchainStale_EmptyPin_NeverStale(string pin, string live, bool expected) =>
+        Assert.Equal(expected, BaselineMigrationService.IsToolchainStale(pin, live));
+
+    [Fact]
+    public void IsToolchainStale_SameRef_NotStale()
+    {
+        var pin = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-1");
+        Assert.False(BaselineMigrationService.IsToolchainStale(pin, pin));
+    }
+
+    [Fact]
+    public void IsToolchainStale_SameToolchain_DifferentRef_NotStale()
+    {
+        var pinned = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-1");
+        var live = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-2");
+        Assert.False(BaselineMigrationService.IsToolchainStale(pinned, live));
+    }
+
+    [Fact]
+    public void IsToolchainStale_DifferentToolchain_Stale()
+    {
+        var pinned = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-1");
+        var live = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "bbbbbbbbbbbb", "vm-1");
+        Assert.True(BaselineMigrationService.IsToolchainStale(pinned, live));
+    }
+
+    [Fact]
+    public void IsToolchainStale_MissingLive_Stale()
+    {
+        var pinned = CodeyBox.Sandbox.BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-1");
+        Assert.True(BaselineMigrationService.IsToolchainStale(pinned, null));
+    }
+
+    [Theory]
+    [InlineData("cb-old", "cb-old", false)]
+    [InlineData("cb-old", "cb-new", true)] // legacy pins: unverifiable, ref drift counts as stale
+    public void IsToolchainStale_LegacyPins_ComparesFullRef(string pinned, string? live, bool expected) =>
+        Assert.Equal(expected, BaselineMigrationService.IsToolchainStale(pinned, live));
 }

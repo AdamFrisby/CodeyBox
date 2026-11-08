@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Tests;
 
@@ -115,16 +116,22 @@ public sealed class BaselinePinAgentAttributionTests : IDisposable
     }
 
     /// <summary>
-    /// A re-dispatch that keeps the same agent must keep the pin: the point of
-    /// pinning is that an in-flight item is not silently migrated when the
-    /// operator's config (and therefore the live ref) changes underneath it.
-    /// The resolver now returns a different ref — the pin still wins.
+    /// A re-dispatch that keeps the same agent must keep the pin when the
+    /// toolchain is unchanged: the point of pinning is that an in-flight item
+    /// is not silently migrated by a non-toolchain config edit (extra runcmd,
+    /// profiles) that moves the live ref without changing the CLI. Both refs
+    /// below are scoped pins over the SAME toolchain hash with different
+    /// provider refs — the stale-pin policy keeps them. (A toolchain change
+    /// combined with a model change migrates; see
+    /// <see cref="BaselineStalePinPickupTests"/>.)
     /// </summary>
     [Fact]
     public async Task ReDispatchToSameAgent_KeepsPinAcrossBaselineChange()
     {
         var gate = new PerMemberSmokeGate();
-        var resolver = new StubResolver("cb-new-live-baseline");
+        var pin = BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-before");
+        var live = BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-after");
+        var resolver = new StubResolver(live);
         var router = BuildRouter(gate, (Claude, 90.0));
         var pipeline = new CapturingPipelineRunner(_store);
         var queue = new InMemoryTaskQueue();
@@ -139,7 +146,7 @@ public sealed class BaselinePinAgentAttributionTests : IDisposable
         var item = MakeItem() with
         {
             Agent = Claude,
-            BaselineImageRef = "cb-original-pin",
+            BaselineImageRef = pin,
             BaselineImageAgent = Claude,
         };
         await _store.CreateAsync(item);
@@ -150,29 +157,31 @@ public sealed class BaselinePinAgentAttributionTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(pipeline.LastItem);
-        Assert.Equal("cb-original-pin", pipeline.LastItem!.BaselineImageRef);
+        Assert.Equal(pin, pipeline.LastItem!.BaselineImageRef);
         Assert.Equal(Claude, pipeline.LastItem.BaselineImageAgent);
 
         var persisted = await _store.GetAsync(item.Id);
-        Assert.Equal("cb-original-pin", persisted!.BaselineImageRef);
+        Assert.Equal(pin, persisted!.BaselineImageRef);
         Assert.Equal(Claude, persisted.BaselineImageAgent);
 
         // The matching member was gated on the pin — the same image the
         // dispatch clones — never on the live ref it no longer resolves to.
-        Assert.Equal([(Claude, "cb-original-pin")], gate.Seen);
+        Assert.Equal([(Claude, pin)], gate.Seen);
     }
 
     /// <summary>
     /// Re-pickup of an item that already started (re-enqueue after a transient
     /// defer) takes the reconcile-only path — no StartedAt write. The pin must
-    /// survive intact for the same agent even though the resolver now reports
-    /// a rebaked baseline.
+    /// survive intact for the same agent when the toolchain is unchanged, even
+    /// though the resolver now reports a different live ref from a
+    /// non-toolchain config edit.
     /// </summary>
     [Fact]
     public async Task RePickup_StartedItem_KeepsPinWhenAgentUnchanged()
     {
         var gate = new PerMemberSmokeGate();
-        var resolver = new StubResolver("cb-rebaked-baseline");
+        var pin = BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-inflight");
+        var resolver = new StubResolver(BaselinePin.FormatScopedPin("incus", "aaaaaaaaaaaa", "vm-rebaked"));
         var router = BuildRouter(gate, (Claude, 90.0));
         var pipeline = new CapturingPipelineRunner(_store);
         var queue = new InMemoryTaskQueue();
@@ -188,7 +197,7 @@ public sealed class BaselinePinAgentAttributionTests : IDisposable
         {
             Agent = Claude,
             StartedAt = DateTimeOffset.UtcNow.AddMinutes(-30),
-            BaselineImageRef = "cb-inflight-pin",
+            BaselineImageRef = pin,
             BaselineImageAgent = Claude,
         };
         await _store.CreateAsync(item);
@@ -199,7 +208,7 @@ public sealed class BaselinePinAgentAttributionTests : IDisposable
         await svc.StopAsync(CancellationToken.None);
 
         Assert.NotNull(pipeline.LastItem);
-        Assert.Equal("cb-inflight-pin", pipeline.LastItem!.BaselineImageRef);
+        Assert.Equal(pin, pipeline.LastItem!.BaselineImageRef);
         Assert.Equal(Claude, pipeline.LastItem.BaselineImageAgent);
     }
 

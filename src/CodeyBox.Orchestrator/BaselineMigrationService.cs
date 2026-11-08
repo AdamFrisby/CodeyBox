@@ -1,4 +1,5 @@
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Orchestrator;
@@ -56,6 +57,7 @@ public sealed class BaselineMigrationService
     private readonly IProjectRepository _projects;
     private readonly TimeProvider _time;
     private readonly Func<BaselineMigrationOptions> _optsAccessor;
+    private readonly Func<BaselineStalePinOptions> _stalePinOptions;
     private readonly ILogger<BaselineMigrationService> _log;
 
     public BaselineMigrationService(
@@ -64,7 +66,8 @@ public sealed class BaselineMigrationService
         IProjectRepository projects,
         TimeProvider time,
         Func<BaselineMigrationOptions> optsAccessor,
-        ILogger<BaselineMigrationService> log)
+        ILogger<BaselineMigrationService> log,
+        Func<BaselineStalePinOptions>? stalePinOptions = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
@@ -72,6 +75,7 @@ public sealed class BaselineMigrationService
         _time = time ?? throw new ArgumentNullException(nameof(time));
         _optsAccessor = optsAccessor ?? throw new ArgumentNullException(nameof(optsAccessor));
         _log = log ?? throw new ArgumentNullException(nameof(log));
+        _stalePinOptions = stalePinOptions ?? (static () => new BaselineStalePinOptions());
     }
 
     /// <summary>
@@ -119,6 +123,22 @@ public sealed class BaselineMigrationService
             skippedTerminal,
             truncated);
 
+        // A config change that moves the toolchain under pinned items is the
+        // incident shape (old baked CLI + new model): name it explicitly so
+        // the operator sees WHY the migration mattered, not just the counts.
+        // Compares the migrated pins' toolchain fingerprints against the live
+        // refs they will recompute to; legacy pins with no fingerprint count
+        // as drifted when their ref differs (provenance unverifiable).
+        var toolchainDrifted = CountToolchainDrift(candidates, plan.ItemIdsToClear, currentRefByProject);
+        if (toolchainDrifted > 0)
+        {
+            _log.LogWarning(
+                "Baseline migration: {Drifted} of {Migrated} migrated pin(s) bake a stale toolchain (CLI upgrade under in-flight items). " +
+                "Items whose dispatch model also changed were running a model their baked CLI may not know; " +
+                "the pickup-time stale-pin policy ({Mode}) now migrates that combination automatically.",
+                toolchainDrifted, migrated, _stalePinOptions().Mode);
+        }
+
         if (truncated)
         {
             _log.LogInformation(
@@ -135,6 +155,99 @@ public sealed class BaselineMigrationService
             plan.RecomputeTargets);
     }
 
+    /// <summary>
+    /// Advisory check behind <c>GET /baselines</c> and
+    /// <c>GET /admin/baseline-images</c>: scans the same non-terminal pinned
+    /// candidate set as <see cref="MigrateAsync"/> (same per-scan cap) and
+    /// reports the pins whose baked toolchain differs from the live config's.
+    /// Those are the items whose CLI/model combination may be inconsistent
+    /// after a config change — the pickup-time stale-pin policy migrates the
+    /// dangerous ones automatically, but when the policy is
+    /// <see cref="BaselineStalePinMode.Disabled"/> (or the model has not
+    /// changed) this warning is the operator's only signal to run a manual
+    /// migrate. Read-only: never clears anything. Bounded by
+    /// <see cref="BaselineMigrationOptions.MaxItemsPerScan"/> like the write
+    /// path.
+    /// </summary>
+    public async Task<BaselinePinConsistencyReport> CheckConsistencyAsync(CancellationToken ct = default)
+    {
+        var max = Math.Max(1, _optsAccessor().MaxItemsPerScan);
+        var candidates = await _store.ListNonTerminalBaselinePinnedAsync(null, null, max + 1, ct).ConfigureAwait(false);
+
+        var truncated = candidates.Count > max;
+        if (truncated)
+            candidates = candidates.Take(max).ToList();
+
+        var currentRefByProject = await BuildCurrentRefMapAsync(candidates, ct).ConfigureAwait(false);
+        var mode = _stalePinOptions().Mode;
+
+        var stale = new List<BaselineToolchainStalePin>();
+        foreach (var candidate in candidates)
+        {
+            var live = currentRefByProject.GetValueOrDefault(candidate.ProjectId);
+            if (!IsToolchainStale(candidate.BaselineImageRef, live))
+                continue;
+            stale.Add(new BaselineToolchainStalePin(
+                candidate.Id, candidate.ProjectId, candidate.BaselineImageRef, candidate.BaselineImageModelId, live));
+        }
+
+        string? warning = stale.Count == 0
+            ? null
+            : $"{stale.Count} pinned work item(s) are stale: their baseline ref differs from the live config's " +
+              "(stale toolchain, or a legacy pin whose provenance is unverifiable). A config change such as an " +
+              "agent CLI upgrade moved the baseline under them; items whose dispatch model also changed run a " +
+              "combination their baked CLI may not know. Pickup-time auto-migration is " +
+              $"{DescribeMode(mode)}; run POST /baselines/migrate to move them now.";
+
+        return new BaselinePinConsistencyReport(candidates.Count, stale.Count, truncated, warning, stale);
+    }
+
+    private static string DescribeMode(BaselineStalePinMode mode) => mode switch
+    {
+        BaselineStalePinMode.Disabled => "DISABLED",
+        BaselineStalePinMode.MigrateOnToolchainChange => "on (migrates any toolchain drift at pickup)",
+        _ => "on (migrates toolchain drift combined with a model change at pickup)",
+    };
+
+    /// <summary>
+    /// True when <paramref name="pinnedRef"/> was baked from different
+    /// toolchain inputs than <paramref name="liveRef"/> resolves now. Scoped
+    /// pins compare fingerprints; legacy pins (or a missing live ref) degrade
+    /// to full-string comparison — an unverifiable pin counts as stale when
+    /// its ref differs.
+    /// </summary>
+    internal static bool IsToolchainStale(string pinnedRef, string? liveRef)
+    {
+        if (string.IsNullOrEmpty(pinnedRef))
+            return false;
+        if (liveRef is null)
+            return true;
+        if (string.Equals(pinnedRef, liveRef, StringComparison.Ordinal))
+            return false;
+        var pinnedHash = BaselinePin.TryExtractToolchainHash(pinnedRef);
+        var liveHash = BaselinePin.TryExtractToolchainHash(liveRef);
+        if (pinnedHash is null || liveHash is null)
+            return true;
+        return !string.Equals(pinnedHash, liveHash, StringComparison.Ordinal);
+    }
+
+    private static int CountToolchainDrift(
+        IReadOnlyList<BaselinePinnedWorkItem> candidates,
+        IReadOnlyList<WorkItemId> migratedIds,
+        IReadOnlyDictionary<ProjectId, string?> currentRefByProject)
+    {
+        var migrated = new HashSet<WorkItemId>(migratedIds);
+        var drifted = 0;
+        foreach (var candidate in candidates)
+        {
+            if (!migrated.Contains(candidate.Id))
+                continue;
+            if (IsToolchainStale(candidate.BaselineImageRef, currentRefByProject.GetValueOrDefault(candidate.ProjectId)))
+                drifted++;
+        }
+        return drifted;
+    }
+
     private async Task<IReadOnlyDictionary<ProjectId, string?>> BuildCurrentRefMapAsync(
         IReadOnlyList<BaselinePinnedWorkItem> candidates,
         CancellationToken ct)
@@ -142,11 +255,33 @@ public sealed class BaselineMigrationService
         var map = new Dictionary<ProjectId, string?>();
         foreach (var projectId in candidates.Select(c => c.ProjectId).Distinct())
         {
-            var project = await _projects.GetAsync(projectId, ct).ConfigureAwait(false);
-            map[projectId] = project is null ? null : SafeResolve(project.NetworkProfiles.Work);
+            map[projectId] = SafeResolveForProject(await SafeGetProjectAsync(projectId, ct).ConfigureAwait(false));
         }
         return map;
     }
+
+    private async Task<Project?> SafeGetProjectAsync(ProjectId projectId, CancellationToken ct)
+    {
+        try
+        {
+            return await _projects.GetAsync(projectId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Mirror SafeResolve: a throwing project lookup (e.g. config
+            // validation failing while items still reference a removed
+            // project) must not abort the operation. Treat as "no current
+            // baseline" — affected items migrate to no-pin / report stale,
+            // exactly as a failing pickup resolve would produce.
+            _log.LogDebug(ex,
+                "Project lookup threw while planning baseline migration for project {ProjectId}; treating as no current baseline",
+                projectId.Value);
+            return null;
+        }
+    }
+
+    private string? SafeResolveForProject(Project? project) =>
+        project is null ? null : SafeResolve(project.NetworkProfiles.Work);
 
     private string? SafeResolve(string? workProfile)
     {

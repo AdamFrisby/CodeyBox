@@ -341,6 +341,13 @@ public static class AgentFailureClassifier
             return new AgentFailureClassification(AgentFailureKind.Infrastructure, Reason: "agent binary was not found in the sandbox");
         }
 
+        if (FindUnknownModelEvidence(stderr, stdout, summary) is { } unknownModel)
+        {
+            return new AgentFailureClassification(
+                AgentFailureKind.Infrastructure,
+                Reason: $"agent CLI does not know the requested model (pattern '{unknownModel.Pattern}' on {unknownModel.Stream}: '{unknownModel.Line}')");
+        }
+
         var noCapturedOutput = string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout);
 
         if (ContainsAny(stderr, HardQuotaPatterns) || ContainsAny(stdout, HardQuotaPatterns))
@@ -701,6 +708,122 @@ public static class AgentFailureClassifier
             }
         }
 
+        return null;
+    }
+
+    /// <summary>
+    /// CLI-reported "the requested model is not known to this CLI" shapes.
+    /// Deliberately CLI-voiced ("unknown model", "model not found") rather
+    /// than bare "model": model prose ("the model failed to compile") must
+    /// never classify as a configuration fault. Matched case-insensitively
+    /// across stderr, stdout, and summary so an agy-style glog line folded
+    /// into any of them still classifies. Real CLI errors name the rejected
+    /// id inline (<c>model 'x' not found</c>), so a second anchored check
+    /// below catches those with the id quoted between the words.
+    /// </summary>
+    public static readonly IReadOnlyList<string> UnknownModelPatterns = new[]
+    {
+        "unknown model",
+        "unsupported model",
+        "unrecognized model",
+        "unrecognised model",
+        "invalid model",
+        "model not found",
+        "model was not found",
+        "no such model",
+        "model does not exist",
+        "unknown --model",
+        "invalid --model",
+        "not a valid model",
+    };
+
+    /// <summary>
+    /// Error words that, on the same line as an anchored model reference
+    /// (<c>model 'id'</c>, <c>model "id"</c>, <c>model: id</c>,
+    /// <c>model=id</c>, <c>--model</c>), mark a CLI model refusal even when
+    /// the quoted id sits between the words (<c>model 'x' not found</c>).
+    /// </summary>
+    private static readonly IReadOnlyList<string> UnknownModelErrorWords = new[]
+    {
+        "unknown",
+        "invalid",
+        "unsupported",
+        "unrecognized",
+        "unrecognised",
+        "not found",
+        "no such",
+        "does not exist",
+        "doesn't exist",
+    };
+
+    private static readonly IReadOnlyList<string> UnknownModelAnchors = new[]
+    {
+        "model '",
+        "model \"",
+        "model '",
+        "model '",
+        "model:",
+        "model=",
+        "--model",
+    };
+
+    /// <summary>
+    /// True when any captured stream carries a CLI-reported unknown-model
+    /// shape. Used by the audit path to fail fast with a deterministic
+    /// configuration error instead of burning the fresh-sandbox retry on a
+    /// command that will fail identically. Never throws.
+    /// </summary>
+    public static bool IsUnknownModelFailure(string? stderr, string? stdout, string? summary = null) =>
+        FindUnknownModelEvidence(stderr, stdout, summary) is not null;
+
+    /// <summary>
+    /// Finds the first unknown-model line across stderr, stdout, then summary
+    /// (that priority order), returning the matched pattern, the stream, and
+    /// the truncated line for reasons. Returns null when nothing matches.
+    /// </summary>
+    public static (string Pattern, string Stream, string Line)? FindUnknownModelEvidence(
+        string? stderr, string? stdout, string? summary = null) =>
+        FindInStream(stderr, "stderr")
+        ?? FindInStream(stdout, "stdout")
+        ?? FindInStream(summary, "summary");
+
+    private static (string Pattern, string Stream, string Line)? FindInStream(string? text, string stream)
+    {
+        if (string.IsNullOrEmpty(text))
+            return null;
+        foreach (var rawLine in text.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (string.IsNullOrEmpty(line))
+                continue;
+            foreach (var pattern in UnknownModelPatterns)
+            {
+                if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    return (pattern, stream, TruncateEvidenceLine(line));
+            }
+            if (FindAnchoredModelRefusal(line) is { } word)
+                return (word, stream, TruncateEvidenceLine(line));
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Catches <c>model 'id' not found</c>-shaped refusals the fixed patterns
+    /// miss because the quoted id breaks the word adjacency. Requires BOTH an
+    /// anchored model reference and an error word on the same line, so bare
+    /// prose ("the model failed", "model output was empty") never matches.
+    /// Returns the matched error word for reasons, else null.
+    /// </summary>
+    private static string? FindAnchoredModelRefusal(string line)
+    {
+        if (!ContainsAny(line, UnknownModelAnchors))
+            return null;
+        for (var i = 0; i < UnknownModelErrorWords.Count; i++)
+        {
+            if (line.Contains(UnknownModelErrorWords[i], StringComparison.OrdinalIgnoreCase))
+                return UnknownModelErrorWords[i];
+        }
         return null;
     }
 

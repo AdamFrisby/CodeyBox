@@ -837,6 +837,60 @@ public sealed partial class PipelineRunner
         && result.AgentSummary is not null
         && HasLlmAgentExecutionFailureSentinel(result.Findings, f => f.Title);
 
+    /// <summary>
+    /// Fails fast when the review-agent run reports a model the CLI does not
+    /// know: the same model against the same baked CLI fails identically on
+    /// every retry, so this throws a deterministic
+    /// <see cref="AuditUnavailableException"/> (surfaced as a configuration
+    /// fault, never as a code finding) instead of burning the fresh-sandbox
+    /// retry. The stale baseline-pin incident is the motivating shape — an old
+    /// baked CLI paired with a model only the new CLI lists, which otherwise
+    /// reads as a generic exit-1 audit failure.
+    /// </summary>
+    private void ThrowIfUnknownModelAgentFailure(AuditorRunRecord run, string? modelId)
+    {
+        if (BuildUnknownModelFailure(run.Auditor.Name, run.Runner.Kind.Value, modelId,
+                run.Result.AgentStderr, run.Result.AgentStdout, run.Result.AgentSummary) is { } failure)
+        {
+            _log.LogWarning(
+                "LLM auditor {Auditor}: agent CLI '{Agent}' does not know requested model '{Model}'; failing as deterministic configuration",
+                run.Auditor.Name,
+                run.Runner.Kind.Value,
+                string.IsNullOrWhiteSpace(modelId) ? "(default)" : modelId);
+            throw failure;
+        }
+    }
+
+    /// <summary>
+    /// Builds the deterministic configuration failure for a review-agent run
+    /// that reports a model the CLI does not know, or null when no
+    /// unknown-model shape is present. Pure (no logging, no throw) so the
+    /// fast-path decision is unit-testable. The exception is marked
+    /// <see cref="AuditUnavailableException.IsDeterministic"/> so the RunAsync
+    /// catch surfaces it as a configuration fault — never as a code finding
+    /// and without burning the fresh-sandbox retry.
+    /// </summary>
+    internal static AuditUnavailableException? BuildUnknownModelFailure(
+        string auditorName,
+        string agentKind,
+        string? modelId,
+        string? stderr,
+        string? stdout,
+        string? summary)
+    {
+        if (AgentFailureClassifier.FindUnknownModelEvidence(stderr, stdout, summary) is not { } evidence)
+            return null;
+
+        var model = string.IsNullOrWhiteSpace(modelId) ? "(default)" : modelId;
+        var message =
+            $"LLM auditor '{auditorName}' could not run: agent CLI '{agentKind}' " +
+            $"does not know the requested model '{model}' " +
+            $"(pattern '{evidence.Pattern}' on {evidence.Stream}: '{evidence.Line}'). " +
+            "This is a configuration fault (stale baked CLI or retired model id), not a code finding: " +
+            "update the model id or migrate the baseline pin and retry.";
+        return new AuditUnavailableException(message) { IsDeterministic = true };
+    }
+
     private static bool HasLlmAgentExecutionFailureSentinel<T>(
         IEnumerable<T> findings,
         Func<T, string> titleSelector) =>

@@ -96,6 +96,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     // factory hands in NullBaselineImageResolver which returns null for every
     // resolve — pickup proceeds without a stamp.
     private readonly IBaselineImageResolver _baselineResolver;
+    private readonly Func<BaselineStalePinOptions> _stalePinOptions;
     private readonly OrchestratorProgressClock _progressClock;
     // Shared swappable holder. Both this service AND PipelineRunner (the
     // pickup-time rebase-resolver's cap-aware router) read through the same
@@ -356,7 +357,8 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         // Project-level base-broken hold: while a condition is active for a
         // project, build-dependent candidates are skipped at pickup (the
         // filed fix item is exempt). Optional; null disables the gate.
-        BaseBrokenConditionTracker? baseBrokenConditions = null)
+        BaseBrokenConditionTracker? baseBrokenConditions = null,
+        Func<BaselineStalePinOptions>? stalePinOptions = null)
     {
         _queue = queue;
         _store = store;
@@ -379,6 +381,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         _releaseService = releaseService;
         _knobRegistry = knobRegistry;
         _baselineResolver = baselineResolver ?? NullBaselineImageResolver.Instance;
+        _stalePinOptions = stalePinOptions ?? (static () => new BaselineStalePinOptions());
         _progressClock = progressClock ?? new OrchestratorProgressClock();
         _reaper?.AttachWorkerPoolSlotReleaser(this);
         _quotaRouterOptions = quotaRouterOptions;
@@ -3101,6 +3104,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                     {
                         BaselineImageRef = pinnedRef,
                         BaselineImageAgent = item.Agent,
+                        BaselineImageModelId = item.ModelId,
                     };
                 }
             }
@@ -3387,11 +3391,18 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                     var stampedAgent = item.BaselineImageRef is not null
                         ? item.BaselineImageAgent
                         : (stampedRef is null ? null : item.Agent ?? project?.DefaultAgent);
+                    // A surviving pin keeps its recorded model unless the
+                    // pickup-time reconcile already restamped it; a freshly
+                    // filled pin is attributed to the routed model.
+                    var stampedModel = item.BaselineImageRef is not null
+                        ? item.BaselineImageModelId
+                        : (stampedRef is null ? null : item.ModelId);
                     item = item with
                     {
                         StartedAt = _time.GetUtcNow(),
                         BaselineImageRef = stampedRef,
                         BaselineImageAgent = stampedAgent,
+                        BaselineImageModelId = stampedModel,
                     };
                     await _store.UpdateAsync(item, ct);
                     item = pipelineItem with
@@ -3399,6 +3410,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
                         StartedAt = item.StartedAt,
                         BaselineImageRef = item.BaselineImageRef,
                         BaselineImageAgent = item.BaselineImageAgent,
+                        BaselineImageModelId = item.BaselineImageModelId,
                     };
                     ClearRefactorDrainClaim(item.ProjectId, item.Id);
                 }
@@ -4119,13 +4131,25 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     /// <see cref="ResolveBaselineRefForPickup"/> already fails open because
     /// pinning is an optimisation, not a correctness primitive.
     /// </summary>
+    /// <remarks>
+    /// After the agent check, the pickup-time stale-pin policy
+    /// (<see cref="BaselineStalePinEvaluator"/>) runs: when the pin's toolchain
+    /// fingerprint differs from the live config's and the dispatch model
+    /// differs from the pinned model, the pin is cleared and re-resolved from
+    /// live config — the same outcome as a manual <c>POST /baselines/migrate</c>,
+    /// applied automatically at pickup. This is what saves a model upgrade
+    /// paired with a CLI upgrade from dispatching a model the baked CLI does
+    /// not know. Governed by the hot-reloadable
+    /// <see cref="BaselineStalePinOptions"/>; terminal items never reach this
+    /// path (pickup only dispatches non-terminal states).
+    /// </remarks>
     private WorkItem ReconcileBaselinePinForDispatchAgent(WorkItem item, AgentKind? dispatchAgent, Project? project)
     {
         if (item.BaselineImageRef is null
             || dispatchAgent is null
             || item.BaselineImageAgent == dispatchAgent)
         {
-            return item;
+            return MaybeMigrateStalePin(item, dispatchAgent, project);
         }
 
         var repinned = ResolveBaselineRefForPickup(item, project);
@@ -4140,7 +4164,66 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         {
             BaselineImageRef = repinned,
             BaselineImageAgent = repinned is null ? null : dispatchAgent,
+            BaselineImageModelId = repinned is null ? null : item.ModelId,
         };
+    }
+
+    /// <summary>
+    /// Applies the stale-toolchain part of the pickup-time pin policy after the
+    /// agent check above has passed (pin present and attributed to the dispatch
+    /// agent). Returns the item unchanged when the pin still serves this
+    /// dispatch; otherwise clears and re-resolves it from live config with a
+    /// warning log and an audit event so the operator can see that a config
+    /// change moved an in-flight item. A pin whose toolchain still matches but
+    /// whose recorded model is out of date keeps its ref and only restamps the
+    /// model attribution (the re-resolve would produce the identical ref).
+    /// </summary>
+    private WorkItem MaybeMigrateStalePin(WorkItem item, AgentKind? dispatchAgent, Project? project)
+    {
+        if (item.BaselineImageRef is null || dispatchAgent is null)
+            return item;
+
+        var liveRef = ResolveBaselineRefForPickup(item, project);
+        var decision = BaselineStalePinEvaluator.Evaluate(
+            item.BaselineImageRef,
+            item.BaselineImageAgent,
+            item.BaselineImageModelId,
+            liveRef,
+            dispatchAgent,
+            item.ModelId,
+            _stalePinOptions().Mode);
+
+        if (decision.ShouldMigrate)
+        {
+            _log.LogWarning(
+                "Work item {Id}: baseline pin {OldRef} is stale ({Reason}; pinned model '{PinnedModel}', dispatch model '{DispatchModel}'); cleared so the item recomputes onto the live baseline {NewRef}",
+                item.Id,
+                item.BaselineImageRef,
+                decision.Reason,
+                item.BaselineImageModelId ?? "(unattributed)",
+                item.ModelId ?? "(default)",
+                liveRef ?? "(unpinned)");
+            AuditLog.BaselineStalePinAutoMigrated(
+                item.Id,
+                item.BaselineImageRef,
+                liveRef,
+                decision.Reason,
+                item.BaselineImageModelId,
+                item.ModelId);
+            return item with
+            {
+                BaselineImageRef = liveRef,
+                BaselineImageAgent = liveRef is null ? null : dispatchAgent,
+                BaselineImageModelId = liveRef is null ? null : item.ModelId,
+            };
+        }
+
+        if (decision.RefreshModelAttribution && !string.Equals(item.BaselineImageModelId, item.ModelId, StringComparison.Ordinal))
+        {
+            return item with { BaselineImageModelId = item.ModelId };
+        }
+
+        return item;
     }
 
     private async Task<WorkItem> ResetInfrastructureDeferredItemAsync(WorkItem item, CancellationToken ct)

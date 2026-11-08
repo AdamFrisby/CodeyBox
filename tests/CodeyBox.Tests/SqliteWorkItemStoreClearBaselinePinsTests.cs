@@ -109,6 +109,7 @@ public sealed class SqliteWorkItemStoreClearBaselinePinsTests : IDisposable
         var a = Sample("cb-baseline-a", WorkItemState.Working) with
         {
             BaselineImageAgent = AgentKind.Copilot,
+            BaselineImageModelId = "old-model",
         };
         await _store.CreateAsync(a);
 
@@ -118,6 +119,24 @@ public sealed class SqliteWorkItemStoreClearBaselinePinsTests : IDisposable
         var read = await _store.GetAsync(a.Id);
         Assert.Null(read!.BaselineImageRef);
         Assert.Null(read.BaselineImageAgent);
+        Assert.Null(read.BaselineImageModelId);
+    }
+
+    [Fact]
+    public async Task List_IncludesPinAttribution()
+    {
+        var a = Sample("cb-baseline-a", WorkItemState.Working) with
+        {
+            BaselineImageAgent = AgentKind.Copilot,
+            BaselineImageModelId = "pinned-model",
+        };
+        await _store.CreateAsync(a);
+
+        var candidates = await _store.ListNonTerminalBaselinePinnedAsync(null, null, 100);
+
+        var item = Assert.Single(candidates);
+        Assert.Equal(AgentKind.Copilot, item.BaselineImageAgent);
+        Assert.Equal("pinned-model", item.BaselineImageModelId);
     }
 
     [Fact]
