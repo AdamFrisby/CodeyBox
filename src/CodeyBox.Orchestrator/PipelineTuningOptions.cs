@@ -111,6 +111,27 @@ public sealed class PipelineTuningOptions
     public int AutoMergeRaceRecoveryMaxAttempts { get; set; } = 3;
 
     /// <summary>
+    /// Upper bound for the post-push mergeability settle before each GitHub
+    /// auto-merge call: after pushing, the orchestrator asks the remote to
+    /// poll the PR until its head equals the pushed tip and mergeability is
+    /// computed, then merges only when mergeable. GitHub recomputes
+    /// mergeability asynchronously after a push, so merging without this
+    /// wait observes the previous head and returns a spurious 405. A settle
+    /// that never converges falls through to the merge call best-effort.
+    /// Default 60 seconds. Hot-reloaded with the rest of
+    /// <c>PipelineTuning</c>; read fresh on every upstream-push attempt.
+    /// </summary>
+    public TimeSpan AutoMergeSettleTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Initial interval between post-push mergeability settle polls; the
+    /// delay backs off exponentially within
+    /// <see cref="AutoMergeSettleTimeout"/>. Default 2 seconds.
+    /// Hot-reloaded with the rest of <c>PipelineTuning</c>.
+    /// </summary>
+    public TimeSpan AutoMergeSettlePollInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
     /// Maximum times a single merge phase re-queues its landing after
     /// detecting the base branch moved between composition and the
     /// conditional base-ref update. A base-moved retry re-runs the merge
@@ -654,6 +675,18 @@ public sealed class PipelineTuningOptions
             throw new ArgumentOutOfRangeException(
                 nameof(MergeResultBuildVerificationInfraMaxAttempts),
                 "MergeResultBuildVerificationInfraMaxAttempts must be >= 1");
+        }
+        if (AutoMergeSettleTimeout <= TimeSpan.Zero || AutoMergeSettleTimeout > TimeSpan.FromMinutes(10))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(AutoMergeSettleTimeout),
+                "AutoMergeSettleTimeout must be positive and at most 10 minutes");
+        }
+        if (AutoMergeSettlePollInterval <= TimeSpan.Zero || AutoMergeSettlePollInterval > TimeSpan.FromMinutes(5))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(AutoMergeSettlePollInterval),
+                "AutoMergeSettlePollInterval must be positive and at most 5 minutes");
         }
         if (EarlyEndedTurnMaxNudges < 0)
         {

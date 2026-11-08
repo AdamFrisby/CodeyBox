@@ -41,6 +41,8 @@ public static class PipelineTuningHotReloadPolicy
         nameof(PipelineTuningOptions.AgentSessionResumeMaxAttempts),
         nameof(PipelineTuningOptions.MaxRetainedAgentTurnSandboxes),
         nameof(PipelineTuningOptions.AutoMergeRaceRecoveryMaxAttempts),
+        nameof(PipelineTuningOptions.AutoMergeSettleTimeout),
+        nameof(PipelineTuningOptions.AutoMergeSettlePollInterval),
         nameof(PipelineTuningOptions.MergeLandingMaxAttempts),
         nameof(PipelineTuningOptions.MergeResultBuildVerificationEnabled),
         nameof(PipelineTuningOptions.MergeResultBuildVerificationTimeout),

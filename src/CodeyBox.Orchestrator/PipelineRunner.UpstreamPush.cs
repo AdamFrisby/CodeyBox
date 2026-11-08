@@ -151,6 +151,8 @@ public sealed partial class PipelineRunner
                 TokenEnvVar = project.Upstream.TokenEnvVar,
                 AutoMerge = project.Upstream.AutoMerge,
                 MergeMethod = project.Upstream.MergeMethod,
+                MergeSettleTimeout = _pipelineTuning.Current.AutoMergeSettleTimeout,
+                MergeSettlePollInterval = _pipelineTuning.Current.AutoMergeSettlePollInterval,
             };
 
             // Restart evidence: a previous attempt may have opened (or raced)
@@ -273,6 +275,11 @@ public sealed partial class PipelineRunner
             // from UpstreamPushMaxAttempts, which caps total upstream API
             // calls including transient infrastructure retries.
             var raceRecoveryCount = 0;
+            // Last classification of an AutoMergeRaced outcome (mergeability
+            // verdict + whether the base moved). The post-loop park uses it
+            // to describe an unchanged base with the actual mergeable values
+            // instead of blaming another writer.
+            AutoMergeRaceAssessment? lastRaceAssessment = null;
             // Each iteration may either retry transient failures OR recover from
             // an auto-merge race (405 on PUT /pulls/N/merge). The shared cap
             // prevents pathological loops since each race-recovery iteration
@@ -340,8 +347,143 @@ public sealed partial class PipelineRunner
                         outcome.BranchPushed && !outcome.Skipped, request, ct);
 
                     lastIterationRaced = outcome.AutoMergeRaced;
-                    if (outcome.AutoMergeRaced)
+                    if (outcome.AutoMergeRaced && reRunMergePhase is not null)
                     {
+                        // GitHub said the PR is unmergeable. Classify before
+                        // spending an LLM merge-phase re-invocation, using the
+                        // forge's own mergeability verdict plus a fresh base
+                        // comparison — not the 405 alone:
+                        //   - base unchanged + mergeable=false: genuine
+                        //     conflict; re-merging cannot help → conflict
+                        //     handling, outside the race-recovery cap.
+                        //   - base unchanged + mergeable unknown/clean: the
+                        //     forge had not finished computing (or the PUT
+                        //     flaked) → retry the merge call with the same
+                        //     tree, no re-merge, outside the cap.
+                        //   - base moved: real race → full recovery (re-run
+                        //     the merge phase), counted against the cap.
+                        var assessment = await AssessAutoMergeRaceAsync(
+                            item, upstream, repoId, baseBranch,
+                            outcome.PullRequestNumber,
+                            outcome,
+                            attempt,
+                            ct);
+                        lastRaceAssessment = assessment;
+                        if (assessment.ParkReason is not null)
+                        {
+                            _log.LogWarning(
+                                "Auto-merge race recovery declined to retry (attempt {Attempt}): {Reason}",
+                                attempt, assessment.ParkReason);
+                            // Stale-base remediation: before parking, try to route
+                            // the item into conflict-rework (rebase onto the
+                            // refreshed base + agentic resolution). CapExhausted /
+                            // NotEnabled fall through to the existing
+                            // MergeConflictResolutionFailed park below.
+                            if (await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
+                            {
+                                raceRecoveryParked = true;
+                                break;
+                            }
+                            var failed = await _store.GetAsync(item.Id, ct) ?? item;
+                            var failedWithReason = failed.With(WorkItemState.MergeConflictResolutionFailed, assessment.ParkReason);
+                            await _store.UpdateAsync(failedWithReason, ct);
+                            var revision = await BuildTerminalRevisionAsync(failedWithReason, ct);
+                            await _webhooks.PublishAsync(new WebhookEvent
+                            {
+                                Event = "work_item.merge_conflict_resolution_failed",
+                                WorkItem = failedWithReason,
+                                Project = project,
+                                PromptRevision = revision?.PromptRevision,
+                                RevisionAtCompletion = revision?.RevisionAtCompletion,
+                                RevisionMatches = revision?.RevisionMatches,
+                            }, ct);
+                            raceRecoveryParked = true;
+                            break;
+                        }
+
+                        if (!assessment.BaseMoved && assessment.Mergeable == false)
+                        {
+                            // The forge settled the PR as conflicting against
+                            // an unchanged base: re-running the merger against
+                            // the same base cannot produce a mergeable tree.
+                            // Route to conflict handling without consuming the
+                            // race-recovery budget, and never describe this as
+                            // another writer mutating the base — the base did
+                            // not move. The actual mergeable verdict travels in
+                            // the message instead.
+                            var conflictReason =
+                                $"GitHub reports PR #{outcome.PullRequestNumber} unmergeable " +
+                                $"(mergeable=false, mergeable_state='{SanitizeMergeableState(assessment.MergeableState)}') " +
+                                $"with base branch '{baseBranch}' unchanged at {assessment.PostFetchBaseSha ?? "(unknown)"}; " +
+                                "re-running the merge phase cannot resolve a settled conflict. Rework the branch onto the current base or resolve manually.";
+                            _log.LogWarning(
+                                "Auto-merge settled unmergeable (attempt {Attempt}): PR #{Pr} mergeable=false, mergeable_state='{State}', base '{Branch}' unchanged at {Sha}; routing to conflict handling without consuming the race-recovery budget",
+                                attempt, outcome.PullRequestNumber, SanitizeMergeableState(assessment.MergeableState),
+                                baseBranch, assessment.PostFetchBaseSha ?? "(unknown)");
+                            // Hand off to the conflict-rework machine (bounded by
+                            // its own attempt cap) before falling back to the park.
+                            if (await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
+                            {
+                                raceRecoveryParked = true;
+                                break;
+                            }
+                            var failed = await _store.GetAsync(item.Id, ct) ?? item;
+                            var failedWithReason = failed.With(WorkItemState.MergeConflictResolutionFailed, conflictReason);
+                            await _store.UpdateAsync(failedWithReason, ct);
+                            var revision = await BuildTerminalRevisionAsync(failedWithReason, ct);
+                            await _webhooks.PublishAsync(new WebhookEvent
+                            {
+                                Event = "work_item.merge_conflict_resolution_failed",
+                                WorkItem = failedWithReason,
+                                Project = project,
+                                PromptRevision = revision?.PromptRevision,
+                                RevisionAtCompletion = revision?.RevisionAtCompletion,
+                                RevisionMatches = revision?.RevisionMatches,
+                            }, ct);
+                            raceRecoveryParked = true;
+                            break;
+                        }
+
+                        if (!assessment.BaseMoved)
+                        {
+                            // Base unchanged and the PR is not settled
+                            // unmergeable: the 405 raced GitHub's asynchronous
+                            // mergeability computation (or the PUT itself
+                            // flaked). The tree is fine — retry the merge call
+                            // with the same merge sha, without re-running the
+                            // merge phase and without consuming the
+                            // race-recovery budget. The loop's own
+                            // UpstreamPushMaxAttempts still bounds retries.
+                            _log.LogInformation(
+                                "Auto-merge race check (attempt {Attempt}): upstream base '{Branch}' unchanged at {Sha} and PR #{Pr} mergeability is {Mergeable} ({State}); retrying the merge call with the same tree (race-recovery budget untouched)",
+                                attempt, baseBranch, assessment.PostFetchBaseSha ?? "(unknown)",
+                                outcome.PullRequestNumber, FormatMergeable(assessment.Mergeable),
+                                SanitizeMergeableState(assessment.MergeableState));
+                            // Persist the PR identity before looping: if the process
+                            // restarts between create/merge/persist, the next run
+                            // reseeds ExistingPullRequestNumber from the store
+                            // instead of creating a duplicate PR.
+                            if (outcome.PullRequestNumber is not null || outcome.PullRequestUrl is not null)
+                            {
+                                var racedPersist = await _store.GetAsync(item.Id, ct) ?? item;
+                                await _store.UpdateAsync(WorkItemPushHistory.RecordPush(
+                                    racedPersist with
+                                    {
+                                        MergedPrNumber = outcome.PullRequestNumber ?? racedPersist.MergedPrNumber,
+                                        MergedPrUrl = outcome.PullRequestUrl ?? racedPersist.MergedPrUrl,
+                                    },
+                                    outcome.PushedWorkBranchSha,
+                                    PushHistoryBound), ct);
+                            }
+                            request = RefreshMergeSettle(request with
+                            {
+                                ExistingPullRequestNumber = outcome.PullRequestNumber,
+                            });
+                            continue;
+                        }
+
+                        // Genuine race: the base moved under us. Re-run the
+                        // merge phase against the fresh tip.
                         // Recorded for operator visibility: a raced landing
                         // re-queues through race recovery below without
                         // consuming the resolver-guard rework budget.
@@ -350,20 +492,9 @@ public sealed partial class PipelineRunner
                             $"upstream landing raced on base branch '{baseBranch}'; re-running merge against the fresh base",
                             bumpLandingAttempt: true,
                             ct);
-                    }
-                    if (outcome.AutoMergeRaced && reRunMergePhase is not null)
-                    {
-                        // GitHub said the PR is unmergeable. Two plausible causes:
-                        //   1) Upstream main moved (a race we can fix by re-running
-                        //      the LLM merger against the fresh base).
-                        //   2) Branch protection / unrelated unmergeability (re-running
-                        //      won't help; base sha will be unchanged).
-                        // Distinguish via the base sha before/after refetch.
-                        var raceRecovery = await TryRecoverFromAutoMergeRaceAsync(
-                            item, project, upstream, repoId, baseBranch, workBranch,
-                            outcome.PullRequestNumber,
+                        var raceRecovery = await ReRunMergeForRaceAsync(
+                            item, repoId, baseBranch, workBranch,
                             reRunMergePhase,
-                            attempt,
                             ct);
                         if (raceRecovery.ParkReason is not null)
                         {
@@ -402,9 +533,16 @@ public sealed partial class PipelineRunner
                         var maxRaceRecovery = _pipelineTuning.Current.AutoMergeRaceRecoveryMaxAttempts;
                         if (raceRecoveryCount >= maxRaceRecovery)
                         {
+                            // Reachable only when every counted recovery
+                            // observed real base motion (an unchanged base
+                            // routes to conflict handling or a same-tree retry
+                            // without touching this counter), so the
+                            // another-writer diagnosis is evidence-backed here.
                             _log.LogWarning(
-                                "Work item {Id} auto-merge race recovery cap ({Cap}) exhausted after {Count} recoveries; baseBranch likely being mutated by another writer",
-                                item.Id, maxRaceRecovery, raceRecoveryCount);
+                                "Work item {Id} auto-merge race recovery cap ({Cap}) exhausted after {Count} recoveries; baseBranch likely being mutated by another writer (last mergeable={Mergeable}, mergeable_state='{State}')",
+                                item.Id, maxRaceRecovery, raceRecoveryCount,
+                                FormatMergeable(lastRaceAssessment?.Mergeable),
+                                SanitizeMergeableState(lastRaceAssessment?.MergeableState));
                             // Hand off to the conflict-rework machine (bounded by
                             // its own attempt cap) before falling back to the park.
                             if (await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
@@ -433,12 +571,12 @@ public sealed partial class PipelineRunner
 
                         mergeSha = raceRecovery.NewMergeSha;
                         agentStdout = raceRecovery.NewAgentStdout;
-                        request = request with
+                        request = RefreshMergeSettle(request with
                         {
                             MergeSha = mergeSha,
                             AgentStdout = agentStdout,
                             ExistingPullRequestNumber = outcome.PullRequestNumber,
-                        };
+                        });
                         // Persist the PR identity before looping: if the process
                         // restarts between create/merge/persist, the next run
                         // reseeds ExistingPullRequestNumber from the store
@@ -558,8 +696,24 @@ public sealed partial class PipelineRunner
             if (completed is null && lastIterationRaced && reRunMergePhase is not null && !raceRecoveryParked)
             {
                 var lastAttemptItem = await _store.GetAsync(item.Id, ct) ?? item;
-                const string raceExhaustionMessage =
-                    "GitHub merge failed repeatedly after re-running LLM merger; baseBranch likely being mutated by another writer. Resolve manually.";
+                // An unchanged base must never be blamed on another writer:
+                // report the forge's own mergeability verdict instead. The
+                // another-writer diagnosis is reserved for the case where the
+                // base actually moved between attempts.
+                string raceExhaustionMessage;
+                if (lastRaceAssessment is { ParkReason: null, BaseMoved: false } settled)
+                {
+                    raceExhaustionMessage =
+                        $"GitHub merge did not complete after {_opts.UpstreamPushMaxAttempts} attempts with base branch '{baseBranch}' " +
+                        $"unchanged at {settled.PostFetchBaseSha ?? "(unknown)"} " +
+                        $"(last mergeable={FormatMergeable(settled.Mergeable)}, mergeable_state='{SanitizeMergeableState(settled.MergeableState)}'); " +
+                        "the forge never accepted the merge. Resolve manually.";
+                }
+                else
+                {
+                    raceExhaustionMessage =
+                        "GitHub merge failed repeatedly after re-running LLM merger; baseBranch likely being mutated by another writer. Resolve manually.";
+                }
                 _log.LogWarning(
                     "Work item {Id} hit upstream-push attempt cap ({UpstreamCap}) with {RaceRecoveryCount} auto-merge recoveries (recovery cap {RaceRecoveryCap}) without resolving",
                     item.Id, _opts.UpstreamPushMaxAttempts, raceRecoveryCount, _pipelineTuning.Current.AutoMergeRaceRecoveryMaxAttempts);
@@ -690,15 +844,96 @@ public sealed partial class PipelineRunner
         string NewMergeSha,
         string? NewAgentStdout);
 
-    private async Task<AutoMergeRaceRecovery> TryRecoverFromAutoMergeRaceAsync(
+    /// <summary>
+    /// Classification of one <c>AutoMergeRaced</c> outcome, combining the
+    /// forge's own mergeability verdict with a fresh upstream-base
+    /// comparison. <see cref="ParkReason"/> is non-null when the assessment
+    /// itself cannot proceed (no PR number, refetch failure, base not
+    /// advertised); otherwise <see cref="BaseMoved"/> tells a genuine race
+    /// (re-run the merge phase) from an unchanged base, where
+    /// <see cref="Mergeable"/> decides conflict handling (<c>false</c>) from
+    /// a same-tree merge-call retry (unknown or clean). Neither non-race path
+    /// consumes the race-recovery budget.
+    /// </summary>
+    private readonly record struct AutoMergeRaceAssessment(
+        string? ParkReason,
+        string? PreMergeBaseSha,
+        string? PostFetchBaseSha,
+        bool BaseMoved,
+        bool? Mergeable,
+        string? MergeableState);
+
+    /// <summary>
+    /// Reads the current mergeability verdict for <paramref name="prNumber"/>
+    /// from the live PR first (authoritative at classification time) and
+    /// falls back to the values the remote observed around its merge attempt.
+    /// Unknown when neither reports — never assumed clean. A failing detail
+    /// read degrades to the outcome snapshot, never to an exception: the
+    /// classifier must still reach the base comparison.
+    /// </summary>
+    private async Task<(bool? Mergeable, string? MergeableState)> ReadPullRequestMergeabilityAsync(
+        IUpstreamRemote upstream,
+        int prNumber,
+        UpstreamCompletionOutcome outcome,
+        CancellationToken ct)
+    {
+        try
+        {
+            var live = await upstream.GetPullRequestAsync(prNumber, ct);
+            if (live?.Mergeable is not null || live?.MergeableState is not null)
+                return (live!.Mergeable, live.MergeableState);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Auto-merge race classification: live PR #{Pr} read failed; falling back to the merge-attempt snapshot",
+                prNumber);
+        }
+        return (outcome.Mergeable, outcome.MergeableState);
+    }
+
+    /// <summary>
+    /// Re-reads the hot-reloadable settle knobs onto a retried completion
+    /// request so a same-tree merge-call retry observes configuration edits
+    /// without rebuilding the request from scratch.
+    /// </summary>
+    private UpstreamCompletionRequest RefreshMergeSettle(UpstreamCompletionRequest request)
+    {
+        var tuning = _pipelineTuning.Current;
+        return request with
+        {
+            MergeSettleTimeout = tuning.AutoMergeSettleTimeout,
+            MergeSettlePollInterval = tuning.AutoMergeSettlePollInterval,
+        };
+    }
+
+    private static string SanitizeMergeableState(string? state)
+    {
+        if (string.IsNullOrWhiteSpace(state))
+            return "(unknown)";
+        var scrubbed = state.Replace("\r", "\\r", StringComparison.Ordinal).Replace("\n", "\\n", StringComparison.Ordinal);
+        return scrubbed.Length > 64 ? scrubbed[..64] + "…" : scrubbed;
+    }
+
+    private static string FormatMergeable(bool? mergeable) =>
+        mergeable switch
+        {
+            true => "true",
+            false => "false",
+            _ => "unknown",
+        };
+
+    private async Task<AutoMergeRaceAssessment> AssessAutoMergeRaceAsync(
         WorkItem item,
-        Project project,
         IUpstreamRemote upstream,
         string repoId,
         string baseBranch,
-        string workBranch,
         int? existingPrNumber,
-        Func<CancellationToken, Task<(string MergeSha, string? AgentStdout)>> reRunMergePhase,
+        UpstreamCompletionOutcome outcome,
         int attempt,
         CancellationToken ct)
     {
@@ -706,11 +941,21 @@ public sealed partial class PipelineRunner
         {
             // CompleteAsync set AutoMergeRaced=true but produced no PR number;
             // we have nothing to retry against. Treat as a hard failure.
-            return new AutoMergeRaceRecovery(
+            return new AutoMergeRaceAssessment(
                 ParkReason: "auto-merge raced but no PR number returned; cannot retry merge",
-                NewMergeSha: string.Empty,
-                NewAgentStdout: null);
+                PreMergeBaseSha: null,
+                PostFetchBaseSha: null,
+                BaseMoved: false,
+                Mergeable: outcome.Mergeable,
+                MergeableState: outcome.MergeableState);
         }
+
+        // The forge's own verdict first: a settled `false` against an
+        // unchanged base is a genuine conflict (re-merging cannot help), and
+        // `null` means the computation had not finished when the merge call
+        // raced it (retry the call, not the merger).
+        var (mergeable, mergeableState) = await ReadPullRequestMergeabilityAsync(
+            upstream, existingPrNumber.Value, outcome, ct);
 
         // Step 1: capture the upstream base sha at merge time for diagnostic
         // logging. We can't read the current local base ref because the local
@@ -766,49 +1011,67 @@ public sealed partial class PipelineRunner
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex, "Auto-merge race recovery: refetch of upstream base failed");
-            return new AutoMergeRaceRecovery(
+            return new AutoMergeRaceAssessment(
                 ParkReason: $"could not refetch upstream base '{baseBranch}': {ex.Message}",
-                NewMergeSha: string.Empty,
-                NewAgentStdout: null);
+                PreMergeBaseSha: preMergeBaseSha,
+                PostFetchBaseSha: null,
+                BaseMoved: false,
+                Mergeable: mergeable,
+                MergeableState: mergeableState);
         }
 
         if (postFetchBaseSha is null)
         {
-            return new AutoMergeRaceRecovery(
+            return new AutoMergeRaceAssessment(
                 ParkReason: $"upstream does not advertise base branch '{baseBranch}' for race recovery",
-                NewMergeSha: string.Empty,
-                NewAgentStdout: null);
+                PreMergeBaseSha: preMergeBaseSha,
+                PostFetchBaseSha: null,
+                BaseMoved: false,
+                Mergeable: mergeable,
+                MergeableState: mergeableState);
         }
 
-        // Step 3: the upstream said the PR is unmergeable. Whether or not
-        // we can detect base motion from the local pre/post sha comparison,
-        // always re-run the merge phase against the freshly-fetched base.
-        // The "base didn't move" check (which used to park here) is now a
-        // diagnostic only — premature escalation on a true race (where the
-        // local bare-repo base ref was too stale to show the movement) is
-        // the defect this change eliminates. The merge itself will reveal
-        // real semantic conflicts, which the in-VM resolver and bounded
-        // retry cap handle.
-        if (preMergeBaseSha is not null)
+        // Step 3: compare. Motion means a genuine race (the caller re-runs
+        // the merge phase against the fresh tip). An unchanged base pairs
+        // with the mergeability verdict above: settled `false` is a real
+        // conflict, anything else is the forge's async computation lagging
+        // the push — never evidence of another writer.
+        var baseMoved = preMergeBaseSha is null
+            || !string.Equals(preMergeBaseSha, postFetchBaseSha, StringComparison.Ordinal);
+        if (baseMoved)
         {
-            if (string.Equals(preMergeBaseSha, postFetchBaseSha, StringComparison.Ordinal))
-            {
-                _log.LogInformation(
-                    "Auto-merge race recovery (attempt {Attempt}): upstream base '{Branch}' sha ({Sha}) unchanged since merge; re-running merge phase anyway in case local base was stale",
-                    attempt, baseBranch, preMergeBaseSha);
-            }
-            else
-            {
-                _log.LogInformation(
-                    "Auto-merge race detected (attempt {Attempt}): upstream base '{Branch}' moved {Old} → {New}; re-running merge phase",
-                    attempt, baseBranch, preMergeBaseSha, postFetchBaseSha);
-            }
+            _log.LogInformation(
+                "Auto-merge race detected (attempt {Attempt}): upstream base '{Branch}' moved {Old} → {New}; re-running merge phase",
+                attempt, baseBranch, preMergeBaseSha ?? "(unknown)", postFetchBaseSha);
+        }
+        else
+        {
+            _log.LogInformation(
+                "Auto-merge race check (attempt {Attempt}): upstream base '{Branch}' sha ({Sha}) unchanged since merge (mergeable={Mergeable}, mergeable_state='{State}')",
+                attempt, baseBranch, postFetchBaseSha, FormatMergeable(mergeable), SanitizeMergeableState(mergeableState));
         }
 
-        // Step 4: re-run the merge phase against the freshly-fetched base. The
+        return new AutoMergeRaceAssessment(
+            ParkReason: null,
+            PreMergeBaseSha: preMergeBaseSha,
+            PostFetchBaseSha: postFetchBaseSha,
+            BaseMoved: baseMoved,
+            Mergeable: mergeable,
+            MergeableState: mergeableState);
+    }
+
+    private async Task<AutoMergeRaceRecovery> ReRunMergeForRaceAsync(
+        WorkItem item,
+        string repoId,
+        string baseBranch,
+        string workBranch,
+        Func<CancellationToken, Task<(string MergeSha, string? AgentStdout)>> reRunMergePhase,
+        CancellationToken ct)
+    {
+        // Re-run the merge phase against the freshly-fetched base. The
         // merge phase reads local baseBranch via ResolveCommitAsync, which now
-        // reflects the upstream tip after step 2. The LLM merger produces a new
-        // merge commit M with parents (postFetchBaseSha, workBranch_tip).
+        // reflects the upstream tip after the assessment refetch. The LLM merger
+        // produces a new merge commit M with parents (postFetchBaseSha, workBranch_tip).
         string newMergeSha;
         string? newAgentStdout;
         try
@@ -825,7 +1088,7 @@ public sealed partial class PipelineRunner
                 $"re-run of merge phase against refreshed base '{baseBranch}' (auto-merge race recovery) failed: {ex.Message}", ex);
         }
 
-        // Step 5: advance local workBranch to the new merge commit. The push
+        // Advance local workBranch to the new merge commit. The push
         // step inside CompleteAsync will then publish this tip to upstream as
         // a fast-forward (M has the prior workBranch tip as a parent, so the
         // upstream workBranch fast-forwards without a force).

@@ -100,16 +100,15 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task AutoMergeRace_BaseNotAdvanced_OrchestratorStillReRunsMergeAndAutoMerges()
+    public async Task AutoMergeRace_BaseNotAdvanced_RetriesMergeCallWithoutReworkAndAutoMerges()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
 
         // Programme the remote to race once, but DON'T mutate the seed.
-        // With the fixed staleness check (live upstream base ref), the
-        // orchestrator re-runs the merge phase against the refreshed base
-        // regardless of whether it can detect motion. Since the base didn't
-        // actually move, the re-merge produces an equivalent tree and the
-        // retry succeeds — no operator intervention needed.
+        // The base is unchanged and mergeability is unknown, so the
+        // orchestrator retries the merge call with the same tree instead of
+        // re-running the merge phase (no race-recovery budget consumed).
+        // The retry succeeds — no operator intervention needed.
         var remote = new RacingUpstreamRemote
         {
             SeedRepoPath = seed,
@@ -676,7 +675,7 @@ public sealed class UpstreamAutoMergeRaceRecoveryTests : IDisposable
 
 /// <summary>
 /// Decorating IGitHost that throws on SetBranchToCommitAsync to exercise the
-/// recovery park-branch in TryRecoverFromAutoMergeRaceAsync.
+/// recovery park-branch in ReRunMergeForRaceAsync.
 /// </summary>
 internal sealed class SetBranchThrowingGitHost : IGitHost
 {
@@ -770,7 +769,12 @@ internal sealed record RacingResponse(
     // When true, force MergedSha=null on the outcome regardless of the
     // override. Mirrors GitHub's AutoMerge=false response (PR opened, no
     // merge commit yet — a human will merge later).
-    bool ForceMergedShaNull = false);
+    bool ForceMergedShaNull = false,
+    // Forge-reported mergeability travelling on the outcome, mirroring the
+    // values GitHubUpstreamRemote reports after its post-push settle. Null
+    // (default) means the forge had not computed it yet.
+    bool? Mergeable = null,
+    string? MergeableState = null);
 
 internal sealed class ThrowingNthTimingPhaseSandboxProvider : ISandboxProvider
 {
@@ -887,6 +891,15 @@ internal sealed class RacingUpstreamRemote : IUpstreamRemote
     public List<UpstreamCompletionRequest> Requests { get; } = new();
     public int CompleteCalls { get; private set; }
     public int FetchCalls { get; private set; }
+    public int PullReads { get; private set; }
+
+    /// <summary>
+    /// Scripted live-PR reads for the orchestrator's mergeability
+    /// classification (consumed in order by <see cref="GetPullRequestAsync"/>).
+    /// Empty (default) means unknown — the classifier falls back to the
+    /// outcome snapshot, matching remotes that do not report mergeability.
+    /// </summary>
+    public Queue<UpstreamPullRequestState?> PullStates { get; } = new();
 
     /// <summary>When set, <see cref="FetchBaseBranchAsync"/> throws on every call.</summary>
     public Exception? FetchThrows { get; set; }
@@ -945,8 +958,18 @@ internal sealed class RacingUpstreamRemote : IUpstreamRemote
                 ? null
                 : response.MergedShaOverride ?? request.MergeSha ?? "merged-sha",
             AutoMergeRaced = response.AutoMergeRaced,
+            Mergeable = response.Mergeable,
+            MergeableState = response.MergeableState,
             Notes = response.AutoMergeRaced ? "racing" : null,
         };
+    }
+
+    public Task<UpstreamPullRequestState?> GetPullRequestAsync(int number, CancellationToken ct = default)
+    {
+        PullReads++;
+        if (PullStates.Count > 0)
+            return Task.FromResult(PullStates.Dequeue());
+        return Task.FromResult<UpstreamPullRequestState?>(null);
     }
 
     public Task<bool> TryMergeUpstreamBranchAsync(string targetBranch, string sourceBranch, CancellationToken ct = default)

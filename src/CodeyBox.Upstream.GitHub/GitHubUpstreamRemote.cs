@@ -43,6 +43,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly IPullRequestDescriptionGenerator? _descriptionGenerator;
     private readonly CommitAttribution _attribution;
     private readonly UpstreamBranchOwnershipSnapshot _ownership;
+    private readonly TimeProvider _clock;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
@@ -52,7 +53,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         ITimingStore? timings = null,
         IPullRequestDescriptionGenerator? descriptionGenerator = null,
         CommitAttribution? attribution = null,
-        UpstreamBranchOwnershipSnapshot? ownership = null)
+        UpstreamBranchOwnershipSnapshot? ownership = null,
+        TimeProvider? clock = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -66,6 +68,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         _descriptionGenerator = descriptionGenerator;
         _attribution = attribution ?? CommitAttribution.Default;
         _ownership = ownership ?? new UpstreamBranchOwnershipSnapshot(new UpstreamBranchOwnershipOptions());
+        _clock = clock ?? TimeProvider.System;
         if (!IsValidRemoteName(_opts.Owner))
             throw new ArgumentException($"GitHub Owner contains invalid characters: '{_opts.Owner}'", nameof(opts));
         if (!IsValidRemoteName(_opts.Repository))
@@ -328,16 +331,47 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             };
         }
 
-        // Step 4: auto-merge
+        // Step 4: post-push mergeability settle, then auto-merge.
+        // GitHub recomputes a PR's mergeability asynchronously after a push,
+        // so a PUT issued ~1 s after the push observes the PREVIOUS
+        // (conflicting) head and returns 405 "not mergeable" for a tree that
+        // is actually clean. Poll GET /pulls/{n} until the reported head
+        // equals the just-pushed tip and `mergeable` is non-null, then merge
+        // only when mergeable. A settled `false` skips the doomed PUT and
+        // surfaces as AutoMergeRaced with the observed values so the
+        // orchestrator routes it to conflict handling instead of burning a
+        // race-recovery re-merge. A settle that never converges (timeout,
+        // unparsable responses) falls through to the PUT — best effort, as
+        // before — and a 405 there carries whatever was last observed.
+        var settled = await WaitForMergeSettledAsync(prNumber, pushedSha, request, ct);
         string? mergedSha;
         string? mergeNotes;
         bool autoMergeRaced;
+        bool? mergeable = settled.Mergeable;
+        string? mergeableState = settled.MergeableState;
         await using (var mergeScope = await TimingScope.BeginAsync(
             _timings, request.WorkItemId, "upstream_push", "upstream.api_merge_pr",
             log: _log))
         {
-            (mergedSha, mergeNotes, autoMergeRaced) = await MergePullRequestAsync(
-                prNumber, prTitle, prDescription, request, ct);
+            if (settled.Mergeable == false)
+            {
+                var settledState = SanitizeForLog(settled.MergeableState);
+                mergeNotes = $"GitHub PR #{prNumber} settled unmergeable before the merge call " +
+                    $"(mergeable=false, mergeable_state='{settledState}'); skipping PUT /pulls/merge so the orchestrator routes it to conflict handling";
+                _log.LogWarning(
+                    "GitHub PR #{N} settled unmergeable (mergeable=false, mergeable_state='{State}'); skipping merge call",
+                    prNumber, settledState);
+                AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", 405, _opts.Owner, _opts.Repository);
+                mergedSha = null;
+                autoMergeRaced = true;
+            }
+            else
+            {
+                bool raced;
+                (mergedSha, mergeNotes, raced, mergeable, mergeableState) = await MergePullRequestAsync(
+                    prNumber, prTitle, prDescription, request, settled, ct);
+                autoMergeRaced = raced;
+            }
         }
 
         if (mergedSha is not null)
@@ -355,6 +389,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             MergedSha = mergedSha,
             Notes = mergeNotes,
             AutoMergeRaced = autoMergeRaced,
+            Mergeable = mergeable,
+            MergeableState = mergeableState,
         };
     }
 
@@ -468,7 +504,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             detail.Number,
             detail.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{detail.Number}",
             status,
-            detail.Merged ? detail.MergeCommitSha : null);
+            detail.Merged ? detail.MergeCommitSha : null,
+            detail.Head?.Sha,
+            detail.Mergeable,
+            detail.MergeableState);
     }
 
     /// <inheritdoc />
@@ -1871,11 +1910,118 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
     }
 
-    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)> MergePullRequestAsync(
+    /// <summary>
+    /// Snapshot of the post-push mergeability settle: the last
+    /// <c>mergeable</c>/<c>mergeable_state</c> values observed on the PR.
+    /// <see cref="Converged"/> is true only when the forge reported the
+    /// just-pushed head with a computed (non-null) mergeability — anything
+    /// else means the merge call proceeds best-effort or is skipped on
+    /// settled <c>false</c>, never on assumed values.
+    /// </summary>
+    private sealed record MergeSettleResult(bool? Mergeable, string? MergeableState, bool Converged);
+
+    /// <summary>Fallback first poll delay when the request carries no interval.</summary>
+    private static readonly TimeSpan DefaultSettlePollInterval = TimeSpan.FromSeconds(2);
+
+    /// <summary>Ceiling for the exponential settle backoff between polls.</summary>
+    private static readonly TimeSpan MaxSettlePollDelay = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Waits for GitHub to finish computing the PR's mergeability for the
+    /// just-pushed revision: polls <c>GET /pulls/{n}</c> until the reported
+    /// head equals <paramref name="pushedSha"/> and <c>mergeable</c> is
+    /// non-null, bounded by the request's settle timeout with exponential
+    /// backoff. Runs only when the request carries a settle timeout (the
+    /// orchestrator sets it from hot-reloadable tuning on every attempt);
+    /// legacy callers with no timeout skip straight to the merge call.
+    /// Poll failures (non-success status, unparsable body) are retried
+    /// until the deadline — never thrown — so a flaky detail read degrades
+    /// to a best-effort merge, not a failed push. Cancellation always throws.
+    /// </summary>
+    private async Task<MergeSettleResult> WaitForMergeSettledAsync(
+        int prNumber,
+        string? pushedSha,
+        UpstreamCompletionRequest request,
+        CancellationToken ct)
+    {
+        if (request.MergeSettleTimeout is not { } timeout || timeout <= TimeSpan.Zero)
+            return new MergeSettleResult(null, null, false);
+
+        var pollInterval = request.MergeSettlePollInterval is { } configured && configured > TimeSpan.Zero
+            ? configured
+            : DefaultSettlePollInterval;
+        var expectedHead = pushedSha?.Trim();
+        var deadline = _clock.GetUtcNow() + timeout;
+        var delay = pollInterval;
+        bool? mergeable = null;
+        string? mergeableState = null;
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var detail = await FetchPullRequestDetailAsync(prNumber, ct);
+                if (detail is not null)
+                {
+                    mergeable = detail.Mergeable;
+                    mergeableState = detail.MergeableState;
+                    var headMatches = string.IsNullOrWhiteSpace(expectedHead)
+                        || string.Equals(detail.Head?.Sha?.Trim(), expectedHead, StringComparison.OrdinalIgnoreCase);
+                    if (headMatches && detail.Mergeable is not null)
+                    {
+                        _log.LogInformation(
+                            "GitHub PR #{N} mergeability settled for pushed head: mergeable={Mergeable}, mergeable_state='{State}'",
+                            prNumber, detail.Mergeable, SanitizeForLog(detail.MergeableState));
+                        return new MergeSettleResult(detail.Mergeable, detail.MergeableState, true);
+                    }
+                    _log.LogDebug(
+                        "GitHub PR #{N} mergeability not yet settled (head matches pushed tip: {HeadMatches}, mergeable computed: {Computed}); polling again",
+                        prNumber, headMatches, detail.Mergeable is not null);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "GitHub PR #{N} settle poll failed; retrying until the deadline", prNumber);
+            }
+
+            var now = _clock.GetUtcNow();
+            if (now >= deadline)
+                break;
+            var remaining = deadline - now;
+            var sleep = delay > remaining ? remaining : delay;
+            if (sleep > TimeSpan.Zero)
+            {
+                try
+                {
+                    await Task.Delay(sleep, _clock, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+            }
+            var doubledTicks = delay.Ticks * 2;
+            var cappedTicks = Math.Min(doubledTicks, MaxSettlePollDelay.Ticks);
+            delay = TimeSpan.FromTicks(Math.Max(cappedTicks, pollInterval.Ticks));
+        }
+
+        _log.LogWarning(
+            "GitHub PR #{N} mergeability did not settle within {Timeout}s (last mergeable={Mergeable}, mergeable_state='{State}'); proceeding to the merge call best-effort",
+            prNumber, timeout.TotalSeconds, mergeable, SanitizeForLog(mergeableState));
+        return new MergeSettleResult(mergeable, mergeableState, false);
+    }
+
+    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced, bool? Mergeable, string? MergeableState)> MergePullRequestAsync(
         int prNumber,
         string prTitle,
         PrDescriptionResult? prDescription,
         UpstreamCompletionRequest completionRequest,
+        MergeSettleResult settled,
         CancellationToken ct)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{prNumber}/merge";
@@ -1922,12 +2068,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 // against the new tip, and retries this PUT. Branch protection can
                 // also surface as 405; in that case re-fetching shows base unchanged
                 // and the orchestrator parks the item rather than spinning.
-                const string note = "GitHub PUT /pulls/N/merge returned 405 (PR not mergeable — likely a race against upstream base; orchestrator will re-fetch base and re-run merge phase)";
+                // The settle snapshot travels with the outcome so the
+                // orchestrator can tell "still computing" (null — retry the
+                // call without re-merging) from a genuine conflict (false
+                // with an unchanged base — re-merging cannot help) instead of
+                // treating every 405 as base motion.
+                var observedState = SanitizeForLog(settled.MergeableState);
+                var note = settled.Mergeable is null
+                    ? "GitHub PUT /pulls/N/merge returned 405 (PR not mergeable — mergeability still unknown after the post-push settle; orchestrator will re-fetch base and retry)"
+                    : $"GitHub PUT /pulls/N/merge returned 405 (PR not mergeable — mergeable={settled.Mergeable}, mergeable_state='{observedState}'; orchestrator will re-fetch base and classify)";
                 _log.LogWarning(
-                    "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable); orchestrator will re-fetch base and re-run merge phase",
-                    prNumber);
+                    "GitHub PUT /pulls/{N}/merge returned 405 (PR not mergeable; mergeable={Mergeable}, mergeable_state='{State}')",
+                    prNumber, settled.Mergeable, observedState);
                 AuditLog.UpstreamApiCallFailed("PUT /pulls/merge", 405, _opts.Owner, _opts.Repository);
-                return (null, note, true);
+                return (null, note, true, settled.Mergeable, settled.MergeableState);
             }
 
             if (!response.IsSuccessStatusCode)
@@ -1942,7 +2096,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 throw new InvalidOperationException(
                     $"GitHub PUT /pulls/{prNumber}/merge returned success but did not prove a merge " +
                     $"(merged={result?.Merged}, sha present={!string.IsNullOrWhiteSpace(result?.Sha)}); refusing to report delivery.");
-            return (result.Sha, null, false);
+            return (result.Sha, null, false, settled.Mergeable, settled.MergeableState);
         }
     }
 
@@ -1953,7 +2107,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     /// alone is insufficient). Null when unprovable — the caller rethrows the
     /// original transport error into the bounded retry loop.
     /// </summary>
-    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced)?> TryVerifyMergeAfterUncertaintyAsync(
+    private async Task<(string? Sha, string? Notes, bool AutoMergeRaced, bool? Mergeable, string? MergeableState)?> TryVerifyMergeAfterUncertaintyAsync(
         int prNumber, UpstreamCompletionRequest request, CancellationToken ct)
     {
         try
@@ -1973,7 +2127,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             }
             _log.LogInformation("GitHub PR #{N} merge verified after transport failure: {Sha}", prNumber, detail.MergeCommitSha);
             AuditLog.UpstreamPrMerged(prNumber, detail.MergeCommitSha);
-            return (detail.MergeCommitSha, "Merge response was lost in transport; delivery verified by re-reading the merged PR state.", false);
+            return (detail.MergeCommitSha, "Merge response was lost in transport; delivery verified by re-reading the merged PR state.", false, detail.Mergeable, detail.MergeableState);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

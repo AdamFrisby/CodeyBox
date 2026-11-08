@@ -303,11 +303,20 @@ public interface IUpstreamRemote
                 $"Upstream kind '{Name}' does not publish audit check runs."));
 }
 
+/// <summary>
+/// Forge-reported state of one pull request. <see cref="HeadSha"/>,
+/// <see cref="Mergeable"/> and <see cref="MergeableState"/> are null when
+/// the upstream kind does not report them (or the forge has not computed
+/// mergeability yet) — callers must treat null as unknown, never as clean.
+/// </summary>
 public sealed record UpstreamPullRequestState(
     int Number,
     string Url,
     PullRequestStatus Status,
-    string? MergeCommitSha);
+    string? MergeCommitSha,
+    string? HeadSha = null,
+    bool? Mergeable = null,
+    string? MergeableState = null);
 
 /// <summary>
 /// One commit in a branch's exclusive range (<c>&lt;base&gt;..&lt;head&gt;</c>),
@@ -754,6 +763,24 @@ public sealed record UpstreamCompletionRequest
     public string MergeMethod { get; init; } = "merge";
 
     /// <summary>
+    /// Post-push mergeability settle bound for forges that compute
+    /// mergeability asynchronously after a push (GitHub: <c>mergeable</c>
+    /// stays null until the computation finishes, and the PR head lags the
+    /// just-pushed tip). When set, the implementation polls the PR until
+    /// its head equals the pushed tip and mergeability is known, then
+    /// merges only when mergeable. Null (legacy callers) skips the settle
+    /// and merges immediately.
+    /// </summary>
+    public TimeSpan? MergeSettleTimeout { get; init; }
+
+    /// <summary>
+    /// Initial interval between mergeability settle polls; the delay backs
+    /// off exponentially within <see cref="MergeSettleTimeout"/>. Ignored
+    /// when <see cref="MergeSettleTimeout"/> is null.
+    /// </summary>
+    public TimeSpan? MergeSettlePollInterval { get; init; }
+
+    /// <summary>
     /// PR number already opened on the forge from a prior CompleteAsync attempt.
     /// When set, the implementation skips PR creation and proceeds directly to
     /// the merge step using this PR number. Used by the orchestrator's
@@ -812,6 +839,22 @@ public sealed record UpstreamCompletionOutcome
     /// motion: re-fetch base, re-run the merge phase, and retry the merge.
     /// </summary>
     public bool AutoMergeRaced { get; init; }
+
+    /// <summary>
+    /// Forge-reported mergeability observed around the merge attempt
+    /// (GitHub <c>mergeable</c>). Null when the forge had not computed it
+    /// yet or the upstream kind does not report it. Lets the orchestrator
+    /// tell a genuine conflict (false with an unchanged base — re-merging
+    /// cannot help) from a still-computing PR (null — retry the merge call
+    /// without re-running the merger) without guessing from the base sha.
+    /// </summary>
+    public bool? Mergeable { get; init; }
+
+    /// <summary>
+    /// Forge-reported mergeability detail (GitHub <c>mergeable_state</c>,
+    /// e.g. "clean", "dirty", "blocked", "unknown"). Diagnostic only.
+    /// </summary>
+    public string? MergeableState { get; init; }
 
     /// <summary>
     /// Tip sha of the work branch the implementation actually pushed (plain
