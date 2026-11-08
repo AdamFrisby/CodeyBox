@@ -340,6 +340,13 @@ public sealed class DotnetFirstRunFailureTests
         },
     };
 
+    private static bool IsToolProbe(SandboxExec exec) =>
+        exec.Argv.Count == 5 &&
+        exec.Argv[0] == "sh" &&
+        exec.Argv[1] == "-c" &&
+        exec.Argv[2] == "command -v \"$1\" >/dev/null 2>&1" &&
+        exec.Argv[3] == "sh";
+
     /// <summary>
     /// Sandbox for the language-preset path: the preset discovery exec
     /// (<c>sh -c "echo ."</c>) reports one project directory, the tool probe
@@ -360,9 +367,7 @@ public sealed class DotnetFirstRunFailureTests
                 return Task.FromResult(new SandboxExecResult(0, ".\n", string.Empty));
             }
 
-            if (exec.Argv.Count > 2
-                && exec.Argv[0] == "sh"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (IsToolProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }
@@ -385,9 +390,7 @@ public sealed class DotnetFirstRunFailureTests
         {
             // The tool-presence probe is `sh -c 'command -v "$1" ...'`; let it
             // succeed so the auditor proceeds to the command exec under test.
-            if (exec.Argv.Count > 2
-                && exec.Argv[0] == "sh"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (IsToolProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }

@@ -189,6 +189,13 @@ public sealed class DotnetTestInvocationRegressionTests
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
 
+    private static bool IsToolProbe(SandboxExec exec) =>
+        exec.Argv.Count == 5 &&
+        exec.Argv[0] == "sh" &&
+        exec.Argv[1] == "-c" &&
+        exec.Argv[2] == "command -v \"$1\" >/dev/null 2>&1" &&
+        exec.Argv[3] == "sh";
+
     private sealed class CapturingSandbox(Func<SandboxExec, SandboxExecResult> onExec) : ISandbox
     {
         private readonly Func<SandboxExec, SandboxExecResult> _onExec = onExec;
@@ -196,10 +203,7 @@ public sealed class DotnetTestInvocationRegressionTests
         public string Id => "capturing";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "sh"
-                && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (IsToolProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, "/usr/bin/dotnet\n", ""));
             }
