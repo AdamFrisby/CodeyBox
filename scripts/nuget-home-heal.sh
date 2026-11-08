@@ -33,11 +33,13 @@
 # once per solution via Directory.Solution.props, and per project via
 # Directory.Build.props/targets only OUTSIDE solution builds (the per-project
 # hooks are suppressed by _CodeyBoxInSolution during solution builds). The
-# per-project invocations set CODEYBOX_NUGET_HEAL_NO_QUARANTINE so they can
+# per-project invocations set CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 — the ONLY
+# value that suppresses quarantine; the solution-level Exec clears any
+# inherited value first — so they can
 # NEVER run the destructive quarantine — repair that renames a directory is
 # reserved for the once-per-solution hook; a non-solution build that still
 # finds an unusable home is covered by the in-process NuGetHomeGuard.targets
-# redirect instead. That MSBuild path relies only on the on-disk repair (an
+# admission check and repoint instead. That MSBuild path relies only on the on-disk repair (an
 # exported DOTNET_CLI_HOME would not survive back to the parent `dotnet`),
 # which the in-place quarantine below performs whenever the cli-home is
 # writable — at solution level, or in any single-shot dot-source caller.
@@ -57,8 +59,14 @@
 # (`id -G`) whose EVERY group-db entry across ALL NSS modules names no members
 # other than possibly this user, which no OTHER account holds as a primary
 # group, and which has at least one group-db entry unless it is the account's
-# own primary gid — with the whole proof requiring NSS enumeration via getent
-# (unverifiable topologies fail closed) — see _codeybox_group_is_private. That
+# own primary gid — see _codeybox_group_is_private. "Across ALL NSS modules"
+# is itself proven, not assumed: a keyless `getent` only iterates modules
+# that support setgrent/getgrent enumeration, and sssd/AD/LDAP commonly run
+# with enumeration disabled while keyed lookups still resolve — so the proof
+# first verifies that EVERY source configured for the group AND passwd
+# databases in nsswitch.conf is enumerable (or covered by the direct /etc/*
+# union) and fails closed when coverage cannot be shown
+# (_codeybox_nss_enumeration_complete). That
 # is the standard Linux
 # user-private-group shape (default umask 002 creates drwxrwxr-x dirs); it
 # does not widen co-tenant access. A uid-owned directory in a SHARED group
@@ -129,6 +137,182 @@ _codeybox_group_dump=
 _codeybox_group_dumped=0
 _codeybox_passwd_dump=
 _codeybox_passwd_dumped=0
+# The account/group database files and NSS configuration the proofs read are
+# variables rather than literals so tests can point them at fixture data;
+# production always uses the /etc defaults shown here.
+_codeybox_group_db="/etc/group"
+_codeybox_passwd_db="/etc/passwd"
+_codeybox_nsswitch_conf="/etc/nsswitch.conf"
+_codeybox_sssd_conf="/etc/sssd/sssd.conf"
+_codeybox_sssd_conf_d="/etc/sssd/sssd.conf.d"
+# Memo for _codeybox_nss_enumeration_complete: "" unchecked, then 0/1.
+_codeybox_nss_enum_checked=0
+_codeybox_nss_enum_ok=0
+
+# Print the NSS service names configured for database $1 in nsswitch.conf —
+# the whitespace-separated tokens after "db:" with every [status=action]
+# bracket removed. A missing conf, or a conf with no line for the db, means
+# glibc's built-in default of `files` alone, which the direct /etc/* union in
+# the proofs already covers. Returns nonzero when the conf exists but cannot
+# be read or parsed: an uninspectable configuration cannot prove coverage,
+# so callers must fail closed.
+_codeybox_nss_db_sources() {
+    if [ ! -e "$_codeybox_nsswitch_conf" ]; then
+        printf 'files\n'
+        return 0
+    fi
+    [ -r "$_codeybox_nsswitch_conf" ] || return 1
+    awk -v db="$1" '
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ "^[ \t]*" db "[ \t]*:") {
+                sub("^[ \t]*" db "[ \t]*:[ \t]*", "", line)
+                gsub(/\[[^]]*\]/, " ", line)
+                n = split(line, fields, /[ \t]+/)
+                for (i = 1; i <= n; i++)
+                    if (fields[i] != "")
+                        print fields[i]
+                found = 1
+                exit
+            }
+        }
+        END { if (!found) print "files" }
+    ' "$_codeybox_nsswitch_conf" 2>/dev/null
+}
+
+# sssd answers setgrent/getgrent enumeration only for domains configured
+# `enumerate = true` — the per-domain default is false — while keyed lookups
+# (getgrgid, initgroups, getpwnam) still resolve. A configured `sss` source
+# can therefore hide group/passwd entries from a keyless getent dump, so
+# enumeration must be PROVEN: sssd serves the domains named in the [sssd]
+# `domains =` list plus every [domain/*] section, and every one of them must
+# carry `enumerate = true` in its own section. sssd.conf is read first, then
+# sssd.conf.d/*.conf in lexical order with later assignments winning — sssd's
+# own merge order (dotfile drop-ins are parsed too, so a hidden override
+# cannot sneak past). The `enumerate` option is per-domain only: an
+# [sssd]-section value is not honoured by sssd and is deliberately not
+# accepted. A missing main conf means sssd serves nothing at all, so nothing
+# can be hidden; an unreadable one fails closed.
+_codeybox_sss_enumeration_proven() {
+    [ -f "$_codeybox_sssd_conf" ] || return 0
+    [ -r "$_codeybox_sssd_conf" ] || return 1
+    # Concatenate the configs in sssd's own read order — main conf, then
+    # conf.d drop-ins lexically (dotfile drop-ins included) — into one stream
+    # for the parser. Every file must cat cleanly: a partially-read config
+    # could hide a later `enumerate = false`, so any read failure fails
+    # closed. sssd runs as root and can read drop-ins this user cannot, so
+    # an unreadable drop-in is refused rather than skipped.
+    _codeybox_sss_text="$({
+        cat "$_codeybox_sssd_conf" || exit 1
+        if [ -d "$_codeybox_sssd_conf_d" ]; then
+            for _codeybox_sss_dropin in \
+                "$_codeybox_sssd_conf_d"/*.conf \
+                "$_codeybox_sssd_conf_d"/.[!.]*.conf; do
+                if [ -f "$_codeybox_sss_dropin" ]; then
+                    [ -r "$_codeybox_sss_dropin" ] || exit 1
+                    cat "$_codeybox_sss_dropin" || exit 1
+                fi
+            done
+        fi
+    })" || return 1
+    [ -n "$_codeybox_sss_text" ] || return 1
+    printf '%s\n' "$_codeybox_sss_text" | awk '
+        {
+            line = $0
+            sub(/[#;].*/, "", line)
+        }
+        /^[ \t]*\[/ {
+            section = line
+            sub(/^[ \t]*\[/, "", section)
+            sub(/\].*/, "", section)
+            gsub(/[ \t]/, "", section)
+            in_sssd = (section == "sssd")
+            curdom = ""
+            if (section ~ /^domain\//) {
+                curdom = substr(section, 8)
+                doms[curdom] = 1
+            }
+            next
+        }
+        {
+            if (line ~ /^[ \t]*$/) next
+            eq = index(line, "=")
+            if (eq == 0) next
+            key = substr(line, 1, eq - 1)
+            val = substr(line, eq + 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", key)
+            gsub(/^[ \t]+|[ \t]+$/, "", val)
+            if (in_sssd && key == "domains") {
+                m = split(val, parts, /[ \t,]+/)
+                for (i = 1; i <= m; i++)
+                    if (parts[i] != "")
+                        doms[parts[i]] = 1
+            } else if (curdom != "") {
+                lk = tolower(key)
+                lv = tolower(val)
+                if (lk == "enumerate")
+                    enum[curdom] = \
+                        (lv == "true" || lv == "yes" || lv == "on" || lv == "1") \
+                            ? "yes" : "no"
+            }
+        }
+        END {
+            bad = 0
+            for (d in doms)
+                if (enum[d] != "yes")
+                    bad = 1
+            exit (bad ? 1 : 0)
+        }
+    ' 2>/dev/null
+}
+
+# Return 0 when a single NSS source is provably covered by the keyless
+# getent enumeration the proofs consume. `files`/`compat` are covered by the
+# direct /etc/* union; `db`, `nis`, `nisplus`, `yp`, and `systemd` implement
+# setXent/getXent enumeration (nss-systemd has since systemd v239, and the
+# dynamic users/groups it synthesizes are privileged-actor creations a
+# co-tenant cannot mint anyway). `sss` is covered only when
+# _codeybox_sss_enumeration_proven shows enumerate=true for every served
+# domain. Anything else — ldap, winbind, dns, hesiod, mymachines, unknown —
+# cannot be proven enumerable and fails closed.
+_codeybox_nss_source_enumerable() {
+    case ${1:-} in
+        files|compat|db|nis|nisplus|yp|systemd) return 0 ;;
+        sss) _codeybox_sss_enumeration_proven ;;
+        *) return 1 ;;
+    esac
+}
+
+# Return 0 only when keyless `getent group` AND `getent passwd` enumeration
+# is proven to cover EVERY NSS source configured for BOTH databases — the
+# precondition for trusting either dump in _codeybox_group_is_private. A
+# non-empty getent dump is NOT proof of complete coverage: modules without
+# enumeration support (sss with enumerate=false, nss_ldap, winbind without
+# enum, ...) are skipped silently while keyed lookups still resolve, so a
+# duplicate-gid group entry or a foreign primary-gid account could hide in
+# exactly the blind spot the member-list and primary-gid proofs exist to
+# close. Result is memoized per process.
+_codeybox_nss_enumeration_complete() {
+    if [ "${_codeybox_nss_enum_checked:-0}" = "1" ]; then
+        [ "${_codeybox_nss_enum_ok:-0}" = "1" ]
+        return
+    fi
+    _codeybox_nss_enum_checked=1
+    _codeybox_nss_enum_ok=0
+    _codeybox_nss_db=group
+    while :; do
+        _codeybox_nss_srcs="$(_codeybox_nss_db_sources "$_codeybox_nss_db")" \
+            || return 1
+        for _codeybox_nss_src in $_codeybox_nss_srcs; do
+            _codeybox_nss_source_enumerable "$_codeybox_nss_src" || return 1
+        done
+        [ "$_codeybox_nss_db" = "group" ] || break
+        _codeybox_nss_db=passwd
+    done
+    _codeybox_nss_enum_ok=1
+    return 0
+}
 
 # Return 0 when gid $1 is provably PRIVATE to this account — group-write on
 # storage bearing it grants no co-tenant access. Every proof must hold, and
@@ -144,6 +328,18 @@ _codeybox_passwd_dumped=0
 #      (OpenDirectory/AD/LDAP) groups and accounts are invisible — both
 #      proofs below would pass for a genuinely shared group, so the verdict
 #      is "not private".
+#   1b. Enumeration COMPLETENESS: getent existing is not enough — a keyless
+#      `getent group`/`getent passwd` only iterates NSS modules that support
+#      setgrent/getgrent enumeration, and sssd/AD/LDAP commonly run with
+#      enumeration disabled while keyed lookups (getgrgid, initgroups,
+#      getpwnam) still resolve. A non-empty dump is therefore NOT proof that
+#      every module's entries were seen: a duplicate-gid group entry listing
+#      a co-tenant, or an LDAP account holding the gid as primary group,
+#      could sit in exactly the blind spot proofs 2 and 3 exist to close.
+#      _codeybox_nss_enumeration_complete requires every source configured
+#      for BOTH databases to be provably enumerable (or covered by the
+#      direct /etc/* union) before either dump is trusted; anything
+#      unverifiable fails closed.
 #   2. Member list: EVERY group-db entry carrying $1 across ALL NSS modules
 #      must name nobody in its member field but possibly this login. A keyed
 #      `getent group <gid>` is NOT sufficient: glibc answers a numeric key
@@ -195,6 +391,12 @@ _codeybox_group_is_private() {
     # Proof 1 — NSS enumeration is mandatory; see the header above.
     command -v getent >/dev/null 2>&1 || return 1
 
+    # Proof 1b — the enumeration must also be COMPLETE across every configured
+    # NSS source for both databases; see the header above. Without this a
+    # non-empty dump from enumerable modules alone would look identical to a
+    # fully-covered one while sss/ldap entries stay invisible.
+    _codeybox_nss_enumeration_complete || return 1
+
     # Proof 2 — member list across EVERY entry for this gid in EVERY NSS
     # module. A KEYED `getent group "$1"` returns only the first module's
     # match for a numeric key (getgrgid), so a duplicate-gid entry in a
@@ -217,8 +419,8 @@ _codeybox_group_is_private() {
     fi
     _codeybox_gp_entries="$(printf '%s\n' "$_codeybox_group_dump" \
         | awk -F: -v g="$1" '$3 == g')"
-    if [ -f /etc/group ]; then
-        _codeybox_gp_etc="$(awk -F: -v g="$1" '$3 == g' /etc/group 2>/dev/null)"
+    if [ -f "$_codeybox_group_db" ]; then
+        _codeybox_gp_etc="$(awk -F: -v g="$1" '$3 == g' "$_codeybox_group_db" 2>/dev/null)"
         if [ -n "$_codeybox_gp_etc" ]; then
             _codeybox_gp_entries="${_codeybox_gp_entries}${_codeybox_gp_entries:+
 }$_codeybox_gp_etc"
@@ -254,9 +456,9 @@ _codeybox_group_is_private() {
     if [ "$_codeybox_passwd_dumped" != "1" ]; then
         _codeybox_passwd_dump="$(getent passwd 2>/dev/null)"
         [ -n "$_codeybox_passwd_dump" ] || return 1
-        if [ -f /etc/passwd ]; then
+        if [ -f "$_codeybox_passwd_db" ]; then
             _codeybox_passwd_dump="$_codeybox_passwd_dump
-$(cat /etc/passwd 2>/dev/null)"
+$(cat "$_codeybox_passwd_db" 2>/dev/null)"
         fi
         _codeybox_passwd_dumped=1
     fi
@@ -1135,6 +1337,13 @@ _codeybox_quarantine_unusable_nuget_home() {
 }
 
 codeybox_heal_nuget_home() {
+    # Outcome token for CODEYBOX_NUGET_HEAL_REPORT consumers (the in-process
+    # NuGetHomeGuard.targets task): usable = the env-provided cli home
+    # verified in place; redirected = an unusable home was bypassed via the
+    # exported fallback DOTNET_CLI_HOME; failed = nothing usable could be
+    # materialized and the rejected env values were unset. Set "failed" up
+    # front so every early return reports the safe verdict.
+    _codeybox_heal_verdict=failed
     # CODEYBOX_NUGET_HOME_UNDER_TEST, when set, names the .nuget directory to
     # repair — an override so tests can exercise the heal against a temporary
     # home without touching the caller's real $HOME; the heal operates on the
@@ -1198,6 +1407,7 @@ codeybox_heal_nuget_home() {
             # drop the marker so a LATER breakage quarantines afresh rather
             # than being suppressed by a stale marker forever.
             rm -f "$_codeybox_quarantine_marker" 2>/dev/null || true
+            _codeybox_heal_verdict=usable
             return 0
         fi
 
@@ -1209,9 +1419,14 @@ codeybox_heal_nuget_home() {
         # Make the heal idempotent and race-free:
         # 1. Destructive repair (the quarantine mv) is NEVER run from a
         #    per-project MSBuild InitialTarget: the MSBuild hook sets
-        #    CODEYBOX_NUGET_HEAL_NO_QUARANTINE for project-level invocations,
-        #    and only the once-per-solution hook (Directory.Solution.props)
-        #    leaves it unset. Direct dot-source callers (build.sh, the audit
+        #    CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 for project-level
+        #    invocations, and only the once-per-solution hook
+        #    (Directory.Solution.props) leaves it unset — that Exec explicitly
+        #    clears any inherited value first, so an ambient or mistyped
+        #    variable can never leak suppression into the mandated repair.
+        #    Only the literal value "1" suppresses: "0", "false", or any
+        #    other presence-based value does NOT disable the quarantine.
+        #    Direct dot-source callers (build.sh, the audit
         #    gates) are single-shot and always allowed.
         # 2. Quarantine runs at most once per unusable-home EPISODE via a
         #    marker file in private storage: the marker suppresses repeat
@@ -1225,8 +1440,9 @@ codeybox_heal_nuget_home() {
         #    reaps — by recorded pid when present, by age when the pid was
         #    never written.
         # 4. Never create more than one quarantine directory per invocation.
-        if [ -z "${CODEYBOX_NUGET_HEAL_NO_QUARANTINE:-}" ] \
+        if [ "${CODEYBOX_NUGET_HEAL_NO_QUARANTINE:-}" != "1" ] \
             && _codeybox_quarantine_unusable_nuget_home; then
+            _codeybox_heal_verdict=usable
             return 0
         fi
     fi
@@ -1258,6 +1474,7 @@ codeybox_heal_nuget_home() {
     export DOTNET_CLI_HOME
     _codeybox_seed_nuget_home "$_codeybox_scratch_home/.nuget/NuGet" \
         "$_codeybox_cli_home_env/.nuget/packages"
+    _codeybox_heal_verdict=redirected
     return 0
 }
 
@@ -1287,3 +1504,30 @@ codeybox_ensure_dotnet_runtime_dir
 # Run LAST so the resolved (possibly just-healed) home values are among the
 # seeded candidates.
 codeybox_seed_nuget_migration_state
+
+# Machine-readable verdict for callers that cannot inherit this process's
+# exports — the in-process NuGetHomeGuard.targets MSBuild task dot-sources
+# this file with CODEYBOX_NUGET_HEAL_REPORT=1 (and
+# CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1, since per-project repair must stay
+# non-destructive) and applies the reported DOTNET_CLI_HOME / HOME /
+# package-cache decision inside the MSBuild process itself. Values are
+# control-stripped so a crafted path cannot break the KEY=VALUE line format.
+# NUGET_PACKAGES is resolved through the same _codeybox_reuse_nuget_packages
+# admission the preamble uses, against the ORIGINAL env home's packages tree —
+# only when the home was not usable in place (a usable home's cache already
+# passed the identical whole-tree check inside the ensure).
+if [ "${CODEYBOX_NUGET_HEAL_REPORT:-}" = "1" ]; then
+    if [ "${_codeybox_heal_verdict:-failed}" != "usable" ] \
+        && [ -n "${_codeybox_cli_home_env:-}" ]; then
+        _codeybox_reuse_nuget_packages \
+            "${_codeybox_cli_home_env%/}/.nuget/packages"
+    fi
+    printf 'CODEYBOX_HEAL_VERDICT=%s\n' \
+        "$(_codeybox_strip_ctrl "${_codeybox_heal_verdict:-failed}")"
+    printf 'CODEYBOX_HEAL_DOTNET_CLI_HOME=%s\n' \
+        "$(_codeybox_strip_ctrl "${DOTNET_CLI_HOME:-}")"
+    printf 'CODEYBOX_HEAL_HOME=%s\n' \
+        "$(_codeybox_strip_ctrl "${HOME:-}")"
+    printf 'CODEYBOX_HEAL_NUGET_PACKAGES=%s\n' \
+        "$(_codeybox_strip_ctrl "${NUGET_PACKAGES:-}")"
+fi

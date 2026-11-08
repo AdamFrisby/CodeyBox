@@ -20,9 +20,10 @@
     docs/development/build-environment.md.
 
     NuGetHomeGuard.targets (imported above) supplies an in-process backstop:
-    when the user config is present-but-unreadable, its initial target
-    redirects DOTNET_CLI_HOME to repository-local state so NuGet's proxy-cache
-    initialization survives before compilation.
+    its initial target applies the heal script's own admission verdict inside
+    MSBuild — redirecting DOTNET_CLI_HOME/HOME and repointing the auto-pinned
+    RestorePackagesPath at verified storage — so NuGet's proxy-cache
+    initialization and package consumption both survive before compilation.
   -->
   <Target Name="EnsureWritableNuGetUserSettings"
           Condition="'$(OS)' != 'Windows_NT' and '$(_CodeyBoxInSolution)' != 'true'">

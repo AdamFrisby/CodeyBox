@@ -83,6 +83,10 @@ public sealed class MsBuildNuGetHealTests
     private static async Task CreateProjectAsync(string projectDir)
     {
         Directory.CreateDirectory(projectDir);
+        // Record the RestorePackagesPath the build actually evaluated so tests
+        // can prove the in-process NuGetHomeGuard repointed the auto-pinned
+        // cache away from a rejected home — the pin lives in
+        // Directory.Build.props and only the guard task may move it.
         await File.WriteAllTextAsync(
             Path.Combine(projectDir, "proj.csproj"),
             """
@@ -91,6 +95,12 @@ public sealed class MsBuildNuGetHealTests
                 <TargetFramework>net10.0</TargetFramework>
                 <Nullable>enable</Nullable>
               </PropertyGroup>
+              <Target Name="CodeyBoxDumpRestorePackagesPath" AfterTargets="Build">
+                <WriteLinesToFile
+                  File="$(MSBuildProjectDirectory)/restore-packages-path.txt"
+                  Lines="$(RestorePackagesPath)"
+                  Overwrite="true" />
+              </Target>
             </Project>
             """);
         await File.WriteAllTextAsync(
@@ -501,6 +511,79 @@ public sealed class MsBuildNuGetHealTests
             Assert.False(
                 File.GetAttributes(Path.Combine(nugetHealthy, "packages")).HasFlag(FileAttributes.ReparsePoint),
                 "packages must not have been converted to a symlink");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The audit gap this pins: a foreign-owned or co-tenant-writable
+    // .nuget/packages tree with a READABLE NuGet.Config used to survive a
+    // non-solution build untouched — the old guard only checked config
+    // readability while Directory.Build.props kept RestorePackagesPath pinned
+    // at the rejected cache, so extracted package build/.props/.targets kept
+    // executing inside the build. The in-process NuGetHomeGuard task now
+    // applies the heal script's own whole-tree admission verdict and must
+    // repoint the auto-pinned RestorePackagesPath at verified storage.
+    [Fact]
+    public async Task MsBuild_NonSolutionBuild_RepointsRejectedPackageCache()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-repoint-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var projectDir = Path.Combine(root, "proj");
+        var nugetHome = Path.Combine(home, ".nuget");
+        Directory.CreateDirectory(projectDir);
+        try
+        {
+            await CreateProjectAsync(projectDir);
+            await CreateBuildWiringAsync(root, repoRoot!);
+            var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+
+            // A READABLE config inside an other-writable .nuget: the old
+            // readability-only guard saw nothing wrong, while the heal's
+            // private-storage admission rejects the tree outright.
+            var nugetDir = Path.Combine(nugetHome, "NuGet");
+            Directory.CreateDirectory(nugetDir);
+            var config = Path.Combine(nugetDir, "NuGet.Config");
+            await File.WriteAllTextAsync(config, "<configuration/>");
+            var packageDir = Path.Combine(nugetHome, "packages", "pkg");
+            Directory.CreateDirectory(packageDir);
+            var marker = Path.Combine(packageDir, "marker.txt");
+            await File.WriteAllTextAsync(marker, "rejected-cache");
+            await ChmodAsync("777", nugetHome); // o+w: co-tenant-writable
+
+            var env = CreateBuildEnv(dotnetDir, home, root, nugetHome);
+            var result = await RunDotnetBuildAsync(
+                dotnetDir,
+                Path.Combine(projectDir, "proj.csproj"),
+                offlineConfig,
+                env);
+
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            // Per-project builds never quarantine — the rejected tree stays.
+            Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+
+            var pinned = (await File.ReadAllTextAsync(
+                Path.Combine(projectDir, "restore-packages-path.txt"))).Trim();
+            var rejected = Path.Combine(nugetHome, "packages");
+            Assert.False(
+                string.Equals(pinned, rejected, StringComparison.Ordinal),
+                $"RestorePackagesPath must be repointed away from the rejected cache, got '{pinned}'");
+            Assert.False(
+                pinned.StartsWith(home + "/", StringComparison.Ordinal),
+                $"RestorePackagesPath must not resolve inside the rejected home, got '{pinned}'");
         }
         finally
         {

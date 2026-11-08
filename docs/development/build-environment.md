@@ -48,9 +48,13 @@ solution build (`dotnet build foo.csproj`, `dotnet test`) those per-project
 hooks still run — but NON-destructively: they export
 `CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1`, so the shared recovery skips the
 quarantine and an unusable home is instead covered by the in-process
-`NuGetHomeGuard.targets` redirect (imported by `Directory.Build.targets` and
-`Directory.Solution.targets`), which repoints `DOTNET_CLI_HOME` to
-repository-local state before NuGet's user-config read. Destructive repair
+`NuGetHomeGuard.targets` task (imported by `Directory.Build.targets` and
+`Directory.Solution.targets`), which dot-sources the same heal script with
+`CODEYBOX_NUGET_HEAL_REPORT=1` and applies its machine-readable verdict
+inside the MSBuild process: it redirects `DOTNET_CLI_HOME`/`HOME` to
+verified storage and repoints the auto-pinned `RestorePackagesPath` at the
+same whole-tree-verified package cache the heal itself would use — an
+operator-supplied `RestorePackagesPath` is never overridden. Destructive repair
 that renames a directory is never performed from a per-project
 `InitialTarget`. All paths delegate the repair to the shared
 `scripts/nuget-home-heal.sh` recovery —
@@ -72,9 +76,19 @@ later module such as sss/LDAP — unioned with `/etc/group`), no other account
 may hold the gid as its primary group, and the gid must have at least one
 group-db entry unless it is the account's own primary gid (`id -g`, the
 user-private-group shape where membership is inherent to the account rather
-than enumerated). The whole proof requires NSS enumeration via `getent`, so
-platforms or topologies where groups/accounts cannot be enumerated (macOS,
-musl, broken NSS) fail closed and treat group-write as co-tenant-writable.
+than enumerated). A non-empty `getent` dump is not by itself proof of
+coverage: a keyless `getent group`/`getent passwd` only iterates NSS modules
+that support `setgrent`/`getgrent` enumeration, and sssd/AD/LDAP commonly run
+with enumeration disabled while keyed lookups still resolve — so the proof
+first requires that EVERY source configured for the `group` and `passwd`
+databases in `nsswitch.conf` is enumerable (`files`/`compat`/`db`/`nis`/
+`nisplus`/`yp`/`systemd` implement enumeration; `sss` is covered only when
+`enumerate = true` is proven for every domain it serves across
+`sssd.conf` + `sssd.conf.d` drop-ins; anything else — `ldap`, `winbind`,
+unknown — fails closed), unioned with the direct `/etc/*` reads. Platforms or
+topologies where groups/accounts cannot be enumerated or coverage cannot be
+proven (macOS, musl, `sss` without `enumerate = true`, non-enumerable NSS
+modules) fail closed and treat group-write as co-tenant-writable.
 On standard
 Linux systems with user-private groups (default umask 002), directories are
 created `drwxrwxr-x` under exactly such a group. A uid-owned directory in a
@@ -100,7 +114,10 @@ Under parallel MSBuild, destructive repair is strictly race-free:
    `CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1`, so they can never rename `.nuget`
    aside no matter how many project nodes evaluate in parallel; a
    non-solution build's unusable home falls back to the in-process
-   `NuGetHomeGuard.targets` `DOTNET_CLI_HOME` redirect instead.
+   `NuGetHomeGuard.targets` admission check, which applies the heal script's
+   verdict in-process — redirecting `DOTNET_CLI_HOME`/`HOME` and repointing
+   the auto-pinned `RestorePackagesPath` at verified storage — instead of
+   renaming anything.
 2. The quarantine path is guarded by an advisory lock (a `mkdir` lock whose
    owner pid is recorded and reaped once dead; a lock whose pid was never
    recorded — e.g. the holder was killed mid-acquire — is reaped by age) and

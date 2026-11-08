@@ -1038,12 +1038,34 @@ public sealed class BuildScriptNuGetHealTests
         {
             var result = await RunHealShellAsync(
                 NewHealEnv(root, home),
+                // The PROBE gid isolates proof 0 (the `id -G` membership check):
+                // the fixture _codeybox_group_db supplies a group-db entry with
+                // an EMPTY member list, so proofs 2 and 3 would PASS for it —
+                // the only thing that can refuse it is proof 0. The gid is
+                // picked in-shell from a candidate list, skipping any that the
+                // account holds, that already has a group entry in the real
+                // dbs, or that some account holds as a primary gid.
                 "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && "
                 + "{ _codeybox_group_is_private \"$(id -g)\" "
                 + "  && echo EGID=private || echo EGID=shared; } && "
                 + "{ _codeybox_group_is_private 999999 "
-                + "  && echo STRANGER=private || echo STRANGER=refused; }",
-                root, HealScriptRepoRoot());
+                + "  && echo STRANGER=private || echo STRANGER=refused; } && "
+                + "probe= && "
+                + "for g in 424242 424243 424244 424245 424246 424247 424248 424249; do "
+                + "  id -G | tr ' ' '\\n' | grep -qx \"$g\" && continue; "
+                + "  getent group \"$g\" 2>/dev/null | grep -q . && continue; "
+                + "  getent passwd 2>/dev/null | awk -F: -v g=\"$g\" '$4 == g { f = 1 } END { exit(f ? 0 : 1) }' && continue; "
+                + "  probe=$g; break; "
+                + "done; "
+                + "if [ -z \"$probe\" ]; then echo PROBE=skipped; else "
+                + "  printf 'probex:x:%s:\\n' \"$probe\" > \"$3/group\" && "
+                + "  : > \"$3/passwd\" && "
+                + "  _codeybox_group_db=\"$3/group\" && "
+                + "  _codeybox_passwd_db=\"$3/passwd\" && "
+                + "  _codeybox_pg_gid= && _codeybox_pg_verdict= && "
+                + "  { _codeybox_group_is_private \"$probe\" "
+                + "    && echo PROBE=private || echo PROBE=refused; }; fi",
+                root, HealScriptRepoRoot(), root);
             Assert.True(result.Success, result.Stdout + result.Stderr);
 
             var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
@@ -1052,11 +1074,296 @@ public sealed class BuildScriptNuGetHealTests
             // group-writable fixtures above would fail too.
             Assert.Contains("EGID=private", lines);
             Assert.Contains("STRANGER=refused", lines);
+            // A gid absent from `id -G` whose ONLY group-db entry (the
+            // fixture file) has an empty member list and which no account
+            // holds as a primary gid must still be refused — deleting proof
+            // 0 would flip this to private.
+            if (!lines.Contains("PROBE=skipped", StringComparer.Ordinal))
+            {
+                Assert.Contains("PROBE=refused", lines);
+            }
         }
         finally
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    // The member-list and primary-gid proofs consume KEYLESS `getent group` /
+    // `getent passwd` dumps, which only iterate NSS modules that support
+    // setgrent/getgrent enumeration. sssd/AD/LDAP commonly run with
+    // enumeration disabled while keyed lookups still resolve, so a non-empty
+    // dump is not proof of coverage: _codeybox_nss_enumeration_complete must
+    // fail closed unless EVERY configured source for BOTH databases is
+    // provably enumerable. These fixtures drive that gate through the
+    // script's db-path overrides; the verdict still comes from the real
+    // getent dumps (this account's own egid), so "private" additionally
+    // requires the host's normal private-group proofs to hold — the same
+    // assumption HealScript_GroupIsPrivate_RequiresHeldGid already makes.
+    [Fact]
+    public async Task HealScript_GroupPrivacy_RequiresEnumerableNssSources()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var home = Path.Combine(root, "home");
+        var fx = Path.Combine(root, "nss");
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(Path.Combine(fx, "sssd", "sssd.conf.d"));
+        try
+        {
+            async Task<string> ProbeAsync(string nsswitch, string? sssdConf, string? dropin)
+            {
+                await File.WriteAllTextAsync(Path.Combine(fx, "nsswitch.conf"), nsswitch);
+                var confPath = Path.Combine(fx, "sssd", "sssd.conf");
+                if (sssdConf is null)
+                {
+                    if (File.Exists(confPath))
+                        File.Delete(confPath);
+                }
+                else
+                {
+                    await File.WriteAllTextAsync(confPath, sssdConf);
+                }
+                foreach (var stale in Directory.GetFiles(
+                    Path.Combine(fx, "sssd", "sssd.conf.d")))
+                {
+                    File.Delete(stale);
+                }
+                if (dropin is not null)
+                {
+                    await File.WriteAllTextAsync(
+                        Path.Combine(fx, "sssd", "sssd.conf.d", "10-enum.conf"), dropin);
+                }
+
+                var result = await RunHealShellAsync(
+                    NewHealEnv(root, home),
+                    "cd \"$1\" && . \"$2/scripts/nuget-home-heal.sh\" && "
+                    + "_codeybox_nsswitch_conf=\"$3/nsswitch.conf\" && "
+                    + "_codeybox_sssd_conf=\"$3/sssd/sssd.conf\" && "
+                    + "_codeybox_sssd_conf_d=\"$3/sssd/sssd.conf.d\" && "
+                    + "_codeybox_pg_gid= && _codeybox_pg_verdict= && "
+                    + "_codeybox_nss_enum_checked=0 && _codeybox_nss_enum_ok=0 && "
+                    + "{ _codeybox_group_is_private \"$(id -g)\" "
+                    + "  && echo G=private || echo G=refused; }",
+                    root, HealScriptRepoRoot(), fx);
+                Assert.True(result.Success, result.Stdout + result.Stderr);
+                var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                Assert.Contains(lines, l => l is "G=private" or "G=refused");
+                return lines.First(l => l is "G=private" or "G=refused");
+            }
+
+            // files-only: fully covered by the direct /etc/* union.
+            Assert.Equal(
+                "G=private",
+                await ProbeAsync("group: files\npasswd: files\n", null, null));
+
+            // sss with enumeration disabled (the sssd default): the keyless
+            // dump cannot be shown complete, so the gid must be refused even
+            // though every other proof would pass.
+            const string SssdNoEnum =
+                "[sssd]\ndomains = example.com\n[domain/example.com]\n";
+            Assert.Equal(
+                "G=refused",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n", SssdNoEnum, null));
+
+            // A later drop-in proving enumerate=true for every served domain
+            // restores coverage.
+            Assert.Equal(
+                "G=private",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n",
+                    SssdNoEnum,
+                    "[domain/example.com]\nenumerate = true\n"));
+
+            // A non-enumerable module (nss_ldap) can never be proven covered.
+            Assert.Equal(
+                "G=refused",
+                await ProbeAsync("group: files ldap\npasswd: files\n", null, null));
+
+            // Two sssd domains where only one enumerates still fails closed.
+            Assert.Equal(
+                "G=refused",
+                await ProbeAsync(
+                    "group: files sss\npasswd: files sss\n",
+                    "[sssd]\ndomains = a.com, b.com\n"
+                        + "[domain/a.com]\nenumerate = true\n"
+                        + "[domain/b.com]\n",
+                    null));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // CODEYBOX_NUGET_HEAL_REPORT=1 makes the dot-sourced recovery emit the
+    // machine-readable verdict the in-process NuGetHomeGuard.targets task
+    // applies inside MSBuild. Pin the contract: a usable home reports
+    // "usable" with its canonical paths; an unusable home under
+    // CODEYBOX_NUGET_HEAL_NO_QUARANTINE reports "redirected" with the
+    // fallback DOTNET_CLI_HOME and leaves the tree untouched; the same home
+    // WITHOUT the suppression is quarantined once and reports "usable" for
+    // the recreated home.
+    [Fact]
+    public async Task HealScript_Report_EmitsVerdictForGuardConsumer()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = HealScriptRepoRoot();
+
+        // Case 1: healthy home -> usable, paths reported.
+        var rootOk = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var homeOk = Path.Combine(rootOk, "home");
+        Directory.CreateDirectory(homeOk);
+        try
+        {
+            var env = NewHealEnv(rootOk, homeOk);
+            env["CODEYBOX_NUGET_HEAL_REPORT"] = "1";
+            env["CODEYBOX_NUGET_HEAL_NO_QUARANTINE"] = "1";
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . ./scripts/nuget-home-heal.sh",
+                repoRoot);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("CODEYBOX_HEAL_VERDICT=usable", lines);
+            Assert.Contains(lines, l => l.StartsWith("CODEYBOX_HEAL_HOME=", StringComparison.Ordinal)
+                && l.Length > "CODEYBOX_HEAL_HOME=".Length);
+        }
+        finally
+        {
+            Directory.Delete(rootOk, recursive: true);
+        }
+
+        // Case 2: unusable home + NO_QUARANTINE -> redirected, tree untouched.
+        var rootNoQ = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var homeNoQ = Path.Combine(rootNoQ, "home");
+        var outsideNoQ = Path.Combine(rootNoQ, "outside");
+        Directory.CreateDirectory(homeNoQ);
+        Directory.CreateDirectory(outsideNoQ);
+        File.CreateSymbolicLink(Path.Combine(homeNoQ, ".nuget"), outsideNoQ);
+        try
+        {
+            var env = NewHealEnv(rootNoQ, homeNoQ);
+            env["CODEYBOX_NUGET_HEAL_REPORT"] = "1";
+            env["CODEYBOX_NUGET_HEAL_NO_QUARANTINE"] = "1";
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . ./scripts/nuget-home-heal.sh",
+                repoRoot);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("CODEYBOX_HEAL_VERDICT=redirected", lines);
+            var cliHome = lines.FirstOrDefault(
+                l => l.StartsWith("CODEYBOX_HEAL_DOTNET_CLI_HOME=", StringComparison.Ordinal));
+            Assert.NotNull(cliHome);
+            var cliHomePath = cliHome!["CODEYBOX_HEAL_DOTNET_CLI_HOME=".Length..];
+            Assert.False(string.IsNullOrEmpty(cliHomePath));
+            Assert.True(Directory.Exists(cliHomePath), "reported cli home must exist");
+            Assert.Empty(Directory.GetDirectories(homeNoQ, ".nuget.codeybox-unwritable.*"));
+            Assert.True(
+                File.GetAttributes(Path.Combine(homeNoQ, ".nuget")).HasFlag(FileAttributes.ReparsePoint),
+                "the rejected tree must be left exactly as found");
+        }
+        finally
+        {
+            Directory.Delete(rootNoQ, recursive: true);
+        }
+
+        // Case 3: same unusable home WITHOUT suppression -> quarantined once,
+        // fresh home usable -> verdict usable.
+        var rootQ = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var homeQ = Path.Combine(rootQ, "home");
+        var outsideQ = Path.Combine(rootQ, "outside");
+        Directory.CreateDirectory(homeQ);
+        Directory.CreateDirectory(outsideQ);
+        File.CreateSymbolicLink(Path.Combine(homeQ, ".nuget"), outsideQ);
+        try
+        {
+            var env = NewHealEnv(rootQ, homeQ);
+            env["CODEYBOX_NUGET_HEAL_REPORT"] = "1";
+            var result = await RunHealShellAsync(
+                env,
+                "cd \"$1\" && . ./scripts/nuget-home-heal.sh",
+                repoRoot);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Contains("CODEYBOX_HEAL_VERDICT=usable", lines);
+            Assert.Single(Directory.GetDirectories(homeQ, ".nuget.codeybox-unwritable.*"));
+        }
+        finally
+        {
+            Directory.Delete(rootQ, recursive: true);
+        }
+    }
+
+    // CODEYBOX_NUGET_HEAL_NO_QUARANTINE suppresses the destructive quarantine
+    // only on the literal value "1": the per-project MSBuild hooks set exactly
+    // that, and the solution-level hook unsets the variable before sourcing.
+    // A mistyped or inherited "0"/"false" must NOT silently disable the
+    // mandated once-per-solution repair.
+    [Fact]
+    public async Task HealScript_NoQuarantine_SuppressesOnlyLiteralOne()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        foreach (var value in new[] { "0", "false" })
+        {
+            var root = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+            var home = Path.Combine(root, "home");
+            var outside = Path.Combine(root, "outside");
+            Directory.CreateDirectory(home);
+            Directory.CreateDirectory(outside);
+            File.CreateSymbolicLink(Path.Combine(home, ".nuget"), outside);
+            try
+            {
+                var env = NewHealEnv(root, home);
+                env["CODEYBOX_NUGET_HEAL_NO_QUARANTINE"] = value;
+                var result = await DotSourceHealAsyncWithEnv(env);
+                Assert.True(result.Success, result.Stdout + result.Stderr);
+                Assert.Single(
+                    Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        // Literal "1" still suppresses: no quarantine, tree left in place.
+        var rootOne = Path.Combine(Path.GetTempPath(), $"codeybox-healsh-{Guid.NewGuid():N}");
+        var homeOne = Path.Combine(rootOne, "home");
+        var outsideOne = Path.Combine(rootOne, "outside");
+        Directory.CreateDirectory(homeOne);
+        Directory.CreateDirectory(outsideOne);
+        File.CreateSymbolicLink(Path.Combine(homeOne, ".nuget"), outsideOne);
+        try
+        {
+            var env = NewHealEnv(rootOne, homeOne);
+            env["CODEYBOX_NUGET_HEAL_NO_QUARANTINE"] = "1";
+            var result = await DotSourceHealAsyncWithEnv(env);
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            Assert.Empty(Directory.GetDirectories(homeOne, ".nuget.codeybox-unwritable.*"));
+        }
+        finally
+        {
+            Directory.Delete(rootOne, recursive: true);
+        }
+    }
+
+    private static Task<ProcessRunResult> DotSourceHealAsyncWithEnv(
+        IReadOnlyDictionary<string, string> environment)
+    {
+        var repoRoot = HealScriptRepoRoot();
+        return RunHealShellAsync(
+            environment,
+            "cd \"$1\" && . ./scripts/nuget-home-heal.sh",
+            repoRoot);
     }
 
     // Regression: a directory that grants execute without read is unlistable

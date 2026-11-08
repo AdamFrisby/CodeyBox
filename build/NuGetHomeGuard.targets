@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <_CodeyBoxRepositoryDotNetHome>$(MSBuildThisFileDirectory)../.build/dotnet-home</_CodeyBoxRepositoryDotNetHome>
+    <_CodeyBoxNuGetHealScript>$(MSBuildThisFileDirectory)../scripts/nuget-home-heal.sh</_CodeyBoxNuGetHealScript>
   </PropertyGroup>
 
   <UsingTask
@@ -10,11 +11,41 @@
     AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
     <ParameterGroup>
       <RepositoryDotNetHome ParameterType="System.String" Required="true" />
+      <HealScript ParameterType="System.String" Required="true" />
+      <AutoPackagesPath ParameterType="System.String" Required="false" />
+      <DeclaredPackagesPath ParameterType="System.String" Required="false" />
+      <RestorePackagesPathOut ParameterType="System.String" Required="false" Output="true" />
     </ParameterGroup>
     <Task>
       <Using Namespace="System" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.Diagnostics" />
       <Using Namespace="System.IO" />
       <Code Type="Fragment" Language="cs"><![CDATA[
+        // The home admission decision is NOT re-implemented here: the task
+        // dot-sources scripts/nuget-home-heal.sh with
+        // CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 (per-project repair must stay
+        // non-destructive — the destructive quarantine is reserved for the
+        // once-per-solution hook) and CODEYBOX_NUGET_HEAL_REPORT=1, then
+        // applies the script's machine-readable verdict inside this MSBuild
+        // process, where the exports can actually reach NuGet. That gives the
+        // non-solution fallback the SAME whole-tree admission the heal applies
+        // everywhere else — _codeybox_ensure_nuget_home_usable plus the
+        // _codeybox_secure_package_cache descendant scan — instead of the old
+        // config-readability-only check that let a foreign-owned or
+        // co-tenant-writable .nuget/packages tree keep being consumed through
+        // the pinned RestorePackagesPath.
+        RestorePackagesPathOut = DeclaredPackagesPath;
+        var report = TryGetHealReport(HealScript);
+        if (report != null)
+        {
+            ApplyHealReport(report);
+            return true;
+        }
+
+        // Report unavailable (no sh, script missing, timeout): degrade to the
+        // original readability-only redirect rather than leaving a known-bad
+        // home in place.
         var dotNetHome = Environment.GetEnvironmentVariable("DOTNET_CLI_HOME");
         var home = string.IsNullOrWhiteSpace(dotNetHome)
             ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
@@ -47,17 +78,138 @@
             Directory.CreateDirectory(RepositoryDotNetHome);
             Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", RepositoryDotNetHome);
         }
+
+        Dictionary<string, string> TryGetHealReport(string scriptPath)
+        {
+            if (string.IsNullOrEmpty(scriptPath) || !File.Exists(scriptPath))
+                return null;
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sh",
+                // The script path travels via the environment so no quoting of
+                // an MSBuild-derived path is needed inside the -c payload.
+                Arguments = "-c \"export CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 "
+                    + "CODEYBOX_NUGET_HEAL_REPORT=1; . \\\"$CODEYBOX_HEAL_GUARD_SCRIPT\\\"\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.EnvironmentVariables["CODEYBOX_HEAL_GUARD_SCRIPT"] = scriptPath;
+            try
+            {
+                using var proc = Process.Start(psi);
+                if (proc == null)
+                    return null;
+                var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+                var stderrTask = proc.StandardError.ReadToEndAsync();
+                // The heal is bounded (no quarantine under NO_QUARANTINE, so no
+                // lock waits), but never let a wedged shell hang the build.
+                if (!proc.WaitForExit(120000))
+                {
+                    try { proc.Kill(); } catch { }
+                    // Observe the pipe readers so no task is left unobserved;
+                    // grandchildren holding the pipes can delay EOF, so bound
+                    // the wait rather than block the build on it.
+                    try { stdoutTask.Wait(5000); stderrTask.Wait(5000); } catch { }
+                    return null;
+                }
+                var stdout = stdoutTask.GetAwaiter().GetResult();
+                _ = stderrTask.GetAwaiter().GetResult();
+                var map = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var rawLine in stdout.Split('\n'))
+                {
+                    var line = rawLine.TrimEnd('\r');
+                    if (!line.StartsWith("CODEYBOX_HEAL_", StringComparison.Ordinal))
+                        continue;
+                    var eq = line.IndexOf('=');
+                    if (eq > 0)
+                        map[line.Substring(0, eq)] = line.Substring(eq + 1);
+                }
+                return map.ContainsKey("CODEYBOX_HEAL_VERDICT") ? map : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        void ApplyHealReport(Dictionary<string, string> report)
+        {
+            var verdict = report.TryGetValue("CODEYBOX_HEAL_VERDICT", out var v) ? v : "";
+            var cliHome = report.TryGetValue("CODEYBOX_HEAL_DOTNET_CLI_HOME", out var ch) ? ch : "";
+            var home = report.TryGetValue("CODEYBOX_HEAL_HOME", out var h) ? h : "";
+            var packages = report.TryGetValue("CODEYBOX_HEAL_NUGET_PACKAGES", out var p) ? p : "";
+
+            if (verdict == "usable")
+            {
+                // The env-provided home verified in place — including its
+                // whole .nuget/packages tree — so the auto-pinned
+                // RestorePackagesPath already points at admitted storage.
+                // Re-export the canonical values the heal resolved (a
+                // symlinked env value must not be retargeted later).
+                if (cliHome.Length > 0)
+                    Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", cliHome);
+                if (home.Length > 0)
+                    Environment.SetEnvironmentVariable("HOME", home);
+                return;
+            }
+            if (verdict != "redirected" && verdict != "failed")
+                return;
+
+            // The original home (or its consumed cache) failed admission:
+            // mirror the heal's env decisions exactly — a reported-empty
+            // value means the heal unset the variable because nothing
+            // verified could replace it.
+            Environment.SetEnvironmentVariable(
+                "DOTNET_CLI_HOME", cliHome.Length > 0 ? cliHome : null);
+            Environment.SetEnvironmentVariable("HOME", home.Length > 0 ? home : null);
+
+            // Repoint the package cache at verified storage too: the
+            // Directory.Build.props auto-pin still names the REJECTED home's
+            // .nuget/packages, which NuGet would otherwise keep consuming.
+            // Prefer the whole-tree-verified reusable cache the heal
+            // reported, else the redirected home's own packages dir (fresh
+            // or the verified link the heal seeded). An operator-supplied
+            // RestorePackagesPath is never overridden — only the value this
+            // repo auto-pinned (Declared == Auto) may be repointed.
+            string packagesPath = null;
+            if (verdict == "redirected")
+            {
+                packagesPath = packages.Length > 0
+                    ? packages
+                    : cliHome.Length > 0 ? cliHome + "/.nuget/packages" : null;
+            }
+            else if (home.Length > 0)
+            {
+                packagesPath = home + "/.nuget/packages";
+            }
+            if (packagesPath != null && packagesPath.Length > 0
+                && !string.IsNullOrEmpty(DeclaredPackagesPath)
+                && string.Equals(
+                    DeclaredPackagesPath, AutoPackagesPath, StringComparison.Ordinal))
+            {
+                RestorePackagesPathOut = packagesPath;
+            }
+        }
       ]]></Code>
     </Task>
   </UsingTask>
 
   <!-- NuGet 7.6 creates its HTTP proxy cache from the user-wide config even
        when RestoreConfigFile names one specific repository config. Run as an
-       initial target so an unreadable config is redirected before NuGet
-       captures its environment-derived paths during restore graph creation. -->
+       initial target so an unusable home is redirected before NuGet
+       captures its environment-derived paths during restore graph creation.
+       Where sh and the heal script exist the task applies the script's own
+       whole-tree admission verdict; elsewhere it degrades to the original
+       config-readability redirect. -->
   <Target Name="_CodeyBoxEnsureReadableNuGetHome">
     <CodeyBoxEnsureReadableNuGetHome
-      RepositoryDotNetHome="$(_CodeyBoxRepositoryDotNetHome)" />
+      RepositoryDotNetHome="$(_CodeyBoxRepositoryDotNetHome)"
+      HealScript="$(_CodeyBoxNuGetHealScript)"
+      AutoPackagesPath="$(_CodeyBoxAutoRestorePackagesPath)"
+      DeclaredPackagesPath="$(RestorePackagesPath)">
+      <Output TaskParameter="RestorePackagesPathOut" PropertyName="RestorePackagesPath" />
+    </CodeyBoxEnsureReadableNuGetHome>
   </Target>
 
 </Project>

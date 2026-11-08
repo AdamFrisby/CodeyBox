@@ -26,8 +26,12 @@
     project-level import in `Directory.Build.props` runs it instead — but with
     `CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1`, because destructive repair from a
     per-project InitialTarget is forbidden: an unusable home there is handled
-    by the in-process `NuGetHomeGuard.targets` redirect (imported by
-    `Directory.Build.targets`), not by renaming directories once per project.
+    by the in-process `NuGetHomeGuard.targets` task (imported by
+    `Directory.Build.targets`), which dot-sources the same heal script with
+    `CODEYBOX_NUGET_HEAL_REPORT=1` and applies its verdict inside the MSBuild
+    process — redirecting DOTNET_CLI_HOME/HOME and repointing the auto-pinned
+    `RestorePackagesPath` at the same whole-tree-verified cache storage the
+    heal itself would use, not by renaming directories once per project.
 
     Either way a plain `dotnet build` / `dotnet test` / `dotnet build
     <solution>` heals itself with no wrapper script, environment override, or
@@ -71,7 +75,7 @@
          importance raised to high; without both, plain stderr (the script's
          only output channel) is silently dropped at normal verbosity. -->
     <Exec Condition=" '$(_CodeyBoxNuGetHealSolutionLevel)' == 'true' "
-          Command="sh -c '. &quot;$(CodeyBoxNuGetHomeHealScript)&quot; || true'"
+          Command="sh -c 'unset CODEYBOX_NUGET_HEAL_NO_QUARANTINE; . &quot;$(CodeyBoxNuGetHomeHealScript)&quot; || true'"
           StandardOutputImportance="low"
           StandardErrorImportance="high"
           IgnoreStandardErrorWarningFormat="true" />

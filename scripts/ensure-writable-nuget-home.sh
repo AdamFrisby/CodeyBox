@@ -35,7 +35,9 @@
 # honours by skipping the destructive quarantine — renaming .nuget aside is
 # reserved for the once-per-solution hook (Directory.NuGetHomeHeal.targets via
 # Directory.Solution.props); a non-solution build's unusable home is covered
-# by the in-process NuGetHomeGuard.targets redirect instead.
+# by the in-process NuGetHomeGuard.targets admission check instead, which
+# applies this script's own verdict and repoints DOTNET_CLI_HOME/HOME plus
+# the auto-pinned RestorePackagesPath at verified storage.
 set -u
 
 codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

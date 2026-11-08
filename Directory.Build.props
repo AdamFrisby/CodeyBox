@@ -57,7 +57,12 @@
     <_CodeyBoxOriginalDotNetHome Condition="'$(DOTNET_CLI_HOME)' != ''">$(DOTNET_CLI_HOME)</_CodeyBoxOriginalDotNetHome>
     <_CodeyBoxOriginalDotNetHome Condition="'$(_CodeyBoxOriginalDotNetHome)' == '' and '$(HOME)' != ''">$(HOME)</_CodeyBoxOriginalDotNetHome>
     <_CodeyBoxOriginalDotNetHome Condition="'$(_CodeyBoxOriginalDotNetHome)' == ''">$(USERPROFILE)</_CodeyBoxOriginalDotNetHome>
-    <RestorePackagesPath Condition="'$(RestorePackagesPath)' == '' and '$(_CodeyBoxOriginalDotNetHome)' != ''">$([System.IO.Path]::Combine('$(_CodeyBoxOriginalDotNetHome)', '.nuget', 'packages'))</RestorePackagesPath>
+    <!-- Recorded BEFORE RestorePackagesPath is pinned below so the in-process
+         NuGetHomeGuard task can tell "this value was auto-pinned by the repo"
+         apart from an operator-supplied RestorePackagesPath it must never
+         override. -->
+    <_CodeyBoxAutoRestorePackagesPath Condition="'$(RestorePackagesPath)' == '' and '$(_CodeyBoxOriginalDotNetHome)' != ''">$([System.IO.Path]::Combine('$(_CodeyBoxOriginalDotNetHome)', '.nuget', 'packages'))</_CodeyBoxAutoRestorePackagesPath>
+    <RestorePackagesPath Condition="'$(_CodeyBoxAutoRestorePackagesPath)' != ''">$(_CodeyBoxAutoRestorePackagesPath)</RestorePackagesPath>
   </PropertyGroup>
 
   <!-- Release identity. Declared once here so assembly metadata, the admin UI's
