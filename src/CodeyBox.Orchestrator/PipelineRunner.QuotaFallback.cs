@@ -286,16 +286,12 @@ public sealed partial class PipelineRunner
             // surfaced as generic stderr auth text must not become an auth exclusion.
             // Yield to the quota converter below when stdout result events or the CLI
             // log carry exhaustion.
-            if (_quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout) is
-                { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } rq
-                && rq.Detection.Kind.IsExhaustionSignal())
+            if (TryGetExhaustionClassification(_quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout)) is not null)
             {
                 return null;
             }
             if (!string.IsNullOrWhiteSpace(last.TerminalDiagnostic)
-                && _quotaClassifier.Classify(runner.Kind, last.TerminalDiagnostic, null) is
-                { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } rt
-                && rt.Detection.Kind.IsExhaustionSignal())
+                && TryGetExhaustionClassification(_quotaClassifier.Classify(runner.Kind, last.TerminalDiagnostic, null)) is not null)
             {
                 return null;
             }

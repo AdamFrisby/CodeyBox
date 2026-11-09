@@ -216,6 +216,18 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
             var inStderr = !string.IsNullOrEmpty(stderr) && stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase);
             var inStream = streamMessages.Any(m => m.Contains(pattern, StringComparison.OrdinalIgnoreCase));
 
+            // "code 429" is an 8-char substring that appears in ordinary prose
+            // (e.g. discussing HTTP 429 handling), so it only counts alongside an
+            // exhaustion anchor in the same surface. The host-side shape always
+            // carries one ("RESOURCE_EXHAUSTED (code 429): Individual quota
+            // reached"), while a bare code mention does not.
+            if (string.Equals(pattern, "code 429", StringComparison.OrdinalIgnoreCase))
+            {
+                inStderr = inStderr && ContainsExhaustionAnchor(stderr);
+                inStream = streamMessages.Any(m =>
+                    m.Contains(pattern, StringComparison.OrdinalIgnoreCase) && ContainsExhaustionAnchor(m));
+            }
+
             if (!inStderr && !inStream) continue;
 
             var resetSources = new List<string?>(streamMessages.Count + 1);
@@ -310,6 +322,27 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
     {
         try { return DateTimeOffset.FromUnixTimeSeconds(unix); }
         catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    private static readonly string[] Code429ExhaustionAnchors =
+    [
+        "resource_exhausted",
+        "quota",
+        "exhausted",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    ];
+
+    private static bool ContainsExhaustionAnchor(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var anchor in Code429ExhaustionAnchors)
+        {
+            if (text.Contains(anchor, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     internal static DateTimeOffset? TryParseAbsoluteReset(string? text)

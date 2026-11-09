@@ -102,19 +102,23 @@ public sealed partial class PipelineRunner
         // When the quota evidence is on the captured streams, return without throwing so
         // the caller's normal quota path (checkpoint/refund/record/park) runs intact.
         // Terminal-diagnostic-only evidence is invisible to that path, so throw here.
+        //
+        // Trust note: the composite scopes stdout to provider JSON error envelopes
+        // and marks stderr matches as provider-surface; stdout-only evidence keeps
+        // ProviderSurfaceMatch=false so the quota path parks it untrusted (probe
+        // corroborated) instead of benching the fleet. Either way exhaustion — never
+        // an Unauthorized shape — is required before auth handling is skipped.
         var quotaBeforeAuth = _quotaClassifier.Classify(runner.Kind, result.Stderr, result.Stdout);
-        if (quotaBeforeAuth is { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } qba
-            && qba.Detection.Kind.IsExhaustionSignal())
+        if (TryGetExhaustionClassification(quotaBeforeAuth) is not null)
         {
             return;
         }
         if (!string.IsNullOrWhiteSpace(result.TerminalDiagnostic))
         {
             var terminalQuota = _quotaClassifier.Classify(runner.Kind, result.TerminalDiagnostic, null);
-            if (terminalQuota is { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } tq
-                && tq.Detection.Kind.IsExhaustionSignal())
+            if (TryGetExhaustionClassification(terminalQuota) is { } terminalExhaustion)
             {
-                await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, terminalQuota, ct).ConfigureAwait(false);
+                await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, terminalExhaustion, ct).ConfigureAwait(false);
             }
         }
 
@@ -175,6 +179,18 @@ public sealed partial class PipelineRunner
             detection.ResetAt,
             providerSurfaceMatch: quotaClassification.ProviderSurfaceMatch);
     }
+
+    /// <summary>
+    /// Single-sourced quota-before-auth guard: returns the classification only when
+    /// it carries an exhaustion signal (rate-limit/lockout with a reset semantic),
+    /// never for Unauthorized shapes. Every quota-beats-auth site calls this so a
+    /// future exhaustion kind cannot silently fork the runner paths.
+    /// </summary>
+    private static QuotaFailureClassification? TryGetExhaustionClassification(QuotaFailureClassification classification)
+        => classification is { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } quota
+            && quota.Detection.Kind.IsExhaustionSignal()
+            ? quota
+            : null;
 
     /// <summary>
     /// True when the only auth evidence for an Antigravity run is the weak sandbox phrase

@@ -99,6 +99,14 @@ public static class AgentFailureClassifier
     /// resume provider-confirmed rate-limit blips that have no parsed reset
     /// window, while reset-window-bearing failures follow the normal
     /// quota defer/fallback path.
+    ///
+    /// <para>Trust split: the bare numeric shapes below ("code 429" et al) are
+    /// matched as raw substrings on stderr only — stderr is the CLI's own
+    /// surface. Stdout can carry model-relayed prose where an 8-char substring
+    /// like "code 429" appears innocently (e.g. discussing HTTP 429 handling),
+    /// so stdout quota evidence must arrive as a provider JSON error envelope
+    /// and bare numerics there additionally require an exhaustion anchor in the
+    /// same envelope line (see the structured-stdout matcher).</para>
     /// </summary>
     public static readonly IReadOnlyList<string> SoftRateLimitPatterns = new[]
     {
@@ -356,13 +364,13 @@ public static class AgentFailureClassifier
 
         var noCapturedOutput = string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout);
 
-        if (ContainsAny(stderr, HardQuotaPatterns) || ContainsAny(stdout, HardQuotaPatterns))
+        if (ContainsAny(stderr, HardQuotaPatterns) || ContainsHardQuotaInStructuredStdout(stdout))
             return new AgentFailureClassification(
                 AgentFailureKind.QuotaExhausted,
                 Reason: HardQuotaReason,
                 QuotaFailure: AgentQuotaFailureKind.HardQuota);
 
-        if (ContainsAny(stderr, SoftRateLimitPatterns) || ContainsAny(stdout, SoftRateLimitPatterns))
+        if (ContainsAny(stderr, SoftRateLimitPatterns) || ContainsSoftQuotaInStructuredStdout(stdout))
             return new AgentFailureClassification(
                 AgentFailureKind.QuotaExhausted,
                 Reason: SoftRateLimitReason,
@@ -599,6 +607,135 @@ public static class AgentFailureClassifier
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Bare numeric rate shapes: short substrings that occur in ordinary prose
+    /// (e.g. a model response discussing HTTP 429 handling mentions "code 429"),
+    /// so they are only ever matched on stderr or inside a provider error
+    /// envelope that also carries an exhaustion anchor — never in raw stdout.
+    /// </summary>
+    private static readonly IReadOnlyList<string> BareNumericRateLimitPatterns = new[]
+    {
+        "HTTP 429",
+        "status 429",
+        "code 429",
+        "API Error: 429",
+        "HTTP 529",
+        "status 529",
+    };
+
+    /// <summary>
+    /// Exhaustion anchors that must accompany a bare numeric shape inside a
+    /// stdout error envelope before it counts as quota evidence. The host-side
+    /// agy shape always carries one ("RESOURCE_EXHAUSTED (code 429): Individual
+    /// quota reached"), while prose mentioning a bare code does not.
+    /// </summary>
+    private static readonly IReadOnlyList<string> StdoutQuotaExhaustionAnchors = new[]
+    {
+        "quota",
+        "exhausted",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    };
+
+    private static bool ContainsHardQuotaInStructuredStdout(string? stdout)
+        => ContainsQuotaInStructuredStdout(stdout, HardQuotaPatterns, anchorBareNumerics: false);
+
+    private static bool ContainsSoftQuotaInStructuredStdout(string? stdout)
+        => ContainsQuotaInStructuredStdout(stdout, SoftRateLimitPatterns, anchorBareNumerics: true);
+
+    /// <summary>
+    /// Scoped stdout quota matcher. Both captured streams can carry model-relayed
+    /// prose, so a raw stdout substring must not force a quota verdict ahead of
+    /// auth: stdout only counts inside provider JSON error envelopes
+    /// (<c>{"type":"error",...}</c> or <c>{"type":"result","status":"error",...}</c>),
+    /// mirroring the per-detector <c>ScopeStdoutForQuotaDetection</c> seam. Bare
+    /// numeric shapes additionally require an exhaustion anchor in the same
+    /// envelope line. Stderr stays a raw substring match: it is the CLI's own
+    /// surface. Never throws.
+    /// </summary>
+    private static bool ContainsQuotaInStructuredStdout(
+        string? stdout,
+        IReadOnlyList<string> patterns,
+        bool anchorBareNumerics)
+    {
+        if (string.IsNullOrWhiteSpace(stdout)) return false;
+        using var reader = new StringReader(stdout);
+        string? rawLine;
+        while ((rawLine = reader.ReadLine()) is not null)
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.Length > MaxStructuredOutputLineChars || line[0] != '{')
+                continue;
+            if (!IsProviderErrorEnvelope(line))
+                continue;
+            for (var i = 0; i < patterns.Count; i++)
+            {
+                var pattern = patterns[i];
+                if (!line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (anchorBareNumerics
+                    && IsBareNumericRateLimitPattern(pattern)
+                    && !ContainsAny(line, StdoutQuotaExhaustionAnchors))
+                    continue;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsBareNumericRateLimitPattern(string pattern)
+    {
+        for (var i = 0; i < BareNumericRateLimitPatterns.Count; i++)
+        {
+            if (string.Equals(pattern, BareNumericRateLimitPatterns[i], StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool IsProviderErrorEnvelope(string line)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+            if (!root.TryGetProperty("type", out var type) || type.ValueKind != JsonValueKind.String)
+                return false;
+            if (string.Equals(type.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.Equals(type.GetString(), "result", StringComparison.OrdinalIgnoreCase))
+                return false;
+            if (root.TryGetProperty("status", out var status)
+                && string.Equals(status.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (root.TryGetProperty("is_error", out var isError) && isError.ValueKind == JsonValueKind.True)
+                return true;
+            if (root.TryGetProperty("error", out _))
+                return true;
+            if (root.TryGetProperty("result", out var result) && result.ValueKind == JsonValueKind.Object)
+            {
+                if (result.TryGetProperty("status", out var resultStatus)
+                    && string.Equals(resultStatus.GetString(), "error", StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (result.TryGetProperty("is_error", out var resultIsError) && resultIsError.ValueKind == JsonValueKind.True)
+                    return true;
+                if (result.TryGetProperty("error", out _))
+                    return true;
+            }
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
     }
 
     private static bool ContainsTurnFailedTransientNetwork(string? output)

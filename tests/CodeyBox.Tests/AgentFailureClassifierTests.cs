@@ -52,6 +52,40 @@ public sealed class AgentFailureClassifierTests
     }
 
     [Fact]
+    public void Classify_BareCode429InStdoutProse_DoesNotSuppressAuth()
+    {
+        // Model-relayed prose mentioning "code 429" (e.g. discussing HTTP 429
+        // handling) must not force a quota verdict ahead of a genuine stderr
+        // auth signal.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "API Error: 401 Unauthorized",
+            stdout: "To handle HTTP 429, retry on code 429 after backoff.");
+        Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+    }
+
+    [Fact]
+    public void Classify_BareCode429InForgedEnvelopeWithoutAnchor_IsNotQuota()
+    {
+        // Even a shaped envelope carrying only a bare code — with no exhaustion
+        // anchor in the same line — is not quota evidence.
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: """{"type":"result","status":"error","error":"discussing code 429 handling"}""");
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    [Fact]
+    public void Classify_QuotaEnvelopeInStdout_WithStderrAuthError_StaysQuota()
+    {
+        // A provider-shaped envelope still wins over stderr auth text: the
+        // envelope is the provider surface, prose is not.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "API Error: 401 Unauthorized",
+            stdout: """{"type":"result","status":"error","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h."}""");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
     public void WeakAgyAuthAlone_IsWeakOnly_RequiresProbeBeforeExclusion()
     {
         var result = new AgentResult(false, "agent exited 3", Stdout: null, Stderr: "error: authentication failed or timed out");

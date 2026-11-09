@@ -383,12 +383,23 @@ public sealed class AntigravityQuotaFailureDetectorTests
     }
 
     [Fact]
-    public void Detect_Code429Alone_ClassifiesRateLimit()
+    public void Detect_Code429WithExhaustionAnchor_ClassifiesRateLimit()
+    {
+        // "code 429" only counts alongside an exhaustion anchor in the same surface,
+        // so prose discussing a bare code cannot force a quota verdict.
+        var detection = new AntigravityQuotaFailureDetector().Detect(
+            stderr: "agy failed (code 429): quota reset soon", stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void Detect_BareCode429WithoutExhaustionAnchor_IsNotQuota()
     {
         var detection = new AntigravityQuotaFailureDetector().Detect(
             stderr: "agy failed (code 429): try again later", stdout: null);
 
-        Assert.NotNull(detection);
-        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.Null(detection);
     }
 }
