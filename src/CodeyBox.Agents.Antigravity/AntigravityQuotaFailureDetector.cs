@@ -127,9 +127,66 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
 
     private static bool LineContainsQuotaOrAuthMarker(string line)
     {
-        foreach (var (pattern, _) in Patterns)
+        foreach (var (pattern, kind) in Patterns)
         {
-            if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            if (!line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // The glog interleaves verbatim model/tool output with provider
+            // errors, so a bare marker match here is forgeable: a tool-output
+            // line echoing 'individual quota reached' or 'code 429' would be
+            // lifted into the classifier-facing Stderr as trusted quota and
+            // suppress the auth gate. Bare numerics only count with a same-line
+            // exhaustion anchor (mirroring Detect), and quota phrases only count
+            // with provider error framing on the same line; Unauthorized shapes
+            // keep the raw match (already framed as 'API Error').
+            if (string.Equals(pattern, "code 429", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ContainsExhaustionAnchor(line))
+                    return true;
+                continue;
+            }
+
+            if (kind is QuotaFailureKind.RateLimitExceeded or QuotaFailureKind.LimitReached
+                && !ContainsProviderErrorFraming(line))
+                continue;
+
+            return true;
+        }
+        return false;
+    }
+
+    // Provider-emission framing for glog marker lines: error/status indicators a
+    // provider-emitted rejection carries and a bare tool-output echo lacks.
+    // Deliberately excludes the generic quota words themselves ('quota',
+    // 'reached', 'limit', 'exceeded') so a bare echo of 'individual quota
+    // reached' does not qualify; real agy terminal lines carry one of these
+    // (RESOURCE_EXHAUSTED, Error:, 429, Resets in, locked/lockout, ...).
+    private static readonly string[] GlogProviderErrorFramingTokens =
+    [
+        "error",
+        "failed",
+        "failure",
+        "exception",
+        "resource_exhausted",
+        "resourceexhausted",
+        "has been exhausted",
+        "429",
+        "529",
+        "401",
+        "403",
+        "resets in",
+        "reset at",
+        "retry",
+        "locked",
+        "lockout",
+    ];
+
+    private static bool ContainsProviderErrorFraming(string line)
+    {
+        foreach (var token in GlogProviderErrorFramingTokens)
+        {
+            if (line.Contains(token, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
         return false;

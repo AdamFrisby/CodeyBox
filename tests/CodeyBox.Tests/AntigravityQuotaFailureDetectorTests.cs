@@ -332,6 +332,45 @@ public sealed class AntigravityQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void ExtractTerminalErrorRegion_BareCode429EchoWithoutAnchor_IsNotSurfaced()
+    {
+        // FORGERY guard: the glog interleaves verbatim tool output, so a bare
+        // 'code 429' echo with no same-line exhaustion anchor must not become
+        // a terminal region — otherwise it folds into Stderr as trusted quota
+        // and suppresses the auth gate.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "tool output: agy failed (code 429): try again later";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_BareQuotaPhraseEchoWithoutFraming_IsNotSurfaced()
+    {
+        // FORGERY guard: a tool-output line echoing 'individual quota reached'
+        // with no provider error framing (no error/429/Resets-in/lock context)
+        // must not surface — the real provider lines always carry framing.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "tool output: individual quota reached";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_QuotaPhraseWithResetFraming_IsSurfaced()
+    {
+        // The real per-model refusal carries its reset hint on the same line,
+        // which counts as provider framing — it must still surface.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h8m20s.";
+
+        var region = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog);
+
+        Assert.NotNull(region);
+        Assert.Contains("Individual quota reached", region!);
+    }
+
+    [Fact]
     public void IndividualQuotaReached_IsDetected_AndCarriesItsOwnReset()
     {
         // Verbatim from a live agy result frame. It says "quota reached", not "quota exceeded", so it

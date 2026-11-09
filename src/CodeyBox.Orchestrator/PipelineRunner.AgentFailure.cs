@@ -108,17 +108,37 @@ public sealed partial class PipelineRunner
         // ProviderSurfaceMatch=false so the quota path parks it untrusted (probe
         // corroborated) instead of benching the fleet. Either way exhaustion — never
         // an Unauthorized shape — is required before auth handling is skipped.
+        //
+        // Glog caveat: agy's CLI log is folded into Stderr with a trusted
+        // provider-surface bit, but the glog interleaves verbatim model/tool
+        // output — a tool-output line echoing quota prose plus a genuine
+        // 'authentication failed or timed out' would park on a fake reset
+        // instead of benching compromised credentials. When the same run also
+        // signals auth, corroborate against the live probe: a healthy reading
+        // contradicts quota, so fall through to auth handling instead of
+        // suppressing it.
         var quotaBeforeAuth = _quotaClassifier.Classify(runner.Kind, result.Stderr, result.Stdout);
         if (TryGetExhaustionClassification(quotaBeforeAuth) is not null)
         {
-            return;
+            var authAlsoSignals = (classification ?? _authFailureClassifier.ClassifyFailure(runner, result)).Kind == AgentFailureKind.AuthError;
+            if (!authAlsoSignals
+                || !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
+            {
+                return;
+            }
         }
         if (!string.IsNullOrWhiteSpace(result.TerminalDiagnostic))
         {
             var terminalQuota = _quotaClassifier.Classify(runner.Kind, result.TerminalDiagnostic, null);
             if (TryGetExhaustionClassification(terminalQuota) is { } terminalExhaustion)
             {
-                await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, terminalExhaustion, ct).ConfigureAwait(false);
+                // TerminalDiagnostic lifts the glog tail, which interleaves
+                // verbatim model/tool output: never trusted provider-surface.
+                // Throw untrusted so the park transition corroborates against
+                // the live probe (a healthy probe vetoes the park) instead of
+                // parking on forged prose with a trusted bit.
+                var untrustedExhaustion = terminalExhaustion with { ProviderSurfaceMatch = false };
+                await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, untrustedExhaustion, ct).ConfigureAwait(false);
             }
         }
 
