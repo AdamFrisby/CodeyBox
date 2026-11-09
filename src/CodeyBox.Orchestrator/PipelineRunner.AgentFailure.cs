@@ -103,28 +103,44 @@ public sealed partial class PipelineRunner
         // the caller's normal quota path (checkpoint/refund/record/park) runs intact.
         // Terminal-diagnostic-only evidence is invisible to that path, so throw here.
         //
-        // Trust note: the composite scopes stdout to provider JSON error envelopes
-        // and marks stderr matches as provider-surface; stdout-only evidence keeps
-        // ProviderSurfaceMatch=false so the quota path parks it untrusted (probe
-        // corroborated) instead of benching the fleet. Either way exhaustion — never
-        // an Unauthorized shape — is required before auth handling is skipped.
+        // Trust note: the composite scopes stdout to provider JSON error envelopes.
+        // Antigravity stderr is NEVER trusted provider-surface (its CLI-log
+        // terminal region folds glog bytes that interleave verbatim model/tool
+        // output into classifier-facing Stderr), so agy quota evidence always
+        // carries ProviderSurfaceMatch=false and the quota path parks it
+        // probe-corroborated (a healthy probe vetoes the park) instead of
+        // benching the fleet. Either way exhaustion — never an Unauthorized
+        // shape — is required before auth handling is skipped.
         //
-        // Glog caveat: agy's CLI log is folded into Stderr with a trusted
-        // provider-surface bit, but the glog interleaves verbatim model/tool
-        // output — a tool-output line echoing quota prose plus a genuine
-        // 'authentication failed or timed out' would park on a fake reset
-        // instead of benching compromised credentials. When the same run also
-        // signals auth, corroborate against the live probe: a healthy reading
+        // Forgery caveat: a tool-output line echoing quota prose plus a genuine
+        // 'authentication failed or timed out' would otherwise park on a fake
+        // reset instead of benching compromised credentials. Untrusted quota
+        // evidence is therefore corroborated against the live probe in ALL
+        // legs — even without a concurrent auth signal — and trusted evidence
+        // is corroborated whenever auth also signals: a healthy reading
         // contradicts quota, so fall through to auth handling instead of
         // suppressing it.
         var quotaBeforeAuth = _quotaClassifier.Classify(runner.Kind, result.Stderr, result.Stdout);
-        if (TryGetExhaustionClassification(quotaBeforeAuth) is not null)
+        if (TryGetExhaustionClassification(quotaBeforeAuth) is { } streamExhaustion)
         {
-            var authAlsoSignals = (classification ?? _authFailureClassifier.ClassifyFailure(runner, result)).Kind == AgentFailureKind.AuthError;
-            if (!authAlsoSignals
-                || !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
+            if (!streamExhaustion.ProviderSurfaceMatch)
             {
-                return;
+                // Untrusted (stdout-only, or any Antigravity stderr): a healthy
+                // probe contradicts forged prose, so only take the quota path
+                // when the probe does not report healthy quota.
+                if (!await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                var authAlsoSignals = (classification ?? _authFailureClassifier.ClassifyFailure(runner, result)).Kind == AgentFailureKind.AuthError;
+                if (!authAlsoSignals
+                    || !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
+                {
+                    return;
+                }
             }
         }
         if (!string.IsNullOrWhiteSpace(result.TerminalDiagnostic))

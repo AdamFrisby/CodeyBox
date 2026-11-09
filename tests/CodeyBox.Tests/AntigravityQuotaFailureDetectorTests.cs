@@ -441,4 +441,37 @@ public sealed class AntigravityQuotaFailureDetectorTests
 
         Assert.Null(detection);
     }
+
+    [Fact]
+    public void Detect_BareIndividualQuotaReachedWithoutAnchor_IsNotQuota()
+    {
+        // FORGERY guard: the per-model phrase only counts with a strong
+        // provider anchor on the same surface. A bare echo with no reset/429/
+        // RESOURCE_EXHAUSTED/lockout context is model-relayed prose.
+        Assert.Null(new AntigravityQuotaFailureDetector().Detect(
+            stderr: "tool output: individual quota reached", stdout: null));
+    }
+
+    [Fact]
+    public void Detect_IndividualQuotaReachedWithResetAnchor_IsQuota()
+    {
+        var detection = new AntigravityQuotaFailureDetector().Detect(
+            stderr: "Individual quota reached. Please upgrade your subscription. Resets in 1h8m20s.",
+            stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_QuotaEchoWithOnlyGenericErrorFraming_IsNotSurfaced()
+    {
+        // Generic prose words ('error') are NOT provider framing: a forged
+        // tool-output line must carry a strong token (429, Resets in,
+        // RESOURCE_EXHAUSTED, lockout, ...) to surface.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "tool output: individual quota reached error";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
+    }
 }

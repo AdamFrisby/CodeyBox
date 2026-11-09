@@ -364,7 +364,7 @@ public static class AgentFailureClassifier
 
         var noCapturedOutput = string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout);
 
-        if (ContainsAny(stderr, HardQuotaPatterns) || ContainsHardQuotaInStructuredStdout(stdout))
+        if (ContainsHardQuotaInStderr(stderr) || ContainsHardQuotaInStructuredStdout(stdout))
             return new AgentFailureClassification(
                 AgentFailureKind.QuotaExhausted,
                 Reason: HardQuotaReason,
@@ -605,6 +605,48 @@ public static class AgentFailureClassifier
         {
             if (haystack.Contains(needles[i], StringComparison.OrdinalIgnoreCase))
                 return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Strong provider-rejection anchors for the forgeable "individual quota
+    /// reached" per-model phrase: the real refusal always carries one on the
+    /// same stderr line (usually "Resets in &lt;duration&gt;" plus
+    /// RESOURCE_EXHAUSTED / code 429). The word "quota" itself is not an
+    /// anchor — the phrase already contains it. A bare echo without an anchor
+    /// is model-relayed prose, not a provider rejection.
+    /// </summary>
+    private static readonly IReadOnlyList<string> IndividualQuotaStderrAnchors = new[]
+    {
+        "resource_exhausted",
+        "resourceexhausted",
+        "has been exhausted",
+        "429",
+        "529",
+        "resets in",
+        "reset at",
+        "locked",
+        "lockout",
+    };
+
+    private static bool ContainsHardQuotaInStderr(string? stderr)
+    {
+        if (string.IsNullOrEmpty(stderr)) return false;
+        foreach (var rawLine in stderr.Split('\n'))
+        {
+            var line = rawLine;
+            if (line.Length == 0) continue;
+            for (var i = 0; i < HardQuotaPatterns.Count; i++)
+            {
+                var pattern = HardQuotaPatterns[i];
+                if (!line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (string.Equals(pattern, "individual quota reached", StringComparison.OrdinalIgnoreCase)
+                    && !ContainsAny(line, IndividualQuotaStderrAnchors))
+                    continue;
+                return true;
+            }
         }
         return false;
     }

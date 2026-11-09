@@ -35,16 +35,24 @@ public sealed class CompositeQuotaFailureClassifier : IQuotaFailureClassifier, I
         if (detection is null)
             return QuotaFailureClassification.None;
 
-        // Evidence-trust split: a marker on process stderr is provider-emitted
-        // (the agent cannot plant it in its own prose), so it keeps the legacy
-        // quota path unconditionally. A stdout/stream-only match is
-        // agent-quotable — the agent may be discussing, committing, or forging
-        // provider errors — so callers must corroborate it against the live
-        // quota probe before parking. Re-running Detect on stderr alone (rather
-        // than threading match sources through every detector) keeps this in
-        // one place; the primary detection above is unchanged.
-        var providerSurfaceMatch = !string.IsNullOrEmpty(stderr)
+        // Evidence-trust split: process stderr is the CLI's own surface, but for
+        // Antigravity it ALSO carries the CLI-log terminal region folded in by
+        // AntigravityAgentRunner (the glog interleaves verbatim model/tool
+        // output, so a tool-output line echoing quota prose plus a genuine
+        // auth signal would otherwise park on a fake reset instead of benching
+        // compromised credentials). Because classifier-facing Stderr cannot
+        // distinguish process bytes from folded glog bytes, Antigravity stderr
+        // matches are NEVER trusted provider-surface: callers must corroborate
+        // them against the live quota probe before parking (a healthy probe
+        // vetoes the park) and before quota suppresses auth. Other agents keep
+        // the legacy trusted-stderr path. A stdout/stream-only match is
+        // agent-quotable for every agent, so it is always untrusted.
+        // Re-running Detect on stderr alone (rather than threading match
+        // sources through every detector) keeps this in one place; the primary
+        // detection above is unchanged.
+        var stderrMatch = !string.IsNullOrEmpty(stderr)
             && detector.Detect(stderr, null) is not null;
+        var providerSurfaceMatch = stderrMatch && agent != AgentKind.Antigravity;
         return QuotaFailureClassification.Quota(detection, providerSurfaceMatch);
     }
 

@@ -133,6 +133,21 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
+    [Fact]
+    public void Classify_BareIndividualQuotaReachedWithoutAnchor_IsNotQuota()
+    {
+        // FORGERY guard: the per-model phrase needs a strong same-line anchor
+        // (Resets in / 429 / RESOURCE_EXHAUSTED / lockout). A bare echo is
+        // model-relayed prose, not a provider rejection, and must not win over
+        // a genuine auth signal.
+        var bare = AgentFailureClassifier.Classify(stderr: "tool output: individual quota reached");
+        Assert.Equal(AgentFailureKind.Normal, bare.Kind);
+
+        var anchored = AgentFailureClassifier.Classify(
+            stderr: "Individual quota reached. Please upgrade your subscription. Resets in 1h8m20s.");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, anchored.Kind);
+    }
+
     /// <summary>
     /// A CLI that does not know the requested model (stale baked CLI after a
     /// model upgrade) must classify as configuration/infrastructure — never as
@@ -140,8 +155,7 @@ public sealed class AgentFailureClassifierTests
     /// fallback chains would burn budget on.
     /// </summary>
     [Theory]
-    [InlineData("Error: unknown model 'gemini-4-argon-high'")]
-    [InlineData("unsupported model: gemini-4-argon-high")]
+    [InlineData("Error: unknown model 'gemini-4-argon-high'")]    [InlineData("unsupported model: gemini-4-argon-high")]
     [InlineData("Invalid model 'gemini-4-argon-high' for this CLI version")]
     [InlineData("model 'gemini-4-argon-high' not found in the model list")]
     [InlineData("E1108 printmode.go:123] unknown --model flag value 'gemini-4-argon-high'")]
