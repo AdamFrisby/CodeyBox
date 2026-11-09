@@ -128,3 +128,15 @@ e2c518740ebb8f971cbdb3415ff4b83acd7b5115:tests/CodeyBox.Tests/MajordomoProposalQ
 3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2034
 3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2038
 3f4046f6022121a2eb9a1f2d0be68647af5dadd2:tests/CodeyBox.Tests/IncusBaselineProvisioningTests.cs:curl-auth-user:2118
+# Synthetic github-pat redaction fixtures (tests/CodeyBox.Tests/AntigravityFailureReportingTests.cs,
+# tests/CodeyBox.Tests/TerminalQuotaErrorRedactionTests.cs): alternating-case alphabet plus
+# sequential-digit placeholder, obviously invented and never issued, used only to exercise
+# the secret-redaction unit tests. The source now assembles the fixture at runtime
+# (string.Concat split) so no scanner-detectable github-pat literal remains; these entries
+# cover the pre-fix commits only.
+d4f51121eb04aa0e5eb28844730d1b81bb081cde:tests/CodeyBox.Tests/AntigravityFailureReportingTests.cs:github-pat:215
+d4f51121eb04aa0e5eb28844730d1b81bb081cde:tests/CodeyBox.Tests/AntigravityFailureReportingTests.cs:github-pat:223
+b406b23cce2b927efed02d9963781b8046616662:tests/CodeyBox.Tests/TerminalQuotaErrorRedactionTests.cs:github-pat:17
+b406b23cce2b927efed02d9963781b8046616662:tests/CodeyBox.Tests/TerminalQuotaErrorRedactionTests.cs:github-pat:24
+b406b23cce2b927efed02d9963781b8046616662:tests/CodeyBox.Tests/TerminalQuotaErrorRedactionTests.cs:github-pat:80
+b406b23cce2b927efed02d9963781b8046616662:tests/CodeyBox.Tests/TerminalQuotaErrorRedactionTests.cs:github-pat:105
