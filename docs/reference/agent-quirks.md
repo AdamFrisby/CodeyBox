@@ -42,6 +42,29 @@ thing that selects the wire model in `-p` mode. `COPILOT_MODEL`, `COPILOT_PROVID
 `COPILOT_PROVIDER_WIRE_MODEL` do **not** change it — captured at an instrumented endpoint, all three
 left the wire model at Copilot's session default.
 
+**Structured mode (`--output-format json`).** The CLI speaks NDJSON stream events
+(`session.*`, `assistant.*`, `model.*`, `user.message`, trailing `result`) carrying the stop/finish
+reason the plaintext footer never had: `result.sessionId` (the resumable native session id),
+`result.exitCode`, `result.usage.codeChanges`, and the concluding `assistant.message` content.
+Verified on **v1.0.106** with a fake local chat-completions endpoint. CodeyBox runs every work turn
+in this mode (forced whenever the CLI's `--help` advertises `--output-format` + `json`; older CLIs
+fall back to plaintext with a stderr warning), so the harness always receives the stop/finish
+reason, crash recovery works via `copilot --resume <uuid>`, and the stream summary attributes
+Copilot events instead of reporting `unknown`. Plaintext-only consumers (plan-artifact,
+check-and-act verdict parsers) see the concatenated `assistant.message` contents through the
+runner's visible-text projection.
+
+**Empty-finish continuation.** A clean-exit turn with no final `assistant.message` and zero
+`codeChanges` died mid-investigation (exploratory tool calls, no concluding message) — it is not a
+verification. While the hot-reloadable `CodeyBox:Copilot:NoFinalResponseMaxContinuations` bound lasts
+(default 2, 0 disables, clamped to 32), the runner re-prompts the SAME native session with a
+"continue and finish" instruction. A spent bound (or a turn with no capturable session id) fails the
+run with `EndedWithoutFinalResponse` set, which the pipeline classifies as the distinct
+`ended-without-final-response` failure kind rather than quota, transient, or "produced no changes".
+Session ids are accepted only from end-anchored CLI positions (the trailing `result` event or the
+trailing `Resume` footer line) and must parse as UUIDs, so a model-printed fake resume hint cannot
+redirect a continuation.
+
 **No stdin prompt mode.** The prompt is an argv element (`-p <text>`); both `-p -` and a bare
 invocation ignore stdin. Unlike the agy/codex/gemini runners this one cannot dodge the 128 KiB
 `MAX_ARG_STRLEN`, so a very large rework prompt can still surface as exit 126.

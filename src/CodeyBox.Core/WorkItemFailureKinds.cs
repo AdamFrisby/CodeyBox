@@ -54,6 +54,19 @@ public static class WorkItemFailureKinds
     public const string OutputLimitExhausted = "output-limit-exhausted";
 
     /// <summary>
+    /// A runner exhausted its bounded same-session continuations after a
+    /// clean-exit turn ended with no final assistant message and no recorded
+    /// edits (or no continuation was possible because no native session id
+    /// was captured). The turn died mid-investigation — exploratory tool
+    /// calls with no concluding message — not declining to work, so this is
+    /// terminally distinct from an empty diff: downstream classifiers must
+    /// never misreport it as a generic "produced no changes" failure. Not
+    /// infra-shaped: the pipeline and the agent are healthy; a retry may
+    /// succeed where the dead turn did not.
+    /// </summary>
+    public const string EndedWithoutFinalResponse = "ended-without-final-response";
+
+    /// <summary>
     /// Upstream push blocked by the owned-branch lease guard: either a third
     /// party pushed to the CodeyBox-owned work branch (lease mismatch) or the
     /// remote diverged from an unrecorded prior push. Retrying the same input

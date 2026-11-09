@@ -235,6 +235,32 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             $"{Kind} declares CLI session resume but does not implement {nameof(BuildSessionResumeInvocation)}.");
 
     /// <summary>
+    /// Maximum bounded same-session continuations sent after a SUCCESSFUL
+    /// turn that ended with no final message and no recorded edits (the
+    /// <see cref="IsEmptySuccessRequiringContinuation"/> signature). Zero
+    /// disables the continuation. Runners source this from a hot-reloadable
+    /// option, clamped like the output-token continuation bounds.
+    /// </summary>
+    protected virtual int EmptySuccessMaxContinuations => 0;
+
+    /// <summary>
+    /// True when a successful turn's captured stdout proves the dead-turn
+    /// signature: the CLI exited 0 but produced no final assistant message
+    /// and recorded no edits (e.g. Copilot exploratory tool calls with no
+    /// concluding <c>assistant.message</c>). Must be a pure, fail-safe read:
+    /// unknown shapes return false so healthy turns are never continued.
+    /// </summary>
+    protected virtual bool IsEmptySuccessRequiringContinuation(AgentResult result) => false;
+
+    /// <summary>
+    /// Builds the "continue and finish" instruction sent into the SAME native
+    /// session after <see cref="IsEmptySuccessRequiringContinuation"/>
+    /// matched. Only called when a continuation is actually dispatched.
+    /// </summary>
+    protected virtual string BuildEmptySuccessContinuationPrompt(AgentResult result)
+        => "Your previous turn ended without a final message. Continue and finish the assigned task in this session, then reply with a concise summary of what you changed.";
+
+    /// <summary>
     /// Gives subclasses a chance to prepare agent-specific, non-credential
     /// prerequisites immediately before credential staging and CLI invocation.
     /// Returning a result short-circuits the run with that failure. Overrides
@@ -616,6 +642,7 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
     {
         var attempt = 0;
         var resumeAttempts = 0;
+        var emptySuccessContinuations = 0;
         var current = invocation;
         AgentResult? last = null;
         // Tracked across the retry loop so a session id captured on attempt N
@@ -672,7 +699,60 @@ public abstract class CliAgentRunnerBase : IPreemptibleAgentRunner, IResumableAg
             // the pipeline can checkpoint that exact conversation when its
             // clean-exit/no-diff classifier recognizes the terminal event.
             if (last.Success)
+            {
+                var needsEmptyContinuation =
+                    EmptySuccessMaxContinuations > 0
+                    && IsEmptySuccessRequiringContinuation(last);
+                if (needsEmptyContinuation
+                    && sessionResumeContext is not null
+                    && capturedSessionId is not null
+                    && emptySuccessContinuations < EmptySuccessMaxContinuations
+                    && SessionResumeQuotaGate.AllowsResume(
+                        sessionResumeContext.Capability.SessionResumeQuotaClassifier,
+                        Kind,
+                        last.Stderr,
+                        last.Stdout))
+                {
+                    // Empty-finish continuation: the turn exited 0 but died
+                    // mid-investigation (no final message, no edits). Resume
+                    // the SAME native session with a "continue and finish"
+                    // instruction so in-progress context is preserved. No
+                    // liveness probe: the sandbox just completed a turn, so
+                    // it is alive by construction. A continuation turn that
+                    // itself crashes re-enters this loop and takes the normal
+                    // crash-resume path (rebuilt from the original prompt in
+                    // the same session, under the existing resume budget).
+                    emptySuccessContinuations++;
+                    current = BuildSessionResumeInvocation(
+                        capturedSessionId,
+                        BuildEmptySuccessContinuationPrompt(last),
+                        sessionResumeContext.Credential,
+                        sessionResumeContext.ModelId,
+                        sessionResumeContext.ReasoningMode,
+                        sessionResumeContext.CaptureStructuredStream);
+                    continue;
+                }
+                if (needsEmptyContinuation)
+                {
+                    // The bound is spent (or no continuation was possible: no
+                    // captured session id, or the quota gate blocked a resume
+                    // that would re-hit quota). Fail distinctly — never a
+                    // silent success, and never the generic no-changes
+                    // outcome the pipeline would otherwise report.
+                    var stallReason = emptySuccessContinuations > 0
+                        ? $"after {emptySuccessContinuations} same-session continuation(s)"
+                        : capturedSessionId is null
+                            ? "and no resumable session id was captured"
+                            : "and same-session continuation was blocked by a quota signal";
+                    last = last with
+                    {
+                        Success = false,
+                        Summary = $"agent {Kind.Value} ended without a final assistant message or recorded edits {stallReason}",
+                        EndedWithoutFinalResponse = true,
+                    };
+                }
                 return last;
+            }
 
             var classification = ((IAgentRunner)this).ClassifyFailure(last);
             var exitCode = AgentSuspendResilience.ParseAgentExitCode(last.Summary);

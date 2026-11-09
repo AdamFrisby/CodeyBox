@@ -144,10 +144,67 @@ public sealed class AgentRunnerStructuredStreamFlagTests
     }
 
     [Fact]
-    public void Copilot_DoesNotAdvertiseStructuredStreamSupport()
+    public void Copilot_AdvertisesStructuredStreamSupport()
     {
         IAgentRunner runner = new CopilotAgentRunner();
-        Assert.False(runner is IStructuredStreamAgentRunner);
+        Assert.True(runner is IStructuredStreamAgentRunner);
+    }
+
+    [Fact]
+    public async Task Copilot_WhenCaptureEnabled_UsesOutputFormatJson()
+    {
+        var sandbox = new CapturingSandbox(stdout: "--output-format <text|json>   Output format: 'text' or 'json'");
+        await new CopilotAgentRunner().RunAsync(sandbox, "/work", "prompt", null, captureStructuredStream: true);
+
+        var argv = sandbox.CapturedExec!.Argv.ToList();
+        var ofIdx = argv.IndexOf("--output-format");
+        Assert.True(ofIdx >= 0, "argv must contain --output-format flag");
+        Assert.Equal("json", argv[ofIdx + 1]);
+    }
+
+    [Fact]
+    public async Task Copilot_WhenHelpAdvertisesOutputFormatJson_ReportsSupport()
+    {
+        var sandbox = new CapturingSandbox(stdout: "--output-format <text|json>   Output format");
+
+        var supported = await new CopilotAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.True(supported);
+        Assert.Equal(["copilot", "--help"], sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task Copilot_WhenCaptureDisabled_DoesNotUseOutputFormatJson()
+    {
+        var sandbox = new CapturingSandbox();
+        await new CopilotAgentRunner().RunAsync(sandbox, "/work", "prompt", null);
+
+        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.DoesNotContain("json", sandbox.CapturedExec!.Argv);
+    }
+
+    [Fact]
+    public async Task Copilot_WhenOutputFormatJsonUnavailable_FallsBackWithoutFlag()
+    {
+        var sandbox = new CapturingSandbox(stdout: "Usage: copilot -p <prompt>");
+        var result = await new CopilotAgentRunner().RunAsync(sandbox, "/work", "prompt", null, captureStructuredStream: true);
+
+        Assert.DoesNotContain("--output-format", sandbox.CapturedExec!.Argv);
+        Assert.Contains("structured stream capture was disabled", result.Stderr);
+    }
+
+    [Fact]
+    public async Task Copilot_WhenHelpOnlyAdvertisesOutputFormatWithoutJson_ReturnsFalse()
+    {
+        // Plausible bug guard: if the marker check became `--output-format`
+        // alone, an older Copilot CLI exposing `--output-format text` but no
+        // json value would falsely report support and the dispatch would
+        // crash with "unknown value". Pin: BOTH markers must be present.
+        var sandbox = new CapturingSandbox(
+            stdout: "  --output-format <text>   Output format");
+        var supported = await new CopilotAgentRunner().SupportsStructuredStreamAsync(sandbox);
+
+        Assert.False(supported);
     }
 
     [Fact]

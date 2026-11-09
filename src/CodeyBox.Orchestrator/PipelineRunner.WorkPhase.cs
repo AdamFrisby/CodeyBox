@@ -888,6 +888,22 @@ public sealed partial class PipelineRunner
                         $"Agent {runner.Kind} exhausted its output-token continuations without completing the turn",
                         agentResult,
                         _opts.MaxFailureDetailBytes));
+            // Runner-reported empty finish (a clean-exit turn ended with no
+            // final assistant message and no recorded edits, and the runner's
+            // bounded same-session continuations were spent without the turn
+            // producing either) is terminal with the distinct
+            // ended-without-final-response kind — never quota, transient, or
+            // no-changes. The continuation budget is already spent, so this
+            // throws before the nudge path below and before any diff
+            // evaluation, exactly like the output-limit-exhausted signal.
+            if (agentResult.EndedWithoutFinalResponse)
+                throw new AgentEndedWithoutFinalResponseException(
+                    runner.Kind,
+                    agentPhase,
+                    BuildAgentFailureDetail(
+                        $"Agent {runner.Kind} ended without a final assistant message or recorded edits",
+                        agentResult,
+                        _opts.MaxFailureDetailBytes));
             // Output-truncation transients (the model hit its maximum output
             // token limit mid-turn) resume the same session with a bounded
             // "continue" nudge instead of failing outright: a nudged turn
