@@ -74,13 +74,7 @@
          IgnoreStandardErrorWarningFormat is set, so it is set here and the
          importance raised to high; without both, plain stderr (the script's
          only output channel) is silently dropped at normal verbosity. -->
-    <Exec Condition=" '$(_CodeyBoxNuGetHealSolutionLevel)' == 'true' "
-          Command="sh -c 'unset CODEYBOX_NUGET_HEAL_NO_QUARANTINE; . &quot;$(CodeyBoxNuGetHomeHealScript)&quot; || true'"
-          StandardOutputImportance="low"
-          StandardErrorImportance="high"
-          IgnoreStandardErrorWarningFormat="true" />
-    <Exec Condition=" '$(_CodeyBoxNuGetHealSolutionLevel)' != 'true' "
-          Command="sh -c 'export CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1; . &quot;$(CodeyBoxNuGetHomeHealScript)&quot; || true'"
+    <Exec Command="sh -c 'if [ &quot;$(_CodeyBoxNuGetHealSolutionLevel)&quot; = true ]; then unset CODEYBOX_NUGET_HEAL_NO_QUARANTINE; else export CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1; fi; . &quot;$(CodeyBoxNuGetHomeHealScript)&quot; || true'"
           StandardOutputImportance="low"
           StandardErrorImportance="high"
           IgnoreStandardErrorWarningFormat="true" />

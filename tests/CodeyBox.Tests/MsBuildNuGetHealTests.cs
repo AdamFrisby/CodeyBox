@@ -161,6 +161,12 @@ public sealed class MsBuildNuGetHealTests
             environment: env);
     }
 
+    private static async Task<string> ReadRestorePackagesPathAsync(string projectDir)
+    {
+        return (await File.ReadAllTextAsync(
+            Path.Combine(projectDir, "restore-packages-path.txt"))).Trim();
+    }
+
     private static Dictionary<string, string> CreateBuildEnv(
         string dotnetDir,
         string home,
@@ -355,6 +361,9 @@ public sealed class MsBuildNuGetHealTests
             Assert.False(
                 File.GetAttributes(Path.Combine(nugetHome, "packages")).HasFlag(FileAttributes.ReparsePoint),
                 "packages must not have been converted to a symlink");
+            Assert.Equal(
+                Path.Combine(nugetHome, "packages"),
+                await ReadRestorePackagesPathAsync(projectDir));
         }
         finally
         {
@@ -498,6 +507,9 @@ public sealed class MsBuildNuGetHealTests
             Assert.False(
                 File.GetAttributes(Path.Combine(nugetHealthy, "packages")).HasFlag(FileAttributes.ReparsePoint),
                 "packages must not have been converted to a symlink");
+            var expectedPackages = Path.Combine(nugetHealthy, "packages");
+            Assert.Equal(expectedPackages, await ReadRestorePackagesPathAsync(proj1));
+            Assert.Equal(expectedPackages, await ReadRestorePackagesPathAsync(proj2));
         }
         finally
         {
@@ -562,15 +574,77 @@ public sealed class MsBuildNuGetHealTests
             // Per-project builds never quarantine — the rejected tree stays.
             Assert.Empty(Directory.GetDirectories(home, ".nuget.codeybox-unwritable.*"));
 
-            var pinned = (await File.ReadAllTextAsync(
-                Path.Combine(projectDir, "restore-packages-path.txt"))).Trim();
+            var pinned = await ReadRestorePackagesPathAsync(projectDir);
             var rejected = Path.Combine(nugetHome, "packages");
             Assert.False(
                 string.Equals(pinned, rejected, StringComparison.Ordinal),
                 $"RestorePackagesPath must be repointed away from the rejected cache, got '{pinned}'");
+            Assert.True(Path.IsPathRooted(pinned), $"RestorePackagesPath must be absolute, got '{pinned}'");
+            Assert.True(
+                pinned.EndsWith("/.nuget/packages", StringComparison.Ordinal),
+                $"RestorePackagesPath must be the verified NuGet packages path, got '{pinned}'");
             Assert.False(
                 pinned.StartsWith(home + "/", StringComparison.Ordinal),
                 $"RestorePackagesPath must not resolve inside the rejected home, got '{pinned}'");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // CODEYBOX_NUGET_HOME_UNDER_TEST is a test-only hook for the dot-sourced
+    // heal scripts. The in-process guard must strip it from the report child
+    // so the verdict describes the home MSBuild actually consumes; at the
+    // same time a usable verdict must repoint the auto-pinned
+    // RestorePackagesPath at the canonical home, not the retargetable symlink
+    // spelling Directory.Build.props evaluated.
+    [Fact]
+    public async Task MsBuild_NonSolutionBuild_IgnoresTestHomeOverride_AndCanonicalizesUsablePackagesPath()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var repoRoot = FindAncestorContaining(
+            AppContext.BaseDirectory, "Directory.NuGetHomeHeal.targets");
+        Assert.NotNull(repoRoot);
+
+        var dotnetDir = ResolveDotnetDirectory();
+        if (dotnetDir is null)
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"codeybox-msbuild-under-test-{Guid.NewGuid():N}");
+        var realHome = Path.Combine(root, "real-home");
+        var homeLink = Path.Combine(root, "home-link");
+        var brokenHome = Path.Combine(root, "broken-home");
+        var outside = Path.Combine(root, "outside");
+        var projectDir = Path.Combine(root, "proj");
+        var realNuget = Path.Combine(realHome, ".nuget");
+        var realPackages = Path.Combine(realNuget, "packages");
+        Directory.CreateDirectory(realPackages);
+        Directory.CreateDirectory(Path.Combine(realNuget, "NuGet"));
+        await File.WriteAllTextAsync(
+            Path.Combine(realNuget, "NuGet", "NuGet.Config"), "<configuration/>");
+        Directory.CreateDirectory(brokenHome);
+        Directory.CreateDirectory(outside);
+        Directory.CreateDirectory(projectDir);
+        File.CreateSymbolicLink(homeLink, realHome);
+        File.CreateSymbolicLink(Path.Combine(brokenHome, ".nuget"), outside);
+        try
+        {
+            await CreateProjectAsync(projectDir);
+            await CreateBuildWiringAsync(root, repoRoot!);
+            var offlineConfig = Path.Combine(projectDir, "offline.nuget.config");
+            var env = CreateBuildEnv(
+                dotnetDir, homeLink, root, Path.Combine(brokenHome, ".nuget"));
+            var result = await RunDotnetBuildAsync(
+                dotnetDir,
+                Path.Combine(projectDir, "proj.csproj"),
+                offlineConfig,
+                env);
+
+            Assert.True(result.Success, result.Stdout + result.Stderr);
+            Assert.Equal(realPackages, await ReadRestorePackagesPathAsync(projectDir));
         }
         finally
         {

@@ -340,9 +340,6 @@ public sealed class DotnetFirstRunFailureTests
         },
     };
 
-    private static bool IsToolProbe(SandboxExec exec) =>
-        TestSupport.IsToolPresenceProbe(exec);
-
     /// <summary>
     /// Sandbox for the language-preset path: the preset discovery exec
     /// (<c>sh -c "echo ."</c>) reports one project directory, the tool probe
@@ -363,7 +360,7 @@ public sealed class DotnetFirstRunFailureTests
                 return Task.FromResult(new SandboxExecResult(0, ".\n", string.Empty));
             }
 
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }
@@ -386,7 +383,7 @@ public sealed class DotnetFirstRunFailureTests
         {
             // The tool-presence probe is `sh -c 'command -v "$1" ...'`; let it
             // succeed so the auditor proceeds to the command exec under test.
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }

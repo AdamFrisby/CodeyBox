@@ -189,9 +189,6 @@ public sealed class DotnetTestInvocationRegressionTests
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
 
-    private static bool IsToolProbe(SandboxExec exec) =>
-        TestSupport.IsToolPresenceProbe(exec);
-
     private sealed class CapturingSandbox(Func<SandboxExec, SandboxExecResult> onExec) : ISandbox
     {
         private readonly Func<SandboxExec, SandboxExecResult> _onExec = onExec;
@@ -199,7 +196,7 @@ public sealed class DotnetTestInvocationRegressionTests
         public string Id => "capturing";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, "/usr/bin/dotnet\n", ""));
             }

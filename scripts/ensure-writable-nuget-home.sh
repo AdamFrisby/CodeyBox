@@ -69,11 +69,16 @@ codeybox_home_before="${HOME:-}"
 . "$codeybox_heal_script" || true
 if [ -n "${DOTNET_CLI_HOME:-}" ]; then
     codeybox_home_shown="${codeybox_home_before:-<unset>}"
-    # HOME is launch-env input: strip control characters before it reaches
-    # operator/CI logs. The helper lives in the dot-sourced recovery; fall
-    # back to the raw value only if that source somehow did not define it.
+    # HOME is launch-env input: it must never reach operator/CI logs with
+    # control characters intact. Prefer the helper the dot-sourced recovery
+    # defines; fall back to the same tr strip, then to a fixed placeholder —
+    # never to the raw value.
     if command -v _codeybox_strip_ctrl >/dev/null 2>&1; then
         codeybox_home_shown="$(_codeybox_strip_ctrl "$codeybox_home_shown")"
+    elif command -v tr >/dev/null 2>&1; then
+        codeybox_home_shown="$(printf '%s' "$codeybox_home_shown" | tr -d '[:cntrl:]')"
+    else
+        codeybox_home_shown="<unavailable>"
     fi
     echo "ensure-writable-nuget-home: cannot repair $codeybox_home_shown/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
 fi

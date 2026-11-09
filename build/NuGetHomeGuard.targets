@@ -54,10 +54,11 @@
         RestorePackagesPathOut = DeclaredPackagesPath;
         const int MaxReportChars = 64 * 1024;
         const int MaxReportStderrChars = 16 * 1024;
+        const int MaxLogValueChars = 512;
         string SanitizeForLog(string value)
         {
-            if (value.Length > 512)
-                value = value.Substring(0, 512) + "...";
+            if (value.Length > MaxLogValueChars)
+                value = value.Substring(0, MaxLogValueChars) + "...";
             var chars = value.ToCharArray();
             for (var i = 0; i < chars.Length; i++)
             {
@@ -137,6 +138,10 @@
             psi.EnvironmentVariables["CODEYBOX_HEAL_GUARD_SCRIPT"] = scriptPath;
             psi.EnvironmentVariables["CODEYBOX_NUGET_REPO_DOTNET_HOME"] =
                 RepositoryDotNetHome;
+            // The report must describe the same home MSBuild will consume:
+            // CODEYBOX_NUGET_HOME_UNDER_TEST is a test-only hook inside the
+            // heal script and must never redirect the guard's verdict.
+            psi.EnvironmentVariables.Remove("CODEYBOX_NUGET_HOME_UNDER_TEST");
             try
             {
                 using var proc = Process.Start(psi);
@@ -194,6 +199,11 @@
             }
         }
 
+        bool IsReportedPackagesPath(string path)
+        {
+            return !string.IsNullOrEmpty(path) && Path.IsPathRooted(path);
+        }
+
         bool ApplyHealReport(Dictionary<string, string> report)
         {
             var verdict = report.TryGetValue("CODEYBOX_HEAL_VERDICT", out var v)
@@ -208,14 +218,29 @@
             if (verdict == "usable")
             {
                 // The env-provided home verified in place — including its
-                // whole .nuget/packages tree — so the auto-pinned
-                // RestorePackagesPath already points at admitted storage.
-                // Re-export the canonical values the heal resolved (a
-                // symlinked env value must not be retargeted later).
+                // whole .nuget/packages tree — so re-export the canonical
+                // values the heal resolved (a symlinked env value must not be
+                // retargeted later) and repoint the auto-pinned package path
+                // at the canonical spelling the report verified.
                 if (cliHome.Length > 0)
                     Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", cliHome);
                 if (home.Length > 0)
                     Environment.SetEnvironmentVariable("HOME", home);
+                if (!string.IsNullOrEmpty(DeclaredPackagesPath)
+                    && string.Equals(
+                        DeclaredPackagesPath, AutoPackagesPath,
+                        StringComparison.Ordinal))
+                {
+                    if (!IsReportedPackagesPath(packages))
+                    {
+                        Log.LogError(
+                            "CodeyBox NuGet-home heal verified a usable home without a verified package path " +
+                            "(cliHome='{0}', home='{1}').",
+                            SanitizeForLog(cliHome), SanitizeForLog(home));
+                        return false;
+                    }
+                    RestorePackagesPathOut = packages;
+                }
                 return true;
             }
 
@@ -223,9 +248,9 @@
             {
                 // The script reports the exact package path it verified (or
                 // the fresh path under the redirected private home). An empty
-                // value means the contract was violated — fail rather than
-                // reconstruct home + "/.nuget/packages" here.
-                if (cliHome.Length == 0 || packages.Length == 0)
+                // or relative value means the contract was violated — fail
+                // rather than reconstruct home + "/.nuget/packages" here.
+                if (cliHome.Length == 0 || !IsReportedPackagesPath(packages))
                 {
                     Log.LogError(
                         "CodeyBox NuGet-home heal redirected without a verified package path " +

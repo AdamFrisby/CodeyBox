@@ -123,8 +123,8 @@ _codeybox_lstat_dir() {
 # Single-entry memo for _codeybox_group_is_private: directory walks revisit
 # the same handful of gids, and each verdict costs a group-db and passwd-db
 # lookup.
-_codeybox_pg_gid=
-_codeybox_pg_verdict=
+_codeybox_private_group_gid=
+_codeybox_private_group_verdict=
 # The process's own group set (`id -G`), primary gid (`id -g`), and the
 # passwd/group dbs are each resolved once per process — all go through NSS
 # (LDAP/AD included), with /etc/passwd and /etc/group unioned in for a
@@ -384,12 +384,12 @@ _codeybox_group_is_private() {
     case $1 in
         *[!0-9]*) return 1 ;;
     esac
-    if [ "$1" = "${_codeybox_pg_gid:-}" ]; then
-        [ "${_codeybox_pg_verdict:-}" = "yes" ]
+    if [ "$1" = "${_codeybox_private_group_gid:-}" ]; then
+        [ "${_codeybox_private_group_verdict:-}" = "yes" ]
         return
     fi
-    _codeybox_pg_gid=$1
-    _codeybox_pg_verdict=no
+    _codeybox_private_group_gid=$1
+    _codeybox_private_group_verdict=no
 
     # Proof 0 — the gid must be one this account actually holds. `id -G`
     # prints the full group set (primary + supplementary) through NSS; an
@@ -481,7 +481,7 @@ $(cat "$_codeybox_passwd_db" 2>/dev/null)"
         '$4 == g && $3 != u { found = 1 } END { exit(found ? 0 : 1) }'; then
         return 1
     fi
-    _codeybox_pg_verdict=yes
+    _codeybox_private_group_verdict=yes
     return 0
 }
 
@@ -1556,17 +1556,29 @@ codeybox_seed_nuget_migration_state
 # control-stripped so a crafted path cannot break the KEY=VALUE line format.
 #
 # CODEYBOX_HEAL_NUGET_PACKAGES is the exact RestorePackagesPath the guard may
-# consume — never a reconstructed home + "/.nuget/packages" and never an
-# inherited NUGET_PACKAGES value (that env var is unverified input). For a
-# redirected home it is the original env home's packages tree only when that
-# tree itself passed _codeybox_secure_package_cache; otherwise it is the
+# consume — never a reconstructed home + "/.nuget/packages" spelling that can
+# retarget, and never an inherited NUGET_PACKAGES value (that env var is
+# unverified input). For a usable home it is the canonical path under the
+# verified cli home; when the packages entry already exists it is re-scanned
+# so a symlinked cache reports its verified target rather than the link. For
+# a redirected home it is the original env home's packages tree only when
+# that tree itself passed _codeybox_secure_package_cache; otherwise it is the
 # redirected home's own packages path, which lives under storage the heal
-# just verified private. Usable and failed verdicts report an empty value:
-# usable keeps the already-admitted auto-pin, while failed must not repoint
-# NuGet at the rejected tree.
+# just verified private. Failed verdicts report an empty value: failed must
+# not repoint NuGet at the rejected tree.
 if [ "${CODEYBOX_NUGET_HEAL_REPORT:-}" = "1" ]; then
     _codeybox_report_packages=
-    if [ "${_codeybox_heal_verdict:-failed}" = "redirected" ] \
+    _codeybox_report_verdict="${_codeybox_heal_verdict:-failed}"
+    if [ "$_codeybox_report_verdict" = "usable" ] \
+        && [ -n "${_codeybox_cli_home:-}" ]; then
+        _codeybox_report_packages="${_codeybox_cli_home%/}/.nuget/packages"
+        if [ -e "$_codeybox_report_packages" ] \
+            || [ -L "$_codeybox_report_packages" ]; then
+            _codeybox_report_packages="$(_codeybox_secure_package_cache \
+                "$_codeybox_report_packages")" \
+                || _codeybox_report_packages=
+        fi
+    elif [ "$_codeybox_report_verdict" = "redirected" ] \
         && [ -n "${DOTNET_CLI_HOME:-}" ]; then
         if [ -n "${_codeybox_cli_home_env:-}" ]; then
             _codeybox_report_packages="$(_codeybox_secure_package_cache \

@@ -1062,7 +1062,7 @@ public sealed class BuildScriptNuGetHealTests
                 + "  : > \"$3/passwd\" && "
                 + "  _codeybox_group_db=\"$3/group\" && "
                 + "  _codeybox_passwd_db=\"$3/passwd\" && "
-                + "  _codeybox_pg_gid= && _codeybox_pg_verdict= && "
+                + "  _codeybox_private_group_gid= && _codeybox_private_group_verdict= && "
                 + "  { _codeybox_group_is_private \"$probe\" "
                 + "    && echo PROBE=private || echo PROBE=refused; }; fi",
                 root, HealScriptRepoRoot(), root);
@@ -1078,10 +1078,10 @@ public sealed class BuildScriptNuGetHealTests
             // fixture file) has an empty member list and which no account
             // holds as a primary gid must still be refused — deleting proof
             // 0 would flip this to private.
-            if (!lines.Contains("PROBE=skipped", StringComparer.Ordinal))
-            {
-                Assert.Contains("PROBE=refused", lines);
-            }
+            Assert.False(
+                lines.Contains("PROBE=skipped", StringComparer.Ordinal),
+                "the held-gid probe must not be skipped — proof 0 is what this test isolates");
+            Assert.Contains("PROBE=refused", lines);
         }
         finally
         {
@@ -1158,7 +1158,7 @@ public sealed class BuildScriptNuGetHealTests
                     + "_codeybox_sssd_conf=\"$3/sssd/sssd.conf\" && "
                     + "_codeybox_sssd_vendor_conf=\"$3/sssd/vendor-sssd.conf\" && "
                     + "_codeybox_sssd_conf_d=\"$3/sssd/conf.d\" && "
-                    + "_codeybox_pg_gid= && _codeybox_pg_verdict= && "
+                    + "_codeybox_private_group_gid= && _codeybox_private_group_verdict= && "
                     + "_codeybox_nss_enum_checked=0 && _codeybox_nss_enum_ok=0 && "
                     + "{ _codeybox_group_is_private \"$(id -g)\" "
                     + "  && echo G=private || echo G=refused; }",
@@ -1284,9 +1284,17 @@ public sealed class BuildScriptNuGetHealTests
             Assert.True(result.Success, result.Stdout + result.Stderr);
             var lines = result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             Assert.Contains("CODEYBOX_HEAL_VERDICT=usable", lines);
-            Assert.Contains("CODEYBOX_HEAL_NUGET_PACKAGES=", lines);
-            Assert.Contains(lines, l => l.StartsWith("CODEYBOX_HEAL_HOME=", StringComparison.Ordinal)
-                && l.Length > "CODEYBOX_HEAL_HOME=".Length);
+            var reportedHomeLine = lines.FirstOrDefault(
+                l => l.StartsWith("CODEYBOX_HEAL_HOME=", StringComparison.Ordinal));
+            Assert.NotNull(reportedHomeLine);
+            var reportedHome = reportedHomeLine!["CODEYBOX_HEAL_HOME=".Length..];
+            Assert.False(string.IsNullOrEmpty(reportedHome));
+            var reportedPackagesLine = lines.FirstOrDefault(
+                l => l.StartsWith("CODEYBOX_HEAL_NUGET_PACKAGES=", StringComparison.Ordinal));
+            Assert.NotNull(reportedPackagesLine);
+            Assert.Equal(
+                reportedHome.TrimEnd('/') + "/.nuget/packages",
+                reportedPackagesLine!["CODEYBOX_HEAL_NUGET_PACKAGES=".Length..]);
         }
         finally
         {
