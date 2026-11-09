@@ -115,28 +115,38 @@ public sealed partial class PipelineRunner
         // Forgery caveat: a tool-output line echoing quota prose plus a genuine
         // 'authentication failed or timed out' would otherwise park on a fake
         // reset instead of benching compromised credentials. Untrusted quota
-        // evidence is therefore corroborated against the live probe in ALL
-        // legs — even without a concurrent auth signal — and trusted evidence
-        // is corroborated whenever auth also signals: a healthy reading
-        // contradicts quota, so fall through to auth handling instead of
-        // suppressing it.
+        // evidence suppresses auth only on positive probe corroboration (a
+        // known-exhausted reading) when auth also signals — unknown, missing,
+        // or healthy probes fail closed to auth handling so forged prose
+        // cannot suppress credential exclusion. Without a concurrent auth
+        // signal there is nothing to suppress, so the quota path stands
+        // (genuine quota detection is preserved). Trusted evidence keeps the
+        // healthy-veto: a healthy reading contradicts quota, so fall through
+        // to auth handling instead of suppressing it.
         var quotaBeforeAuth = _quotaClassifier.Classify(runner.Kind, result.Stderr, result.Stdout);
+        // ClassifyFailure is quota-first: forged quota prose hides a genuine
+        // auth signal behind QuotaExhausted. The gate must see auth
+        // independently of that ordering, or forged quota always suppresses it.
+        var authForQuotaGate = TryGetAuthClassificationIgnoringQuota(runner.Kind, result, classification);
         if (TryGetExhaustionClassification(quotaBeforeAuth) is { } streamExhaustion)
         {
             if (!streamExhaustion.ProviderSurfaceMatch)
             {
-                // Untrusted (stdout-only, or any Antigravity stderr): a healthy
-                // probe contradicts forged prose, so only take the quota path
-                // when the probe does not report healthy quota.
-                if (!await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
+                // Untrusted (stdout-only, or any Antigravity stderr): fail
+                // closed when auth also signals — only a known-exhausted
+                // probe reading corroborates forged-able prose.
+                if (authForQuotaGate is null)
+                {
+                    return;
+                }
+                if (await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, phase, ct).ConfigureAwait(false))
                 {
                     return;
                 }
             }
             else
             {
-                var authAlsoSignals = (classification ?? _authFailureClassifier.ClassifyFailure(runner, result)).Kind == AgentFailureKind.AuthError;
-                if (!authAlsoSignals
+                if (authForQuotaGate is null
                     || !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
                 {
                     return;
@@ -150,15 +160,32 @@ public sealed partial class PipelineRunner
             {
                 // TerminalDiagnostic lifts the glog tail, which interleaves
                 // verbatim model/tool output: never trusted provider-surface.
-                // Throw untrusted so the park transition corroborates against
-                // the live probe (a healthy probe vetoes the park) instead of
-                // parking on forged prose with a trusted bit.
+                // Fail closed when auth also signals: only throw (suppressing
+                // auth) on a known-exhausted probe reading; otherwise fall
+                // through to auth handling. Without auth, throw untrusted so
+                // the park transition corroborates against the live probe
+                // (a healthy probe vetoes the park) instead of parking on
+                // forged prose with a trusted bit.
                 var untrustedExhaustion = terminalExhaustion with { ProviderSurfaceMatch = false };
-                await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, untrustedExhaustion, ct).ConfigureAwait(false);
+                if (authForQuotaGate is null
+                    || await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, phase, ct).ConfigureAwait(false))
+                {
+                    await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, untrustedExhaustion, ct).ConfigureAwait(false);
+                }
             }
         }
 
-        var resolved = classification ?? _authFailureClassifier.ClassifyFailure(runner, result);
+        // Auth handling uses the quota-independent signal: when forged quota
+        // is present, ClassifyFailure reports QuotaExhausted and would hide
+        // the genuine auth failure if consulted here.
+        var resolved = authForQuotaGate ?? classification;
+        if (resolved is null)
+        {
+            var fallback = _authFailureClassifier.ClassifyFailure(runner, result);
+            if (fallback.Kind != AgentFailureKind.AuthError)
+                return;
+            resolved = fallback;
+        }
         if (resolved.Kind != AgentFailureKind.AuthError)
             return;
 
@@ -227,6 +254,29 @@ public sealed partial class PipelineRunner
             && quota.Detection.Kind.IsExhaustionSignal()
             ? quota
             : null;
+
+    /// <summary>
+    /// Quota-independent auth signal for the quota-before-auth gate.
+    /// <see cref="AgentFailureClassifier.Classify(AgentKind,string?,string?,string?)"/>
+    /// is quota-first, so forged quota prose hides genuine auth behind
+    /// QuotaExhausted; consulting it here would let forged quota always
+    /// suppress auth. This checks the auth legs directly: an explicit
+    /// caller classification, a login-prompt detection, or an auth-error
+    /// pattern in stderr. Returns null when no auth signals.
+    /// </summary>
+    private static AgentFailureClassification? TryGetAuthClassificationIgnoringQuota(
+        AgentKind kind,
+        AgentResult result,
+        AgentFailureClassification? classification)
+    {
+        if (classification?.Kind is AgentFailureKind.AuthError or AgentFailureKind.AuthRequired)
+            return classification;
+        if (AgentFailureClassifier.DetectAuthRequired(kind, result.Stderr, result.Stdout) is { } authRequired)
+            return authRequired.Classification;
+        if (AgentFailureClassifier.ContainsAuthErrorPattern(result.Stderr))
+            return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched in stderr");
+        return null;
+    }
 
     /// <summary>
     /// True when the only auth evidence for an Antigravity run is the weak sandbox phrase
