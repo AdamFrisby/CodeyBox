@@ -361,4 +361,34 @@ public sealed class AntigravityQuotaFailureDetectorTests
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
     }
+
+    [Fact]
+    public void Detect_HostSideExit3Shape_ResultErrorWith113hReset_ParsesPreciseReset()
+    {
+        // Host-side truth for the sandbox-masked failure: result status ERROR with
+        // 'RESOURCE_EXHAUSTED (code 429): Individual quota reached ... Resets in 113h',
+        // agy exit 3, cli.log 'Individual quota reached'. Must classify as quota-exhausted
+        // with the parsed reset — never auth_required.
+        const string stdout =
+            """{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 113h."}""";
+
+        var before = DateTimeOffset.UtcNow;
+        var detection = new AntigravityQuotaFailureDetector().Detect(null, stdout);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        Assert.InRange(detection.ResetAt!.Value, before.AddHours(113), after.AddHours(113));
+    }
+
+    [Fact]
+    public void Detect_Code429Alone_ClassifiesRateLimit()
+    {
+        var detection = new AntigravityQuotaFailureDetector().Detect(
+            stderr: "agy failed (code 429): try again later", stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
 }

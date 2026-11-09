@@ -64,16 +64,25 @@ public static class QuotaFailureClassifierStoreExtensions
     /// Other failure shapes (e.g. <c>"failed to materialise gemini auth: exit 1"</c>)
     /// remain excluded - they are infrastructure failures, not provider quota
     /// signals.
+    /// agy reports quota exhaustion as exit 3 with the quota text in stderr/stdout
+    /// ("RESOURCE_EXHAUSTED (code 429): Individual quota reached ... Resets in 113h"),
+    /// so that shape is accepted too — the detection narrowing below still requires a
+    /// positive provider quota signal, so a non-quota exit 3 never records.
     /// </summary>
     internal static bool IsAgentExited1Summary(string? summary)
     {
         if (string.IsNullOrEmpty(summary)) return false;
         var trimmed = summary.Trim();
-        const string Base = "agent exited 1";
-        if (string.Equals(trimmed, Base, StringComparison.OrdinalIgnoreCase))
+        return IsAgentExitedCodeSummary(trimmed, "agent exited 1")
+            || IsAgentExitedCodeSummary(trimmed, "agent exited 3");
+    }
+
+    private static bool IsAgentExitedCodeSummary(string trimmed, string @base)
+    {
+        if (string.Equals(trimmed, @base, StringComparison.OrdinalIgnoreCase))
             return true;
-        return trimmed.Length > Base.Length
-            && trimmed.StartsWith(Base, StringComparison.OrdinalIgnoreCase)
-            && trimmed[Base.Length] == ':';
+        return trimmed.Length > @base.Length
+            && trimmed.StartsWith(@base, StringComparison.OrdinalIgnoreCase)
+            && trimmed[@base.Length] == ':';
     }
 }

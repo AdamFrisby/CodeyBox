@@ -140,6 +140,8 @@ public sealed class CompositeQuotaFailureClassifierTests
     [InlineData("agent exited 1: RESOURCE_EXHAUSTED quota exceeded")]
     [InlineData("agent exited 1: API Error: 401 Unauthorized")]
     [InlineData("agent exited 1: …<truncated tail>")]
+    [InlineData("agent exited 3")]
+    [InlineData("agent exited 3: RESOURCE_EXHAUSTED (code 429): Individual quota reached")]
     public void IsAgentExited1Summary_AcceptsBaseAndEnrichedForms(string summary)
     {
         Assert.True(QuotaFailureClassifierStoreExtensions.IsAgentExited1Summary(summary));

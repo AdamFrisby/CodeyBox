@@ -71,6 +71,11 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         // own reset which QuotaResetParser already knows how to read. RateLimitExceeded rather than
         // LimitReached because this is a short rolling window (~1h), not a weekly lockout.
         ("individual quota reached", QuotaFailureKind.RateLimitExceeded),
+        // Host-side shape for the same exhaustion: "RESOURCE_EXHAUSTED (code 429):
+        // Individual quota reached ... Resets in 113h" with agy exit 3. The status
+        // token above already matches that line, but a rendering that carries only
+        // the numeric code must still route through the quota path — not auth.
+        ("code 429", QuotaFailureKind.RateLimitExceeded),
         ("too many requests", QuotaFailureKind.RateLimitExceeded),
         ("API Error: 401", QuotaFailureKind.Unauthorized),
         ("API Error: 403", QuotaFailureKind.Unauthorized),

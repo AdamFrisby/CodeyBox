@@ -77,6 +77,32 @@ public sealed class AntigravityQuotaProbeRuntimeTests
     }
 
     [Fact]
+    public async Task QuotaSummary_PerModelRowExhausted_GatesConfiguredFamilyOnMostRestrictiveRow()
+    {
+        // agy --print /usage (CLI 1.5.2, 2026-11-09) real shape: pool fresh, configured
+        // family gemini-4-argon-high exhausted. The snapshot for that member must report 0%
+        // with the per-model reset so the router stops dispatching to it.
+        const string summary = """
+        {"groups":[
+          {"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","remainingFraction":1.0,"resetTime":"2026-11-16T00:00:00Z","window":"weekly"},
+            {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","remainingFraction":1.0,"resetTime":"2026-11-09T12:00:00Z","window":"5h"}]},
+          {"displayName":"Gemini 4 Argon","buckets":[
+            {"bucketId":"gemini-4-argon-weekly","displayName":"Gemini 4 Argon Weekly Limit","remainingFraction":0.0,"resetTime":"2026-11-14T00:16:26Z","window":"weekly"}]}
+        ]}
+        """;
+        var handler = new LoadCodeAssistRouter(
+            HttpStatusCode.OK, TierBody,
+            quotaSummaryStatus: HttpStatusCode.OK, quotaSummaryBody: summary);
+
+        var probe = BuildProbe(handler);
+        var snapshot = await probe.GetAvailabilityAsync(Member("gemini-4-argon-high"), CancellationToken.None);
+
+        Assert.Equal(0.0, snapshot.AvailablePct);
+        Assert.Equal(new DateTimeOffset(2026, 11, 14, 0, 16, 26, TimeSpan.Zero), snapshot.ResetAt);
+    }
+
+    [Fact]
     public async Task QuotaSummary_403_FallsBackToAuthorizationRead()
     {
         // An unentitled client identity gets 403 from the meter. That must degrade to the liveness

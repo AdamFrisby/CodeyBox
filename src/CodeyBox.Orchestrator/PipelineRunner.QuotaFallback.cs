@@ -282,6 +282,23 @@ public sealed partial class PipelineRunner
             CancellationToken token)
         {
             var last = resumeEx.LastResult;
+            // Quota-before-auth (agy exit-3 / result-ERROR shape): a quota block that
+            // surfaced as generic stderr auth text must not become an auth exclusion.
+            // Yield to the quota converter below when stdout result events or the CLI
+            // log carry exhaustion.
+            if (_quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout) is
+                { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } rq
+                && rq.Detection.Kind.IsExhaustionSignal())
+            {
+                return null;
+            }
+            if (!string.IsNullOrWhiteSpace(last.TerminalDiagnostic)
+                && _quotaClassifier.Classify(runner.Kind, last.TerminalDiagnostic, null) is
+                { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } rt
+                && rt.Detection.Kind.IsExhaustionSignal())
+            {
+                return null;
+            }
             var detection = _authFailureClassifier.DetectDetailed(runner.Kind, last.Stderr, last.Stdout);
             if (detection is { Classification.Kind: AgentFailureKind.AuthRequired })
             {
@@ -363,7 +380,20 @@ public sealed partial class PipelineRunner
                 }
                 || !resumeQuotaKind.IsExhaustionSignal())
             {
-                return null;
+                // The CLI log terminal region (agy exit-3 glog) may carry the only
+                // exhaustion evidence when stderr was the generic auth blip.
+                if (!string.IsNullOrWhiteSpace(last.TerminalDiagnostic)
+                    && _quotaClassifier.Classify(runner.Kind, last.TerminalDiagnostic, null) is
+                    { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } terminal
+                    && terminal.Detection.Kind.IsExhaustionSignal())
+                {
+                    classification = terminal;
+                    detection = terminal.Detection;
+                }
+                else
+                {
+                    return null;
+                }
             }
 
             await _quotaClassifier.RecordIfQuotaFailureAsync(

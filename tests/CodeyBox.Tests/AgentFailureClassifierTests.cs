@@ -31,12 +31,41 @@ public sealed class AgentFailureClassifierTests
     [InlineData("RESOURCE_EXHAUSTED")]
     [InlineData("quota exceeded for project")]
     [InlineData("[API Error: You have exhausted your capacity on this model.]")]
+    [InlineData("Individual quota reached. Please upgrade your subscription. Resets in 1h8m20s.")]
     public void HardQuotaPatterns_Classified_AsHardQuota(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.HardQuota, c.QuotaFailure);
         Assert.Equal(AgentFailureClassifier.HardQuotaReason, c.Reason);
+    }
+
+    [Fact]
+    public void Classify_AgyQuotaInStdoutResultEvent_WinsOverGenericStderrAuthText()
+    {
+        // Sandbox shape: stderr carries only the generic blip while stdout carries the
+        // true result-ERROR exhaustion. Must route quota, not auth.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "error: authentication failed or timed out",
+            stdout: """{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 113h."}""");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void WeakAgyAuthAlone_IsWeakOnly_RequiresProbeBeforeExclusion()
+    {
+        var result = new AgentResult(false, "agent exited 3", Stdout: null, Stderr: "error: authentication failed or timed out");
+        Assert.True(PipelineRunner.IsWeakAgyAuthOnly(AgentKind.Antigravity, result));
+    }
+
+    [Fact]
+    public void WeakAgyAuth_WithStrongSignal_IsNotWeakOnly()
+    {
+        var with401 = new AgentResult(false, "agent exited 1", Stdout: null, Stderr: "error: authentication failed or timed out\nAPI Error: 401 Unauthorized");
+        Assert.False(PipelineRunner.IsWeakAgyAuthOnly(AgentKind.Antigravity, with401));
+
+        var otherAgent = new AgentResult(false, "agent exited 1", Stdout: null, Stderr: "error: authentication failed or timed out");
+        Assert.False(PipelineRunner.IsWeakAgyAuthOnly(AgentKind.Codex, otherAgent));
     }
 
     [Theory]
@@ -46,6 +75,7 @@ public sealed class AgentFailureClassifierTests
     [InlineData("HTTP 529")]
     [InlineData("HTTP 429")]
     [InlineData("API Error: 429")]
+    [InlineData("code 429")]
     [InlineData("status 529")]
     [InlineData("overloaded_error")]
     [InlineData("exceeded the rate limit")]

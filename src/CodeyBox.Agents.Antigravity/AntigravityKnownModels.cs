@@ -34,6 +34,8 @@ public static class AntigravityKnownModels
     /// </summary>
     public static readonly IReadOnlyList<string> All = new[]
     {
+        // Gemini 4 Argon family (agy 1.5.2 gateway; carries its own weekly limit row).
+        "gemini-4-argon-high",
         // Gemini 3.8 Flash — current top of the gateway. Thinking level is encoded in the id.
         "gemini-3.8-flash-high",
         "gemini-3.8-flash-medium",

@@ -86,6 +86,11 @@ public static class AgentFailureClassifier
         "RESOURCE_EXHAUSTED",
         "quota exceeded",
         "exhausted your capacity",
+        // agy per-model rolling limit: "Individual quota reached. ... Resets in 1h8m20s."
+        // Says "quota reached", not "quota exceeded", so without this row a real 429
+        // falls through to the generic auth patterns ("authentication failed or timed out")
+        // and misclassifies as auth_required instead of quota-exhausted.
+        "individual quota reached",
     };
 
     /// <summary>
@@ -107,6 +112,7 @@ public static class AgentFailureClassifier
         // Bare HTTP shapes the CLIs surface verbatim
         "HTTP 429",
         "status 429",
+        "code 429",
         "API Error: 429",
         "HTTP 529",
         "status 529",
