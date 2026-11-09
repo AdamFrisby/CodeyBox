@@ -41,7 +41,14 @@ jobs:
           chmod +x /tmp/cosign
           /tmp/cosign version
       - name: deterministic tests
-        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build --filter 'requires_multipass!=true'
+        run: dotnet test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build --filter 'requires_multipass!=true&requires_privileged_process!=true'
+      # The foreign-owned NuGet-home fixture needs a real chown; the
+      # unprivileged deterministic leg can only skip it, so run that one test
+      # as root rather than counting an unexecuted case as coverage.
+      - name: privileged NuGet heal test
+        run: |
+          DOTNET_BIN="$(command -v dotnet)"
+          sudo env "PATH=$PATH" "HOME=/root" "$DOTNET_BIN" test tests/CodeyBox.Tests/CodeyBox.Tests.csproj --configuration Release --no-build --filter 'FullyQualifiedName~EnsureWritableNuGetHomeTests.Script_ForeignOwnedTree_IsQuarantined'
       - name: admin tests
         run: dotnet test tools/CodeyBox.Admin/tests/CodeyBox.Admin.Tests/CodeyBox.Admin.Tests.csproj --configuration Release --no-build
       - name: dependency vulnerability audit

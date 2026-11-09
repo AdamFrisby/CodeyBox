@@ -360,9 +360,7 @@ public sealed class DotnetFirstRunFailureTests
                 return Task.FromResult(new SandboxExecResult(0, ".\n", string.Empty));
             }
 
-            if (exec.Argv.Count > 2
-                && exec.Argv[0] == "sh"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }
@@ -385,9 +383,7 @@ public sealed class DotnetFirstRunFailureTests
         {
             // The tool-presence probe is `sh -c 'command -v "$1" ...'`; let it
             // succeed so the auditor proceeds to the command exec under test.
-            if (exec.Argv.Count > 2
-                && exec.Argv[0] == "sh"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, string.Empty, string.Empty));
             }

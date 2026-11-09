@@ -149,7 +149,7 @@ public sealed class AuditTests
         SandboxExec? commandExec = null;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
 
             commandExec = exec;
@@ -187,7 +187,7 @@ public sealed class AuditTests
             Argv = ["false"],
         });
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/false\n", "")
                 : new SandboxExecResult(1, "", "lint error: bad"));
         var result = await auditor.RunAsync(sandbox, "/work", FakeContext(), CancellationToken.None);
@@ -208,7 +208,7 @@ public sealed class AuditTests
         SandboxExec? commandExec = null;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/lint\n", "");
 
             commandExec = exec;
@@ -236,7 +236,7 @@ public sealed class AuditTests
         var sandbox = new FakeSandbox(exec =>
         {
             execs.Add(exec);
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/review-plan\n", "");
 
             return new SandboxExecResult(0, "ok", "");
@@ -352,7 +352,7 @@ public sealed class AuditTests
         var commandRan = false;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/review-plan\n", "");
 
             commandRan = true;
@@ -385,7 +385,7 @@ public sealed class AuditTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/lint\n", "");
             commandExecs++;
             return new SandboxExecResult(
@@ -416,7 +416,7 @@ public sealed class AuditTests
         var sandbox = new FakeSandbox(exec =>
             IsLanguageMarkerProbe(exec)
                 ? new SandboxExecResult(0, ".\n", "")
-                : IsToolProbe(exec)
+                : TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(2, "", stderr));
 
@@ -442,7 +442,7 @@ public sealed class AuditTests
         var sandbox = new FakeSandbox(exec =>
             IsLanguageMarkerProbe(exec)
                 ? new SandboxExecResult(0, ".\n", "")
-                : IsToolProbe(exec)
+                : TestSupport.IsToolPresenceProbe(exec)
                     ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                     : new SandboxExecResult(2, "", stderr));
 
@@ -465,7 +465,7 @@ public sealed class AuditTests
         var sandbox = new FakeSandbox(exec =>
             IsLanguageMarkerProbe(exec)
                 ? new SandboxExecResult(0, ".\n", "")
-                : IsToolProbe(exec)
+                : TestSupport.IsToolPresenceProbe(exec)
                     ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                     : new SandboxExecResult(2, "", stderr));
 
@@ -487,7 +487,7 @@ public sealed class AuditTests
         var sandbox = new FakeSandbox(exec =>
             IsLanguageMarkerProbe(exec)
                 ? new SandboxExecResult(0, ".\n", "")
-                : IsToolProbe(exec)
+                : TestSupport.IsToolPresenceProbe(exec)
                     ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                     : new SandboxExecResult(2, "", "format verification failed"));
 
@@ -510,7 +510,7 @@ public sealed class AuditTests
         {
             if (IsLanguageMarkerProbe(exec))
                 return new SandboxExecResult(0, ".\n", "");
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
 
             formatExec = exec;
@@ -542,7 +542,7 @@ public sealed class AuditTests
         var sandbox = new FakeSandbox(exec =>
             IsLanguageMarkerProbe(exec)
                 ? new SandboxExecResult(0, ".\n", "")
-                : IsToolProbe(exec)
+                : TestSupport.IsToolPresenceProbe(exec)
                     ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                     : new SandboxExecResult(2, "", stderr));
 
@@ -570,7 +570,7 @@ public sealed class AuditTests
         SandboxExec? gateExec = null;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             if (IsLanguageMarkerProbe(exec))
                 return new SandboxExecResult(0, ".\n", "");
@@ -640,7 +640,7 @@ public sealed class AuditTests
             Argv = ["npm", "test"],
         });
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/npm\n", "")
                 : new SandboxExecResult(127, "", "npm: not found"));
 
@@ -742,7 +742,7 @@ public sealed class AuditTests
             Failed!  - Failed: 4, Passed: 98, Skipped: 0, Total: 102, Duration: 4 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -774,7 +774,7 @@ public sealed class AuditTests
             Build FAILED.
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -802,7 +802,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 98, Skipped: 0, Total: 99, Duration: 4 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -833,7 +833,7 @@ public sealed class AuditTests
         var filteredDotnetInvocations = new List<IReadOnlyList<string>>();
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
 
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
@@ -882,7 +882,7 @@ public sealed class AuditTests
             """;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
 
             if (exec.Argv.Count >= 2 && exec.Argv[0] == "dotnet" && exec.Argv[1] == "test")
@@ -921,7 +921,7 @@ public sealed class AuditTests
             Failed!  - Failed: 2, Passed: 100, Skipped: 0, Total: 102, Duration: 4 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -945,7 +945,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 100, Skipped: 0, Total: 101, Duration: 4 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -970,7 +970,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -998,7 +998,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1028,7 +1028,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1056,7 +1056,7 @@ public sealed class AuditTests
                 1 Error(s)
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1084,7 +1084,7 @@ public sealed class AuditTests
             Build FAILED.
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1112,7 +1112,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 5, Skipped: 0, Total: 6, Duration: 1 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1131,7 +1131,7 @@ public sealed class AuditTests
         var auditor = CSharpTestPassAuditor();
         var output = BuildRepeatedDotnetFailureOutput(60);
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1149,7 +1149,7 @@ public sealed class AuditTests
         var auditor = CSharpTestPassAuditor();
         var output = BuildRepeatedDotnetFailureOutput(1_100);
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1192,7 +1192,7 @@ public sealed class AuditTests
             The argument /work/tests/CodeyBox.Tests/bin/Debug/net10.0/CodeyBox.Tests.dll is invalid. Please use the /help option to check the list of valid arguments.
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1220,7 +1220,7 @@ public sealed class AuditTests
             The test source file "/work/tests/CodeyBox.Tests/bin/Debug/net10.0/CodeyBox.Tests.dll" provided was not found.
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1238,7 +1238,7 @@ public sealed class AuditTests
         // target runs. Both are environment faults, not code findings.
         var auditor = CSharpTestPassAuditor();
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, "MSBUILD : error MSB1003: Specify a project or solution file. The current working directory does not contain a project or solution file.", ""));
 
@@ -1254,7 +1254,7 @@ public sealed class AuditTests
     {
         var auditor = CSharpTestPassAuditor();
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, "MSBUILD : error MSB1009: Project file does not exist.", ""));
 
@@ -1278,7 +1278,7 @@ public sealed class AuditTests
             Build FAILED.
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1312,7 +1312,7 @@ public sealed class AuditTests
             Failed!  - Failed: 1, Passed: 98, Skipped: 0, Total: 99, Duration: 4 s
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, output, ""));
 
@@ -1349,7 +1349,7 @@ public sealed class AuditTests
             """;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             seenArgv = [.. exec.Argv];
             return new SandboxExecResult(1, output, "");
@@ -1377,7 +1377,7 @@ public sealed class AuditTests
             Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: 18 ms - Vec.Tests.dll (net10.0)
             """;
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(0, output, ""));
 
@@ -1589,12 +1589,6 @@ public sealed class AuditTests
 
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
-
-    private static bool IsToolProbe(SandboxExec exec) =>
-        exec.Argv.Count >= 3 &&
-        exec.Argv[0] == "sh" &&
-        exec.Argv[1] == "-c" &&
-        exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private static bool IsLanguageMarkerProbe(SandboxExec exec) =>
         exec.Argv.Count >= 3 &&

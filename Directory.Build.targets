@@ -10,19 +10,27 @@
     Repair that environmental fault before any project targets run so auditors
     that invoke `dotnet` directly (process:required-build, csharp:build-WaE)
     succeed without depending on DOTNET_CLI_HOME redirects in the host
-    orchestrator binary. See scripts/ensure-writable-nuget-home.sh and
+    orchestrator binary. Like the sibling heal hook, this per-project target is
+    suppressed during solution builds ($(_CodeyBoxInSolution)) where the
+    once-per-solution hook does the repair — and even when it does run it is
+    NON-destructive: CODEYBOX_NUGET_HEAL_NO_QUARANTINE keeps the shared
+    recovery from renaming .nuget aside, because destructive repair is
+    reserved for the once-per-solution hook (see
+    Directory.NuGetHomeHeal.targets). See scripts/ensure-writable-nuget-home.sh and
     docs/development/build-environment.md.
 
     NuGetHomeGuard.targets (imported above) supplies an in-process backstop:
-    when the user config is present-but-unreadable, its initial target
-    redirects DOTNET_CLI_HOME to repository-local state so NuGet's proxy-cache
-    initialization survives before compilation.
+    its initial target applies the heal script's own admission verdict inside
+    MSBuild — redirecting DOTNET_CLI_HOME/HOME and repointing the auto-pinned
+    RestorePackagesPath at verified storage — so NuGet's proxy-cache
+    initialization and package consumption both survive before compilation.
   -->
-  <Target Name="EnsureWritableNuGetUserSettings">
+  <Target Name="EnsureWritableNuGetUserSettings"
+          Condition="'$(OS)' != 'Windows_NT' and '$(_CodeyBoxInSolution)' != 'true'">
     <Exec
-      Command="sh &quot;$(MSBuildThisFileDirectory)scripts/ensure-writable-nuget-home.sh&quot;"
-      Condition="'$(OS)' != 'Windows_NT'"
-      IgnoreStandardErrorWarningFormat="true" />
+      Command="env CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 sh &quot;$(MSBuildThisFileDirectory)scripts/ensure-writable-nuget-home.sh&quot;"
+      IgnoreStandardErrorWarningFormat="true"
+      StandardErrorImportance="high" />
   </Target>
 
   <!--

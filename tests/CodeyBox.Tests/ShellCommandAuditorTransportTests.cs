@@ -29,7 +29,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             commandExecs++;
             return commandExecs == 1
@@ -60,7 +60,7 @@ public sealed class ShellCommandAuditorTransportTests
             TimeProvider = clock,
         });
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(255, "", TransportDiagnostic));
 
@@ -86,7 +86,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/custom-test\n", "");
             commandExecs++;
             return new SandboxExecResult(255, "", "Failed! - Failed: 3, Passed: 10, Total: 13");
@@ -116,7 +116,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/custom-test\n", "");
             commandExecs++;
             return new SandboxExecResult(1, "", $"test failed; log line mentions {TransportDiagnostic}");
@@ -147,7 +147,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             commandExecs++;
             return commandExecs == 1
@@ -179,7 +179,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             commandExecs++;
             return new SandboxExecResult(1, "", "exec channel lost before exit report", ExecutionUnavailable: true);
@@ -209,7 +209,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(255, "", TransportDiagnostic, ExecutionUnavailable: true);
             commandExecs++;
             return new SandboxExecResult(0, "Passed!\n", "");
@@ -236,7 +236,7 @@ public sealed class ShellCommandAuditorTransportTests
         });
         var sandbox = new FakeSandbox(exec =>
         {
-            if (IsToolProbe(exec))
+            if (TestSupport.IsToolPresenceProbe(exec))
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             commandExecs++;
             return new SandboxExecResult(255, "", TransportDiagnostic);
@@ -270,7 +270,7 @@ public sealed class ShellCommandAuditorTransportTests
             SelfHealNuGetHome = true,
         });
         var sandbox = new FakeSandbox(exec =>
-            IsToolProbe(exec)
+            TestSupport.IsToolPresenceProbe(exec)
                 ? new SandboxExecResult(0, "/usr/bin/dotnet\n", "")
                 : new SandboxExecResult(1, "", "some ordinary failure output"));
 
@@ -302,12 +302,6 @@ public sealed class ShellCommandAuditorTransportTests
 
     private static AuditContext FakeContext() =>
         new(WorkItemId.New(), "feature", "main", 1, "do x");
-
-    private static bool IsToolProbe(SandboxExec exec) =>
-        exec.Argv.Count >= 3 &&
-        exec.Argv[0] == "sh" &&
-        exec.Argv[1] == "-c" &&
-        exec.Argv[2].Contains("command -v", StringComparison.Ordinal);
 
     private sealed class FakeSandbox(Func<SandboxExec, SandboxExecResult> onExec) : ISandbox
     {

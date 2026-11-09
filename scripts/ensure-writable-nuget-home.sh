@@ -11,12 +11,15 @@
 # scripts/nuget-home-heal.sh — the same recovery build.sh, the audit gates,
 # and the sibling InitialTargets hook all dot-source — so writability is
 # never mistaken for ownership: an existing .nuget is admitted only as
-# canonical storage owned by this uid or root with no co-tenant write bits;
-# a foreign-owned, co-tenant-writable, or symlinked entry is quarantined
+# canonical storage owned by this uid or root with no co-tenant write bits
+# (group-write tolerated only on uid-owned entries whose group is provably
+# private to this account); a foreign-owned, co-tenant-writable, or
+# symlinked entry is quarantined
 # aside; a fresh private settings dir is created with a readable seeded
 # config; and the package cache is relinked only when its WHOLE tree
 # verifies as consumable storage — every descendant owned by this uid or
-# root with no group/other write bits and no access-broadening ACL.
+# root, never other-writable, and group-writable only under a provably
+# private group, with no access-broadening ACL.
 #
 # When $HOME itself cannot be repaired in place, no in-place fix exists —
 # the DOTNET_CLI_HOME redirect (the NuGetHomeSelfHeal preamble wrapping
@@ -27,7 +30,14 @@
 #
 # Invoked from Directory.Build.targets (InitialTargets) so every raw
 # `dotnet build` in this repository — including process:required-build and
-# csharp:build-WaE — self-heals on a misprovisioned image.
+# csharp:build-WaE — self-heals on a misprovisioned image. That per-project
+# hook exports CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1, which the shared recovery
+# honours by skipping the destructive quarantine — renaming .nuget aside is
+# reserved for the once-per-solution hook (Directory.NuGetHomeHeal.targets via
+# Directory.Solution.props); a non-solution build's unusable home is covered
+# by the in-process NuGetHomeGuard.targets admission check instead, which
+# applies this script's own verdict and repoints DOTNET_CLI_HOME/HOME plus
+# the auto-pinned RestorePackagesPath at verified storage.
 set -u
 
 codeybox_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -58,6 +68,18 @@ codeybox_home_before="${HOME:-}"
 # private home, seeded config and markers — persist for every later exec.
 . "$codeybox_heal_script" || true
 if [ -n "${DOTNET_CLI_HOME:-}" ]; then
-    echo "ensure-writable-nuget-home: cannot repair ${codeybox_home_before:-<unset>}/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
+    codeybox_home_shown="${codeybox_home_before:-<unset>}"
+    # HOME is launch-env input: it must never reach operator/CI logs with
+    # control characters intact. Prefer the helper the dot-sourced recovery
+    # defines; fall back to the same tr strip, then to a fixed placeholder —
+    # never to the raw value.
+    if command -v _codeybox_strip_ctrl >/dev/null 2>&1; then
+        codeybox_home_shown="$(_codeybox_strip_ctrl "$codeybox_home_shown")"
+    elif command -v tr >/dev/null 2>&1; then
+        codeybox_home_shown="$(printf '%s' "$codeybox_home_shown" | tr -d '[:cntrl:]')"
+    else
+        codeybox_home_shown="<unavailable>"
+    fi
+    echo "ensure-writable-nuget-home: cannot repair $codeybox_home_shown/.nuget in place; relying on the DOTNET_CLI_HOME redirect" >&2
 fi
 exit 0

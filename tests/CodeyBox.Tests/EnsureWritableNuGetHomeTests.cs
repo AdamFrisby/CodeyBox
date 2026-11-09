@@ -47,9 +47,9 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     {
         var home = Path.Combine(_workspace, "home");
         var nugetHome = Path.Combine(home, ".nuget");
-        var packages = Path.Combine(nugetHome, "packages", "newtonsoft.json");
-        Directory.CreateDirectory(packages);
-        File.WriteAllText(Path.Combine(packages, "marker.txt"), "cached");
+        var packageDir = Path.Combine(nugetHome, "packages", "newtonsoft.json");
+        Directory.CreateDirectory(packageDir);
+        File.WriteAllText(Path.Combine(packageDir, "marker.txt"), "cached");
         // Simulate the baked image: parent not writable by the build user.
         File.SetUnixFileMode(nugetHome, UnixFileMode.UserRead | UnixFileMode.UserExecute
             | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
@@ -271,6 +271,227 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
     }
 
     [Fact]
+    public async Task Script_UidOwnedGroupWritableTree_IsLeftInPlaceWithPackagesIntact()
+    {
+        var home = Path.Combine(_workspace, "arg-home-group-writable");
+        var nugetHome = Path.Combine(home, ".nuget");
+        var packageDir = Path.Combine(nugetHome, "packages", "pkg");
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+        Directory.CreateDirectory(packageDir);
+        Directory.CreateDirectory(nugetDir);
+        var marker = Path.Combine(packageDir, "marker.txt");
+        await File.WriteAllTextAsync(marker, "healthy-cache");
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(config, "<configuration/>");
+
+        // Simulate Linux umask 002: group-writable directory (0775) and files (0664)
+        // owned by the current UID.
+        File.SetUnixFileMode(nugetHome, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(Path.Combine(nugetHome, "packages"), UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(packageDir, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(nugetDir, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(marker, UnixUmask002Permissions.File);
+        File.SetUnixFileMode(config, UnixUmask002Permissions.File);
+
+        var (exit, output) = await RunScriptAsync(home, nugetHome);
+
+        Assert.Equal(0, exit);
+        Assert.Empty(AsideDirs(nugetHome));
+        Assert.True(File.Exists(marker), output);
+        Assert.Equal("healthy-cache", await File.ReadAllTextAsync(marker));
+        Assert.True(File.Exists(config));
+        Assert.False(
+            File.GetAttributes(Path.Combine(nugetHome, "packages")).HasFlag(FileAttributes.ReparsePoint),
+            "packages directory must not have been replaced by a symlink");
+    }
+
+    [Fact]
+    public async Task Script_UnusableTree_IsQuarantined()
+    {
+        // 1. .nuget symlinked at a foreign root-owned system directory (/etc) —
+        //    rejected as a link before ownership is even inspected.
+        var homeLink = Path.Combine(_workspace, "arg-home-foreign-symlink");
+        Directory.CreateDirectory(homeLink);
+        var nugetHomeLink = Path.Combine(homeLink, ".nuget");
+        File.CreateSymbolicLink(nugetHomeLink, "/etc");
+
+        var (exitLink, outputLink) = await RunScriptAsync(homeLink, nugetHomeLink);
+        Assert.Equal(0, exitLink);
+        Assert.Single(AsideDirs(nugetHomeLink));
+        Assert.Contains("quarantined unusable", outputLink, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(Path.Combine(nugetHomeLink, "NuGet")));
+        Assert.False(
+            File.GetAttributes(nugetHomeLink).HasFlag(FileAttributes.ReparsePoint),
+            "recreated .nuget must be a real directory, not a symlink");
+
+        // 2. Unusable tree simulated via mode 0555 (uid-owned but unwritable —
+        //    foreign-OWNERSHIP is covered separately by
+        //    Script_ForeignOwnedTree_IsQuarantined).
+        if (!Environment.IsPrivilegedProcess)
+        {
+            var homeUnwritable = Path.Combine(_workspace, "arg-home-foreign-unwritable");
+            var nugetHomeUnwritable = Path.Combine(homeUnwritable, ".nuget");
+            Directory.CreateDirectory(nugetHomeUnwritable);
+            File.SetUnixFileMode(
+                nugetHomeUnwritable,
+                UnixFileMode.UserRead | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            try
+            {
+                var (exitUnwritable, outputUnwritable) = await RunScriptAsync(homeUnwritable, nugetHomeUnwritable);
+                Assert.Equal(0, exitUnwritable);
+                Assert.Single(AsideDirs(nugetHomeUnwritable));
+                Assert.Contains("quarantined unusable", outputUnwritable, StringComparison.Ordinal);
+                Assert.True(Directory.Exists(Path.Combine(nugetHomeUnwritable, "NuGet")));
+            }
+            finally
+            {
+                if (Directory.Exists(nugetHomeUnwritable))
+                {
+                    File.SetUnixFileMode(
+                        nugetHomeUnwritable,
+                        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Script_NoQuarantineFlag_SkipsDestructiveRepair()
+    {
+        // CODEYBOX_NUGET_HEAL_NO_QUARANTINE is the contract the per-project
+        // MSBuild InitialTargets rely on: the shared recovery must leave an
+        // unusable .nuget untouched (no mv, no recreation) and take only the
+        // non-destructive redirect fallback.
+        var home = Path.Combine(_workspace, "arg-home-no-quarantine");
+        Directory.CreateDirectory(home);
+        var nugetHome = Path.Combine(home, ".nuget");
+        File.CreateSymbolicLink(nugetHome, "/etc");
+
+        var (exit, output) = await RunScriptAsync(
+            home, nugetHome,
+            new Dictionary<string, string> { ["CODEYBOX_NUGET_HEAL_NO_QUARANTINE"] = "1" });
+
+        Assert.Equal(0, exit);
+        Assert.Empty(AsideDirs(nugetHome));
+        Assert.True(
+            File.GetAttributes(nugetHome).HasFlag(FileAttributes.ReparsePoint),
+            "non-destructive mode must leave the unusable .nuget exactly as found");
+        Assert.Contains("relying on the DOTNET_CLI_HOME redirect", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [Trait("requires_privileged_process", "true")]
+    public async Task Script_ForeignOwnedTree_IsQuarantined()
+    {
+        // A genuinely foreign-owned .nuget (uid != ours) is the co-tenant risk
+        // the ownership admission exists for: it must be quarantined aside and
+        // replaced, never trusted because it happens to be writable.
+        //
+        // Creating a foreign-owned fixture needs a real chown, which requires
+        // privilege. An unprivileged user-namespace fixture cannot substitute:
+        // without newuidmap (absent here, and no_new_privs blocks the setuid
+        // helpers anyway) a user namespace can only map the caller's own uid,
+        // so every file it creates still carries the same kuid the heal sees
+        // as its own — never a foreign one.
+        if (!Environment.IsPrivilegedProcess)
+            return;
+
+        var home = Path.Combine(_workspace, "arg-home-foreign-owned");
+        var nugetHome = Path.Combine(home, ".nuget");
+        var nugetDir = Path.Combine(nugetHome, "NuGet");
+        Directory.CreateDirectory(nugetDir);
+        await File.WriteAllTextAsync(Path.Combine(nugetDir, "NuGet.Config"), "<configuration/>");
+        var marker = Path.Combine(nugetHome, "packages-marker");
+        await File.WriteAllTextAsync(marker, "foreign-cache");
+
+        // nobody (uid/gid 65534) — a uid that is neither ours nor root.
+        await ChownAsync("65534:65534", nugetHome);
+
+        var (exit, output) = await RunScriptAsync(home, nugetHome);
+
+        Assert.Equal(0, exit);
+        Assert.Single(AsideDirs(nugetHome));
+        Assert.Contains("quarantined unusable", output, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(Path.Combine(nugetHome, "NuGet")));
+        Assert.False(
+            File.GetAttributes(nugetHome).HasFlag(FileAttributes.ReparsePoint),
+            "recreated .nuget must be a real directory, not a symlink");
+    }
+
+    private static async Task ChownAsync(string owner, string path)
+    {
+        var psi = new ProcessStartInfo("chown")
+        {
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add(owner);
+        psi.ArgumentList.Add(path);
+        using var proc = Process.Start(psi)!;
+        var stderr = await proc.StandardError.ReadToEndAsync();
+        await proc.WaitForExitAsync();
+        Assert.True(proc.ExitCode == 0, $"chown {owner} {path} failed: {stderr}");
+    }
+
+    [Fact]
+    public async Task Script_ConcurrentInvocations_ProduceAtMostOneQuarantine_AndNeverRemoveHealthyCache()
+    {
+        // Case 1: Unusable tree requiring quarantine. Multiple parallel invocations must coordinate
+        // via lock/marker so at most one quarantine directory is produced.
+        var homeBroken = Path.Combine(_workspace, "concurrent-broken");
+        Directory.CreateDirectory(homeBroken);
+        var nugetBroken = Path.Combine(homeBroken, ".nuget");
+        File.CreateSymbolicLink(nugetBroken, "/etc");
+
+        var tasksBroken = Enumerable.Range(0, 8)
+            .Select(_ => RunScriptAsync(homeBroken, nugetBroken))
+            .ToArray();
+        var resultsBroken = await Task.WhenAll(tasksBroken);
+
+        foreach (var (exit, _) in resultsBroken)
+            Assert.Equal(0, exit);
+
+        Assert.Single(AsideDirs(nugetBroken));
+        Assert.True(Directory.Exists(Path.Combine(nugetBroken, "NuGet")));
+        Assert.False(File.GetAttributes(nugetBroken).HasFlag(FileAttributes.ReparsePoint));
+
+        // Case 2: Healthy tree with umask 002 (group-writable). Multiple parallel invocations
+        // must never quarantine and never remove or replace the healthy cache.
+        var homeHealthy = Path.Combine(_workspace, "concurrent-healthy");
+        var nugetHealthy = Path.Combine(homeHealthy, ".nuget");
+        var packageDir = Path.Combine(nugetHealthy, "packages", "pkg");
+        var nugetDir = Path.Combine(nugetHealthy, "NuGet");
+        Directory.CreateDirectory(packageDir);
+        Directory.CreateDirectory(nugetDir);
+        var marker = Path.Combine(packageDir, "marker.txt");
+        await File.WriteAllTextAsync(marker, "healthy-concurrent-cache");
+        var config = Path.Combine(nugetDir, "NuGet.Config");
+        await File.WriteAllTextAsync(config, "<configuration/>");
+
+        File.SetUnixFileMode(nugetHealthy, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(Path.Combine(nugetHealthy, "packages"), UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(packageDir, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(nugetDir, UnixUmask002Permissions.Directory);
+        File.SetUnixFileMode(marker, UnixUmask002Permissions.File);
+        File.SetUnixFileMode(config, UnixUmask002Permissions.File);
+
+        var tasksHealthy = Enumerable.Range(0, 8)
+            .Select(_ => RunScriptAsync(homeHealthy, nugetHealthy))
+            .ToArray();
+        var resultsHealthy = await Task.WhenAll(tasksHealthy);
+
+        foreach (var (exit, _) in resultsHealthy)
+            Assert.Equal(0, exit);
+
+        Assert.Empty(AsideDirs(nugetHealthy));
+        Assert.True(File.Exists(marker));
+        Assert.Equal("healthy-concurrent-cache", await File.ReadAllTextAsync(marker));
+        Assert.False(File.GetAttributes(Path.Combine(nugetHealthy, "packages")).HasFlag(FileAttributes.ReparsePoint));
+    }
+
+    [Fact]
     public async Task DirectoryBuildTargets_LetsRawDotnetRestore_WhenNuGetHomeIsNotWritable()
     {
         // End-to-end: the same fault the auditors hit (root-owned $HOME/.nuget)
@@ -330,10 +551,16 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
 
         Assert.Equal(0, proc.ExitCode);
         Assert.DoesNotContain("Failed to read NuGet.Config", output, StringComparison.Ordinal);
-        Assert.True(Directory.Exists(Path.Combine(home, ".nuget", "NuGet")), output);
-        Assert.True(
-            new DirectoryInfo(Path.Combine(home, ".nuget")).UnixFileMode.HasFlag(UnixFileMode.UserWrite),
-            "Directory.Build.targets must leave a writable NuGet home");
+        // This is a NON-solution restore, so the per-project hook runs
+        // non-destructively (CODEYBOX_NUGET_HEAL_NO_QUARANTINE): it must NOT
+        // rename the unwritable .nuget aside — destructive repair is reserved
+        // for the once-per-solution hook. The build still succeeds because the
+        // in-process NuGetHomeGuard.targets redirect supplies a writable
+        // DOTNET_CLI_HOME for NuGet's user-config read.
+        Assert.Empty(AsideDirs(nugetHome));
+        Assert.False(
+            new DirectoryInfo(nugetHome).UnixFileMode.HasFlag(UnixFileMode.UserWrite),
+            "per-project hook must leave the unwritable .nuget untouched");
     }
 
     private static IReadOnlyList<string> AsideDirs(string nugetHome)
@@ -345,7 +572,8 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
             : [];
     }
 
-    private async Task<(int ExitCode, string Output)> RunScriptAsync(string home, string? nugetArg = null)
+    private async Task<(int ExitCode, string Output)> RunScriptAsync(
+        string home, string? nugetArg = null, IReadOnlyDictionary<string, string>? extraEnv = null)
     {
         var psi = new ProcessStartInfo("/bin/sh")
         {
@@ -361,6 +589,14 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         psi.Environment.Remove("CODEYBOX_NUGET_HOME_UNDER_TEST");
         if (nugetArg is not null)
             psi.Environment["CODEYBOX_NUGET_HOME_UNDER_TEST"] = nugetArg;
+        // Same for the non-destructive-mode flag: cleared so a value inherited
+        // from the test host cannot silently change what the fixture exercises.
+        psi.Environment.Remove("CODEYBOX_NUGET_HEAL_NO_QUARANTINE");
+        if (extraEnv is not null)
+        {
+            foreach (var (key, value) in extraEnv)
+                psi.Environment[key] = value;
+        }
         psi.Environment["TMPDIR"] = _workspace;
         // The fixture home must be authoritative: a stamped DOTNET_CLI_HOME or
         // runtime dir inherited from the test host would make the heal repair
@@ -391,4 +627,25 @@ public sealed class EnsureWritableNuGetHomeTests : IDisposable
         }
         throw new InvalidOperationException("Could not locate repository root from test base directory.");
     }
+}
+
+/// <summary>
+/// Shared umask-002 fixture permissions (directories 0775, files 0664) used to
+/// simulate the standard Linux user-private-group layout across the NuGet-home
+/// heal tests, so the simulated modes cannot drift between fixtures.
+/// </summary>
+internal static class UnixUmask002Permissions
+{
+    internal const string DirectoryMode = "0775";
+    internal const string FileMode = "0664";
+
+    internal static readonly UnixFileMode Directory =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+        | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
+
+    internal static readonly UnixFileMode File =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite
+        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+        | UnixFileMode.OtherRead;
 }

@@ -2,6 +2,11 @@
 
   <PropertyGroup>
     <_CodeyBoxRepositoryDotNetHome>$(MSBuildThisFileDirectory)../.build/dotnet-home</_CodeyBoxRepositoryDotNetHome>
+    <_CodeyBoxNuGetHealScript>$(MSBuildThisFileDirectory)../scripts/nuget-home-heal.sh</_CodeyBoxNuGetHealScript>
+    <_CodeyBoxIsWindows Condition="'$(OS)' == 'Windows_NT'">true</_CodeyBoxIsWindows>
+    <_CodeyBoxIsWindows Condition="'$(OS)' != 'Windows_NT'">false</_CodeyBoxIsWindows>
+    <_CodeyBoxNuGetHealReportTimeoutMilliseconds Condition="'$(_CodeyBoxNuGetHealReportTimeoutMilliseconds)' == ''">120000</_CodeyBoxNuGetHealReportTimeoutMilliseconds>
+    <_CodeyBoxNuGetHealPipeDrainTimeoutMilliseconds Condition="'$(_CodeyBoxNuGetHealPipeDrainTimeoutMilliseconds)' == ''">5000</_CodeyBoxNuGetHealPipeDrainTimeoutMilliseconds>
   </PropertyGroup>
 
   <UsingTask
@@ -10,42 +15,354 @@
     AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
     <ParameterGroup>
       <RepositoryDotNetHome ParameterType="System.String" Required="true" />
+      <HealScript ParameterType="System.String" Required="true" />
+      <IsWindows ParameterType="System.Boolean" Required="true" />
+      <AutoPackagesPath ParameterType="System.String" Required="false" />
+      <DeclaredPackagesPath ParameterType="System.String" Required="false" />
+      <RestorePackagesPathOut ParameterType="System.String" Required="false" Output="true" />
+      <HealReportTimeoutMilliseconds ParameterType="System.Int32" Required="true" />
+      <PipeDrainTimeoutMilliseconds ParameterType="System.Int32" Required="true" />
     </ParameterGroup>
     <Task>
       <Using Namespace="System" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.Diagnostics" />
       <Using Namespace="System.IO" />
+      <Using Namespace="System.Text" />
+      <Using Namespace="System.Threading.Tasks" />
       <Code Type="Fragment" Language="cs"><![CDATA[
-        var dotNetHome = Environment.GetEnvironmentVariable("DOTNET_CLI_HOME");
-        var home = string.IsNullOrWhiteSpace(dotNetHome)
-            ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-            : dotNetHome;
-        var configPath = Path.Combine(home, ".nuget", "NuGet", "NuGet.Config");
-        var useRepositoryHome = !File.Exists(configPath);
-
-        if (!useRepositoryHome)
+        // The home admission decision is NOT re-implemented here: on POSIX
+        // the task dot-sources scripts/nuget-home-heal.sh with
+        // CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 (per-project repair must stay
+        // non-destructive — the destructive quarantine is reserved for the
+        // once-per-solution hook) and CODEYBOX_NUGET_HEAL_REPORT=1, then
+        // applies the script's machine-readable verdict inside this MSBuild
+        // process, where the exports can actually reach NuGet. That gives the
+        // non-solution fallback the SAME whole-tree admission the heal applies
+        // everywhere else — _codeybox_ensure_nuget_home_usable plus the
+        // _codeybox_secure_package_cache descendant scan — instead of the old
+        // config-readability-only check that let a foreign-owned or
+        // co-tenant-writable .nuget/packages tree keep being consumed through
+        // the pinned RestorePackagesPath.
+        //
+        // When the report cannot be obtained on POSIX the target fails
+        // closed: falling back to config readability alone would leave the
+        // auto-pinned RestorePackagesPath on storage the heal never verified.
+        // Windows keeps the legacy readability redirect (the POSIX heal
+        // script does not apply there), but a redirect also repoints the
+        // auto-pinned package path at repository-local storage.
+        RestorePackagesPathOut = DeclaredPackagesPath;
+        const int MaxReportChars = 64 * 1024;
+        const int MaxReportStderrChars = 16 * 1024;
+        const int MaxLogValueChars = 512;
+        string SanitizeForLog(string value)
         {
+            if (value.Length > MaxLogValueChars)
+                value = value.Substring(0, MaxLogValueChars) + "...";
+            var chars = value.ToCharArray();
+            for (var i = 0; i < chars.Length; i++)
+            {
+                if (char.IsControl(chars[i]))
+                    chars[i] = ' ';
+            }
+            return new string(chars);
+        }
+
+        async System.Threading.Tasks.Task<string> ReadBoundedAsync(
+            StreamReader reader,
+            int maxChars)
+        {
+            var builder = new StringBuilder(Math.Min(maxChars, 4096));
+            var buffer = new char[4096];
+            int read;
+            while ((read = await reader
+                .ReadAsync(buffer, 0, buffer.Length)
+                .ConfigureAwait(false)) > 0)
+            {
+                if (builder.Length >= maxChars)
+                    continue;
+                var take = Math.Min(read, maxChars - builder.Length);
+                builder.Append(buffer, 0, take);
+            }
+            return builder.ToString();
+        }
+
+        bool WaitForPipeDrain(
+            System.Threading.Tasks.Task first,
+            System.Threading.Tasks.Task second)
+        {
+            var all = System.Threading.Tasks.Task.WhenAll(first, second);
             try
             {
-                using var config = new FileStream(
-                    configPath,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.ReadWrite | FileShare.Delete);
+                if (all.Wait(PipeDrainTimeoutMilliseconds))
+                    return true;
             }
-            catch (UnauthorizedAccessException)
+            catch (AggregateException)
             {
-                useRepositoryHome = true;
+                // The readers completed (faulted or not); result retrieval
+                // below reports the failure through the outer catch.
+                return true;
             }
-            catch (IOException)
+            _ = all.ContinueWith(
+                completed => { _ = completed.Exception; },
+                System.Threading.Tasks.TaskContinuationOptions.OnlyOnFaulted
+                    | System.Threading.Tasks.TaskContinuationOptions.ExecuteSynchronously);
+            return false;
+        }
+
+        Dictionary<string, string> TryGetHealReport(
+            string scriptPath,
+            out string stderr,
+            out string failure)
+        {
+            stderr = string.Empty;
+            failure = string.Empty;
+            if (string.IsNullOrEmpty(scriptPath) || !File.Exists(scriptPath))
             {
-                useRepositoryHome = true;
+                failure = "heal script not found";
+                return null;
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "sh",
+                // The script and repository fallback paths travel via the
+                // environment so no quoting of an MSBuild-derived path is
+                // needed inside the -c payload.
+                Arguments = "-c \"export CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1 "
+                    + "CODEYBOX_NUGET_HEAL_REPORT=1; . \\\"$CODEYBOX_HEAL_GUARD_SCRIPT\\\"\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.EnvironmentVariables["CODEYBOX_HEAL_GUARD_SCRIPT"] = scriptPath;
+            psi.EnvironmentVariables["CODEYBOX_NUGET_REPO_DOTNET_HOME"] =
+                RepositoryDotNetHome;
+            // The report must describe the same home MSBuild will consume:
+            // CODEYBOX_NUGET_HOME_UNDER_TEST is a test-only hook inside the
+            // heal script and must never redirect the guard's verdict.
+            psi.EnvironmentVariables.Remove("CODEYBOX_NUGET_HOME_UNDER_TEST");
+            try
+            {
+                using var proc = Process.Start(psi);
+                if (proc == null)
+                {
+                    failure = "failed to start sh";
+                    return null;
+                }
+                var stdoutTask = ReadBoundedAsync(
+                    proc.StandardOutput, MaxReportChars);
+                var stderrTask = ReadBoundedAsync(
+                    proc.StandardError, MaxReportStderrChars);
+                // The heal is bounded (no quarantine under NO_QUARANTINE, so no
+                // lock waits), but never let a wedged shell hang the build.
+                if (!proc.WaitForExit(HealReportTimeoutMilliseconds))
+                {
+                    try { proc.Kill(); } catch { }
+                    WaitForPipeDrain(stdoutTask, stderrTask);
+                    failure = "heal report timed out";
+                    return null;
+                }
+                if (!WaitForPipeDrain(stdoutTask, stderrTask))
+                {
+                    failure = "heal report output did not complete";
+                    return null;
+                }
+                if (proc.ExitCode != 0)
+                {
+                    failure = "heal report exited " + proc.ExitCode;
+                    return null;
+                }
+                var stdout = stdoutTask.GetAwaiter().GetResult();
+                stderr = stderrTask.GetAwaiter().GetResult();
+                var map = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var rawLine in stdout.Split('\n'))
+                {
+                    var line = rawLine.TrimEnd('\r');
+                    if (!line.StartsWith("CODEYBOX_HEAL_", StringComparison.Ordinal))
+                        continue;
+                    var eq = line.IndexOf('=');
+                    if (eq > 0)
+                        map[line.Substring(0, eq)] = line.Substring(eq + 1);
+                }
+                if (!map.ContainsKey("CODEYBOX_HEAL_VERDICT"))
+                {
+                    failure = "heal report had no verdict";
+                    return null;
+                }
+                return map;
+            }
+            catch (Exception ex)
+            {
+                failure = ex.GetType().Name + ": " + ex.Message;
+                return null;
             }
         }
 
-        if (useRepositoryHome)
+        bool IsReportedPackagesPath(string path)
         {
+            return !string.IsNullOrEmpty(path) && Path.IsPathRooted(path);
+        }
+
+        bool ApplyHealReport(Dictionary<string, string> report)
+        {
+            var verdict = report.TryGetValue("CODEYBOX_HEAL_VERDICT", out var v)
+                ? v : string.Empty;
+            var cliHome = report.TryGetValue(
+                "CODEYBOX_HEAL_DOTNET_CLI_HOME", out var ch) ? ch : string.Empty;
+            var home = report.TryGetValue("CODEYBOX_HEAL_HOME", out var h)
+                ? h : string.Empty;
+            var packages = report.TryGetValue(
+                "CODEYBOX_HEAL_NUGET_PACKAGES", out var p) ? p : string.Empty;
+
+            if (verdict == "usable")
+            {
+                // The env-provided home verified in place — including its
+                // whole .nuget/packages tree — so re-export the canonical
+                // values the heal resolved (a symlinked env value must not be
+                // retargeted later) and repoint the auto-pinned package path
+                // at the canonical spelling the report verified.
+                if (cliHome.Length > 0)
+                    Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", cliHome);
+                if (home.Length > 0)
+                    Environment.SetEnvironmentVariable("HOME", home);
+                if (!string.IsNullOrEmpty(DeclaredPackagesPath)
+                    && string.Equals(
+                        DeclaredPackagesPath, AutoPackagesPath,
+                        StringComparison.Ordinal))
+                {
+                    if (!IsReportedPackagesPath(packages))
+                    {
+                        Log.LogError(
+                            "CodeyBox NuGet-home heal verified a usable home without a verified package path " +
+                            "(cliHome='{0}', home='{1}').",
+                            SanitizeForLog(cliHome), SanitizeForLog(home));
+                        return false;
+                    }
+                    RestorePackagesPathOut = packages;
+                }
+                return true;
+            }
+
+            if (verdict == "redirected")
+            {
+                // The script reports the exact package path it verified (or
+                // the fresh path under the redirected private home). An empty
+                // or relative value means the contract was violated — fail
+                // rather than reconstruct home + "/.nuget/packages" here.
+                if (cliHome.Length == 0 || !IsReportedPackagesPath(packages))
+                {
+                    Log.LogError(
+                        "CodeyBox NuGet-home heal redirected without a verified package path " +
+                        "(cliHome='{0}', packages='{1}').",
+                        SanitizeForLog(cliHome), SanitizeForLog(packages));
+                    return false;
+                }
+                Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", cliHome);
+                Environment.SetEnvironmentVariable(
+                    "HOME", home.Length > 0 ? home : null);
+                if (!string.IsNullOrEmpty(DeclaredPackagesPath)
+                    && string.Equals(
+                        DeclaredPackagesPath, AutoPackagesPath,
+                        StringComparison.Ordinal))
+                {
+                    RestorePackagesPathOut = packages;
+                }
+                return true;
+            }
+
+            if (verdict == "failed")
+            {
+                Log.LogError(
+                    "CodeyBox NuGet-home heal could not materialize verified storage " +
+                    "(cliHome='{0}', home='{1}'); refusing to consume the rejected package cache.",
+                    SanitizeForLog(cliHome), SanitizeForLog(home));
+                return false;
+            }
+
+            Log.LogError(
+                "CodeyBox NuGet-home heal returned unknown verdict '{0}'.",
+                SanitizeForLog(verdict));
+            return false;
+        }
+
+        bool ApplyLegacyWindowsFallback()
+        {
+            var dotNetHome = Environment.GetEnvironmentVariable("DOTNET_CLI_HOME");
+            var home = string.IsNullOrWhiteSpace(dotNetHome)
+                ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                : dotNetHome;
+            var configPath = Path.Combine(home, ".nuget", "NuGet", "NuGet.Config");
+            var useRepositoryHome = !File.Exists(configPath);
+
+            if (!useRepositoryHome)
+            {
+                try
+                {
+                    using var config = new FileStream(
+                        configPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    useRepositoryHome = true;
+                }
+                catch (IOException)
+                {
+                    useRepositoryHome = true;
+                }
+            }
+
+            if (!useRepositoryHome)
+                return true;
+
+            if (string.IsNullOrWhiteSpace(RepositoryDotNetHome))
+            {
+                Log.LogError("CodeyBox repository NuGet home is not configured.");
+                return false;
+            }
             Directory.CreateDirectory(RepositoryDotNetHome);
             Environment.SetEnvironmentVariable("DOTNET_CLI_HOME", RepositoryDotNetHome);
+            if (!string.IsNullOrEmpty(DeclaredPackagesPath)
+                && string.Equals(
+                    DeclaredPackagesPath, AutoPackagesPath, StringComparison.Ordinal))
+            {
+                RestorePackagesPathOut = Path.Combine(
+                    RepositoryDotNetHome, ".nuget", "packages");
+            }
+            return true;
+        }
+
+        if (!IsWindows)
+        {
+            string reportStderr;
+            string reportFailure;
+            var report = TryGetHealReport(
+                HealScript, out reportStderr, out reportFailure);
+            if (report != null)
+            {
+                if (!ApplyHealReport(report))
+                    return false;
+            }
+            else
+            {
+                Log.LogError(
+                    "CodeyBox NuGet-home heal report unavailable: {0}",
+                    SanitizeForLog(reportFailure));
+                if (!string.IsNullOrWhiteSpace(reportStderr))
+                {
+                    Log.LogError(
+                        "CodeyBox NuGet-home heal stderr: {0}",
+                        SanitizeForLog(reportStderr));
+                }
+                return false;
+            }
+        }
+        else if (!ApplyLegacyWindowsFallback())
+        {
+            return false;
         }
       ]]></Code>
     </Task>
@@ -53,11 +370,21 @@
 
   <!-- NuGet 7.6 creates its HTTP proxy cache from the user-wide config even
        when RestoreConfigFile names one specific repository config. Run as an
-       initial target so an unreadable config is redirected before NuGet
-       captures its environment-derived paths during restore graph creation. -->
+       initial target so an unusable home is handled before NuGet captures its
+       environment-derived paths during restore graph creation. On POSIX the
+       heal script's verdict is mandatory; on Windows the legacy readability
+       redirect remains. -->
   <Target Name="_CodeyBoxEnsureReadableNuGetHome">
     <CodeyBoxEnsureReadableNuGetHome
-      RepositoryDotNetHome="$(_CodeyBoxRepositoryDotNetHome)" />
+      RepositoryDotNetHome="$(_CodeyBoxRepositoryDotNetHome)"
+      HealScript="$(_CodeyBoxNuGetHealScript)"
+      IsWindows="$(_CodeyBoxIsWindows)"
+      AutoPackagesPath="$(_CodeyBoxAutoRestorePackagesPath)"
+      DeclaredPackagesPath="$(RestorePackagesPath)"
+      HealReportTimeoutMilliseconds="$(_CodeyBoxNuGetHealReportTimeoutMilliseconds)"
+      PipeDrainTimeoutMilliseconds="$(_CodeyBoxNuGetHealPipeDrainTimeoutMilliseconds)">
+      <Output TaskParameter="RestorePackagesPathOut" PropertyName="RestorePackagesPath" />
+    </CodeyBoxEnsureReadableNuGetHome>
   </Target>
 
 </Project>

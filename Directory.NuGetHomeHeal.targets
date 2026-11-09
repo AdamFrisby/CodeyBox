@@ -10,13 +10,33 @@
     package is restored. NuGet performs that user-config read during restore, so
     the home must be repaired on disk before restore runs.
 
-    This is wired through `InitialTargets` (see Directory.Build.props /
-    Directory.Solution.props), which MSBuild runs at the very start of every
-    invocation — verified to execute BEFORE NuGet's user-config read, at both the
-    solution and the individual-project level. It therefore heals a plain
-    `dotnet build` / `dotnet test` / `dotnet build <solution>` with no wrapper
-    script, environment override, or orchestrator change: the exact commands the
-    build/test gates invoke directly.
+    This is wired through `InitialTargets`. At solution level it is imported by
+    `Directory.Solution.props`, which also sets `_CodeyBoxNuGetHealSolutionLevel`
+    — the ONLY invocation allowed to run the destructive quarantine (the `mv`
+    that renames an unusable `.nuget` aside), once per solution before the
+    solution restore dispatches per-project work. That flag is REQUIRED, not
+    decorative: during the solution-node evaluation `Directory.Build.props` is
+    imported too and sets `_CodeyBoxInSolution` (because `$(SolutionPath)` is
+    non-empty), so without it this target's own suppression condition would
+    evaluate false and the mandated once-per-solution repair would never run.
+
+    During a solution build the per-project evaluations suppress this same
+    target via `_CodeyBoxInSolution` (set in `Directory.Build.props`). For
+    non-solution builds (`dotnet build foo.csproj`, `dotnet test`) the
+    project-level import in `Directory.Build.props` runs it instead — but with
+    `CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1`, because destructive repair from a
+    per-project InitialTarget is forbidden: an unusable home there is handled
+    by the in-process `NuGetHomeGuard.targets` task (imported by
+    `Directory.Build.targets`), which dot-sources the same heal script with
+    `CODEYBOX_NUGET_HEAL_REPORT=1` and applies its verdict inside the MSBuild
+    process — redirecting DOTNET_CLI_HOME/HOME and repointing the auto-pinned
+    `RestorePackagesPath` at the same whole-tree-verified cache storage the
+    heal itself would use, not by renaming directories once per project.
+
+    Either way a plain `dotnet build` / `dotnet test` / `dotnet build
+    <solution>` heals itself with no wrapper script, environment override, or
+    orchestrator change: the exact commands the build/test gates invoke
+    directly.
 
     The repair itself is the single source of truth in scripts/nuget-home-heal.sh
     (also dot-sourced by build.sh and the orchestrator's audit gates). The
@@ -40,15 +60,24 @@
   <Target Name="CodeyBoxHealNuGetHome"
           Condition=" '$(OS)' != 'Windows_NT'
                       and '$(DesignTimeBuild)' != 'true'
-                      and Exists('$(CodeyBoxNuGetHomeHealScript)') ">
+                      and Exists('$(CodeyBoxNuGetHomeHealScript)')
+                      and ('$(_CodeyBoxNuGetHealSolutionLevel)' == 'true'
+                           or '$(_CodeyBoxInSolution)' != 'true') ">
     <!-- The script never fails a `set -e` caller and returns 0 in every path, so
          the command always exits 0 and produces no warning under
          TreatWarningsAsErrors; the trailing `|| true` is belt-and-suspenders in
-         case a future edit changes that. Output is suppressed so a clean build
-         stays quiet. -->
-    <Exec Command="sh -c '. &quot;$(CodeyBoxNuGetHomeHealScript)&quot; &gt;/dev/null 2&gt;&amp;1 || true'"
+         case a future edit changes that. stderr must reach the operator: the
+         script is quiet on a clean home, and its diagnostics — above all the
+         quarantine notice — are the only signal that the solution-level repair
+         renamed an unusable .nuget aside. Exec only surfaces stderr lines that
+         match the MSBuild warning/error format unless
+         IgnoreStandardErrorWarningFormat is set, so it is set here and the
+         importance raised to high; without both, plain stderr (the script's
+         only output channel) is silently dropped at normal verbosity. -->
+    <Exec Command="sh -c 'if [ &quot;$(_CodeyBoxNuGetHealSolutionLevel)&quot; = true ]; then unset CODEYBOX_NUGET_HEAL_NO_QUARANTINE; else export CODEYBOX_NUGET_HEAL_NO_QUARANTINE=1; fi; . &quot;$(CodeyBoxNuGetHomeHealScript)&quot; || true'"
           StandardOutputImportance="low"
-          StandardErrorImportance="low" />
+          StandardErrorImportance="high"
+          IgnoreStandardErrorWarningFormat="true" />
   </Target>
 
 </Project>

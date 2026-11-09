@@ -472,9 +472,7 @@ public sealed class PresetCatalogTests
             """;
         var sandbox = new FakeSandbox(exec =>
         {
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "sh"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return new SandboxExecResult(0, "/usr/bin/dotnet\n", "");
             }

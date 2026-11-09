@@ -46,6 +46,24 @@ internal static class TestSupport
             : argv;
 
     /// <summary>
+    /// True when <paramref name="exec"/> is a tool-presence probe emitted by
+    /// the auditors — either the <c>sh -c 'command -v "$1" …' sh|codeybox-plugin-tool-check
+    /// &lt;tool&gt;</c> shape (ExternalToolAuditorBase / ShellCommandAuditor /
+    /// PluginBaselineProvisioning) or the dotnet-path probe
+    /// <c>sh -c 'command -v dotnet …'</c> (AuditReviewDotnetShim).
+    /// </summary>
+    public static bool IsToolPresenceProbe(SandboxExec exec) =>
+        (exec.Argv.Count == 5
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2] == "command -v \"$1\" >/dev/null 2>&1"
+            && (exec.Argv[3] == "sh" || exec.Argv[3] == "codeybox-plugin-tool-check"))
+        || (exec.Argv.Count == 3
+            && exec.Argv[0] == "sh"
+            && exec.Argv[1] == "-c"
+            && exec.Argv[2] == "command -v dotnet 2>/dev/null || true");
+
+    /// <summary>
     /// Numeric uid of the current user via <c>id -u</c>, for tests that assert
     /// on the uid-stamped per-user fallback dirs
     /// (<see cref="NuGetHomeSelfHeal.WritableHomeLeaf"/>) the NuGet-home heal

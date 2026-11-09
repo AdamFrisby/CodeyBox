@@ -196,10 +196,7 @@ public sealed class DotnetTestInvocationRegressionTests
         public string Id => "capturing";
         public Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
         {
-            if (exec.Argv.Count >= 3
-                && exec.Argv[0] == "sh"
-                && exec.Argv[1] == "-c"
-                && exec.Argv[2].Contains("command -v", StringComparison.Ordinal))
+            if (TestSupport.IsToolPresenceProbe(exec))
             {
                 return Task.FromResult(new SandboxExecResult(0, "/usr/bin/dotnet\n", ""));
             }
