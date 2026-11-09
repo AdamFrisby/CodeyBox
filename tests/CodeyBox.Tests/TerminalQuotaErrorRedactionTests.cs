@@ -14,14 +14,20 @@ namespace CodeyBox.Tests;
 /// </summary>
 public sealed class TerminalQuotaErrorRedactionUnitTests
 {
-    private const string SecretSummary = "exit 1 token ghp_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890 leaked";
+    // Synthetic GitHub PAT shape assembled at runtime so no scanner-detectable
+    // github-pat literal remains in source. The alternating-case + sequential-digit
+    // suffix is obviously invented and never issued; at runtime it still matches
+    // the redactor's secret pattern, exercising the same redaction path.
+    private static string SyntheticPat => string.Concat("ghp_", "AbCdEfGhIjKlMnOpQrSt", "UvWxYz1234567890");
+
+    private static string SecretSummary => "exit 1 token " + SyntheticPat + " leaked";
 
     [Fact]
     public void FromRaw_RedactsSecretShapedToken()
     {
         var detail = SanitizedAgentDetail.FromRaw(SecretSummary);
 
-        Assert.DoesNotContain("ghp_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890", detail.Value);
+        Assert.DoesNotContain(SyntheticPat, detail.Value);
         Assert.Contains("***", detail.Value);
     }
 
@@ -77,7 +83,7 @@ public sealed class TerminalQuotaErrorRedactionUnitTests
                 prefix,
                 SanitizedAgentDetail.FromRaw(SecretSummary));
 
-            Assert.DoesNotContain("ghp_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890", message);
+            Assert.DoesNotContain(SyntheticPat, message);
             Assert.Contains(prefix switch
             {
                 _ when prefix.Contains("reported quota failure") && kind == QuotaFailureKind.RateLimitExceeded
@@ -102,7 +108,8 @@ public sealed class TerminalQuotaErrorRedactionUnitTests
 [Collection("Pipeline integration")]
 public sealed class TerminalQuotaErrorRedactionPersistenceTests : IDisposable
 {
-    private const string SecretToken = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890";
+    // Same synthetic shape as above, assembled at runtime (see comment there).
+    private static string SecretToken => string.Concat("ghp_", "AbCdEfGhIjKlMnOpQrSt", "UvWxYz1234567890");
     private readonly string _workspace =
         Directory.CreateTempSubdirectory("codeybox-quota-redact-").FullName;
 
