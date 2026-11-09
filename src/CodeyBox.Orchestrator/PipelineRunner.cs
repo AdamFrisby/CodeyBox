@@ -1469,6 +1469,30 @@ public sealed partial class PipelineRunner : IPipelineRunner
                 failureKind: WorkItemFailureKinds.OutputLimitExhausted,
                 agent: ex.Agent);
         }
+        catch (AgentEndedWithoutFinalResponseException ex)
+        {
+            // The runner already spent its bounded same-session
+            // continuations against a turn that died mid-investigation (no
+            // final message, no edits): not declining to work. Fail
+            // terminally with the distinct ended-without-final-response
+            // kind so the outcome is never misreported as quota, transient,
+            // or "produced no changes". Never a transient park (the budget
+            // is spent) and never quota fallback (the dead turn is a
+            // property of how that run ended, not the agent choice).
+            _log.LogWarning(
+                "Work item {Id} ended without a final response: agent={Agent} phase={Phase} error={Error}",
+                item.Id,
+                ex.Agent.Value,
+                ex.Phase ?? "(unknown)",
+                ex.Message);
+            await TransitionFailed(
+                item,
+                ex.Message,
+                CancellationToken.None,
+                project,
+                failureKind: WorkItemFailureKinds.EndedWithoutFinalResponse,
+                agent: ex.Agent);
+        }
         catch (TerminalQuotaError ex)
         {
             // Quota rejection is never a terminal Failure: the agent (or a peer

@@ -350,6 +350,21 @@ public sealed record AgentResult(bool Success, string Summary, string? Stdout, s
     public bool OutputTokenLimitExhausted { get; init; }
 
     /// <summary>
+    /// True when a clean-exit (exit 0) turn ended with no final assistant
+    /// message and no recorded edits, and the runner's bounded same-session
+    /// continuations (see <c>CopilotOptions.NoFinalResponseMaxContinuations</c>)
+    /// were spent — or no continuation was possible because no native session
+    /// id was captured — without the turn producing either. Set only
+    /// alongside <c>Success: false</c>: the pipeline classifies this as the
+    /// distinct ended-without-final-response failure kind rather than quota,
+    /// transient, or the generic "produced no changes" outcome. The turn died
+    /// mid-investigation (exploratory tool calls with no concluding message),
+    /// which is observably different from a verification turn that completed
+    /// with a summary but no diff.
+    /// </summary>
+    public bool EndedWithoutFinalResponse { get; init; }
+
+    /// <summary>
     /// True when the exec was terminated (or its output truncated) because it
     /// exceeded a provider output bound. Agent-turn streaming execs never set
     /// this; a set flag means a bounded control-plane-style exec hit its cap

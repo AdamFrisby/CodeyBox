@@ -53,6 +53,23 @@ public sealed class CopilotOptions
     /// BYOK rather than being conditioned on the model id.</para>
     /// </summary>
     public IList<string>? ExcludedTools { get; set; }
+
+    /// <summary>
+    /// Bounded same-session continuations the runner sends (via
+    /// <c>copilot --resume &lt;session-id&gt;</c>) after a clean-exit turn
+    /// ends with no final assistant message and no recorded edits — the
+    /// signature of a turn that died mid-investigation. Each continuation
+    /// re-prompts the SAME native session with a "continue and finish"
+    /// instruction, so in-progress context is preserved instead of
+    /// restarting the turn. A spent bound ends the run with
+    /// <see cref="CodeyBox.Core.WorkItemFailureKinds.EndedWithoutFinalResponse"/>
+    /// rather than the generic "produced no changes" outcome. Clamped into
+    /// [0, 32] on the dispatch path like the output-token continuation
+    /// bounds; 0 disables the continuation (the first empty finish ends the
+    /// turn). Hot-reloadable: read on every dispatch, so an operator edit
+    /// lands on the next run.
+    /// </summary>
+    public int NoFinalResponseMaxContinuations { get; set; } = 2;
 }
 
 /// <summary>

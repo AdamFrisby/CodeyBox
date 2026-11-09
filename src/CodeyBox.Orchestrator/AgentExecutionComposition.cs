@@ -529,7 +529,8 @@ public static class AgentExecutionComposition
             sp.GetRequiredService<AgentNetworkToleranceSnapshot>(),
             sp.GetRequiredService<IQuotaFailureClassifier>()));
         services.AddSingleton<IAgentRunner>(sp => new CopilotAgentRunner(
-            sp.GetRequiredService<AgentDefaultsSnapshot>())
+            sp.GetRequiredService<AgentDefaultsSnapshot>(),
+            () => sp.GetRequiredService<IOptionsMonitor<CopilotOptions>>().CurrentValue)
         {
             Options = sp.GetRequiredService<IOptionsMonitor<CopilotOptions>>().CurrentValue,
         });

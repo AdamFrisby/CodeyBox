@@ -1,5 +1,6 @@
 using CodeyBox.Agents;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Agents.Copilot;
 
@@ -21,15 +22,27 @@ namespace CodeyBox.Agents.Copilot;
 /// exceed it and surface as exit 126 from the sandbox wrapper's exec. There is no CLI affordance to work
 /// around this today.</para>
 /// </summary>
-public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentRunner, IAgentDefaultModelProvider
+public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentRunner, IAgentDefaultModelProvider, IStructuredStreamAgentRunner, ICliSessionResumableAgentRunner, IAgentVisibleTextExtractor
 {
     private readonly AgentDefaultsSnapshot? _defaults;
+    private readonly Func<CopilotOptions>? _optionsProvider;
 
     public CopilotAgentRunner() : this(defaults: null) { }
 
     public CopilotAgentRunner(AgentDefaultsSnapshot? defaults)
+        : this(defaults, optionsProvider: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a runner with a live options provider so hot-reloadable knobs
+    /// (see <see cref="NoFinalResponseMaxContinuations"/>) are re-read on
+    /// every dispatch instead of freezing the construction-time snapshot.
+    /// </summary>
+    public CopilotAgentRunner(AgentDefaultsSnapshot? defaults, Func<CopilotOptions>? optionsProvider)
     {
         _defaults = defaults;
+        _optionsProvider = optionsProvider;
     }
 
     public override AgentKind Kind => AgentKind.Copilot;
@@ -74,6 +87,34 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
 
     /// <summary>Operator configuration. Defaults to subscription mode with no BYOK provider.</summary>
     public CopilotOptions Options { get; init; } = new();
+
+    /// <summary>
+    /// Bounded same-session continuations sent after a clean-exit turn ends
+    /// with no final assistant message and no recorded edits (see
+    /// <see cref="CopilotOptions.NoFinalResponseMaxContinuations"/>). Read
+    /// live from the options provider on every dispatch — falling back to
+    /// the construction-time <see cref="Options"/> snapshot when no provider
+    /// was supplied — so an operator edit lands on the next run without
+    /// restart. Clamped through <see cref="OutputTokenLimit.ClampContinuations"/>;
+    /// a failing provider degrades to the option default rather than failing
+    /// the dispatch.
+    /// </summary>
+    public int NoFinalResponseMaxContinuations
+    {
+        get
+        {
+            try
+            {
+                return OutputTokenLimit.ClampContinuations(
+                    _optionsProvider?.Invoke()?.NoFinalResponseMaxContinuations
+                        ?? Options.NoFinalResponseMaxContinuations);
+            }
+            catch (Exception)
+            {
+                return OutputTokenLimit.ClampContinuations(new CopilotOptions().NoFinalResponseMaxContinuations);
+            }
+        }
+    }
 
     /// <summary>Generates the session identifier substituted for
     /// <see cref="ProviderSessionIdPlaceholder"/>. Defaults to a fresh random UUID per call and is an
@@ -122,7 +163,7 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         // The bound runner must carry this instance's defaults snapshot: DefaultModelId
         // is sourced from it, and a member-scoped BYOK provider has no usable built-in
         // default, so dropping it makes every bound dispatch fail for want of a model.
-        return new CopilotAgentRunner(_defaults)
+        return new CopilotAgentRunner(_defaults, _optionsProvider)
         {
             Binary = Binary,
             SessionIdGenerator = SessionIdGenerator,
@@ -132,8 +173,109 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
                 Providers = Options.Providers,
                 Offline = Options.Offline,
                 ExcludedTools = Options.ExcludedTools,
+                NoFinalResponseMaxContinuations = NoFinalResponseMaxContinuations,
             },
         };
+    }
+
+    /// <summary>
+    /// Structured-stream capability probe: <c>copilot --help</c> advertises
+    /// <c>--output-format</c> with a <c>json</c> value on builds that ship
+    /// <c>--output-format json</c> (verified on 1.0.106). Both markers are
+    /// required — a help text mentioning the flag without a json value (or
+    /// vice versa) must not report support, or the dispatch would crash with
+    /// "unknown value". Older CLIs fail the probe and the pipeline falls
+    /// back to plaintext capture with a stderr warning.
+    /// </summary>
+    public async Task<bool> SupportsStructuredStreamAsync(ISandbox sandbox, CancellationToken ct = default)
+    {
+        SandboxExecResult probe;
+        try
+        {
+            probe = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = [Binary, "--help"],
+            }, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
+
+        if (!probe.Success)
+            return false;
+
+        var output = string.Concat(probe.Stdout, "\n", probe.Stderr);
+        return output.Contains("--output-format", StringComparison.Ordinal)
+            && output.Contains("json", StringComparison.Ordinal);
+    }
+
+    public override async Task<AgentResult> RunAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null,
+        bool captureStructuredStream = false)
+    {
+        var structuredStreamSupported = !captureStructuredStream
+            || await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
+        var effectiveCaptureStructuredStream = captureStructuredStream && structuredStreamSupported;
+
+        var result = await base.RunAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            modelId,
+            reasoningMode,
+            ct,
+            stdoutChunkCallback,
+            effectiveCaptureStructuredStream).ConfigureAwait(false);
+
+        if (!captureStructuredStream || structuredStreamSupported)
+            return result;
+
+        return WithStructuredStreamDisabledWarning(result);
+    }
+
+    public override async Task<AgentResult> RunResumedAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string prompt,
+        AgentCredential? credential,
+        AgentResumeContext resume,
+        string? modelId = null,
+        string? reasoningMode = null,
+        CancellationToken ct = default,
+        Action<string>? stdoutChunkCallback = null)
+    {
+        var structuredStreamSupported = await SupportsStructuredStreamAsync(sandbox, ct).ConfigureAwait(false);
+        var result = await RunResumedCoreAsync(
+            sandbox,
+            workingDirectory,
+            prompt,
+            credential,
+            resume,
+            modelId,
+            reasoningMode,
+            ct,
+            stdoutChunkCallback,
+            captureStructuredStream: structuredStreamSupported).ConfigureAwait(false);
+
+        return structuredStreamSupported
+            ? result
+            : WithStructuredStreamDisabledWarning(result);
+    }
+
+    private AgentResult WithStructuredStreamDisabledWarning(AgentResult result)
+    {
+        var warning = $"Warning: Copilot CLI at '{Binary}' does not support --output-format json; structured stream capture was disabled.";
+        var stderr = string.IsNullOrEmpty(result.Stderr) ? warning : $"{warning}\n{result.Stderr}";
+        return result with { Stderr = stderr };
     }
 
     /// <summary>
@@ -300,6 +442,110 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         string? modelId = null,
         string? reasoningMode = null,
         bool captureStructuredStream = false)
+        => BuildCopilotInvocation(
+            prompt,
+            modelId,
+            sessionIdForResume: null,
+            captureStructuredStream);
+
+    /// <summary>
+    /// Copilot emits its resumable native session id in the trailing
+    /// <c>result</c> event (<c>sessionId</c>) of <c>--output-format json</c>
+    /// output, so orchestrator call sites must force structured output when
+    /// they want crash recovery or empty-finish continuation independent of
+    /// AgentStreams.
+    /// </summary>
+    public bool RequiresStructuredStreamForSessionId => true;
+
+    public IQuotaFailureClassifier SessionResumeQuotaClassifier => CopilotSessionResumeQuotaClassifier.Instance;
+
+    public string? TryExtractSessionId(string? stdout)
+        => CopilotSessionIdExtractor.Extract(stdout);
+
+    /// <summary>
+    /// Unwraps the <c>--output-format json</c> envelope so the orchestrator's
+    /// plan-artifact parser sees the agent-visible message text rather than
+    /// raw NDJSON. Returns <c>null</c> when no JSON events were observed —
+    /// the caller then feeds the raw stdout to the parser directly.
+    /// </summary>
+    public string? ExtractAgentVisibleText(string rawStdout)
+        => CopilotVisibleTextExtractor.Extract(rawStdout);
+
+    /// <summary>
+    /// Builds the argv for a CLI-native session continuation:
+    /// <c>copilot --resume &lt;uuid&gt; -p &lt;prompt&gt;</c>. The session id
+    /// travels as one argv element and must parse as a UUID — anything else
+    /// (including nearly-plausible native-id shapes) fails loudly here
+    /// instead of reaching the process launch, where a crafted value could
+    /// smuggle extra CLI flags.
+    /// </summary>
+    protected override AgentInvocation BuildSessionResumeInvocation(
+        AgentNativeSessionId sessionId,
+        string prompt,
+        AgentCredential? credential,
+        string? modelId = null,
+        string? reasoningMode = null,
+        bool captureStructuredStream = false)
+    {
+        ArgumentNullException.ThrowIfNull(sessionId);
+        return BuildCopilotInvocation(
+            prompt,
+            modelId,
+            ValidateCopilotSessionId(sessionId),
+            captureStructuredStream);
+    }
+
+    internal static string ValidateCopilotSessionId(AgentNativeSessionId sessionId)
+    {
+        ArgumentNullException.ThrowIfNull(sessionId);
+        if (!Guid.TryParseExact(sessionId.Value, "D", out _))
+            throw new ArgumentException(
+                "Copilot native session ids must be UUIDs (the CLI prints one as 'copilot --resume=<uuid>').",
+                nameof(sessionId));
+        return sessionId.Value;
+    }
+
+    protected override int EmptySuccessMaxContinuations => NoFinalResponseMaxContinuations;
+
+    protected override bool IsEmptySuccessRequiringContinuation(AgentResult result)
+        => result.Success
+            && !result.EndedWithoutFinalResponse
+            && CopilotTurnOutcome.Extract(result.Stdout).RequiresContinuation;
+
+    protected override string BuildEmptySuccessContinuationPrompt(AgentResult result)
+    {
+        _ = result;
+        return CopilotContinuationPrompts.BuildEmptyFinishContinuePrompt();
+    }
+
+    private sealed class CopilotSessionResumeQuotaClassifier : IQuotaFailureClassifier
+    {
+        public static readonly CopilotSessionResumeQuotaClassifier Instance = new();
+
+        private readonly CopilotQuotaFailureDetector _detector = new();
+
+        private CopilotSessionResumeQuotaClassifier() { }
+
+        public QuotaFailureClassification Classify(AgentKind agent, string? stderr, string? stdout)
+        {
+            if (agent != AgentKind.Copilot || (string.IsNullOrEmpty(stderr) && string.IsNullOrEmpty(stdout)))
+                return QuotaFailureClassification.None;
+
+            var detection = _detector.Detect(stderr, stdout);
+            return detection is null
+                ? QuotaFailureClassification.None
+                : QuotaFailureClassification.Quota(detection);
+        }
+
+        public QuotaDetection? Detect(AgentKind agent, string? stderr, string? stdout)
+            => Classify(agent, stderr, stdout).Detection;
+    }
+
+    private AgentInvocation BuildCopilotInvocation(
+        string prompt,
+        string? modelId,
+        string? sessionIdForResume,
+        bool captureStructuredStream)
     {
         // --allow-all-tools is REQUIRED for non-interactive mode: without it Copilot waits on a
         // permission prompt that nothing will answer. --allow-all-paths is added because every
@@ -310,11 +556,27 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         var argv = new List<string>
         {
             Binary,
-            "-p",
-            prompt,
-            "--allow-all-tools",
-            "--allow-all-paths",
         };
+        if (sessionIdForResume is not null)
+        {
+            argv.Add("--resume");
+            argv.Add(sessionIdForResume);
+        }
+        argv.Add("-p");
+        argv.Add(prompt);
+        argv.Add("--allow-all-tools");
+        argv.Add("--allow-all-paths");
+
+        // --output-format json switches the CLI to NDJSON stream events with
+        // a trailing result envelope (sessionId, exitCode, usage.codeChanges)
+        // instead of plaintext with a human footer. Verified on 1.0.106: the
+        // result event is the last stdout line, and the resume hint keeps
+        // printing when the model call itself failed.
+        if (captureStructuredStream)
+        {
+            argv.Add("--output-format");
+            argv.Add("json");
+        }
 
         // --model selects the model actually sent on the wire, including under BYOK, where it must name
         // a model the configured endpoint serves. Verified against v1.0.82: the COPILOT_MODEL /
@@ -344,9 +606,8 @@ public sealed class CopilotAgentRunner : CliAgentRunnerBase, IMemberScopedAgentR
         }
 
         // Reasoning level is not a Copilot flag: it derives reasoning_effort from the model id, so the
-        // choice is expressed by picking the model. Informational only on this runner.
-        _ = reasoningMode;
-        _ = captureStructuredStream;
+        // choice is expressed by picking the model. Informational only on this runner; the private
+        // builder takes no reasoningMode parameter, so callers drop it at the boundary.
 
         var env = BuildProviderEnvironment(Options, SessionIdGenerator);
         return new AgentInvocation(argv, ExtraEnvironment: env.Count == 0 ? null : env);
