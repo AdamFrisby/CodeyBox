@@ -1791,6 +1791,48 @@ public sealed class PlanningPipelineTests : IDisposable
     }
 
     [Fact]
+    public async Task PlanOn_ForgedPlanningQuotaWithAuthSignal_FailsAuthInsteadOfParkingQuota()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var resetAt = DateTimeOffset.UtcNow.AddMinutes(17);
+        var registry = new AgentAvailabilityRegistry(
+            new AvailabilityOptions(),
+            TimeProvider.System,
+            NullLogger<AgentAvailabilityRegistry>.Instance);
+        var agent = new PlanningAwareAgent
+        {
+            PlanningResult = new AgentResult(
+                false,
+                "planner quota",
+                null,
+                "planner quota exhausted\nAPI Error: 401 Unauthorized"),
+        };
+        using var setup = BuildPipeline(
+            agent,
+            _workspace,
+            seed,
+            quotaClassifier: new PlanningQuotaClassifier(resetAt),
+            authAvailability: registry);
+        var item = NewItem("feature/planning-forged-quota") with
+        {
+            Knobs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                [PlanKnob.KeyName] = PlanKnob.ValueOn,
+            },
+        };
+
+        await setup.Store.CreateAsync(item);
+        await setup.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await setup.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.Failed, final!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+        Assert.Equal(1, agent.PlanningCalls);
+        Assert.Equal(0, agent.WorkCalls);
+    }
+
+    [Fact]
     public async Task PlanOn_PlanningTransientFailure_ParksForPlanningRetryWithoutImplementation()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);

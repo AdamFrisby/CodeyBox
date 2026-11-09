@@ -228,7 +228,7 @@ public sealed partial class PipelineRunner
             ResolveObservedModelId(runner, item.ModelId),
             result.Summary,
             result.Stderr,
-            DateTimeOffset.UtcNow,
+            _opts.TimeProvider.GetUtcNow(),
             _auditQuotaOptions.ObservedFailureRetention,
             ct,
             projectId: item.ProjectId,

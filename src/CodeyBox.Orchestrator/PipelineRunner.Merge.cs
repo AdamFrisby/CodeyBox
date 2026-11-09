@@ -346,15 +346,20 @@ public sealed partial class PipelineRunner
                     ct);
                 _quotaAuditEmitter.EmitAdvisoryAuditEvents(
                     chosenMergeRunner.Kind, agentResult.Stderr, agentResult.Stdout, "merge", sandbox.Id);
-                var detection = _quotaClassifier.Detect(
+                var mergeQuotaClassification = _quotaClassifier.Classify(
                     chosenMergeRunner.Kind,
                     classificationResult.Stderr,
                     classificationResult.Stdout);
                 // Only genuine quota/rate-limit signals take the quota path —
                 // a 401/403 (Unauthorized) is handled by the auth path above
                 // and must never bench the member or park for a reset.
-                if (detection is { Kind: var mergeQuotaKind } && mergeQuotaKind.IsExhaustionSignal())
+                // Auth handling already ran first, so this block cannot
+                // suppress it; the trust bit still travels explicitly so
+                // forgeable stdout-only evidence stays vetoable by a healthy
+                // probe instead of parking trusted.
+                if (TryGetExhaustionClassification(mergeQuotaClassification) is { } mergeExhaustion)
                 {
+                    var mergeDetection = mergeExhaustion.Detection!;
                     await _quotaClassifier.RecordIfQuotaFailureAsync(
                         _quotaFailures,
                         chosenMergeRunner.Kind,
@@ -367,12 +372,13 @@ public sealed partial class PipelineRunner
                         projectId: item.ProjectId,
                         stdout: classificationResult.Stdout);
                     throw new TerminalQuotaError(
-                        detection.Kind,
+                        mergeDetection.Kind,
                         QuotaFailureMessage(
-                            detection.Kind,
+                            mergeDetection.Kind,
                             $"Merge agent {chosenMergeRunner.Kind} reported quota failure",
                             SanitizedAgentDetail.FromRaw(classificationResult.Summary)),
-                        detection.ResetAt);
+                        mergeDetection.ResetAt,
+                        providerSurfaceMatch: mergeExhaustion.ProviderSurfaceMatch);
                 }
 
                 ThrowIfTransientAgentFailure(chosenMergeRunner, classificationResult, "merge");
