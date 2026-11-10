@@ -3717,21 +3717,27 @@ public sealed class IncusSandboxProvider :
         }
     }
 
-    private async Task DeleteInstanceAsync(IncusSandboxOptions options, string name, CancellationToken ct) =>
+    private async Task DeleteInstanceAsync(
+        IncusSandboxOptions options,
+        string name,
+        CancellationToken ct,
+        bool callerHoldsOperationGate = false) =>
         await _cli.RunCheckedAsync(
             "delete VM",
             options,
             IncusCommandBuilder.Prefix(options, "delete", name, "--force"),
             stdin: null,
             options.OperationTimeout,
-            ct).ConfigureAwait(false);
+            ct,
+            heavyOperation: !callerHoldsOperationGate).ConfigureAwait(false);
 
     private async Task DeleteVerifiedOwnedInstanceAsync(
         IncusSandboxOptions options,
         string name,
         string expectedKind,
         string? expectedBakeToken,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool callerHoldsOperationGate = false)
     {
         var managed = await _cli.RunCheckedAsync(
             "verify managed instance before delete",
@@ -3774,7 +3780,7 @@ public sealed class IncusSandboxProvider :
             if (!string.Equals(token.Stdout.Trim(), expectedBakeToken, StringComparison.Ordinal))
                 throw new InvalidOperationException("Refusing to delete an Incus baseline candidate whose bake token changed.");
         }
-        await DeleteInstanceAsync(options, name, ct).ConfigureAwait(false);
+        await DeleteInstanceAsync(options, name, ct, callerHoldsOperationGate).ConfigureAwait(false);
         await WaitForInstanceAbsenceAsync(options, name, ct).ConfigureAwait(false);
     }
 
@@ -3840,8 +3846,13 @@ public sealed class IncusSandboxProvider :
         {
             if (await FindInstanceAsync(options, name, ct).ConfigureAwait(false) is null)
                 return true;
-            await DeleteVerifiedOwnedInstanceAsync(options, name, kind, expectedBakeToken, ct)
-                .ConfigureAwait(false);
+            await DeleteVerifiedOwnedInstanceAsync(
+                options,
+                name,
+                kind,
+                expectedBakeToken,
+                ct,
+                callerHoldsOperationGate: true).ConfigureAwait(false);
             return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

@@ -964,6 +964,128 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public async Task CowCopy_DaemonConnectionLoss_SingleFlightCleanupDoesNotDeadlock()
+    {
+        // At MaxConcurrentOperations 1 the failed copy holds the operation-gate
+        // lease across its pre-retry cleanup, so the cleanup delete must not
+        // re-enter the gate: without gate-free cleanup this provisioning hangs
+        // until cancellation instead of retrying. The bounded cancellation
+        // turns that hang into a failure rather than a stuck suite.
+        const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
+        var stagingRoot = Path.Combine(_root, "cow-daemon-retry-singleflight-staging");
+        var options = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            MaxConcurrentOperations = 1,
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+            DaemonReadyProbeTimeout = TimeSpan.FromSeconds(5),
+        };
+        var fixedGuid = new Guid("33333333-4444-5555-6666-777777777777");
+        var sandboxName = $"{options.InstanceNamePrefix}{fixedGuid.ToString("N")[..20]}";
+        var copyAttempts = 0;
+        var sandboxExists = false;
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            existingPinnedName: pinned,
+            onInvocation: (argv, _) =>
+            {
+                if (argv.Contains("copy", StringComparer.Ordinal))
+                {
+                    copyAttempts++;
+                    if (copyAttempts == 1)
+                    {
+                        sandboxExists = true;
+                        return Task.FromResult(new ProcessRunResult(
+                            1,
+                            string.Empty,
+                            "Error: Lost connection to the event listener and failed to reconnect: " +
+                            "websocket: close 1006 (abnormal closure): unexpected EOF"));
+                    }
+                    return null;
+                }
+                var deleteIndex = argv.ToList().IndexOf("delete");
+                if (deleteIndex >= 0
+                    && deleteIndex + 1 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[deleteIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    sandboxExists = false;
+                    return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+                }
+                var getIndex = argv.ToList().IndexOf("get");
+                if (getIndex > 0
+                    && getIndex + 2 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[getIndex - 1], "config", StringComparison.Ordinal)
+                    && string.Equals(argv[getIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    var value = argv[^1] switch
+                    {
+                        IncusSandboxProvider.ManagedKey => "true",
+                        IncusSandboxProvider.KindKey => IncusSandboxProvider.SandboxKind,
+                        _ => string.Empty,
+                    };
+                    return Task.FromResult(new ProcessRunResult(0, value + "\n", string.Empty));
+                }
+                if (argv.Contains("list", StringComparer.Ordinal)
+                    && argv.Contains("--format=json", StringComparer.Ordinal)
+                    && !argv.Contains("snapshot", StringComparer.Ordinal)
+                    && sandboxExists)
+                {
+                    var entries = new List<object>
+                    {
+                        new
+                        {
+                            name = pinned,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.BaselineKind,
+                            },
+                        },
+                        new
+                        {
+                            name = sandboxName,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.SandboxKind,
+                            },
+                        },
+                    };
+                    return Task.FromResult(new ProcessRunResult(
+                        0, JsonSerializer.Serialize(entries), string.Empty));
+                }
+                return null;
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: TimeProvider.System,
+            newGuid: () => fixedGuid,
+            environmentVariableReader: EnvironmentReader(_root));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = options.DefaultImage,
+            BaselineImageRef = pinned,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        }, timeout.Token);
+
+        Assert.NotNull(sandbox);
+        Assert.Equal(2, copyAttempts);
+        Assert.False(sandboxExists, "the retried copy requires the half-created instance to be deleted first");
+    }
+
+    [Fact]
     public async Task CowCopy_DaemonNeverRecovers_DefersAsTransientInfrastructureAndCleansUp()
     {
         const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
