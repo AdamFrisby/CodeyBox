@@ -285,26 +285,91 @@ public sealed class GitHubUpstreamRemoteTests
     }
 
     [Fact]
-    public async Task CompleteAsync_MergeHeadBaseTipProbeFails_Merges()
+    public async Task CompleteAsync_MergeHeadBaseTipProbeFails_ThrowsBeforeMergeCall()
     {
         // The existence probe failing is an operational git failure, not
-        // proof the base tip is absent: the gate must stay unevaluable and
-        // the historical PUT path (forge mergeability as backstop) runs.
+        // proof the base tip is absent: the gate must fail CLOSED — abort
+        // before PUT so the orchestrator retries as infrastructure rather
+        // than letting an unevaluable check false-pass the merge gate.
         var gitHost = MergeHeadGitHost();
         gitHost.CommitExistsFailure = new InvalidOperationException("git rev-parse probe failed: fatal: not a git repository");
         var handler = new FakeHttpMessageHandler();
         handler.Enqueue(PrCreatedResponse(15, "https://github.com/myorg/myrepo/pull/15"));
-        handler.Enqueue(MergeOkResponse("probe-failure-merge-sha"));
 
         var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
-        var outcome = await remote.CompleteAsync(
-            SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None);
+        var ex = await Assert.ThrowsAsync<UpstreamCompletionVerificationException>(() =>
+            remote.CompleteAsync(
+                SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None));
 
-        Assert.Equal(2, handler.Requests.Count);
-        Assert.Equal(HttpMethod.Put, handler.Requests[1].Method);
-        Assert.Contains("/pulls/15/merge", handler.Requests[1].RequestUri!.PathAndQuery);
-        Assert.False(outcome.AutoMergeRaced);
-        Assert.Equal("probe-failure-merge-sha", outcome.MergedSha);
+        Assert.Single(handler.Requests);
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadBaseTipReadFails_ThrowsBeforeMergeCall()
+    {
+        // ls-remote failing means the current base tip is unknown: the gate
+        // cannot prove the pushed head contains it, so it must abort as
+        // infrastructure instead of proceeding to PUT on a guess.
+        var gitHost = MergeHeadGitHost();
+        gitHost.UpstreamBranchShaFailure = new InvalidOperationException("git ls-remote failed: fatal: unable to access");
+        // Scope the failure to the base-branch probe the ancestry gate makes;
+        // the work-branch lease probe during push must still succeed.
+        gitHost.UpstreamBranchShaFailureBranch = SampleRequest.BaseBranch;
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(16, "https://github.com/myorg/myrepo/pull/16"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        await Assert.ThrowsAsync<UpstreamCompletionVerificationException>(() =>
+            remote.CompleteAsync(
+                SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None));
+
+        Assert.Single(handler.Requests);
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadBaseTipUnadvertised_ThrowsBeforeMergeCall()
+    {
+        // ls-remote succeeded but advertised no base ref: ancestry is
+        // unevaluable — fail closed like any other probe failure.
+        var gitHost = MergeHeadGitHost();
+        gitHost.UpstreamBranchShas.Remove(SampleRequest.BaseBranch);
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(17, "https://github.com/myorg/myrepo/pull/17"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        await Assert.ThrowsAsync<UpstreamCompletionVerificationException>(() =>
+            remote.CompleteAsync(
+                SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None));
+
+        Assert.Single(handler.Requests);
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadAncestryProbeFails_ThrowsBeforeMergeCall()
+    {
+        // merge-base --is-ancestor failing (e.g. a missing head object,
+        // exit 128) is operational, not a proven non-ancestry: abort before
+        // PUT so a stale-base head cannot reach the forge merge call.
+        var gitHost = MergeHeadGitHost();
+        gitHost.IsAncestorFailure = new InvalidOperationException("git merge-base --is-ancestor failed: fatal: Not a valid object name");
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(18, "https://github.com/myorg/myrepo/pull/18"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        await Assert.ThrowsAsync<UpstreamCompletionVerificationException>(() =>
+            remote.CompleteAsync(
+                SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None));
+
+        Assert.Single(handler.Requests);
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1972,6 +2037,27 @@ internal sealed class FakeGitHost : IGitHost
     /// </summary>
     public Exception? CommitExistsFailure { get; set; }
 
+    /// <summary>
+    /// When set, <see cref="GetUpstreamBranchShaAsync"/> throws it —
+    /// simulates an ls-remote/transport failure. The push path also calls
+    /// this probe (for the work branch), so scope the failure to a single
+    /// branch via <see cref="UpstreamBranchShaFailureBranch"/> when the test
+    /// targets the post-settle ancestry gate.
+    /// </summary>
+    public Exception? UpstreamBranchShaFailure { get; set; }
+
+    /// <summary>
+    /// When non-null, <see cref="UpstreamBranchShaFailure"/> fires only for
+    /// ls-remote probes of this branch; other branches answer normally.
+    /// </summary>
+    public string? UpstreamBranchShaFailureBranch { get; set; }
+
+    /// <summary>
+    /// When set, <see cref="IsAncestorAsync"/> throws it — simulates a
+    /// merge-base failure (e.g. a missing head object, exit 128).
+    /// </summary>
+    public Exception? IsAncestorFailure { get; set; }
+
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
@@ -2017,10 +2103,16 @@ internal sealed class FakeGitHost : IGitHost
         string branch,
         IReadOnlyDictionary<string, string> upstreamEnv,
         CancellationToken ct = default)
-        => Task.FromResult(UpstreamBranchShas.TryGetValue(branch, out var sha) ? sha : null);
+        => UpstreamBranchShaFailure is not null
+            && (UpstreamBranchShaFailureBranch is null
+                || string.Equals(branch, UpstreamBranchShaFailureBranch, StringComparison.Ordinal))
+            ? Task.FromException<string?>(UpstreamBranchShaFailure)
+            : Task.FromResult(UpstreamBranchShas.TryGetValue(branch, out var sha) ? sha : null);
 
     public Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
-        => Task.FromResult(Ancestors.Contains((ancestorCommit, descendantCommit)));
+        => IsAncestorFailure is not null
+            ? Task.FromException<bool>(IsAncestorFailure)
+            : Task.FromResult(Ancestors.Contains((ancestorCommit, descendantCommit)));
 
     public Task<bool> CommitExistsAsync(string repositoryId, string commitish, CancellationToken ct = default)
         => CommitExistsFailure is not null

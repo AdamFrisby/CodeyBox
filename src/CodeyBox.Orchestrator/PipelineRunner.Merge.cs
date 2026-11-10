@@ -218,6 +218,13 @@ public sealed partial class PipelineRunner
             // suggestions.json is unstaged (its worktree copy is still read
             // after the resolver returns) and the conflict files are staged
             // from the worktree.
+            //
+            // Contract: return null on pass, a defect reason on a genuine
+            // scope-fence violation (fed back to the agent), and throw
+            // <see cref="PostResolutionVerificationInfrastructureException"/>
+            // for sandbox/git plumbing failures — those abort the resolver
+            // as infrastructure instead of burning agent attempts on a
+            // failure no agent turn can repair.
             async Task<string?> VerifyResolvedMergeScopeAsync(
                 ISandbox verifySandbox, string verifyWorkDir,
                 string baselineTree, IReadOnlyList<ConflictHunk> hunks,
@@ -234,7 +241,8 @@ public sealed partial class PipelineRunner
                         ".codeybox/suggestions.json"],
                 }, verifyCt);
                 if (!unstage.Success)
-                    return $"could not unstage suggestions.json: {unstage.Stderr.Trim()}";
+                    throw new PostResolutionVerificationInfrastructureException(
+                        $"could not unstage suggestions.json: {unstage.Stderr.Trim()}");
                 var conflictPaths = hunks
                     .Select(h => h.Path)
                     .Distinct(StringComparer.Ordinal)
@@ -254,15 +262,24 @@ public sealed partial class PipelineRunner
                         ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
                     }, verifyCt);
                     if (!add.Success)
-                        return $"could not stage resolved conflict files: {add.Stderr.Trim()}";
+                        throw new PostResolutionVerificationInfrastructureException(
+                            $"could not stage resolved conflict files: {add.Stderr.Trim()}");
                 }
 
                 var tree = await verifySandbox.ExecAsync(new SandboxExec
                 {
                     Argv = ["git", "-C", verifyWorkDir, "write-tree"],
                 }, verifyCt);
-                if (!tree.Success || string.IsNullOrWhiteSpace(tree.Stdout))
-                    return $"could not compute resolved merge tree: {tree.Stderr.Trim()}";
+                var resolvedTree = tree.Stdout.Trim();
+                if (!tree.Success)
+                    throw new PostResolutionVerificationInfrastructureException(
+                        $"could not compute resolved merge tree: {tree.Stderr.Trim()}");
+                // The resolved treeish is fed back into sandbox git argv by
+                // the fence — validate it is a real object id before reuse,
+                // same contract as the merge-tree baseline above.
+                if (!Validation.IsGitObjectId(resolvedTree))
+                    throw new PostResolutionVerificationInfrastructureException(
+                        "could not compute resolved merge tree: git write-tree did not return a valid object id");
 
                 try
                 {
@@ -270,7 +287,7 @@ public sealed partial class PipelineRunner
                         verifySandbox,
                         verifyWorkDir,
                         baselineTree,
-                        tree.Stdout.Trim(),
+                        resolvedTree,
                         hunks,
                         project.Audit.MergeScopeBufferLines,
                         verifyCt);
@@ -279,6 +296,19 @@ public sealed partial class PipelineRunner
                 catch (ScopeFenceViolation ex)
                 {
                     return ex.Message;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (ex is not IExecutionTransportLoss)
+                {
+                    // Fence plumbing failures (sandbox exec, git diff) are
+                    // infrastructure, not resolution defects. Transport-loss
+                    // signals stay unwrapped so SandboxDeferralGuard still
+                    // recognizes them.
+                    throw new PostResolutionVerificationInfrastructureException(
+                        $"merge scope fence verification could not run: {ex.Message}", ex);
                 }
             }
 
@@ -486,7 +516,7 @@ public sealed partial class PipelineRunner
                 if (mergeFailureClassification.Kind == AgentFailureKind.Infrastructure && hostMerge.HasConflicts)
                 {
                     throw new MergeConflictResolutionFailedException(
-                        $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}: {RedactAndTruncateAgentDetail(agentResult.Summary)}",
+                        MergeResolverConflictFailureMessage(hostMerge, agentResult),
                         failureKind: WorkItemFailureKinds.Infrastructure,
                         agent: chosenMergeRunner.Kind,
                         phase: "merge");
@@ -516,7 +546,7 @@ public sealed partial class PipelineRunner
                     // the guard-rework brief and operator-facing LastError
                     // must name WHY resolution failed, not just that it did.
                     throw new MergeConflictResolutionFailedException(
-                        $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}: {RedactAndTruncateAgentDetail(agentResult.Summary)}");
+                        MergeResolverConflictFailureMessage(hostMerge, agentResult));
                 var detail = BuildAgentFailureDetail($"Merge agent {chosenMergeRunner.Kind} reported failure", agentResult, _opts.MaxFailureDetailBytes);
                 throw new InvalidOperationException(detail);
             }
@@ -629,6 +659,14 @@ public sealed partial class PipelineRunner
                 await _gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedMergeRepoPath, CancellationToken.None);
         }
     }
+
+    /// <summary>
+    /// Single source for the merge-resolver conflict failure text: the
+    /// infrastructure-classified and generic conflict throws must not drift
+    /// apart, so both build the message here.
+    /// </summary>
+    private static string MergeResolverConflictFailureMessage(GitMergeTreeResult hostMerge, AgentResult agentResult)
+        => $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}: {RedactAndTruncateAgentDetail(agentResult.Summary)}";
 
     /// <summary>
     /// Sanity-check the agent's merge before letting the orchestrator push:

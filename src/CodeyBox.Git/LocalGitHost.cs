@@ -1277,7 +1277,7 @@ public sealed class LocalGitHost : IGitHost
     {
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
-        var rc = await RunGitAsync(path, ct, "diff", "--name-status", "-M", fromTreeish, toTreeish);
+        var rc = await RunGitAsync(path, ct, MergeScopeFenceDiffContract.NameStatusArguments(fromTreeish, toTreeish));
         if (rc.ExitCode != 0)
             throw new InvalidOperationException($"git diff --name-status failed: {rc.Stderr}");
 
@@ -1294,11 +1294,10 @@ public sealed class LocalGitHost : IGitHost
         ValidateRepositoryRelativePath(filePath);
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
-        // --text/--no-textconv keep repository-controlled attributes
-        // (.gitattributes -diff/binary markers, textconv drivers) from
-        // suppressing or rewriting the hunks callers measure.
+        // Attribute-proofing flags live in the shared fence contract so the
+        // host and sandbox diffs cannot drift apart.
         var rc = await RunGitAsync(
-            path, ct, "diff", "--no-ext-diff", "--no-textconv", "--text", "--no-color", "--unified=0", fromTreeish, toTreeish, "--", filePath);
+            path, ct, MergeScopeFenceDiffContract.FileContentArguments(fromTreeish, toTreeish, filePath));
         if (rc.ExitCode != 0)
             throw new InvalidOperationException($"git diff for '{filePath}' failed: {rc.Stderr}");
         return rc.Stdout;

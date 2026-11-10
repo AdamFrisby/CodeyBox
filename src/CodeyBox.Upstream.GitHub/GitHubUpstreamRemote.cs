@@ -416,12 +416,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     /// PR carries the resolved tree — that head must contain the CURRENT
     /// upstream base tip. A head built on a stale base would either conflict
     /// against the moved base or merge a tree the merge phase never
-    /// verified. Returns true only on a PROVABLE miss; unevaluable cases
-    /// (no merge sha recorded, a plain work tip pushed — which legitimately
-    /// lacks base ancestry because the PR merge itself supplies it — an
-    /// unadvertised base, or transport failures) return false so the
-    /// historical PUT path, with the forge's own mergeability verdict as
-    /// backstop, is preserved.
+    /// verified. Returns true only on a PROVABLE miss. The gate is
+    /// fail-closed: a plain work tip pushed (which legitimately lacks base
+    /// ancestry because the PR merge itself supplies it) or no merge sha
+    /// recorded returns false so the historical PUT path runs, while ANY
+    /// probe failure — base-tip read, existence probe, or ancestry check —
+    /// throws <see cref="UpstreamCompletionVerificationException"/> so
+    /// <see cref="CompleteAsync"/> aborts before PUT /pulls/merge and the
+    /// orchestrator retries as infrastructure. A swallowed probe failure
+    /// must never false-pass this gate: a transient ls-remote/git failure
+    /// would otherwise let a stale-base merge head reach the forge merge
+    /// call — the exact divergence this assertion exists to prevent.
     /// </summary>
     private async Task<bool> PushedMergeHeadMissesUpstreamBaseAsync(
         UpstreamCompletionRequest request,
@@ -446,16 +451,22 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex,
-                "Could not read upstream base tip for '{Branch}'; skipping pushed-head ancestry assertion",
-                SanitizeForLog(request.BaseBranch));
-            return false;
+            throw new UpstreamCompletionVerificationException(
+                $"could not read the upstream '{SanitizeForLog(request.BaseBranch)}' tip needed to verify the pushed merge head contains the current base",
+                ex);
         }
 
-        if (string.IsNullOrWhiteSpace(upstreamBaseSha))
-            return false;
+        var baseTip = upstreamBaseSha?.Trim();
+        if (string.IsNullOrEmpty(baseTip))
+        {
+            // ls-remote answered but advertised no such ref: the ancestry
+            // question has no answer — unevaluable, not a proven miss and
+            // not a proven pass. Fail closed so the merge call is retried
+            // as infrastructure rather than guessed at.
+            throw new UpstreamCompletionVerificationException(
+                $"upstream branch '{SanitizeForLog(request.BaseBranch)}' advertised no tip; cannot verify the pushed merge head ancestry");
+        }
 
-        var baseTip = upstreamBaseSha.Trim();
         var headSha = pushedSha.Trim();
 
         // If the upstream tip object is absent from the local bare repo the
@@ -463,7 +474,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         // itself local, so a PROVEN-absent base tip is a definitive miss —
         // the base moved to something this repo has never fetched. The typed
         // probe separates that case from operational git failures, which
-        // stay unevaluable (historical PUT path) rather than misreporting a
+        // abort the merge call as infrastructure rather than misreporting a
         // base race.
         bool baseTipExists;
         try
@@ -476,10 +487,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex,
-                "Could not probe upstream base tip {Base} for '{Branch}'; skipping pushed-head ancestry assertion",
-                baseTip, SanitizeForLog(request.BaseBranch));
-            return false;
+            throw new UpstreamCompletionVerificationException(
+                $"could not probe upstream base tip '{baseTip}' for '{SanitizeForLog(request.BaseBranch)}'",
+                ex);
         }
 
         if (!baseTipExists)
@@ -502,10 +512,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         }
         catch (Exception ex)
         {
-            _log.LogDebug(ex,
-                "Could not evaluate pushed-head ancestry for '{Branch}'; skipping assertion",
-                SanitizeForLog(request.BaseBranch));
-            return false;
+            throw new UpstreamCompletionVerificationException(
+                $"could not evaluate pushed-head ancestry for '{SanitizeForLog(request.BaseBranch)}'",
+                ex);
         }
 
         if (containsBase)

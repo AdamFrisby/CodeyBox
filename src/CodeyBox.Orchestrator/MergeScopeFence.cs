@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
+using CodeyBox.Git;
 using CodeyBox.Sandbox;
 
 namespace CodeyBox.Orchestrator;
@@ -290,8 +291,8 @@ internal static partial class MergeScopeFence
 
         var nameStatus = await sandbox.ExecAsync(new SandboxExec
         {
-            Argv = ["git", "-C", workingDirectory, "diff", "--name-status", "-M",
-                conflictBaselineTreeish, resolvedTreeish],
+            Argv = ["git", "-C", workingDirectory,
+                .. MergeScopeFenceDiffContract.NameStatusArguments(conflictBaselineTreeish, resolvedTreeish)],
         }, ct);
         if (!nameStatus.Success)
             throw new InvalidOperationException(
@@ -304,12 +305,11 @@ internal static partial class MergeScopeFence
             MergeConflictPathInspector.ValidateRelativeWorkPath(path);
             var diff = await sandbox.ExecAsync(new SandboxExec
             {
-                // --text/--no-textconv keep repository-controlled attributes
-                // (.gitattributes -diff/binary markers, textconv drivers)
-                // from suppressing or rewriting the hunks the fence measures.
-                Argv = ["git", "-C", workingDirectory, "diff",
-                    "--no-ext-diff", "--no-textconv", "--text", "--no-color", "--unified=0",
-                    conflictBaselineTreeish, resolvedTreeish, "--", path],
+                // Attribute-proofing flags come from the shared fence
+                // contract so this diff stays byte-identical to the host
+                // IGitHost path the final VerifyAsync measures.
+                Argv = ["git", "-C", workingDirectory,
+                    .. MergeScopeFenceDiffContract.FileContentArguments(conflictBaselineTreeish, resolvedTreeish, path)],
                 ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
             }, ct);
             if (!diff.Success)
@@ -331,9 +331,7 @@ internal static partial class MergeScopeFence
         if (bufferLines < 0)
             throw new ArgumentOutOfRangeException(nameof(bufferLines), "buffer must be non-negative");
 
-        var hunksByPath = hunks
-            .GroupBy(h => h.Path, StringComparer.Ordinal)
-            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+        var hunksByPath = GroupHunksByPath(hunks);
         var expected = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
         var actual = resolvedContents.Keys.ToHashSet(StringComparer.Ordinal);
         var violations = new List<string>();

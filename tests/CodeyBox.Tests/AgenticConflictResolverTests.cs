@@ -166,6 +166,71 @@ public sealed class AgenticConflictResolverTests
     }
 
     [Fact]
+    public async Task ResolveAsync_PostVerificationDefect_ConsumesAttemptAsFeedback()
+    {
+        // A string reason from the post-verification hook is a resolution
+        // defect: it is charged like a verification failure and its reason
+        // becomes the failure summary.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 1 }));
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var result = await resolver.ResolveAsync(
+            sandbox,
+            "/work",
+            WorkItemId.New(),
+            new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+            [new AgenticConflictResolverCandidate(runner, Credential: null)],
+            CancellationToken.None,
+            postVerificationAsync: (_, _, _) => Task.FromResult<string?>("merge scope fence violation: src/a.txt:9"));
+
+        Assert.False(result.Success);
+        Assert.Contains("scope fence violation", result.Summary, StringComparison.Ordinal);
+        Assert.Equal(1, runner.InvocationCount);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_PostVerificationInfrastructureFailure_Propagates()
+    {
+        // Plumbing failures (sandbox/git) must abort the resolver as
+        // infrastructure — never folded into per-attempt agent feedback,
+        // where no agent turn could repair them.
+        var sandbox = new ConflictSandbox();
+        sandbox.AddConflictedFile("src/a.txt", BuildSimpleConflict("b", "m", "w"));
+
+        var resolver = new AgenticConflictResolver(
+            new AgenticConflictResolverOptionsSnapshot(new AgenticConflictResolverOptions { MaxIterations = 3 }));
+        var runner = new FakeAgentResolverRunner(sb =>
+        {
+            sb.WriteFile("src/a.txt", "m + w\n");
+            sb.GitAdd("src/a.txt");
+            return new AgentResult(true, "resolved", null, null);
+        });
+
+        var ex = await Assert.ThrowsAsync<PostResolutionVerificationInfrastructureException>(() =>
+            resolver.ResolveAsync(
+                sandbox,
+                "/work",
+                WorkItemId.New(),
+                new AgenticConflictResolverContext("main", "feature", AgenticConflictResolverOperation.Merge),
+                [new AgenticConflictResolverCandidate(runner, Credential: null)],
+                CancellationToken.None,
+                postVerificationAsync: (_, _, _) =>
+                    throw new PostResolutionVerificationInfrastructureException("git write-tree failed")));
+
+        Assert.Equal("git write-tree failed", ex.Message);
+        Assert.Equal(1, runner.InvocationCount);
+    }
+
+    [Fact]
     public async Task ResolveAsync_LargeFileBeyond128KB_HandledWithoutTruncation()
     {
         var sandbox = new ConflictSandbox();
