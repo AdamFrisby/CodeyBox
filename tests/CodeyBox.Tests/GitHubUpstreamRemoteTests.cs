@@ -190,6 +190,7 @@ public sealed class GitHubUpstreamRemoteTests
         // ancestry gate evaluates (pushedSha == request.MergeSha).
         gitHost.ResolveCommits[SampleRequest.WorkBranch] = MergeHeadSha;
         gitHost.ResolveCommits[UpstreamBaseSha] = UpstreamBaseSha;
+        gitHost.ExistingCommits.Add(UpstreamBaseSha);
         gitHost.UpstreamBranchShas[SampleRequest.BaseBranch] = UpstreamBaseSha;
         return gitHost;
     }
@@ -281,6 +282,29 @@ public sealed class GitHubUpstreamRemoteTests
             r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
         Assert.True(outcome.AutoMergeRaced);
         Assert.Null(outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadBaseTipProbeFails_Merges()
+    {
+        // The existence probe failing is an operational git failure, not
+        // proof the base tip is absent: the gate must stay unevaluable and
+        // the historical PUT path (forge mergeability as backstop) runs.
+        var gitHost = MergeHeadGitHost();
+        gitHost.CommitExistsFailure = new InvalidOperationException("git rev-parse probe failed: fatal: not a git repository");
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(15, "https://github.com/myorg/myrepo/pull/15"));
+        handler.Enqueue(MergeOkResponse("probe-failure-merge-sha"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        var outcome = await remote.CompleteAsync(
+            SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None);
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Put, handler.Requests[1].Method);
+        Assert.Contains("/pulls/15/merge", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.False(outcome.AutoMergeRaced);
+        Assert.Equal("probe-failure-merge-sha", outcome.MergedSha);
     }
 
     [Fact]
@@ -1934,6 +1958,20 @@ internal sealed class FakeGitHost : IGitHost
     /// </summary>
     public HashSet<(string Ancestor, string Descendant)> Ancestors { get; } = new();
 
+    /// <summary>
+    /// Commit objects <see cref="CommitExistsAsync"/> reports present, keyed
+    /// by the exact commitish the probe receives (typically a full sha).
+    /// Empty (default) means every probe answers false — "provably absent".
+    /// </summary>
+    public HashSet<string> ExistingCommits { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// When set, <see cref="CommitExistsAsync"/> throws it — simulates an
+    /// operational git failure (missing repo, corrupt object store) that
+    /// must NOT be read as proof of absence.
+    /// </summary>
+    public Exception? CommitExistsFailure { get; set; }
+
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
@@ -1983,6 +2021,11 @@ internal sealed class FakeGitHost : IGitHost
 
     public Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
         => Task.FromResult(Ancestors.Contains((ancestorCommit, descendantCommit)));
+
+    public Task<bool> CommitExistsAsync(string repositoryId, string commitish, CancellationToken ct = default)
+        => CommitExistsFailure is not null
+            ? Task.FromException<bool>(CommitExistsFailure)
+            : Task.FromResult(ExistingCommits.Contains(commitish));
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;

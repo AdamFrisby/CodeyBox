@@ -720,7 +720,12 @@ public sealed record UpstreamCompletionRequest
     public required ProjectId ProjectId { get; init; }
     public required string WorkBranch { get; init; }
     public required string BaseBranch { get; init; }
-    /// <summary>SHA produced by the local merge. Null when resuming past the merge phase.</summary>
+    /// <summary>
+    /// SHA produced by the local merge. Null when the merge phase did not run
+    /// for this pickup — except on a skip-merge resume, where the orchestrator
+    /// backfills it from the recorded local squash sha so the pushed-head/base
+    /// ancestry assertion still evaluates.
+    /// </summary>
     public string? MergeSha { get; init; }
     public required string Title { get; init; }
     /// <summary>Static fallback PR description. Used when LLM generation is disabled or fails.</summary>

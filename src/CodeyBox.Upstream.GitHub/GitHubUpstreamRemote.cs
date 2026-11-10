@@ -460,17 +460,29 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
 
         // If the upstream tip object is absent from the local bare repo the
         // pushed head cannot contain it: every ancestor of a local commit is
-        // itself local, so an unresolvable base tip is a definitive miss —
-        // the base moved to something this repo has never fetched.
+        // itself local, so a PROVEN-absent base tip is a definitive miss —
+        // the base moved to something this repo has never fetched. The typed
+        // probe separates that case from operational git failures, which
+        // stay unevaluable (historical PUT path) rather than misreporting a
+        // base race.
+        bool baseTipExists;
         try
         {
-            await _gitHost.ResolveCommitAsync(request.RepositoryId, baseTip, ct);
+            baseTipExists = await _gitHost.CommitExistsAsync(request.RepositoryId, baseTip, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception)
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Could not probe upstream base tip {Base} for '{Branch}'; skipping pushed-head ancestry assertion",
+                baseTip, SanitizeForLog(request.BaseBranch));
+            return false;
+        }
+
+        if (!baseTipExists)
         {
             _log.LogWarning(
                 "Pushed head {Sha} cannot contain upstream base tip {Base} for '{Branch}': the base tip is not present in the local repo; skipping merge call",

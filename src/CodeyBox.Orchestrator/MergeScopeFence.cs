@@ -304,8 +304,11 @@ internal static partial class MergeScopeFence
             MergeConflictPathInspector.ValidateRelativeWorkPath(path);
             var diff = await sandbox.ExecAsync(new SandboxExec
             {
+                // --text/--no-textconv keep repository-controlled attributes
+                // (.gitattributes -diff/binary markers, textconv drivers)
+                // from suppressing or rewriting the hunks the fence measures.
                 Argv = ["git", "-C", workingDirectory, "diff",
-                    "--no-ext-diff", "--no-color", "--unified=0",
+                    "--no-ext-diff", "--no-textconv", "--text", "--no-color", "--unified=0",
                     conflictBaselineTreeish, resolvedTreeish, "--", path],
                 ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
             }, ct);

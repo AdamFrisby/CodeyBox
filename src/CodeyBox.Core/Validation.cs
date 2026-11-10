@@ -29,6 +29,18 @@ public static partial class Validation
     private static partial Regex CommitShaRegex();
 
     /// <summary>
+    /// Lowercase hex git object id: 40 chars for SHA-1 repos, 64 for
+    /// SHA-256. Used to validate raw plumbing output (e.g. merge-tree's
+    /// emitted tree id) before it is fed back into git argv.
+    /// </summary>
+    [GeneratedRegex(@"^[0-9a-f]{40,64}$", RegexOptions.CultureInvariant)]
+    private static partial Regex GitObjectIdRegex();
+
+    /// <summary>True when <paramref name="value"/> is a well-formed lowercase git object id.</summary>
+    public static bool IsGitObjectId(string? value)
+        => value is not null && GitObjectIdRegex().IsMatch(value);
+
+    /// <summary>
     /// Git tag name: ASCII alnum plus a small set of separators. Slashes are
     /// excluded (tags don't need namespacing), keeping the set conservative
     /// and safe for URL path segments and JSON bodies.

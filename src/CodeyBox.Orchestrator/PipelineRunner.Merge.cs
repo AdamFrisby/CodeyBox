@@ -201,7 +201,7 @@ public sealed partial class PipelineRunner
                 }, ct);
                 var baselineLines = sandboxMergeTree.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
                 if (baselineLines.Length == 0
-                    || !System.Text.RegularExpressions.Regex.IsMatch(baselineLines[0].Trim(), "^[0-9a-f]{40,64}$"))
+                    || !Validation.IsGitObjectId(baselineLines[0].Trim()))
                     throw new MergePhaseInconsistentResultException(
                         $"sandbox git merge-tree did not return a baseline tree: {sandboxMergeTree.Stderr}{sandboxMergeTree.Stdout}");
                 sandboxMergeBaselineTree = baselineLines[0].Trim();
@@ -219,14 +219,23 @@ public sealed partial class PipelineRunner
             // after the resolver returns) and the conflict files are staged
             // from the worktree.
             async Task<string?> VerifyResolvedMergeScopeAsync(
-                ISandbox verifySandbox, string verifyWorkDir, CancellationToken verifyCt)
+                ISandbox verifySandbox, string verifyWorkDir,
+                string baselineTree, IReadOnlyList<ConflictHunk> hunks,
+                CancellationToken verifyCt)
             {
-                await verifySandbox.ExecAsync(new SandboxExec
+                // --ignore-unmatch: suggestions.json is legitimately absent
+                // from the index on resolutions that never wrote it; real
+                // git failures must still surface — an unchecked failure
+                // here would let write-tree measure a tree the merge commit
+                // path later strips, corrupting the fence's verdict.
+                var unstage = await verifySandbox.ExecAsync(new SandboxExec
                 {
-                    Argv = ["git", "-C", verifyWorkDir, "rm", "--cached", "--force", "--",
+                    Argv = ["git", "-C", verifyWorkDir, "rm", "--cached", "--force", "--ignore-unmatch", "--",
                         ".codeybox/suggestions.json"],
                 }, verifyCt);
-                var conflictPaths = conflictHunks
+                if (!unstage.Success)
+                    return $"could not unstage suggestions.json: {unstage.Stderr.Trim()}";
+                var conflictPaths = hunks
                     .Select(h => h.Path)
                     .Distinct(StringComparer.Ordinal)
                     .ToArray();
@@ -260,9 +269,9 @@ public sealed partial class PipelineRunner
                     await MergeScopeFence.VerifySandboxAsync(
                         verifySandbox,
                         verifyWorkDir,
-                        sandboxMergeBaselineTree,
+                        baselineTree,
                         tree.Stdout.Trim(),
-                        conflictHunks,
+                        hunks,
                         project.Audit.MergeScopeBufferLines,
                         verifyCt);
                     return null;
@@ -324,7 +333,10 @@ public sealed partial class PipelineRunner
                         },
                         candidates,
                         ct,
-                        postVerificationAsync: VerifyResolvedMergeScopeAsync);
+                        postVerificationAsync: (verifySandbox, verifyWorkDir, verifyCt) =>
+                            VerifyResolvedMergeScopeAsync(
+                                verifySandbox, verifyWorkDir,
+                                sandboxMergeBaselineTree, conflictHunks, verifyCt));
                     await HandleAgenticResolverAuthRequiredOutputAsync(
                         item, project, "merge-resolver", resolverResult, ct);
                     agentResult = new AgentResult(
@@ -514,11 +526,13 @@ public sealed partial class PipelineRunner
             // Mirror the work-phase pattern: strip from the git index first so a staged
             // suggestions.json doesn't leave a deletion entry that confuses git status.
             var mergeSuggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
-            await sandbox.ExecAsync(new SandboxExec
+            var unstageSuggestions = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--",
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--ignore-unmatch", "--",
                 ".codeybox/suggestions.json"],
             }, ct);
+            if (!unstageSuggestions.Success)
+                throw new InvalidOperationException($"could not unstage suggestions.json: {unstageSuggestions.Stderr.Trim()}");
             await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["rm", "-f", $"{SandboxConventions.WorkDir}/.codeybox/suggestions.json"],
@@ -560,18 +574,6 @@ public sealed partial class PipelineRunner
                     {
                         await DeleteHostRefBestEffortAsync(repoId, verificationRef, CancellationToken.None);
                     }
-
-                    // Publish the resolved merge result as the work-branch tip:
-                    // the PR head must BE this merge commit — it carries the
-                    // base ancestry plus the fence-verified resolution — not
-                    // the pre-merge work tip. Pushing the latter leaves GitHub
-                    // looking at a stale, divergent head whose tree lacks the
-                    // resolution entirely (the Foligen #43 failure: the merge
-                    // agent resolved locally, the original work commit was
-                    // pushed instead, and the PR went dirty against an
-                    // unchanged base). Fast-forward by construction: the
-                    // merge commit's second parent is the prior work tip.
-                    await _gitHost.SetBranchToCommitAsync(repoId, workBranch, mergeSha, ct);
                 }
                 catch (ScopeFenceViolation ex)
                 {
@@ -581,6 +583,22 @@ public sealed partial class PipelineRunner
                 {
                     throw new MergeConflictResolutionFailedException(ex.Message, ex);
                 }
+
+                // Publish the resolved merge result as the work-branch tip:
+                // the PR head must BE this merge commit — it carries the
+                // base ancestry plus the fence-verified resolution — not
+                // the pre-merge work tip. Pushing the latter leaves GitHub
+                // looking at a stale, divergent head whose tree lacks the
+                // resolution entirely (the Foligen #43 failure: the merge
+                // agent resolved locally, the original work commit was
+                // pushed instead, and the PR went dirty against an
+                // unchanged base). Fast-forward by construction: the
+                // merge commit's second parent is the prior work tip.
+                // Deliberately OUTSIDE the try above: advancing the durable
+                // ref is host-git infrastructure, not a resolution verdict —
+                // wrapping it would misroute an infra failure into bounded
+                // conflict rework.
+                await _gitHost.SetBranchToCommitAsync(repoId, workBranch, mergeSha, ct);
             }
             else
             {

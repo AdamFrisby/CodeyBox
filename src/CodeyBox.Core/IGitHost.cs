@@ -438,6 +438,21 @@ public interface IGitHost
         => throw new NotSupportedException("This git host does not support host-side commit resolution.");
 
     /// <summary>
+    /// Typed object-existence probe: returns true when
+    /// <paramref name="commitish"/> resolves to a commit object present in
+    /// the host bare repo, and false ONLY when git proves the object (or a
+    /// commit it peels to) is absent. Operational failures — missing repo
+    /// path, corrupt object store, git-level errors — throw, so a caller
+    /// can distinguish "provably absent" from "could not evaluate" and must
+    /// never treat the latter as absence.
+    ///
+    /// Default throws <see cref="NotSupportedException"/> so test fakes that
+    /// cannot run git behave as before.
+    /// </summary>
+    Task<bool> CommitExistsAsync(string repositoryId, string commitish, CancellationToken ct = default)
+        => throw new NotSupportedException("This git host does not support host-side commit existence probes.");
+
+    /// <summary>
     /// Returns true when <paramref name="ancestorCommit"/> is reachable from
     /// <paramref name="descendantCommit"/> in the host bare repo
     /// (<c>git merge-base --is-ancestor</c>). Both inputs must be full commit

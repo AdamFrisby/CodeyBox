@@ -906,6 +906,25 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout.Trim();
     }
 
+    public async Task<bool> CommitExistsAsync(string repositoryId, string commitish, CancellationToken ct = default)
+    {
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        // `rev-parse --verify --quiet` exits 1 (silently) only when the
+        // expression does not resolve to a commit — a missing object, an
+        // unknown name, or a non-commit type. Fatal conditions (repo path
+        // gone, corrupt object store) exit non-1 and surface as stderr, so
+        // they throw instead of masquerading as "object absent".
+        var rc = await RunGitAsync(path, ct, "rev-parse", "--verify", "--quiet", $"{commitish}^{{commit}}");
+        return rc.ExitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => throw new InvalidOperationException(
+                $"git rev-parse existence probe for '{commitish}' failed: {rc.Stderr}"),
+        };
+    }
+
     public async Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
     {
         if (!LooksLikeSha(ancestorCommit))
@@ -1275,8 +1294,11 @@ public sealed class LocalGitHost : IGitHost
         ValidateRepositoryRelativePath(filePath);
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
+        // --text/--no-textconv keep repository-controlled attributes
+        // (.gitattributes -diff/binary markers, textconv drivers) from
+        // suppressing or rewriting the hunks callers measure.
         var rc = await RunGitAsync(
-            path, ct, "diff", "--no-ext-diff", "--no-color", "--unified=0", fromTreeish, toTreeish, "--", filePath);
+            path, ct, "diff", "--no-ext-diff", "--no-textconv", "--text", "--no-color", "--unified=0", fromTreeish, toTreeish, "--", filePath);
         if (rc.ExitCode != 0)
             throw new InvalidOperationException($"git diff for '{filePath}' failed: {rc.Stderr}");
         return rc.Stdout;
