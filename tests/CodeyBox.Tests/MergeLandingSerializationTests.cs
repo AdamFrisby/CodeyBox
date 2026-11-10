@@ -4,6 +4,7 @@ using CodeyBox.Audit;
 using CodeyBox.Core;
 using CodeyBox.Orchestrator;
 using CodeyBox.Projects;
+using Microsoft.Extensions.Logging;
 
 namespace CodeyBox.Tests;
 
@@ -489,12 +490,13 @@ public sealed class MergeLandingSerializationTests : IDisposable
     }
 
     /// <summary>
-    /// Pickup-time rebase stopped with no unmerged paths on a NON-empty
-    /// commit (persistent environmental failure): parks with a clear
-    /// no-progress reason instead of looping or silently skipping work.
+    /// Pickup-time rebase whose initial step fails with NO rebase in
+    /// progress (git refused to start — here a simulated failure on a clean
+    /// tree): fails precisely with git's stderr instead of looping into the
+    /// misleading "stopped with no unmerged paths" park.
     /// </summary>
     [Fact]
-    public async Task RebaseNoConflictStop_NonEmptyCommitNoProgress_ParksWithClearReason()
+    public async Task RebaseStartFailure_CleanTreeNoRebase_FailsWithGitStderr()
     {
         using var tp = TestSupport.BuildPipeline(
             _workspace,
@@ -546,10 +548,317 @@ public sealed class MergeLandingSerializationTests : IDisposable
                 precomputedCandidateFailure: null,
                 CancellationToken.None));
 
+        Assert.Contains("could not start", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("simulated rebase failure with nothing unmerged", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("no unmerged paths", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("no conflicts to resolve", ex.Message, StringComparison.Ordinal);
+        // The work branch is untouched: nothing was skipped or continued.
+        Assert.Equal(oldTip, await LandingGit.RevParseAsync(repoDir, "work"));
+    }
+
+    /// <summary>
+    /// Pickup-time rebase stopped with no unmerged paths on a genuine
+    /// sequencer stop whose --continue AND --skip both keep failing
+    /// (persistent environmental failure): parks with the no-progress
+    /// reason instead of looping forever, and every failed step's stderr
+    /// is logged.
+    /// </summary>
+    [Fact]
+    public async Task RebaseNoConflictStop_StuckStopNoProgress_ParksWithClearReason()
+    {
+        var logger = new RebaseCapturingLogger<PipelineRunner>();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace, "seed-rebase-stuckstop-unused"),
+            logger: logger);
+        var repoDir = Directory.CreateDirectory(Path.Combine(_workspace, "rebase-stuckstop-" + Guid.NewGuid().ToString("N")[..8])).FullName;
+        await LandingGit.RunAsync(repoDir, "init", "-b", "main", ".");
+        await LandingGit.RunAsync(repoDir, "config", "user.email", "test@test.com");
+        await LandingGit.RunAsync(repoDir, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\n");
+        await LandingGit.RunAsync(repoDir, "add", "README.md");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "init");
+        await LandingGit.RunAsync(repoDir, "checkout", "-qb", "work");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\nsame\n");
+        await LandingGit.RunAsync(repoDir, "commit", "-am", "work change (duplicated on main)");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "main");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\nsame\n");
+        await LandingGit.RunAsync(repoDir, "commit", "-am", "main change");
+        await LandingGit.RunAsync(repoDir, "update-ref", "refs/remotes/origin/main", "main");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "work");
+
+        // Stage a genuine stopped-at-empty-commit state, then break both
+        // recovery steps via the sandbox so every step's stderr is
+        // observable: the stop persists with no progress.
+        var (emptyExit, _, _) = await LandingGit.RunAllowFailureAsync(repoDir, "rebase", "--reapply-cherry-picks", "--empty=ask", "main");
+        Assert.Equal(1, emptyExit);
+
+        var oldTip = await LandingGit.RevParseAsync(repoDir, "work");
+        var sandbox = new LocalGitSandbox(
+            repoDir,
+            failFirstRebase: true,
+            failContinueStderr: "simulated --continue environmental failure",
+            failSkipStderr: "simulated --skip environmental failure");
+        var item = NewLocalItem("work");
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "test",
+            RepositoryUrl = repoDir,
+        };
+        var candidates = new AgenticConflictCandidatesResult(
+            [new AgenticConflictResolverCandidate(ThrowingAgentRunner.Instance, null)]);
+
+        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
+            tp.Pipeline.RebaseCheckedOutBranchWithScopeFenceAsync(
+                item,
+                tp.Agent,
+                sandbox,
+                "test-repo",
+                "main",
+                "work",
+                "origin/main",
+                oldTip,
+                new MergeScopeHint("test", false),
+                project,
+                candidates,
+                precomputedCandidateFailure: null,
+                CancellationToken.None));
+
         Assert.Contains("made no progress", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("no conflicts to resolve", ex.Message, StringComparison.Ordinal);
         // The work branch is untouched: nothing was skipped or continued.
         Assert.Equal(oldTip, await LandingGit.RevParseAsync(repoDir, "work"));
+        // Every failed step's stderr is logged: initial, --continue, --skip.
+        var logText = string.Join('\n', logger.Lines);
+        Assert.Contains("simulated rebase failure with nothing unmerged", logText, StringComparison.Ordinal);
+        Assert.Contains("simulated --continue environmental failure", logText, StringComparison.Ordinal);
+        Assert.Contains("simulated --skip environmental failure", logText, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A dirty worktree containing ONLY pipeline-owned
+    /// <c>.codeybox/</c> scratch (agent-log tee files the pipeline writes
+    /// into the git tree) refuses the initial rebase start. The runner
+    /// cleans that scratch, retries once, and completes — never reporting
+    /// the pre-start failure as "no unmerged paths".
+    /// </summary>
+    [Fact]
+    public async Task RebaseStartFailure_PipelineScratchDirt_CleanedAndRebased()
+    {
+        var logger = new RebaseCapturingLogger<PipelineRunner>();
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace, "seed-rebase-scratch-unused"),
+            logger: logger);
+        var repoDir = Directory.CreateDirectory(Path.Combine(_workspace, "rebase-scratch-" + Guid.NewGuid().ToString("N")[..8])).FullName;
+        await LandingGit.RunAsync(repoDir, "init", "-b", "main", ".");
+        await LandingGit.RunAsync(repoDir, "config", "user.email", "test@test.com");
+        await LandingGit.RunAsync(repoDir, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\n");
+        await LandingGit.RunAsync(repoDir, "add", "README.md");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "init");
+        await LandingGit.RunAsync(repoDir, "checkout", "-qb", "work");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\nwork\n");
+        // A self-committed agent-log file, as an agent-side `git add -A`
+        // sweeps in when the exclude guard misses: tracked scratch.
+        Directory.CreateDirectory(Path.Combine(repoDir, ".codeybox", "agent-logs"));
+        await File.WriteAllTextAsync(Path.Combine(repoDir, ".codeybox", "agent-logs", "keep.log"), "old log\n");
+        await LandingGit.RunAsync(repoDir, "add", ".");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "work change with committed logs");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "main");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "other.txt"), "main\n");
+        await LandingGit.RunAsync(repoDir, "add", "other.txt");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "main change");
+        await LandingGit.RunAsync(repoDir, "update-ref", "refs/remotes/origin/main", "main");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "work");
+
+        // Dirty the tree with pipeline-owned scratch only: a modified
+        // tracked log plus a fresh untracked tee file.
+        await File.WriteAllTextAsync(Path.Combine(repoDir, ".codeybox", "agent-logs", "keep.log"), "old log\nappended\n");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, ".codeybox", "agent-logs", "run-2.log"), "tee output\n");
+        var (dirtyExit, dirtyStdout, _) = await LandingGit.RunAllowFailureAsync(repoDir, "status", "--porcelain");
+        Assert.Equal(0, dirtyExit);
+        Assert.Contains(".codeybox/agent-logs/", dirtyStdout, StringComparison.Ordinal);
+
+        var oldTip = await LandingGit.RevParseAsync(repoDir, "work");
+        // No interception: the REAL git rebase refuses to start on the
+        // dirty tree, which is exactly the production failure mode.
+        var sandbox = new LocalGitSandbox(repoDir, failFirstRebase: false);
+        var item = NewLocalItem("work");
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "test",
+            RepositoryUrl = repoDir,
+        };
+        var candidates = new AgenticConflictCandidatesResult(
+            [new AgenticConflictResolverCandidate(ThrowingAgentRunner.Instance, null)]);
+
+        var result = await tp.Pipeline.RebaseCheckedOutBranchWithScopeFenceAsync(
+            item,
+            tp.Agent,
+            sandbox,
+            "test-repo",
+            "main",
+            "work",
+            "origin/main",
+            oldTip,
+            new MergeScopeHint("test", false),
+            project,
+            candidates,
+            precomputedCandidateFailure: null,
+            CancellationToken.None);
+
+        // Clean replay of non-conflicting changes: no resolver needed, the
+        // branch advanced past the old tip onto the new base.
+        Assert.Empty(result.ConflictFiles);
+        Assert.Null(result.ChosenResolver);
+        Assert.False(string.Equals(await LandingGit.RevParseAsync(repoDir, "HEAD"), oldTip, StringComparison.Ordinal));
+        var (cleanExit, cleanStdout, _) = await LandingGit.RunAllowFailureAsync(repoDir, "status", "--porcelain");
+        Assert.Equal(0, cleanExit);
+        Assert.True(string.IsNullOrWhiteSpace(cleanStdout));
+        var logText = string.Join('\n', logger.Lines);
+        Assert.Contains("You have unstaged changes", logText, StringComparison.Ordinal);
+        Assert.Contains("cleaning and retrying", logText, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An untracked file the rebase would overwrite is NOT pipeline scratch:
+    /// the runner fails precisely with git's stderr, never as a phantom
+    /// "no unmerged paths" stop, and leaves the branch alone.
+    /// </summary>
+    [Fact]
+    public async Task RebaseStartFailure_UntrackedOverwrite_FailsPrecise()
+    {
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace, "seed-rebase-overwrite-unused"));
+        var repoDir = Directory.CreateDirectory(Path.Combine(_workspace, "rebase-overwrite-" + Guid.NewGuid().ToString("N")[..8])).FullName;
+        await LandingGit.RunAsync(repoDir, "init", "-b", "main", ".");
+        await LandingGit.RunAsync(repoDir, "config", "user.email", "test@test.com");
+        await LandingGit.RunAsync(repoDir, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\n");
+        await LandingGit.RunAsync(repoDir, "add", "README.md");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "init");
+        await LandingGit.RunAsync(repoDir, "checkout", "-qb", "work");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\nwork\n");
+        await LandingGit.RunAsync(repoDir, "commit", "-am", "work change");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "main");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "data.txt"), "main data\n");
+        await LandingGit.RunAsync(repoDir, "add", "data.txt");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "main adds data");
+        await LandingGit.RunAsync(repoDir, "update-ref", "refs/remotes/origin/main", "main");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "work");
+
+        // An untracked file that checking out the new base would overwrite.
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "data.txt"), "rogue\n");
+
+        var oldTip = await LandingGit.RevParseAsync(repoDir, "work");
+        var sandbox = new LocalGitSandbox(repoDir, failFirstRebase: false);
+        var item = NewLocalItem("work");
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "test",
+            RepositoryUrl = repoDir,
+        };
+        var candidates = new AgenticConflictCandidatesResult(
+            [new AgenticConflictResolverCandidate(ThrowingAgentRunner.Instance, null)]);
+
+        var ex = await Assert.ThrowsAsync<MergeConflictResolutionFailedException>(() =>
+            tp.Pipeline.RebaseCheckedOutBranchWithScopeFenceAsync(
+                item,
+                tp.Agent,
+                sandbox,
+                "test-repo",
+                "main",
+                "work",
+                "origin/main",
+                oldTip,
+                new MergeScopeHint("test", false),
+                project,
+                candidates,
+                precomputedCandidateFailure: null,
+                CancellationToken.None));
+
+        Assert.Contains("could not start", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("untracked files would be overwritten", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("would be overwritten by checkout", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("no unmerged paths", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(oldTip, await LandingGit.RevParseAsync(repoDir, "work"));
+    }
+
+    /// <summary>
+    /// A REAL content conflict reaches the agentic resolver: the candidate
+    /// runs, its staged resolution verifies, and the rebase continues to
+    /// completion with the conflict attributed.
+    /// </summary>
+    [Fact]
+    public async Task RebaseConflict_ReachesResolverAndCompletes()
+    {
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            await TestSupport.CreateSeedRepoAsync(_workspace, "seed-rebase-resolver-unused"));
+        var repoDir = Directory.CreateDirectory(Path.Combine(_workspace, "rebase-resolver-" + Guid.NewGuid().ToString("N")[..8])).FullName;
+        await LandingGit.RunAsync(repoDir, "init", "-b", "main", ".");
+        await LandingGit.RunAsync(repoDir, "config", "user.email", "test@test.com");
+        await LandingGit.RunAsync(repoDir, "config", "user.name", "Test");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "base\n");
+        await LandingGit.RunAsync(repoDir, "add", "README.md");
+        await LandingGit.RunAsync(repoDir, "commit", "-m", "init");
+        await LandingGit.RunAsync(repoDir, "checkout", "-qb", "work");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "work\n");
+        await LandingGit.RunAsync(repoDir, "commit", "-am", "work change");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "main");
+        await File.WriteAllTextAsync(Path.Combine(repoDir, "README.md"), "main\n");
+        await LandingGit.RunAsync(repoDir, "commit", "-am", "main change");
+        await LandingGit.RunAsync(repoDir, "update-ref", "refs/remotes/origin/main", "main");
+        await LandingGit.RunAsync(repoDir, "checkout", "-q", "work");
+
+        var oldTip = await LandingGit.RevParseAsync(repoDir, "work");
+        // No interception: the real rebase stops on the README conflict and
+        // the resolver must be consulted (ThrowingAgentRunner would explode).
+        var sandbox = new LocalGitSandbox(repoDir, failFirstRebase: false);
+        var scripted = new ScriptedAgent([MergeStrategy.RealMerge]);
+        scripted.ConflictResolutionPlan.Enqueue(files =>
+        {
+            Assert.Single(files);
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["README.md"] = "main\nwork\n",
+            };
+        });
+        var item = NewLocalItem("work");
+        var project = new Project
+        {
+            Id = new ProjectId("test-project"),
+            DisplayName = "test",
+            RepositoryUrl = repoDir,
+        };
+        var candidates = new AgenticConflictCandidatesResult(
+            [new AgenticConflictResolverCandidate(scripted, null)]);
+
+        var result = await tp.Pipeline.RebaseCheckedOutBranchWithScopeFenceAsync(
+            item,
+            tp.Agent,
+            sandbox,
+            "test-repo",
+            "main",
+            "work",
+            "origin/main",
+            oldTip,
+            new MergeScopeHint("test", false),
+            project,
+            candidates,
+            precomputedCandidateFailure: null,
+            CancellationToken.None);
+
+        Assert.Single(scripted.AgenticConflictInvocations);
+        Assert.Equal(["README.md"], result.ConflictFiles);
+        Assert.NotNull(result.ChosenResolver);
+        Assert.False(string.Equals(await LandingGit.RevParseAsync(repoDir, "HEAD"), oldTip, StringComparison.Ordinal));
+        Assert.Equal("main\nwork\n", await File.ReadAllTextAsync(Path.Combine(repoDir, "README.md")));
     }
 
     private sealed class LandingAuditor(string workspace, string path, string content) : IAuditor
@@ -660,6 +969,30 @@ internal sealed class SharedLandingFactory(SerialLandingRemote remote) : IUpstre
 }
 
 /// <summary>
+/// Capturing <see cref="ILogger{PipelineRunner}"/> so rebase tests can
+/// assert git's stderr is logged for every failed rebase step.
+/// </summary>
+internal sealed class RebaseCapturingLogger<T> : ILogger<T>
+{
+    public List<string> Lines { get; } = new();
+
+    IDisposable? ILogger.BeginScope<TState>(TState state) => null;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        lock (Lines)
+            Lines.Add($"{logLevel}: {formatter(state, exception)}");
+    }
+}
+
+/// <summary>
 /// Agent stub that must never run: the no-conflict rebase tests assert the
 /// resolver short-circuits before invoking any candidate, so an invocation
 /// is a loud failure.
@@ -683,13 +1016,16 @@ internal sealed class ThrowingAgentRunner : IAgentRunner
 
 /// <summary>
 /// Minimal <see cref="ISandbox"/> that executes <c>git</c> argv against a
-/// host temp repo, translating the sandbox work-dir prefix. Non-git commands
-/// fail loudly. The first pipeline-shaped <c>git rebase</c> (without
+/// host temp repo, translating the sandbox work-dir prefix. The first
+/// pipeline-shaped <c>git rebase</c> (without
 /// <c>--continue</c>/<c>--skip</c>) can be forced to fail once to reproduce
 /// the production "rebase failed but nothing is unmerged" state on top of a
-/// real, staged sequencer state.
+/// real, staged sequencer state. <c>test -d</c> is answered from the host
+/// filesystem so the rebase-in-progress probe works; <c>cat</c> and
+/// <c>sh</c> pass through so scripted resolver agents can read/write files.
+/// Non-git/non-shell commands fail loudly.
 /// </summary>
-internal sealed class LocalGitSandbox(string repoDir, bool failFirstRebase) : ISandbox
+internal sealed class LocalGitSandbox(string repoDir, bool failFirstRebase, string? failContinueStderr = null, string? failSkipStderr = null) : ISandbox
 {
     private bool _interceptArmed = failFirstRebase;
 
@@ -699,6 +1035,24 @@ internal sealed class LocalGitSandbox(string repoDir, bool failFirstRebase) : IS
     public async Task<SandboxExecResult> ExecAsync(SandboxExec exec, CancellationToken ct = default)
     {
         var argv = exec.Argv.Select(a => Translate(a)).ToList();
+        if (argv.Count >= 2
+            && string.Equals(argv[0], "git", StringComparison.Ordinal)
+            && argv.Any(a => string.Equals(a, "rebase", StringComparison.Ordinal))
+            && argv.Any(a => string.Equals(a, "--continue", StringComparison.Ordinal))
+            && failContinueStderr is not null)
+        {
+            return new SandboxExecResult(1, "", failContinueStderr);
+        }
+
+        if (argv.Count >= 2
+            && string.Equals(argv[0], "git", StringComparison.Ordinal)
+            && argv.Any(a => string.Equals(a, "rebase", StringComparison.Ordinal))
+            && argv.Any(a => string.Equals(a, "--skip", StringComparison.Ordinal))
+            && failSkipStderr is not null)
+        {
+            return new SandboxExecResult(1, "", failSkipStderr);
+        }
+
         if (argv.Count > 0
             && string.Equals(argv[0], "git", StringComparison.Ordinal)
             && argv.Any(a => string.Equals(a, "rebase", StringComparison.Ordinal))
@@ -712,24 +1066,65 @@ internal sealed class LocalGitSandbox(string repoDir, bool failFirstRebase) : IS
             return new SandboxExecResult(1, "", "simulated rebase failure with nothing unmerged");
         }
 
-        if (argv.Count == 0 || !string.Equals(argv[0], "git", StringComparison.Ordinal))
-            throw new InvalidOperationException($"LocalGitSandbox only executes git argv, got: {string.Join(' ', exec.Argv)}");
-
-        var psi = new ProcessStartInfo(argv[0], argv.Skip(1).Select(Quote).Aggregate("", static (a, b) => a.Length == 0 ? b : a + " " + b))
+        if (argv.Count == 3
+            && string.Equals(argv[0], "test", StringComparison.Ordinal)
+            && string.Equals(argv[1], "-d", StringComparison.Ordinal))
         {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
+            return Directory.Exists(argv[2])
+                ? new SandboxExecResult(0, "", "")
+                : new SandboxExecResult(1, "", "");
+        }
+
+        if (argv.Count == 0
+            || (!string.Equals(argv[0], "git", StringComparison.Ordinal)
+                && !string.Equals(argv[0], "cat", StringComparison.Ordinal)
+                && !string.Equals(argv[0], "sh", StringComparison.Ordinal)))
+            throw new InvalidOperationException($"LocalGitSandbox only executes git/cat/sh argv, got: {string.Join(' ', exec.Argv)}");
+
+        var psi = string.Equals(argv[0], "git", StringComparison.Ordinal)
+            ? GitPsi(argv)
+            : ShellPsi(argv);
         foreach (var (k, v) in exec.ExtraEnvironment ?? new Dictionary<string, string>())
             psi.Environment[k] = v;
+        if (exec.Stdin is not null)
+            psi.RedirectStandardInput = true;
         using var proc = Process.Start(psi)!;
+        if (exec.Stdin is not null)
+        {
+            await proc.StandardInput.WriteAsync(exec.Stdin);
+            await proc.StandardInput.FlushAsync();
+            proc.StandardInput.Close();
+        }
+
         var stdout = await proc.StandardOutput.ReadToEndAsync(ct);
         var stderr = await proc.StandardError.ReadToEndAsync(ct);
         await proc.WaitForExitAsync(ct);
         return new SandboxExecResult(proc.ExitCode, stdout, stderr);
 
         static string Quote(string a) => a.Length == 0 ? "\"\"" : a.Any(char.IsWhiteSpace) ? $"\"{a}\"" : a;
+
+        static ProcessStartInfo GitPsi(List<string> gitArgv) => new(
+            gitArgv[0],
+            gitArgv.Skip(1).Select(Quote).Aggregate("", static (a, b) => a.Length == 0 ? b : a + " " + b))
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        static ProcessStartInfo ShellPsi(List<string> shellArgv)
+        {
+            var shellPsi = new ProcessStartInfo
+            {
+                FileName = shellArgv[0],
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var arg in shellArgv.Skip(1))
+                shellPsi.ArgumentList.Add(arg);
+            return shellPsi;
+        }
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
