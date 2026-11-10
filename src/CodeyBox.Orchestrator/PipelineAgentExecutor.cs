@@ -66,8 +66,8 @@ internal sealed class PipelineAgentExecutor
         if (string.IsNullOrWhiteSpace(sharedFolderProjectId) || sharedFolders.Count == 0)
         {
             if (_placer is null)
-                return _sandboxes.CreateAsync(spec, ct);
-            return _placer.AcquireAsync(
+                return await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
+            return await _placer.AcquireAsync(
                 new SandboxPlacementAcquisition(
                     workItemId,
                     phase,

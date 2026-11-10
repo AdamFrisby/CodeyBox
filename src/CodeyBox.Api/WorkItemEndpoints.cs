@@ -2098,7 +2098,17 @@ internal static class WorkItemEndpoints
                 grant.Group,
                 grant.WorkItemId?.ToString("N"),
                 grant.IsProjectWide,
-                grant.IsImplicit)).ToList());
+                grant.IsImplicit)).ToList(),
+            p.SharedFolders.Count > 0,
+            p.SharedFolders.Select(folder => new ProjectSharedFolderDto(
+                folder.Name,
+                folder.HostPath,
+                folder.SandboxPath,
+                folder.Mode.ToString(),
+                folder.Phases.ToString(),
+                folder.Required,
+                folder.WriterPolicy.ToString(),
+                folder.ExclusiveFallback.ToString())).ToList());
     }
 
     private static AgentControlDto? ToAgentControlDto(AgentControlSpec? spec) =>
@@ -2564,7 +2574,26 @@ public sealed record ProjectDto(
     int AuditMaxIterations,
     bool HasSandboxSecrets = false,
     IReadOnlyList<ProjectSandboxSecretDto>? SandboxSecrets = null,
-    IReadOnlyList<ProjectSandboxSecretGrantDto>? SecretGrants = null);
+    IReadOnlyList<ProjectSandboxSecretGrantDto>? SecretGrants = null,
+    bool HasSharedFolders = false,
+    IReadOnlyList<ProjectSharedFolderDto>? SharedFolders = null);
+
+/// <summary>
+/// Configured view of one project host-folder share: names and modes only.
+/// Live resolved status (existence, allow-list verdict) is served by
+/// <c>GET /projects/{id}/shared-folders</c>. A <c>ReadWrite</c> mode lets
+/// agent code modify host files through the mount; audit sandboxes always
+/// receive read-only mounts regardless of mode.
+/// </summary>
+public sealed record ProjectSharedFolderDto(
+    string Name,
+    string HostPath,
+    string SandboxPath,
+    string Mode,
+    string Phases,
+    bool Required,
+    string WriterPolicy,
+    string ExclusiveFallback);
 
 /// <summary>
 /// Names-only view of one project sandbox secret. Never carries a value.

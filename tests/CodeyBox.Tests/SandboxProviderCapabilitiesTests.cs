@@ -101,6 +101,8 @@ public sealed class SandboxProviderCapabilitiesTests
                 SandboxCapabilities.CacheSeeding,
                 SandboxCapabilities.DiskGuard,
                 SandboxCapabilities.Teardown,
+                SandboxCapabilities.HostFolderShares,
+                SandboxCapabilities.HostFolderSharesReadWrite,
             ],
             provider.DeclaredCapabilities);
 
@@ -121,13 +123,18 @@ public sealed class SandboxProviderCapabilitiesTests
     }
 
     [Fact]
-    public void BubblewrapSandboxProvider_DeclaresEmptyCapabilities()
+    public void BubblewrapSandboxProvider_DeclaresHostFolderShareCapabilities()
     {
         var provider = new BubblewrapSandboxProvider(
             new BubblewrapSandboxOptions(),
             NullLogger<BubblewrapSandboxProvider>.Instance);
 
-        Assert.Empty(provider.DeclaredCapabilities);
+        Assert.Equal(
+            [
+                SandboxCapabilities.HostFolderShares,
+                SandboxCapabilities.HostFolderSharesReadWrite,
+            ],
+            provider.DeclaredCapabilities);
     }
 
     [Fact]
@@ -157,8 +164,10 @@ public sealed class SandboxProviderCapabilitiesTests
         Assert.Equal("port-publishing", SandboxCapabilities.PortPublishing);
         Assert.Equal("suspend-resume", SandboxCapabilities.SuspendResume);
         Assert.Equal("teardown", SandboxCapabilities.Teardown);
+        Assert.Equal("host-folder-shares", SandboxCapabilities.HostFolderShares);
+        Assert.Equal("host-folder-shares-rw", SandboxCapabilities.HostFolderSharesReadWrite);
 
-        Assert.Equal(6, SandboxCapabilities.All.Count);
+        Assert.Equal(8, SandboxCapabilities.All.Count);
         Assert.Equal(SandboxCapabilities.All.Count, SandboxCapabilities.All.Distinct(StringComparer.Ordinal).Count());
 
         // Verify alias classes match
@@ -168,6 +177,8 @@ public sealed class SandboxProviderCapabilitiesTests
         Assert.Equal(SandboxCapabilities.PortPublishing, SandboxCapabilityTags.PortPublishing);
         Assert.Equal(SandboxCapabilities.SuspendResume, SandboxCapabilityTags.SuspendResume);
         Assert.Equal(SandboxCapabilities.Teardown, SandboxCapabilityTags.Teardown);
+        Assert.Equal(SandboxCapabilities.HostFolderShares, SandboxCapabilityTags.HostFolderShares);
+        Assert.Equal(SandboxCapabilities.HostFolderSharesReadWrite, SandboxCapabilityTags.HostFolderSharesReadWrite);
 
         Assert.Equal(SandboxCapabilities.BaselineBake, WellKnownSandboxCapabilities.BaselineBake);
         Assert.Equal(SandboxCapabilities.CacheSeeding, WellKnownSandboxCapabilities.CacheSeeding);
@@ -175,6 +186,8 @@ public sealed class SandboxProviderCapabilitiesTests
         Assert.Equal(SandboxCapabilities.PortPublishing, WellKnownSandboxCapabilities.PortPublishing);
         Assert.Equal(SandboxCapabilities.SuspendResume, WellKnownSandboxCapabilities.SuspendResume);
         Assert.Equal(SandboxCapabilities.Teardown, WellKnownSandboxCapabilities.Teardown);
+        Assert.Equal(SandboxCapabilities.HostFolderShares, WellKnownSandboxCapabilities.HostFolderShares);
+        Assert.Equal(SandboxCapabilities.HostFolderSharesReadWrite, WellKnownSandboxCapabilities.HostFolderSharesReadWrite);
     }
 
     [Fact]

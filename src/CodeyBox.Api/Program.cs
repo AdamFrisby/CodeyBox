@@ -2981,13 +2981,14 @@ static ProjectSharedFolderPolicy BuildProjectSharedFolderPolicy(IServiceProvider
 // that drop a project with in-flight work items, so reloads that would
 // strand running pipelines are surfaced as ERR and the prior project list
 // is retained.
+builder.Services.AddSingleton(BuildProjectSharedFolderPolicy);
 builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
     sp.GetRequiredService<ILogger<ProjectRepository>>(),
     sp.GetService<PresetCatalogOptions>(),
     sp.GetRequiredService<IKnobRegistry>(),
     sp.GetService<IDeploymentDriverRegistry>(),
-    BuildProjectSharedFolderPolicy(sp)));
+    sp.GetRequiredService<ProjectSharedFolderPolicy>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GitHubAppConnectState>();
@@ -5056,6 +5057,7 @@ WorkItemFailureEventsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
 AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
+ProjectSharedFolderEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 WorkItemDossierEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
