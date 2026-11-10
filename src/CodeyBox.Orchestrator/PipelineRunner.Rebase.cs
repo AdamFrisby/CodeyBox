@@ -640,7 +640,7 @@ public sealed partial class PipelineRunner
         IReadOnlyList<AgenticConflictResolverCandidate>? candidates = null;
         AgenticConflictCandidatesResult? candidateResult = precomputedCandidateResult;
 
-        var rebase = await sandbox.ExecAsync(new SandboxExec
+        Task<SandboxExecResult> RunInitialRebaseAsync() => sandbox.ExecAsync(new SandboxExec
         {
             Argv =
             [
@@ -652,6 +652,28 @@ public sealed partial class PipelineRunner
                 upstreamRef,
             ],
         }, ct);
+
+        var rebase = await RunInitialRebaseAsync();
+
+        if (!rebase.Success)
+        {
+            // A non-zero exit does NOT imply a conflict stop: git also
+            // refuses to start (dirty worktree, untracked files it would
+            // overwrite, missing upstream ref, lock contention,
+            // identity/hook failure) without creating any sequencer state.
+            // Resolve that BEFORE consulting the resolver so a pre-start
+            // failure is never misreported as "no unmerged paths".
+            rebase = await RecoverRebaseStartFailureAsync(
+                item,
+                sandbox,
+                baseBranch,
+                workBranch,
+                upstreamRef,
+                oldTip,
+                rebase,
+                RunInitialRebaseAsync,
+                ct);
+        }
 
         // Tracks the commit a no-conflict stop was last handled at. A second
         // consecutive no-conflict stop at the same commit means the
@@ -706,6 +728,28 @@ public sealed partial class PipelineRunner
                     // failure. Proceed with a clean rebase instead of
                     // parking: --continue first; when the worktree is clean
                     // but the stop persists, --skip the empty commit.
+                    //
+                    // A rebase must actually be in progress here. When the
+                    // initial rebase never started (dirty worktree, lock,
+                    // missing upstream) the upfront start-failure recovery
+                    // above already threw; reaching this branch without
+                    // sequencer state means something aborted the rebase
+                    // underneath us (for example an agent-side
+                    // `git rebase --abort`), which must fail precisely
+                    // instead of looping on a phantom stop.
+                    if (!await IsRebaseInProgressAsync(sandbox, ct))
+                    {
+                        var orphanStatus = await ReadWorktreeStatusAsync(sandbox, ct);
+                        var orphanStatusText = orphanStatus.Success
+                            ? orphanStatus.Stdout.Trim()
+                            : $"status failed: {orphanStatus.Stderr.Trim()}";
+                        _log.LogWarning(
+                            "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} is no longer in progress after a no-conflict resolver pass; worktree status: {Status}",
+                            workBranch, baseBranch, TruncateForLog(orphanStatusText));
+                        throw new MergeConflictResolutionFailedException(
+                            $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' is no longer in progress with no unmerged paths; worktree status: {TruncateForLog(orphanStatusText)}; work branch left at original tip {oldTip}");
+                    }
+
                     var stopId = await TryRevParseSandboxAsync(sandbox, "REBASE_HEAD", ct)
                         ?? await RevParseSandboxAsync(sandbox, "HEAD", ct);
                     if (string.Equals(stopId, lastNoConflictStop, StringComparison.Ordinal))
@@ -729,10 +773,10 @@ public sealed partial class PipelineRunner
                     }, ct);
                     if (!rebase.Success)
                     {
-                        var stopStatus = await sandbox.ExecAsync(new SandboxExec
-                        {
-                            Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
-                        }, ct);
+                        _log.LogWarning(
+                            "Pickup-time rebase --continue for work branch {WorkBranch} onto {BaseBranch} failed (exit {Exit}): {Stderr}",
+                            workBranch, baseBranch, rebase.ExitCode, TruncateForLog(rebase.Stderr.Trim()));
+                        var stopStatus = await ReadWorktreeStatusAsync(sandbox, ct);
                         var stopUnmerged = await MergeConflictPathInspector.ListUnmergedPathsAsync(
                             sandbox, SandboxConventions.WorkDir, ct);
                         // --skip drops the stopped commit. Only take it when
@@ -758,6 +802,25 @@ public sealed partial class PipelineRunner
                             {
                                 Argv = ["git", "-C", SandboxConventions.WorkDir, "rebase", "--skip"],
                             }, ct);
+                            if (!rebase.Success)
+                            {
+                                _log.LogWarning(
+                                    "Pickup-time rebase --skip for work branch {WorkBranch} onto {BaseBranch} failed (exit {Exit}): {Stderr}",
+                                    workBranch, baseBranch, rebase.ExitCode, TruncateForLog(rebase.Stderr.Trim()));
+                            }
+                        }
+
+                        // A failed --continue/--skip that also ended the
+                        // rebase (sequencer state gone) is not a stop to
+                        // loop on — fail precisely with the step's stderr.
+                        if (!rebase.Success && !await IsRebaseInProgressAsync(sandbox, ct))
+                        {
+                            var endStatus = await ReadWorktreeStatusAsync(sandbox, ct);
+                            var endStatusText = endStatus.Success
+                                ? endStatus.Stdout.Trim()
+                                : $"status failed: {endStatus.Stderr.Trim()}";
+                            throw new MergeConflictResolutionFailedException(
+                                $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' ended without completing: {TruncateForMessage(rebase.Stderr.Trim())}; worktree status: {TruncateForMessage(endStatusText)}; work branch left at original tip {oldTip}");
                         }
                     }
 
@@ -867,6 +930,373 @@ public sealed partial class PipelineRunner
             resolvedAnyConflict ? conflictFiles.ToArray() : [],
             resolvedAnyConflict ? chosenResolver : null,
             resolvedAnyConflict ? chosenCredential : null);
+    }
+
+    /// <summary>
+    /// Why a <c>git rebase</c> step failed before doing any work. A rebase
+    /// that never started leaves no sequencer state
+    /// (<c>.git/rebase-merge</c>, <c>.git/rebase-apply</c>,
+    /// <c>REBASE_HEAD</c>), so the failure is classified from git's stderr
+    /// instead of being misreported as a conflict stop with no unmerged
+    /// paths.
+    /// </summary>
+    public enum RebaseStartFailureKind
+    {
+        Unknown,
+        DirtyWorktree,
+        UntrackedFilesWouldBeOverwritten,
+        MissingUpstreamRef,
+        LockContention,
+        IdentityOrHook,
+    }
+
+    private const int RebaseDiagnosticsLogMaxChars = 2000;
+    private const int RebaseDiagnosticsMessageMaxChars = 1000;
+
+    /// <summary>
+    /// Pipeline-owned scratch namespace inside the git worktree. The exec
+    /// wrapper tees agent stdout/stderr under
+    /// <c>.codeybox/agent-logs/</c>, agents may leave
+    /// <c>.codeybox/suggestions.json</c> /
+    /// <c>.codeybox/no-action-required.json</c> behind, and that mount
+    /// survives VM suspend/resume — so a reused sandbox can present this
+    /// dirt at rebase time. It is diagnostics, never deliverable (every
+    /// orchestrator commit strips it from the index), so the rebase may
+    /// remove it; anything outside this namespace is user content and must
+    /// fail precisely instead.
+    /// </summary>
+    private const string PipelineScratchNamespacePrefix = ".codeybox/";
+
+    private static string TruncateForLog(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "(empty)";
+        return value.Length <= RebaseDiagnosticsLogMaxChars
+            ? value
+            : value[..RebaseDiagnosticsLogMaxChars] + "… [truncated]";
+    }
+
+    private static string TruncateForMessage(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "(no output)";
+        var trimmed = value.Trim();
+        return trimmed.Length <= RebaseDiagnosticsMessageMaxChars
+            ? trimmed
+            : trimmed[..RebaseDiagnosticsMessageMaxChars] + "… [truncated]";
+    }
+
+    /// <summary>
+    /// Pure classifier over git's rebase stderr. Substring matching is
+    /// against git's own stable error phrases (exact phrases, never
+    /// branch/file content), so an unrecognized message stays
+    /// <see cref="RebaseStartFailureKind.Unknown"/> rather than guessing.
+    /// </summary>
+    internal static RebaseStartFailureKind ClassifyRebaseStartFailure(string? stderr)
+    {
+        if (string.IsNullOrWhiteSpace(stderr))
+            return RebaseStartFailureKind.Unknown;
+        if (stderr.Contains("untracked working tree file", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("untracked files would be overwritten", StringComparison.OrdinalIgnoreCase))
+            return RebaseStartFailureKind.UntrackedFilesWouldBeOverwritten;
+        if (stderr.Contains("index.lock", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Another git process seems to be running", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("already a rebase-merge directory", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("already a rebase-apply directory", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("could not lock", StringComparison.OrdinalIgnoreCase))
+            return RebaseStartFailureKind.LockContention;
+        if (stderr.Contains("You have unstaged changes", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Your index contains uncommitted changes", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Your local changes to the following files would be overwritten", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Please commit your changes or stash them", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Please commit or stash them", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("cannot rebase: you have unstaged", StringComparison.OrdinalIgnoreCase))
+            return RebaseStartFailureKind.DirtyWorktree;
+        if (stderr.Contains("no such branch", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("unknown revision", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("invalid upstream", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Couldn't find remote ref", StringComparison.Ordinal)
+            || stderr.Contains("Needed a single revision", StringComparison.OrdinalIgnoreCase))
+            return RebaseStartFailureKind.MissingUpstreamRef;
+        if (stderr.Contains("Please tell me who you are", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("empty ident name", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("unable to auto-detect email address", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("Author identity unknown", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("gpg failed to sign", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("signing failed", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("hook declined", StringComparison.OrdinalIgnoreCase)
+            || stderr.Contains("cannot exec", StringComparison.OrdinalIgnoreCase))
+            return RebaseStartFailureKind.IdentityOrHook;
+        return RebaseStartFailureKind.Unknown;
+    }
+
+    private static string DescribeRebaseStartFailure(RebaseStartFailureKind kind, bool worktreeDirty) =>
+        kind switch
+        {
+            RebaseStartFailureKind.DirtyWorktree => "dirty worktree",
+            RebaseStartFailureKind.UntrackedFilesWouldBeOverwritten => "untracked files would be overwritten",
+            RebaseStartFailureKind.MissingUpstreamRef => "missing upstream ref",
+            RebaseStartFailureKind.LockContention => "git lock contention",
+            RebaseStartFailureKind.IdentityOrHook => "git identity/hook failure",
+            _ => worktreeDirty ? "unrecognized git error with a dirty worktree" : "unrecognized git error",
+        };
+
+    /// <summary>
+    /// Whether a rebase sequencer is currently in progress: either stop
+    /// pseudo-ref (<c>REBASE_HEAD</c>, set at every merge-backend stop) or
+    /// either sequencer state directory. A failed rebase step with none of
+    /// these never started — it must not enter the conflict loop.
+    /// </summary>
+    internal static async Task<bool> IsRebaseInProgressAsync(ISandbox sandbox, CancellationToken ct)
+    {
+        var head = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "-q", "--verify", "REBASE_HEAD"],
+        }, ct);
+        if (head.Success)
+            return true;
+
+        var gitDir = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rev-parse", "--absolute-git-dir"],
+        }, ct);
+        if (!gitDir.Success)
+            return false;
+        // Guard AT the sink: the git-dir path comes from repo state, so
+        // bound it and pass it as a single argv element (no shell) — a
+        // hostile value can only make the probe return false.
+        var dir = gitDir.Stdout.Trim();
+        if (string.IsNullOrWhiteSpace(dir) || dir.Length > 4096 || dir.Contains('\0'))
+            return false;
+        var mergeState = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-d", dir + "/rebase-merge"],
+        }, ct);
+        if (mergeState.Success)
+            return true;
+        var applyState = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["test", "-d", dir + "/rebase-apply"],
+        }, ct);
+        return applyState.Success;
+    }
+
+    private static Task<SandboxExecResult> ReadWorktreeStatusAsync(ISandbox sandbox, CancellationToken ct) =>
+        sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "status", "--porcelain"],
+        }, ct);
+
+    /// <summary>
+    /// Report over <c>git status --porcelain</c> output: whether the tree is
+    /// clean, whether every dirty entry lives under the pipeline-owned
+    /// <c>.codeybox/</c> scratch namespace, and whether any of that scratch
+    /// is tracked (needs a checkout restore rather than just an untracked
+    /// sweep).
+    /// </summary>
+    internal readonly record struct WorktreeDirtReport(bool IsClean, bool AllPipelineOwnedScratch, bool HasTrackedScratch);
+
+    /// <summary>
+    /// Pure porcelain parser for the rebase pre-start gate. Rename entries
+    /// check both sides; C-quoted paths are unquoted for the prefix test.
+    /// Anything unparseable is treated as NOT pipeline-owned (fail precise
+    /// rather than clean something unrecognized).
+    /// </summary>
+    internal static WorktreeDirtReport AnalyzeWorktreeDirt(string? porcelainStdout)
+    {
+        if (string.IsNullOrWhiteSpace(porcelainStdout))
+            return new WorktreeDirtReport(IsClean: true, AllPipelineOwnedScratch: true, HasTrackedScratch: false);
+
+        var allOwned = true;
+        var hasTracked = false;
+        foreach (var rawLine in porcelainStdout.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            if (string.IsNullOrWhiteSpace(line) || line.Length < 4)
+                continue;
+            var statusX = line[0];
+            var statusY = line[1];
+            if (line[2] != ' ')
+            {
+                allOwned = false;
+                continue;
+            }
+            var paths = line[3..].Split(" -> ", StringSplitOptions.None);
+            var owned = true;
+            foreach (var rawPath in paths)
+            {
+                var path = rawPath.Trim();
+                if (path.Length >= 2 && path.StartsWith('"') && path.EndsWith('"'))
+                    path = path[1..^1];
+                if (!path.StartsWith(PipelineScratchNamespacePrefix, StringComparison.Ordinal))
+                    owned = false;
+            }
+            if (!owned)
+                allOwned = false;
+            if (statusX != '?' || statusY != '?')
+                hasTracked = true;
+        }
+
+        return new WorktreeDirtReport(IsClean: false, AllPipelineOwnedScratch: allOwned, HasTrackedScratch: hasTracked);
+    }
+
+    /// <summary>
+    /// Handles a failed initial rebase. When a rebase is actually in
+    /// progress the failed result is returned unchanged so the caller
+    /// enters the conflict loop; when git refused to start, the stdout,
+    /// stderr, and worktree status are logged, pipeline-owned
+    /// <c>.codeybox/</c> scratch is cleaned with a single retry, and
+    /// anything else throws a precise error carrying git's stderr — never
+    /// the misleading "no unmerged paths" stop.
+    /// </summary>
+    private async Task<SandboxExecResult> RecoverRebaseStartFailureAsync(
+        WorkItem item,
+        ISandbox sandbox,
+        string baseBranch,
+        string workBranch,
+        string upstreamRef,
+        string oldTip,
+        SandboxExecResult failedRebase,
+        Func<Task<SandboxExecResult>> retryRebaseAsync,
+        CancellationToken ct)
+    {
+        var stderr = failedRebase.Stderr.Trim();
+        _log.LogWarning(
+            "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} for work item {WorkItemId} failed (exit {Exit}); stdout: {Stdout}; stderr: {Stderr}",
+            workBranch, baseBranch, item.Id, failedRebase.ExitCode,
+            TruncateForLog(failedRebase.Stdout.Trim()),
+            TruncateForLog(stderr));
+
+        if (await IsRebaseInProgressAsync(sandbox, ct))
+            return failedRebase;
+
+        var status = await ReadWorktreeStatusAsync(sandbox, ct);
+        var statusText = status.Success ? status.Stdout.Trim() : $"status failed: {status.Stderr.Trim()}";
+        _log.LogWarning(
+            "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} for work item {WorkItemId} is not in progress: git refused to start; worktree status: {Status}",
+            workBranch, baseBranch, item.Id, TruncateForLog(statusText));
+
+        var dirt = status.Success
+            ? AnalyzeWorktreeDirt(status.Stdout)
+            : new WorktreeDirtReport(IsClean: false, AllPipelineOwnedScratch: false, HasTrackedScratch: false);
+        var kind = ClassifyRebaseStartFailure(stderr);
+
+        if (!dirt.IsClean
+            && dirt.AllPipelineOwnedScratch
+            && (kind is RebaseStartFailureKind.DirtyWorktree
+                or RebaseStartFailureKind.UntrackedFilesWouldBeOverwritten
+                or RebaseStartFailureKind.Unknown))
+        {
+            // Dirt the pipeline itself created (agent-log tee files,
+            // suggestion/no-action reports under .codeybox/) must not wedge
+            // the rebase: remove it per the existing strip rules (never
+            // committed, diagnostics only) and retry exactly once.
+            _log.LogInformation(
+                "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} found only pipeline-owned scratch in the worktree; cleaning and retrying once",
+                workBranch, baseBranch);
+            if (await TryCleanPipelineOwnedScratchAsync(sandbox, dirt.HasTrackedScratch, workBranch, baseBranch, ct))
+            {
+                var retry = await retryRebaseAsync();
+                if (retry.Success)
+                    return retry;
+                var retryStderr = retry.Stderr.Trim();
+                _log.LogWarning(
+                    "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} failed again after scratch cleanup (exit {Exit}); stdout: {Stdout}; stderr: {Stderr}",
+                    workBranch, baseBranch, retry.ExitCode,
+                    TruncateForLog(retry.Stdout.Trim()),
+                    TruncateForLog(retryStderr));
+                if (await IsRebaseInProgressAsync(sandbox, ct))
+                    return retry;
+                stderr = retryStderr;
+                kind = ClassifyRebaseStartFailure(stderr);
+            }
+        }
+
+        throw new MergeConflictResolutionFailedException(
+            $"pickup-time rebase of work branch '{workBranch}' onto '{baseBranch}' could not start ({DescribeRebaseStartFailure(kind, !dirt.IsClean)}): {TruncateForMessage(stderr)}; worktree status: {TruncateForMessage(statusText)}; work branch left at original tip {oldTip}");
+    }
+
+    /// <summary>
+    /// Removes pipeline-owned <c>.codeybox/</c> scratch so a refused rebase
+    /// can start, then verifies the tree is clean. Returns false when the
+    /// tree is still dirty — the caller then fails precisely instead of
+    /// retrying. Individual step failures are best-effort (logged, not
+    /// thrown): the final status verification is the authoritative gate.
+    ///
+    /// Ordering matters: restore tracked scratch from HEAD first (repairs
+    /// modified/deleted entries while they are still tracked), then unstage
+    /// (mirroring the work-phase index strips), sweep untracked files, and
+    /// restore from HEAD again (the sweep deletes the worktree copies the
+    /// unstage just detached from the index).
+    /// </summary>
+    private async Task<bool> TryCleanPipelineOwnedScratchAsync(
+        ISandbox sandbox,
+        bool hasTrackedScratch,
+        string workBranch,
+        string baseBranch,
+        CancellationToken ct)
+    {
+        if (hasTrackedScratch)
+        {
+            var restore = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "checkout", "HEAD", "--", ".codeybox"],
+            }, ct);
+            if (!restore.Success)
+            {
+                _log.LogDebug(
+                    "Pickup-time rebase scratch cleanup on {WorkBranch} could not pre-restore tracked .codeybox (exit {Exit}): {Stderr}",
+                    workBranch, restore.ExitCode, TruncateForLog(restore.Stderr.Trim()));
+            }
+        }
+
+        var unstage = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "-r", "--cached", "--ignore-unmatch", "--", ".codeybox"],
+        }, ct);
+        if (!unstage.Success)
+        {
+            _log.LogDebug(
+                "Pickup-time rebase scratch cleanup on {WorkBranch} could not unstage .codeybox (exit {Exit}): {Stderr}",
+                workBranch, unstage.ExitCode, TruncateForLog(unstage.Stderr.Trim()));
+        }
+
+        var sweep = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", SandboxConventions.WorkDir, "clean", "-fd", "--", ".codeybox"],
+        }, ct);
+        if (!sweep.Success)
+        {
+            _log.LogDebug(
+                "Pickup-time rebase scratch cleanup on {WorkBranch} could not sweep untracked .codeybox (exit {Exit}): {Stderr}",
+                workBranch, sweep.ExitCode, TruncateForLog(sweep.Stderr.Trim()));
+        }
+
+        if (hasTrackedScratch)
+        {
+            var restore = await sandbox.ExecAsync(new SandboxExec
+            {
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "checkout", "HEAD", "--", ".codeybox"],
+            }, ct);
+            if (!restore.Success)
+            {
+                _log.LogDebug(
+                    "Pickup-time rebase scratch cleanup on {WorkBranch} could not restore tracked .codeybox (exit {Exit}): {Stderr}",
+                    workBranch, restore.ExitCode, TruncateForLog(restore.Stderr.Trim()));
+            }
+        }
+
+        var verify = await ReadWorktreeStatusAsync(sandbox, ct);
+        if (!verify.Success || !string.IsNullOrWhiteSpace(verify.Stdout))
+        {
+            _log.LogWarning(
+                "Pickup-time rebase of work branch {WorkBranch} onto {BaseBranch} is still dirty after scratch cleanup; status: {Status}",
+                workBranch, baseBranch,
+                TruncateForLog(verify.Success ? verify.Stdout.Trim() : $"status failed: {verify.Stderr.Trim()}"));
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>
