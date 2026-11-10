@@ -355,6 +355,42 @@ public sealed class PipelineRunnerQuotaFallbackTests : IDisposable
     }
 
     [Fact]
+    public async Task Codex_ExhaustsSessionResumeWithUncorroboratedQuotaAndConcurrentAuth_FailsAuthRequiredWithoutQuotaFallback()
+    {
+        // Fail-closed quota-before-auth for session-resume exhaustion: the
+        // LastResult carries agent-quotable quota prose (a stdout stream-json
+        // error event, always untrusted) alongside a genuine stderr auth
+        // signal, and the live probe reads healthy (no positive corroboration
+        // of exhaustion). Yielding to quota here would suppress credential
+        // handling on forged-able text, so the item must fail as auth_required
+        // with no quota fallback to the next member.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        using var fix = BuildPipeline(seed);
+
+        fix.Codex.ScriptedExceptions.Enqueue(new AgentSessionResumeExhaustedException(
+            AgentKind.Codex,
+            maxResumeAttempts: 2,
+            new AgentResult(
+                false,
+                "agent exited 1",
+                "{\"type\":\"error\",\"message\":\"rate_limit_exceeded, retry after 60s\"}",
+                "error: authentication failed or timed out")));
+        fix.Claude.WorkPlan.Enqueue(new FileWrite("should-not-run.txt", "quota fallback must not run"));
+
+        var item = NewItem(initialAgent: AgentKind.Codex);
+        await fix.Store.CreateAsync(item);
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var finalItem = await fix.Store.GetAsync(item.Id, CancellationToken.None);
+        Assert.NotNull(finalItem);
+        Assert.Equal(WorkItemState.Failed, finalItem!.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, finalItem.FailureKind);
+        Assert.NotEqual("quota", finalItem.FailureKind);
+        Assert.Equal(0, fix.Claude.CallCount);
+        Assert.Empty(await fix.FallbackHistory.ListByWorkItemAsync(item.Id, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task SoleMember_ExhaustsSessionResume_FailsCleanlyWithoutFallback()
     {
         // Companion guard for the nextMember == null path in

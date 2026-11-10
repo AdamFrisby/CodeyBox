@@ -81,6 +81,7 @@ public sealed partial class PipelineRunner
 
     private async Task ThrowIfNoDiffTerminalDiagnosticQuotaFailureAsync(
         WorkItem item,
+        Project? project,
         AgentKind agent,
         string? observedModelId,
         AgentResult agentResult,
@@ -92,20 +93,101 @@ public sealed partial class PipelineRunner
         if (string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
             return;
 
-        await ThrowIfNoDiffQuotaFailureFromTextAsync(
-            item: item,
-            project: null,
-            agent: agent,
-            observedModelId: observedModelId,
-            summary: agentResult.Summary,
-            stderr: agentResult.TerminalDiagnostic,
+        var noChangeQuota = _quotaClassifier.Detect(agent, agentResult.TerminalDiagnostic, null);
+        if (noChangeQuota is null)
+            return;
+
+        if (noChangeQuota.Kind == QuotaFailureKind.Unauthorized && project is not null)
+        {
+            var authRequired = ToAuthRequiredClassification(new AgentFailureClassification(
+                AgentFailureKind.AuthError,
+                Reason: "auth pattern matched"));
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                agent,
+                phase,
+                authRequired,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: false,
+                requireStdoutOnlyCorroboration: false,
+                requireAuthCorroboration: true,
+                ct: ct);
+        }
+
+        if (!IsParkableQuotaKind(noChangeQuota))
+            return;
+
+        // Fail-closed quota-before-auth mirroring the audit gate. The terminal
+        // region lifts the CLI log tail, which interleaves verbatim model/tool
+        // output: forged quota prose plus a genuine auth signal must neither
+        // park on a fake reset nor suppress credential handling. With no
+        // concurrent auth signal the quota path stands (a silent changeless
+        // turn is exactly what a quota block produces); otherwise only a
+        // positive known-exhausted probe reading corroborates the prose.
+        // The park below is always untrusted so a healthy probe still vetoes
+        // it at the transition.
+        var gateResult = agentResult with
+        {
+            Stderr = string.Join(
+                "\n",
+                new[] { agentResult.TerminalDiagnostic, agentResult.Stderr }
+                    .Where(static s => !string.IsNullOrWhiteSpace(s))),
+        };
+        var authForGate = TryGetAuthClassificationIgnoringQuota(agent, gateResult, classification: null);
+        var takeQuotaPath = authForGate is null
+            || await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, phase, ct).ConfigureAwait(false);
+        if (!takeQuotaPath)
+        {
+            if (project is not null
+                && authForGate?.Kind is AgentFailureKind.AuthError or AgentFailureKind.AuthRequired)
+            {
+                await HandleAuthRequiredDetectionAsync(
+                    item,
+                    project,
+                    agent,
+                    phase,
+                    ToAuthRequiredClassification(authForGate),
+                    throwOnMatch: true,
+                    stdoutOnlyEvidence: string.IsNullOrWhiteSpace(gateResult.Stderr)
+                        && !string.IsNullOrWhiteSpace(gateResult.Stdout),
+                    requireStdoutOnlyCorroboration: true,
+                    requireAuthCorroboration: true,
+                    ct: ct);
+            }
+
+            _log.LogWarning(
+                "Ignoring uncorroborated clean-exit/no-diff quota evidence from terminal diagnostic for agent {Agent} during {Phase} with concurrent auth signal; treating run as genuine no-diff",
+                agent.Value,
+                phase);
+            return;
+        }
+
+        _quotaAuditEmitter.EmitAdvisoryAuditEvents(agent, agentResult.TerminalDiagnostic, null, phase, sandboxId);
+        // Feed the observed-failure store so the router proactively gates this
+        // member during its quota window. A clean-exit give-up summary is often
+        // "ok", so bypass the exit-1 summary guard after a positive no-diff quota
+        // match.
+        await _quotaClassifier.RecordIfQuotaFailureAsync(
+            _quotaFailures,
+            agent,
+            observedModelId,
+            agentResult.Summary,
+            agentResult.TerminalDiagnostic,
+            agentEndedAt,
+            _auditQuotaOptions.ObservedFailureRetention,
+            ct,
+            projectId: item.ProjectId,
             stdout: null,
-            phase: phase,
-            sandboxId: sandboxId,
-            agentEndedAt: agentEndedAt,
-            evidenceSource: "terminal diagnostic",
-            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
-            ct: ct);
+            bypassExitedSummaryGuard: true);
+
+        throw new TerminalQuotaError(noChangeQuota.Kind,
+            QuotaFailureMessage(
+                noChangeQuota.Kind,
+                $"Agent {agent} reported quota failure on clean-exit/no-diff from terminal diagnostic",
+                SanitizedAgentDetail.FromRaw(agentResult.TerminalDiagnostic)),
+            noChangeQuota.ResetAt,
+            providerSurfaceMatch: false);
     }
 
     private enum NoDiffQuotaEvidenceTrust

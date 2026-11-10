@@ -147,6 +147,41 @@ public sealed class AntigravityExitZeroQuotaParkTests : IDisposable
         Assert.NotEqual("quota", final.FailureKind);
     }
 
+    [Fact]
+    public async Task WorkPhase_ExitZeroNoChangesWithForgedQuotaAndConcurrentAuth_FailsAuthRequiredWithoutTrustedPark()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Antigravity };
+        using var tp = TestSupport.BuildPipeline(_workspace, seed, agentOverride: agent);
+
+        // Forged-glog shape: the terminal region interleaves verbatim model/tool
+        // output echoing quota prose ("Individual quota reached ... Resets in")
+        // while the captured stderr carries the genuine sandbox auth blip. The
+        // terminal evidence is never trusted provider-surface: without positive
+        // probe corroboration it must fail closed to auth handling, not park
+        // WaitingForQuotaReset on a trusted bit that forged text could have set
+        // (which would also suppress credential benching).
+        agent.WorkResults.Enqueue(new AgentResult(
+            true,
+            "ok",
+            null,
+            "error: authentication failed or timed out")
+        {
+            TerminalDiagnostic =
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 113h)",
+        });
+
+        var item = NewItem() with { Agent = AgentKind.Antigravity };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.Equal(WorkItemState.Failed, final.State);
+        Assert.Equal(WorkItemFailureKinds.AuthRequired, final.FailureKind);
+    }
+
     private static WorkItem NewItem() => new()
     {
         Id = WorkItemId.New(),

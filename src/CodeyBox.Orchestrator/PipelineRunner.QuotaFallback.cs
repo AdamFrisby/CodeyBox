@@ -282,42 +282,87 @@ public sealed partial class PipelineRunner
             CancellationToken token)
         {
             var last = resumeEx.LastResult;
+            // The terminal region lifts CLI-log bytes that interleave verbatim
+            // model/tool output, so the auth gate below reads it folded into
+            // stderr (mirroring the audit gate): a genuine auth signal counts
+            // wherever it surfaces, not only on the captured streams.
+            var authGateResult = string.IsNullOrWhiteSpace(last.TerminalDiagnostic)
+                ? last
+                : last with
+                {
+                    Stderr = string.Join(
+                        "\n",
+                        new[] { last.Stderr, last.TerminalDiagnostic }
+                            .Where(static s => !string.IsNullOrWhiteSpace(s))),
+                };
             // Quota-before-auth (agy exit-3 / result-ERROR shape): a quota block that
             // surfaced as generic stderr auth text must not become an auth exclusion.
             // Yield to the quota converter below when stdout result events or the CLI
             // log carry exhaustion.
-            if (TryGetExhaustionClassification(_quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout)) is not null)
+            //
+            // Fail-closed forgery gate mirroring the work/planning/audit paths:
+            // agent-controlled output can echo quota prose alongside a genuine
+            // auth signal. Untrusted exhaustion suppresses auth only with no
+            // concurrent auth signal or with positive probe corroboration
+            // (unknown/missing/healthy probes fall through to auth handling);
+            // trusted evidence keeps the healthy-veto instead.
+            // uncorroboratedExhaustionWithAuth records the fall-through so the
+            // quota-first ClassifyFailure below cannot mask the auth signal a
+            // second time behind the same forged prose.
+            var uncorroboratedExhaustionWithAuth = false;
+            if (TryGetExhaustionClassification(_quotaClassifier.Classify(runner.Kind, last.Stderr, last.Stdout)) is { } streamExhaustion)
             {
-                return null;
+                var streamAuthForGate = TryGetAuthClassificationIgnoringQuota(runner.Kind, authGateResult, classification: null);
+                if (streamAuthForGate is null
+                    || (!streamExhaustion.ProviderSurfaceMatch
+                        ? await IsQuotaExhaustionCorroboratedByProbeAsync(trialItem, project, phase, token).ConfigureAwait(false)
+                        : !await IsQuotaContradictedByProbeForWorkItemAsync(trialItem, project, phase, token).ConfigureAwait(false)))
+                {
+                    return null;
+                }
+
+                uncorroboratedExhaustionWithAuth = true;
             }
             if (!string.IsNullOrWhiteSpace(last.TerminalDiagnostic)
                 && TryGetExhaustionClassification(_quotaClassifier.Classify(runner.Kind, last.TerminalDiagnostic, null)) is not null)
             {
-                return null;
+                // The terminal region is never trusted provider-surface.
+                // Without a concurrent auth signal there is nothing to
+                // suppress, so the quota path stands; otherwise only a
+                // known-exhausted probe reading corroborates the prose.
+                var terminalAuthForGate = TryGetAuthClassificationIgnoringQuota(runner.Kind, authGateResult, classification: null);
+                if (terminalAuthForGate is null
+                    || await IsQuotaExhaustionCorroboratedByProbeAsync(trialItem, project, phase, token).ConfigureAwait(false))
+                {
+                    return null;
+                }
+
+                uncorroboratedExhaustionWithAuth = true;
             }
-            var detection = _authFailureClassifier.DetectDetailed(runner.Kind, last.Stderr, last.Stdout);
-            if (detection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            // Route stdout-only evidence through the shared corroboration
+            // policy so a model-controlled stdout match cannot globally bench
+            // the agent without the forced in-VM probe confirming the prompt.
+            // The exception we return still fails the work item terminally —
+            // that's the deterministic per-item handling — but the global
+            // bench side effect only fires when corroborated.
+            async Task<AgentAuthRequiredException> ReturnAuthRequiredAsync(
+                AgentFailureClassification authClassification,
+                bool stdoutOnlyEvidence,
+                bool matchedConfiguredPattern)
             {
-                // Route stdout-only evidence through the shared corroboration
-                // policy so a model-controlled stdout match cannot globally bench
-                // the agent without the forced in-VM probe confirming the prompt.
-                // The exception we return still fails the work item terminally —
-                // that's the deterministic per-item handling — but the global
-                // bench side effect only fires when corroborated.
                 var handling = await HandleAuthRequiredDetectionAsync(
                     trialItem,
                     project,
                     runner.Kind,
                     phase,
-                    detection.Classification,
+                    authClassification,
                     throwOnMatch: false,
-                    stdoutOnlyEvidence: detection.IsStdoutOnly,
+                    stdoutOnlyEvidence: stdoutOnlyEvidence,
                     requireStdoutOnlyCorroboration: true,
-                    matchedConfiguredPattern: detection.MatchedConfiguredStderrPattern
-                        || detection.MatchedConfiguredStdoutPattern,
+                    matchedConfiguredPattern: matchedConfiguredPattern,
                     ct: token).ConfigureAwait(false);
 
-                var reason = _authRequiredHandler.BuildReason(phase, detection.Classification, detection.IsStdoutOnly);
+                var reason = _authRequiredHandler.BuildReason(phase, authClassification, stdoutOnlyEvidence);
                 return new AgentAuthRequiredException(
                     runner.Kind,
                     phase,
@@ -325,9 +370,43 @@ public sealed partial class PipelineRunner
                     handling.Scope ?? WorkItemAuthFailureScope.Fleet);
             }
 
+            var detection = _authFailureClassifier.DetectDetailed(
+                runner.Kind,
+                uncorroboratedExhaustionWithAuth ? authGateResult.Stderr : last.Stderr,
+                uncorroboratedExhaustionWithAuth ? authGateResult.Stdout : last.Stdout);
+            if (detection is { Classification.Kind: AgentFailureKind.AuthRequired })
+            {
+                return await ReturnAuthRequiredAsync(
+                    detection.Classification,
+                    detection.IsStdoutOnly,
+                    detection.MatchedConfiguredStderrPattern || detection.MatchedConfiguredStdoutPattern).ConfigureAwait(false);
+            }
+
             var classification = _authFailureClassifier.ClassifyFailure(runner, last);
             if (classification.Kind != AgentFailureKind.AuthError)
-                return null;
+            {
+                // ClassifyFailure is quota-first: the same forged prose the
+                // gate above refused to corroborate would hide the genuine
+                // auth signal behind QuotaExhausted here. Unmask with the
+                // quota-independent signal (scoped to this gated fall-through
+                // so pure non-auth outcomes keep their existing path).
+                if (!uncorroboratedExhaustionWithAuth)
+                    return null;
+
+                var unmasked = TryGetAuthClassificationIgnoringQuota(runner.Kind, authGateResult, classification: null);
+                if (unmasked?.Kind is AgentFailureKind.AuthRequired)
+                {
+                    return await ReturnAuthRequiredAsync(
+                        unmasked,
+                        stdoutOnlyEvidence: false,
+                        matchedConfiguredPattern: false).ConfigureAwait(false);
+                }
+
+                if (unmasked?.Kind is not AgentFailureKind.AuthError)
+                    return null;
+
+                classification = unmasked;
+            }
 
             // Same contradiction policy as the steady-state AuthError path: a
             // healthy quota reading on the same credential vetoes the
