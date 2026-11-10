@@ -51,7 +51,14 @@ public sealed class BubblewrapSandboxProvider : ISandboxProvider
 
     public string Name => "bubblewrap";
     public SandboxIsolationLevel IsolationLevel => SandboxIsolationLevel.SharedKernel;
-    public IReadOnlyList<string> DeclaredCapabilities => [];
+    // Host folders arrive as explicit --ro-bind/--bind mounts built from the
+    // spec at every Exec, so read-only is enforced at the mount level for
+    // both modes.
+    public IReadOnlyList<string> DeclaredCapabilities =>
+    [
+        SandboxCapabilities.HostFolderShares,
+        SandboxCapabilities.HostFolderSharesReadWrite,
+    ];
 
     /// <inheritdoc/>
     public bool MightOwnSandbox(string name, string? hostId) => false;

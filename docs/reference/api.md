@@ -1355,6 +1355,42 @@ Returns the monthly cost budget status for a project.
 
 `thresholdState` is one of `ok | warning | exceeded`. When `monthlyBudgetUsd = 0` the state is always `ok`.
 
+### `GET /projects/{id}/shared-folders`
+
+Returns the operator-configured host-folder shares for a project with
+their live resolved status.
+
+```json
+{
+  "projectId": "my-app",
+  "shares": [
+    {
+      "name": "samples",
+      "hostPath": "/srv/reference/samples",
+      "resolvedHostPath": "/srv/reference/samples",
+      "sandboxPath": "/shared/samples",
+      "mode": "ReadOnly",
+      "auditEffectiveMode": "ReadOnly",
+      "phases": "All",
+      "required": true,
+      "writerPolicy": "Exclusive",
+      "exclusiveFallback": "Wait",
+      "exists": true,
+      "allowed": true,
+      "error": null
+    }
+  ],
+  "requiredCapabilitiesWork": ["host-folder-shares"],
+  "requiredCapabilitiesAudit": ["host-folder-shares"]
+}
+```
+
+`mode` is the configured mode; `auditEffectiveMode` is always
+`ReadOnly` because audit sandboxes receive read-only mounts regardless
+of configuration. A share whose host path is missing or outside the
+allow-list reports `exists: false` / `allowed: false` with an operator
+message in `error`.
+
 ### `GET /queue/status`
 
 Returns global queue pause state plus active refactor project gates.

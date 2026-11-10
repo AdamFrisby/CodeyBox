@@ -69,6 +69,11 @@ public sealed class IncusSandboxProvider :
         SandboxCapabilities.CacheSeeding,
         SandboxCapabilities.DiskGuard,
         SandboxCapabilities.Teardown,
+        // Host folders arrive as virtiofs disk devices with the requested
+        // readonly flag verified before boot (see IncusDeviceTopology), so
+        // read-only is enforced at the VM/mount level for both modes.
+        SandboxCapabilities.HostFolderShares,
+        SandboxCapabilities.HostFolderSharesReadWrite,
     ];
 
     public IReadOnlyList<string> DeclaredCapabilities => Capabilities;

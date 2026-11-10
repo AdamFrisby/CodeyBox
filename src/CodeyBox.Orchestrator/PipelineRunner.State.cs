@@ -419,6 +419,11 @@ public sealed partial class PipelineRunner
     private readonly AsyncLocal<ClaudeSessionLifecycle?> _ambientSessionLifecycle = new();
     private readonly PickupRebaseLockRegistry _rebaseLocks;
     private readonly MergeLandingGate _mergeLandingGate;
+    // Exclusive write coordination for project shared folders. One instance
+    // per PipelineRunner (production DI shares the runner host-wide, so this
+    // coordinates every concurrent item); tests inject a fresh instance per
+    // fixture for isolation.
+    private readonly SharedFolderWriterGate _sharedFolderWriterGate;
     // CancellationTokenSource timers use a uint millisecond due-time internally;
     // keep computed phase caps inside that runtime ceiling.
     private static readonly TimeSpan MaxCancellationTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
@@ -628,7 +633,11 @@ public sealed partial class PipelineRunner
         // history bound). Optional: when null the shipped defaults apply, so
         // tests and embeddings that don't wire the snapshot keep the
         // previous behaviour.
-        UpstreamBranchOwnershipSnapshot? branchOwnership = null)
+        UpstreamBranchOwnershipSnapshot? branchOwnership = null,
+        // Exclusive write coordination for project shared folders. Optional:
+        // null creates a runner-private gate (tests/embeddings); production
+        // DI shares one instance process-wide with the runner.
+        SharedFolderWriterGate? sharedFolderWriterGate = null)
     {
         _sandboxes = sandboxes;
         _gitHost = gitHost;
@@ -795,6 +804,7 @@ public sealed partial class PipelineRunner
         _baselineStager = baselineStager;
         _rebaseLocks = rebaseLockRegistry ?? PickupRebaseLockRegistry.Shared;
         _mergeLandingGate = mergeLandingGate ?? MergeLandingGate.Shared;
+        _sharedFolderWriterGate = sharedFolderWriterGate ?? new SharedFolderWriterGate();
         _baseBrokenConditions = baseBrokenConditions;
         _postMergeCiWatch = postMergeCiWatch;
         var effectiveToolchainFaultClassifier =

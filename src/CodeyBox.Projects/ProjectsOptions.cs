@@ -121,6 +121,14 @@ public sealed class ProjectConfig
     public ProjectJobTrackExportConfig? JobTrackExport { get; set; }
 
     /// <summary>
+    /// Host folders shared into this project's sandboxes as runtime mounts
+    /// (never copied, never baked into baselines). Null/empty = no shares.
+    /// Maps to <see cref="CodeyBox.Core.Project.SharedFolders"/> after
+    /// resolution.
+    /// </summary>
+    public List<ProjectSharedFolderConfig>? SharedFolders { get; set; }
+
+    /// <summary>
     /// Project-scoped test secrets injected into this project's sandboxes.
     /// Each entry names a host environment variable (the value source) and a
     /// sandbox environment variable (the injection target); the literal secret
@@ -139,6 +147,51 @@ public sealed class ProjectConfig
     /// cref="CodeyBox.Core.Project.SandboxSecretGrants"/> after resolution.
     /// </summary>
     public List<ProjectSecretGrantConfig>? SecretGrants { get; set; }
+}
+
+/// <summary>
+/// Config-binding shape for one <see cref="CodeyBox.Core.ProjectSharedFolder"/>.
+/// Lives under <c>CodeyBox:Projects:&lt;id&gt;:SharedFolders</c> as a list.
+/// </summary>
+public sealed class ProjectSharedFolderConfig
+{
+    /// <summary>Short operator-chosen name. Required; unique per project; used in the default sandbox path.</summary>
+    public string? Name { get; set; }
+
+    /// <summary>Absolute host path to share. Required; must exist and resolve under an allow-list root.</summary>
+    public string? HostPath { get; set; }
+
+    /// <summary>Guest mount point. Null/empty defaults to <c>/shared/&lt;Name&gt;</c>.</summary>
+    public string? SandboxPath { get; set; }
+
+    /// <summary>
+    /// Access mode: <c>ReadOnly</c> (default) or <c>ReadWrite</c>.
+    /// <c>ReadWrite</c> lets agent code modify host files through the mount.
+    /// Auditors always get read-only regardless of this value.
+    /// </summary>
+    public string? Mode { get; set; }
+
+    /// <summary>
+    /// Phases receiving this mount: <c>work</c>, <c>audit</c>, or <c>all</c> (default).
+    /// </summary>
+    public string? Phases { get; set; }
+
+    /// <summary>When false, a missing host path skips the mount (still reported) instead of failing dispatch. Default true.</summary>
+    public bool? Required { get; set; }
+
+    /// <summary>
+    /// Write-concurrency policy when several sandboxes run at once:
+    /// <c>Shared</c> (concurrent writers allowed) or <c>Exclusive</c> (default;
+    /// at most one running item holds the read-write mount).
+    /// </summary>
+    public string? WriterPolicy { get; set; }
+
+    /// <summary>
+    /// What an exclusive folder does when its write lease is held:
+    /// <c>Wait</c> (default; defer until the holder finishes) or
+    /// <c>ReadOnly</c> (mount read-only for the waiter instead).
+    /// </summary>
+    public string? ExclusiveFallback { get; set; }
 }
 
 /// <summary>

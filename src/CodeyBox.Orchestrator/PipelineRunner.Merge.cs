@@ -138,7 +138,10 @@ public sealed partial class PipelineRunner
                     project,
                     new SandboxTarget(networkProfile, SandboxProfileFlavor.Headless),
                     item.BaselineImageRef),
-                projectSecretEnvironment: mergeSecrets.Environment);
+                projectSecretEnvironment: mergeSecrets.Environment,
+                sharedFolderProject: project,
+                sharedFolderScope: ProjectSandboxSecretScopes.Merge,
+                sharedFolderIsAudit: false);
             var mergeSandboxStartSw = Stopwatch.StartNew();
             // Release-then-acquire: the merge phase provisions its own sandbox
             // while the work-phase reusable sandbox may still be admitted.
@@ -147,8 +150,8 @@ public sealed partial class PipelineRunner
             await ReleaseAmbientWorkSandboxAsync().ConfigureAwait(false);
             using var mergeWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "merge");
             await using var sandbox = isolatedMergeRepoPath is null
-                ? await _sandboxes.CreateAsync(spec, ct)
-                : await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedMergeRepoPath, ct);
+                ? await CreateSharedFolderSandboxAsync(spec, project, ProjectSandboxSecretScopes.Merge, false, ct)
+                : await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedMergeRepoPath, ct, project);
             mergeSandboxStartSw.Stop();
             CodeyBoxMeters.SandboxLifecycle.Record(mergeSandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
 
@@ -633,24 +636,69 @@ public sealed partial class PipelineRunner
         SandboxSpec spec,
         string repoId,
         string stagingPath,
-        CancellationToken ct)
+        CancellationToken ct,
+        Project? sharedFolderProject = null,
+        string sharedFolderScope = ProjectSandboxSecretScopes.Merge)
     {
-        for (var attempt = 1; ; attempt++)
+        // Shared-folder write leases are acquired once, outside the
+        // staging-restore retry loop: retries re-clone the merge staging
+        // directory, never the shares, so the lease must survive them.
+        SandboxSpec effectiveSpec = spec;
+        IReadOnlyList<SharedFolderSandboxMapper.LeaseAcquisition> acquisitions = [];
+        if (sharedFolderProject is not null && sharedFolderProject.SharedFolders.Count > 0)
         {
-            try
+            var plan = SharedFolderSandboxMapper.BuildPlan(
+                sharedFolderProject.Id.Value,
+                sharedFolderProject.SharedFolders,
+                sharedFolderScope,
+                false,
+                _log);
+            acquisitions = await SharedFolderSandboxMapper.AcquireLeasesAsync(
+                sharedFolderProject.Id.Value,
+                plan,
+                _sharedFolderWriterGate,
+                _sandboxes.GetType().Name,
+                _log,
+                ct).ConfigureAwait(false);
+            var downgraded = acquisitions
+                .Where(a => a.Lease.DowngradedToReadOnly)
+                .Select(a => a.Folder.SandboxPath)
+                .ToHashSet(StringComparer.Ordinal);
+            if (downgraded.Count > 0)
             {
-                return await _sandboxes.CreateAsync(spec, ct);
+                var mounts = spec.Mounts.ToList();
+                SharedFolderSandboxMapper.DowngradeToReadOnly(mounts, downgraded);
+                effectiveSpec = spec with { Mounts = mounts };
             }
-            catch (SandboxMountSourceMissingException ex)
-                when (attempt < _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts
-                    && string.Equals(ex.HostPath, stagingPath, StringComparison.Ordinal))
+        }
+        try
+        {
+            for (var attempt = 1; ; attempt++)
             {
-                _log.LogWarning(
-                    ex,
-                    "merge sandbox mount source missing — re-cloning staging clone and retrying CreateAsync (attempt {Attempt}/{Max}): {Path}",
-                    attempt, _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts, stagingPath);
-                await RestoreIsolatedMergeRepositoryAsync(repoId, stagingPath, ct);
+                try
+                {
+                    var sandbox = await _sandboxes.CreateAsync(effectiveSpec, ct);
+                    return acquisitions.Count == 0
+                        ? sandbox
+                        : new SharedFolderLeaseSandbox(sandbox, acquisitions.Select(a => a.Lease).ToList());
+                }
+                catch (SandboxMountSourceMissingException ex)
+                    when (attempt < _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts
+                        && string.Equals(ex.HostPath, stagingPath, StringComparison.Ordinal))
+                {
+                    _log.LogWarning(
+                        ex,
+                        "merge sandbox mount source missing — re-cloning staging clone and retrying CreateAsync (attempt {Attempt}/{Max}): {Path}",
+                        attempt, _pipelineTuning.Current.MergeSandboxStagingRestoreAttempts, stagingPath);
+                    await RestoreIsolatedMergeRepositoryAsync(repoId, stagingPath, ct);
+                }
             }
+        }
+        catch
+        {
+            foreach (var acquisition in acquisitions)
+                await acquisition.Lease.DisposeAsync().ConfigureAwait(false);
+            throw;
         }
     }
 

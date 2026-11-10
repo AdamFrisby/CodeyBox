@@ -851,9 +851,12 @@ public sealed partial class PipelineRunner
                 project,
                 new SandboxTarget(project.NetworkProfiles.Work, SandboxProfileFlavor.Headless),
                 item.BaselineImageRef),
-            credentialRunner: agentRunner);
+            credentialRunner: agentRunner,
+            sharedFolderProject: project,
+            sharedFolderScope: "rework",
+            sharedFolderIsAudit: false);
 
-        await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+        await using var sandbox = await CreateSharedFolderSandboxAsync(spec, project, "rework", false, ct);
         if (credential is not null && credential.Files.Count > 0)
             await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 

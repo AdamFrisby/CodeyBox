@@ -125,7 +125,11 @@ public sealed partial class PipelineRunner
                 new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
                 item.BaselineImageRef),
             includeAgentTurnScratchpadTmpfs: true,
-            credentialRunner: runner);
+            credentialRunner: runner,
+            sharedFolderProject: project,
+            sharedFolderScope: "work",
+            sharedFolderIsAudit: false,
+            skipSharedFolderCapabilityCheck: true);
 
         var sandbox = await _agentExecutor.AcquireWorkPhaseSandboxAsync(
             item.Id,
@@ -134,7 +138,12 @@ public sealed partial class PipelineRunner
             credential?.Agent.Value,
             sandboxTarget.NetworkProfile,
             spec,
-            ct).ConfigureAwait(false);
+            ct,
+            sharedFolderProjectId: project.Id.Value,
+            sharedFolders: project.SharedFolders,
+            sharedFolderScope: "work",
+            sharedFolderIsAudit: false,
+            sharedFolderWriterGate: _sharedFolderWriterGate).ConfigureAwait(false);
         try
         {
             if (credential is not null && credential.Files.Count > 0)

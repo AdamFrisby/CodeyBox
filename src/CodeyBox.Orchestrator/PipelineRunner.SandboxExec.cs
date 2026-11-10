@@ -31,12 +31,33 @@ public sealed partial class PipelineRunner
         bool includeAgentTurnScratchpadTmpfs = false,
         bool agentCredentialScope = false,
         IAgentRunner? credentialRunner = null,
-        IReadOnlyDictionary<string, string>? projectSecretEnvironment = null)
+        IReadOnlyDictionary<string, string>? projectSecretEnvironment = null,
+        Project? sharedFolderProject = null,
+        string sharedFolderScope = "work",
+        bool sharedFolderIsAudit = false,
+        IReadOnlyList<string>? sharedFolderProviderCapabilities = null,
+        bool skipSharedFolderCapabilityCheck = false)
     {
         var mounts = new List<SandboxMount>(access.Mounts)
         {
             new() { SandboxPath = SandboxConventions.WorkDir, Tmpfs = true },
         };
+        if (sharedFolderProject is not null && sharedFolderProject.SharedFolders.Count > 0)
+        {
+            if (!skipSharedFolderCapabilityCheck)
+            {
+                SharedFolderSandboxMapper.ThrowIfProviderCannotServe(
+                    sharedFolderProject.Id.Value,
+                    sharedFolderProject.SharedFolders,
+                    sharedFolderScope,
+                    sharedFolderIsAudit,
+                    sharedFolderProviderCapabilities ?? _sandboxes.DeclaredCapabilities,
+                    _sandboxes.GetType().Name);
+            }
+            var plan = SharedFolderSandboxMapper.BuildPlan(
+                sharedFolderProject.Id.Value, sharedFolderProject.SharedFolders, sharedFolderScope, sharedFolderIsAudit, _log);
+            SharedFolderSandboxMapper.AppendTo(mounts, plan, sharedFolderProject.Id.Value, sharedFolderProject.SharedFolders, _log);
+        }
 
         var env = new Dictionary<string, string>();
         if (projectSecretEnvironment is not null)
@@ -144,6 +165,63 @@ public sealed partial class PipelineRunner
             TimingPhase = timingPhase,
             BaselineImageRef = baselineImageRef,
         });
+    }
+
+    /// <summary>
+    /// Direct-provider sandbox creation with shared-folder write coordination.
+    /// Projects without shares take the historical path unchanged. With
+    /// shares, exclusive write leases are acquired before creation (a held
+    /// lease either waits via bounded deferral or downgrades to read-only per
+    /// the folder's fallback, patched into the spec before the provider sees
+    /// it), and the returned sandbox releases its leases on dispose.
+    /// </summary>
+    private async Task<ISandbox> CreateSharedFolderSandboxAsync(
+        SandboxSpec spec,
+        Project? sharedFolderProject,
+        string sharedFolderScope,
+        bool sharedFolderIsAudit,
+        CancellationToken ct)
+    {
+        if (sharedFolderProject is null || sharedFolderProject.SharedFolders.Count == 0)
+            return await _sandboxes.CreateAsync(spec, ct).ConfigureAwait(false);
+        var providerName = _sandboxes.GetType().Name;
+        var plan = SharedFolderSandboxMapper.BuildPlan(
+            sharedFolderProject.Id.Value,
+            sharedFolderProject.SharedFolders,
+            sharedFolderScope,
+            sharedFolderIsAudit,
+            _log);
+        var acquisitions = await SharedFolderSandboxMapper.AcquireLeasesAsync(
+            sharedFolderProject.Id.Value,
+            plan,
+            _sharedFolderWriterGate,
+            providerName,
+            _log,
+            ct).ConfigureAwait(false);
+        try
+        {
+            var downgraded = acquisitions
+                .Where(a => a.Lease.DowngradedToReadOnly)
+                .Select(a => a.Folder.SandboxPath)
+                .ToHashSet(StringComparer.Ordinal);
+            SandboxSpec effectiveSpec = spec;
+            if (downgraded.Count > 0)
+            {
+                var mounts = spec.Mounts.ToList();
+                SharedFolderSandboxMapper.DowngradeToReadOnly(mounts, downgraded);
+                effectiveSpec = spec with { Mounts = mounts };
+            }
+            var sandbox = await _sandboxes.CreateAsync(effectiveSpec, ct).ConfigureAwait(false);
+            return acquisitions.Count == 0
+                ? sandbox
+                : new SharedFolderLeaseSandbox(sandbox, acquisitions.Select(a => a.Lease).ToList());
+        }
+        catch
+        {
+            foreach (var acquisition in acquisitions)
+                await acquisition.Lease.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     /// <summary>

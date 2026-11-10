@@ -26,6 +26,20 @@ public static class SandboxCapabilities
     public const string Teardown = "teardown";
 
     /// <summary>
+    /// Provider can expose operator-declared host folders into the sandbox as
+    /// read-only runtime mounts (Incus virtiofs <c>readonly</c>, bubblewrap
+    /// <c>--ro-bind</c>), enforced at the VM/mount level.
+    /// </summary>
+    public const string HostFolderShares = "host-folder-shares";
+
+    /// <summary>
+    /// Provider can additionally expose those host folders read-write.
+    /// Requires <see cref="HostFolderShares"/>; declared separately so routing
+    /// can refuse read-write shares on a read-only-only provider.
+    /// </summary>
+    public const string HostFolderSharesReadWrite = "host-folder-shares-rw";
+
+    /// <summary>
     /// All well-known sandbox capability tags.
     /// </summary>
     public static readonly IReadOnlyList<string> All =
@@ -36,6 +50,8 @@ public static class SandboxCapabilities
         PortPublishing,
         SuspendResume,
         Teardown,
+        HostFolderShares,
+        HostFolderSharesReadWrite,
     ];
 
     /// <summary>
@@ -66,6 +82,8 @@ public static class SandboxCapabilityTags
     public const string PortPublishing = SandboxCapabilities.PortPublishing;
     public const string SuspendResume = SandboxCapabilities.SuspendResume;
     public const string Teardown = SandboxCapabilities.Teardown;
+    public const string HostFolderShares = SandboxCapabilities.HostFolderShares;
+    public const string HostFolderSharesReadWrite = SandboxCapabilities.HostFolderSharesReadWrite;
 }
 
 /// <summary>
@@ -79,4 +97,6 @@ public static class WellKnownSandboxCapabilities
     public const string PortPublishing = SandboxCapabilities.PortPublishing;
     public const string SuspendResume = SandboxCapabilities.SuspendResume;
     public const string Teardown = SandboxCapabilities.Teardown;
+    public const string HostFolderShares = SandboxCapabilities.HostFolderShares;
+    public const string HostFolderSharesReadWrite = SandboxCapabilities.HostFolderSharesReadWrite;
 }

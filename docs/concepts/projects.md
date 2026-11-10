@@ -589,6 +589,66 @@ and the value never enters the guest at all. Providers offering only
 static values keep working unchanged. See `SecretLeasing` in
 [configuration reference](../reference/configuration.md#secretleasing).
 
+### Shared folders
+
+Set `SharedFolders` on a project to mount operator-owned host folders
+(sample files, reference material, datasets) into its sandboxes without
+copying them. Shares are runtime mounts resolved per sandbox creation —
+never baked into baselines, so they never change baseline hashes:
+
+```json
+{
+  "Id": "docs-work",
+  "SharedFolders": [
+    { "Name": "samples", "HostPath": "/srv/reference/samples" },
+    {
+      "Name": "scratch",
+      "HostPath": "/srv/scratch/docs-work",
+      "Mode": "ReadWrite",
+      "Phases": "work",
+      "WriterPolicy": "Exclusive",
+      "ExclusiveFallback": "ReadOnly"
+    }
+  ]
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Name` | `string` | required | Short operator-chosen name, unique per project. Seeds the default guest path. |
+| `HostPath` | `string` | required | Absolute host path to share. Must exist and resolve (after symlinks) under an allow-list root. |
+| `SandboxPath` | `string` | `/shared/<Name>` | Absolute guest mount point. Must not overlap the workspace mount or protected guest paths; must be unique per project. |
+| `Mode` | `string` | `ReadOnly` | `ReadOnly` or `ReadWrite`. **ReadWrite lets agent code modify host files** through the mount — declare it only for data the agent is meant to change. |
+| `Phases` | `string` | `all` | `work`, `audit`, or `all`. |
+| `Required` | `bool` | `true` | When `true`, a missing host path or unsatisfiable provider fails dispatch with an operator-visible error. When `false`, the mount is skipped (still reported). |
+| `WriterPolicy` | `string` | `Exclusive` | `Shared` (concurrent writers allowed, last-writer-wins) or `Exclusive` (at most one running item holds the folder read-write). |
+| `ExclusiveFallback` | `string` | `Wait` | What waiters do when the exclusive write lease is held: `Wait` (defer creation until the holder finishes, bounded, then requeue) or `ReadOnly` (mount read-only instead). |
+
+**Validated at load, hot-reloadable.** A misconfigured share fails
+config load/reload with the project and folder named — never a silent
+skip. Host paths must resolve under a configured allow-list root (the
+Incus `AllowedHostMountRoots`; empty rejects everything), and sensitive
+locations (`~/.ssh`, `~/.codeybox`, credential/secret directories, the
+orchestrator's repository and state directories) plus workspace overlaps
+are rejected.
+
+**Read-only is enforced at the VM/mount level** (Incus virtiofs
+`readonly`, bubblewrap `--ro-bind`), not by permissions inside the
+guest — and **audit sandboxes always receive read-only mounts**
+regardless of `Mode`, so audit code can never mutate shared host state.
+The work/rework prompt lists each sandbox's folders, paths, and modes
+(including the host-write warning for read-write mounts) so agents know
+the reference material exists.
+
+**Routing.** Providers declare `host-folder-shares` (read-only) and
+`host-folder-shares-rw` (read-write); Incus and Bubblewrap declare both.
+A project whose required shares a provider cannot satisfy is never
+dispatched to it — the item fails with the missing capability named.
+
+**Visible.** `GET /projects` and `GET /projects/{id}` report
+`hasSharedFolders` plus the `sharedFolders` list (configuration), and
+`GET /projects/{id}/shared-folders` adds live resolved status per share.
+
 ### Graphical sandboxes
 
 Set `GraphicalSandbox: true` on a project to run GUI-capable sandboxes for

@@ -536,6 +536,11 @@ public sealed class ProjectSandboxSecretsTests : IDisposable
                     ["WORK_TOKEN"] = "from-project-secret",
                     ["ONLY_SECRET"] = "secret-only",
                 },
+                null,
+                "work",
+                false,
+                null,
+                false,
             ]));
 
         Assert.Equal("from-credential", spec.Environment["WORK_TOKEN"]);

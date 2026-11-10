@@ -593,7 +593,9 @@ public sealed partial class PipelineRunner : IPipelineRunner
                                             auditors,
                                             selfReviewChecklistEnabled,
                                             ApprovedPlanForImplementation(trialItem, planningLifecycleRequiredAtEntry),
-                                            ResolveAttribution(project)),
+                                            ResolveAttribution(project),
+                                            CodeyBox.Core.SharedFolderPromptSection.Build(
+                                                project.SharedFolders, "work", isAudit: false)),
                                         isInitial: true,
                                         networkProfile: sandboxTarget.NetworkProfile,
                                         sandboxFlavor: sandboxTarget.Flavor,

@@ -972,10 +972,13 @@ public sealed partial class PipelineRunner
                     project,
                     new SandboxTarget(sandboxTarget.NetworkProfile, sandboxTarget.Flavor),
                     item.BaselineImageRef),
-                credentialRunner: runner);
+                credentialRunner: runner,
+                sharedFolderProject: project,
+                sharedFolderScope: "planning",
+                sharedFolderIsAudit: false);
 
             using var planningWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "planning");
-            sandbox = await _sandboxes.CreateAsync(spec, ct);
+            sandbox = await CreateSharedFolderSandboxAsync(spec, project, "planning", false, ct);
 
             if (credential is not null && credential.Files.Count > 0)
                 await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);

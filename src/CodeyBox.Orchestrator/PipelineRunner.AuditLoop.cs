@@ -1106,7 +1106,8 @@ public sealed partial class PipelineRunner
             ? await _questionStore.ListByWorkItemAsync(item.Id.ToString(), ct)
             : (IReadOnlyList<WorkItemQuestion>)[];
         var baseReworkPrompt = ReworkPromptBuilder.Build(
-            freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions, ResolveAttribution(project));
+            freshForRework.Prompt, findings, auditIteration, maxIterations, answeredQuestions, project.AllowAgentQuestions, ResolveAttribution(project),
+            CodeyBox.Core.SharedFolderPromptSection.Build(project.SharedFolders, "rework", isAudit: false));
         using var reworkPhase = new PhaseCancellation("rework", ct, _opts.TimeProvider);
         var (reworkTimeout, _) = ResolveEffectiveWorkTimeout(item, project);
         reworkPhase.SetPhaseTimeout(ResolvePhaseAbsoluteTimeout(reworkTimeout));

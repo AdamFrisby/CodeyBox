@@ -368,14 +368,17 @@ public sealed partial class PipelineRunner
                 timingWorkItemId: item.Id, timingPhase: ConflictReworkPhaseKey,
                 baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, conflictReworkTarget, item.BaselineImageRef),
                 credentialRunner: runner,
-                projectSecretEnvironment: conflictReworkSecrets.Environment);
+                projectSecretEnvironment: conflictReworkSecrets.Environment,
+                sharedFolderProject: project,
+                sharedFolderScope: ProjectSandboxSecretScopes.Rework,
+                sharedFolderIsAudit: false);
 
             // Release-then-acquire (same pool-deadlock rationale as the merge
             // phase above): conflict rework provisions its own sandbox while a
             // prior phase's reusable sandbox may still be admitted.
             await ReleaseAmbientWorkSandboxAsync().ConfigureAwait(false);
             using var conflictReworkWaitScope = SandboxPermitWaitScope.Begin(item.Id.ToString(), "conflict-rework");
-            await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct);
+            await using var sandbox = await CreateMergeSandboxWithStagingRestoreAsync(spec, repoId, isolatedRepoPath, ct, project, ProjectSandboxSecretScopes.Rework);
             if (credential is not null && credential.Files.Count > 0)
                 await PipelineAgentExecutor.MaterialiseCredentialFilesAsync(sandbox, credential, ct);
 

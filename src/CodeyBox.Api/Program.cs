@@ -2947,6 +2947,33 @@ builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
     sp.GetRequiredService<IProjectRepository>()));
 
 // --- Projects + per-project upstream + audit composer ------------------------
+// Project shared folders resolve host paths against the live Incus
+// allow-list (AllowedHostMountRoots plus the configured staging directory
+// and the git root, mirroring IncusMountStaging's mount-time roots) while
+// the orchestrator's repository and state directories stay off-limits. The
+// accessors read IOptionsMonitor on every project (re)build, so an
+// allow-list edit applies to the next project reload; the mount-time
+// authorization re-checks the same roots on every sandbox creation.
+static ProjectSharedFolderPolicy BuildProjectSharedFolderPolicy(IServiceProvider sp)
+{
+    var options = sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>();
+    return new ProjectSharedFolderPolicy
+    {
+        AllowedRoots = () =>
+        {
+            var live = options.CurrentValue;
+            var incus = live.Incus ?? new IncusSandboxConfig();
+            var roots = new List<string>(incus.AllowedHostMountRoots);
+            if (!string.IsNullOrWhiteSpace(live.GitRootDirectory))
+                roots.Add(live.GitRootDirectory);
+            if (!string.IsNullOrWhiteSpace(incus.StagingDirectory))
+                roots.Add(incus.StagingDirectory);
+            return roots;
+        },
+        RepositoriesDirectory = () => options.CurrentValue.GitRootDirectory,
+        StateDatabasePath = () => options.CurrentValue.StateDatabasePath,
+    };
+}
 // ProjectRepository observes IOptionsMonitor<ProjectsOptions>, so an
 // appsettings.json edit that adds a new project — or changes an existing
 // project's audit timeout — takes effect within the framework's debounce
@@ -2954,12 +2981,14 @@ builder.Services.AddHostedService(sp => new InVmSmokeProbeService(
 // that drop a project with in-flight work items, so reloads that would
 // strand running pipelines are surfaced as ERR and the prior project list
 // is retained.
+builder.Services.AddSingleton(BuildProjectSharedFolderPolicy);
 builder.Services.AddSingleton<IProjectRepository>(sp => new ProjectRepository(
     sp.GetRequiredService<IOptionsMonitor<ProjectsOptions>>(),
     sp.GetRequiredService<ILogger<ProjectRepository>>(),
     sp.GetService<PresetCatalogOptions>(),
     sp.GetRequiredService<IKnobRegistry>(),
-    sp.GetService<IDeploymentDriverRegistry>()));
+    sp.GetService<IDeploymentDriverRegistry>(),
+    sp.GetRequiredService<ProjectSharedFolderPolicy>()));
 builder.Services.AddSingleton<IUpstreamRemoteFactory, UpstreamRemoteFactory>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<GitHubAppConnectState>();
@@ -4276,7 +4305,11 @@ builder.Services.AddSingleton<PipelineRunner>(sp => new PipelineRunner(
     baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>(),
     postMergeCiWatch: sp.GetService<PostMergeCiWatchService>(),
     attributionPolicy: sp.GetRequiredService<CodeyBox.Core.CommitAttributionPolicy>(),
-    branchOwnership: sp.GetRequiredService<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>()));
+    branchOwnership: sp.GetRequiredService<CodeyBox.Core.UpstreamBranchOwnershipSnapshot>(),
+    sharedFolderWriterGate: sp.GetRequiredService<CodeyBox.Core.SharedFolderWriterGate>()));
+// One process-wide exclusive-write gate for project shared folders, so
+// concurrent pipeline workers coordinate through a single instance.
+builder.Services.AddSingleton<CodeyBox.Core.SharedFolderWriterGate>();
 builder.Services.AddSingleton<IPipelineRunner>(sp => sp.GetRequiredService<PipelineRunner>());
 // Isolated base-branch fix-item spawner for NotDiffAttributable audit test
 // failures. Constructed lazily from the store/queue plus the hot-reloadable
@@ -5024,6 +5057,7 @@ WorkItemFailureEventsEndpoints.Map(app);
 WorkItemCostsEndpoints.Map(app);
 AgentPricingEndpoints.Map(app);
 ProjectBudgetEndpoints.Map(app);
+ProjectSharedFolderEndpoints.Map(app);
 WorkItemDiffEndpoints.Map(app);
 WorkItemDossierEndpoints.Map(app);
 SuggestionEndpoints.Map(app);
