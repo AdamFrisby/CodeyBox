@@ -132,6 +132,61 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
     }
 
     [Fact]
+    public void TryClassify_TypedCarrier_ReturnsFaultWithoutSignatureInMessage()
+    {
+        var fault = new IncusTransientInfrastructureFault(
+            IncusTransientInfrastructure.DaemonConnectionLostFaultClass,
+            IncusTransientInfrastructure.DaemonConnectionLostSignature,
+            IsTeardown: false);
+        var exception = new IncusTransientInfrastructureException(
+            "Incus cloud-init did not reach a non-fatal completed state (exit code 1).",
+            fault);
+
+        var classified = IncusTransientInfrastructure.TryClassify(
+            exception,
+            IncusTransientInfrastructure.DefaultSignatures);
+
+        Assert.NotNull(classified);
+        Assert.Equal(fault, classified);
+    }
+
+    [Fact]
+    public void TryClassify_TypedCarrier_StillHonoursTheSignatureAllowlist()
+    {
+        var fault = new IncusTransientInfrastructureFault(
+            IncusTransientInfrastructure.DaemonConnectionLostFaultClass,
+            IncusTransientInfrastructure.DaemonConnectionLostSignature,
+            IsTeardown: false);
+        var exception = new IncusTransientInfrastructureException("plain failure", fault);
+
+        // A hot-reload that dropped the signature must re-terminal the fault
+        // exactly like a message match would.
+        Assert.Null(IncusTransientInfrastructure.TryClassify(exception, ["unrelated-signature"]));
+        Assert.Null(IncusTransientInfrastructure.TryClassify(exception, []));
+        Assert.Null(IncusTransientInfrastructure.TryClassify(exception, null));
+    }
+
+    [Fact]
+    public void TryBuildTransientProvisioningDeferral_TypedCarrier_Defers()
+    {
+        var fault = new IncusTransientInfrastructureFault(
+            IncusTransientInfrastructure.DaemonUnreachableFaultClass,
+            IncusTransientInfrastructure.DaemonSocketSignature,
+            IsTeardown: false);
+        var exception = new IncusTransientInfrastructureException(
+            "Incus restricted-project creation failed with exit code 1.",
+            fault);
+
+        var deferral = IncusSandboxProvider.TryBuildTransientProvisioningDeferral(
+            exception,
+            new IncusSandboxOptions { ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(42) });
+
+        Assert.NotNull(deferral);
+        Assert.Equal(IncusTransientInfrastructure.DaemonUnreachableFaultClass, deferral!.ErrorClass);
+        Assert.Equal(TimeSpan.FromSeconds(42), deferral.RecheckIn);
+    }
+
+    [Fact]
     public void TryClassify_EmptyConfiguredList_MatchesNothing()
     {
         Assert.Null(IncusTransientInfrastructure.TryClassifyMessage(

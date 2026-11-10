@@ -219,14 +219,21 @@ public sealed record IncusSandboxOptions
     /// </summary>
     public TimeSpan ProvisioningRetryRecheckIn { get; init; } = DefaultProvisioningRetryRecheckIn;
     /// <summary>
-    /// Extra in-place retries for one Incus CLI step (copy, init, start,
-    /// exec, file push/pull, delete, and every other shelled-out operation)
-    /// after the CLI reports a lost daemon connection. Before each retry the
-    /// provider waits — bounded by <see cref="DaemonReadyTimeout"/> — for the
-    /// daemon to answer a lightweight probe again, so the retry does not
-    /// immediately hit the same restart window. Zero disables in-place
-    /// retries; the failure still classifies as transient infrastructure and
-    /// defers through <see cref="ProvisioningRetryRecheckIn"/>. Hot-reloadable.
+    /// Extra in-place retries for one checked Incus CLI step after the CLI
+    /// reports a lost daemon connection, limited to argv the call site marks
+    /// safe to re-run: idempotent reads (query/list/config get), idempotent
+    /// configuration writes (config set / project set / device set / file
+    /// push of fixed content), and instance-creating steps (init/copy) that
+    /// first prove any half-created target instance absent. <c>incus exec</c>
+    /// argv and other guest-side-effect or existence-sensitive steps (start,
+    /// stop, delete, move, snapshot create, device add, exec) are never
+    /// retried in-band — exec stderr is guest-controlled and must not drive
+    /// transport-loss classification either — but they still classify as
+    /// transient infrastructure and defer through
+    /// <see cref="ProvisioningRetryRecheckIn"/>. Before each retry the runner
+    /// waits — bounded by <see cref="DaemonReadyTimeout"/> — for the daemon
+    /// to answer a probe again, so the retry does not immediately hit the
+    /// same restart window. Zero disables in-place retries. Hot-reloadable.
     /// </summary>
     public int DaemonUnavailableRetryAttempts { get; init; } = DefaultDaemonUnavailableRetryAttempts;
     /// <summary>

@@ -827,6 +827,143 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public async Task CowCopy_DaemonConnectionLoss_DeletesHalfCreatedInstanceBeforeRetry()
+    {
+        const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
+        var stagingRoot = Path.Combine(_root, "cow-daemon-retry-cleanup-staging");
+        var options = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+            DaemonReadyProbeTimeout = TimeSpan.FromSeconds(5),
+        };
+        var fixedGuid = new Guid("22222222-3333-4444-5555-666666666666");
+        var sandboxName = $"{options.InstanceNamePrefix}{fixedGuid.ToString("N")[..20]}";
+        var copyAttempts = 0;
+        var sandboxExists = false;
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            existingPinnedName: pinned,
+            onInvocation: (argv, _) =>
+            {
+                if (argv.Contains("copy", StringComparer.Ordinal))
+                {
+                    copyAttempts++;
+                    if (copyAttempts == 1)
+                    {
+                        // The daemon completed the copy server-side before the
+                        // connection dropped.
+                        sandboxExists = true;
+                        return Task.FromResult(new ProcessRunResult(
+                            1,
+                            string.Empty,
+                            "Error: Lost connection to the event listener and failed to reconnect: " +
+                            "websocket: close 1006 (abnormal closure): unexpected EOF"));
+                    }
+                    return null;
+                }
+                var deleteIndex = argv.ToList().IndexOf("delete");
+                if (deleteIndex >= 0
+                    && deleteIndex + 1 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[deleteIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    // Only the pre-retry cleanup is intercepted; later deletes
+                    // (e.g. sandbox disposal) fall through to the fake's default
+                    // handler so it can drop the instance from its listings.
+                    sandboxExists = false;
+                    return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+                }
+                var getIndex = argv.ToList().IndexOf("get");
+                if (getIndex > 0
+                    && getIndex + 2 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[getIndex - 1], "config", StringComparison.Ordinal)
+                    && string.Equals(argv[getIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    // The verified-delete path re-reads ownership metadata per
+                    // instance at delete time; answer for the half-created
+                    // sandbox the way incusd would.
+                    var value = argv[^1] switch
+                    {
+                        IncusSandboxProvider.ManagedKey => "true",
+                        IncusSandboxProvider.KindKey => IncusSandboxProvider.SandboxKind,
+                        _ => string.Empty,
+                    };
+                    return Task.FromResult(new ProcessRunResult(0, value + "\n", string.Empty));
+                }
+                if (argv.Contains("list", StringComparer.Ordinal)
+                    && argv.Contains("--format=json", StringComparer.Ordinal)
+                    && !argv.Contains("snapshot", StringComparer.Ordinal)
+                    && sandboxExists)
+                {
+                    var entries = new List<object>
+                    {
+                        new
+                        {
+                            name = pinned,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.BaselineKind,
+                            },
+                        },
+                        new
+                        {
+                            name = sandboxName,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.SandboxKind,
+                            },
+                        },
+                    };
+                    return Task.FromResult(new ProcessRunResult(
+                        0, JsonSerializer.Serialize(entries), string.Empty));
+                }
+                return null;
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: TimeProvider.System,
+            newGuid: () => fixedGuid,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = options.DefaultImage,
+            BaselineImageRef = pinned,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        });
+
+        Assert.NotNull(sandbox);
+        Assert.Equal(2, copyAttempts);
+        Assert.False(sandboxExists, "the retried copy requires the half-created instance to be deleted first");
+        var argvList = runner.Invocations.Select(static invocation => invocation.Argv).ToList();
+        var copyIndexes = argvList
+            .Select((argv, index) => (argv, index))
+            .Where(pair => pair.argv.Contains("copy", StringComparer.Ordinal))
+            .Select(pair => pair.index)
+            .ToArray();
+        var deleteIndex = argvList.FindIndex(argv =>
+            argv.Contains("delete", StringComparer.Ordinal)
+            && argv.Contains(sandboxName, StringComparer.Ordinal));
+        Assert.True(
+            copyIndexes.Length == 2
+            && deleteIndex > copyIndexes[0]
+            && deleteIndex < copyIndexes[1],
+            "the half-created instance must be deleted between the failed copy and its retry");
+    }
+
+    [Fact]
     public async Task CowCopy_DaemonNeverRecovers_DefersAsTransientInfrastructureAndCleansUp()
     {
         const string pinned = "cb-incus-baseline-internet-headless-123456789abc";

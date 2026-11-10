@@ -31,10 +31,35 @@ public sealed record IncusTransientInfrastructureFault(
 }
 
 /// <summary>
+/// Carries an already-classified transient fault so throw sites never have
+/// to smuggle classification through exception-message prose that the
+/// downstream classifier must substring-match again. The fault still records
+/// the allowlisted signature it matched, and <see cref="IncusTransientInfrastructure.TryClassify"/>
+/// honours it only while that signature remains configured.
+/// </summary>
+public sealed class IncusTransientInfrastructureException : InvalidOperationException
+{
+    public IncusTransientInfrastructureException(
+        string message,
+        IncusTransientInfrastructureFault fault,
+        Exception? innerException = null)
+        : base(message, innerException)
+    {
+        ArgumentNullException.ThrowIfNull(fault);
+        Fault = fault;
+    }
+
+    /// <summary>The allowlisted transient fault this failure was classified as.</summary>
+    public IncusTransientInfrastructureFault Fault { get; }
+}
+
+/// <summary>
 /// Typed transient classification for Incus control-plane faults that are
 /// infrastructure contention, not work faults: incusd DB/storage deadline
-/// misses, unmount/stop failures during teardown, and unverifiable guest
-/// control-file cleanup after a completed exec.
+/// misses, unmount/stop failures during teardown, unverifiable guest
+/// control-file cleanup after a completed exec, and daemon-restart
+/// connection losses (lost event listener, websocket close 1006, unix-socket
+/// dial failures).
 /// Matching is an exact ordinal substring test against the allowlisted known
 /// signatures only; an unrelated incus error never matches.
 /// </summary>
@@ -96,6 +121,15 @@ public static class IncusTransientInfrastructure
             var current = exception;
             for (var depth = 0; depth < MaxExceptionChainDepth && current is not null; depth++)
             {
+                // A typed carrier wins over message scanning, but only while
+                // its matched signature is still on the operator allowlist —
+                // a hot-reload that removed the signature must re-terminal
+                // the fault just like a message match would.
+                if (current is IncusTransientInfrastructureException classified
+                    && SignatureAllowlisted(classified.Fault.MatchedSignature, signatures))
+                {
+                    return classified.Fault;
+                }
                 var fault = TryClassifyMessage(current.Message, signatures);
                 if (fault is not null)
                     return fault;
@@ -149,6 +183,10 @@ public static class IncusTransientInfrastructure
         fault is not null
         && (fault.FaultClass == DaemonConnectionLostFaultClass
             || fault.FaultClass == DaemonUnreachableFaultClass);
+
+    private static bool SignatureAllowlisted(string signature, IReadOnlyList<string>? signatures) =>
+        signatures is { Count: > 0 }
+        && signatures.Contains(signature, StringComparer.Ordinal);
 
     private static IEnumerable<string> OrderedSignatures(IReadOnlyList<string>? signatures)
     {
