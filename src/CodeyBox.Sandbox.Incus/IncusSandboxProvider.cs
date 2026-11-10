@@ -678,15 +678,27 @@ public sealed class IncusSandboxProvider :
     /// <see cref="IncusTransientInfrastructureException"/> so the downstream
     /// classifier reads it directly — never re-parsed out of message prose.
     /// Raw stderr is never embedded: it may carry secrets.
+    /// <paramref name="isExec"/> must be true when the argv ran
+    /// <c>incus exec</c>: the CLI merges guest-process stderr into the
+    /// captured stream, so a guest printing a daemon-loss signature must
+    /// never forge a transient deferral. Daemon-connectivity faults from exec
+    /// stderr therefore stay terminal; genuine exec transport loss is
+    /// reported out-of-band via <c>ExecutionUnavailable</c> and the guest
+    /// completion-sentinel check instead.
     /// </summary>
-    private static Exception BuildAllowFailureException(
+    internal static Exception BuildAllowFailureException(
         string message,
         string? stderr,
-        IncusSandboxOptions options)
+        IncusSandboxOptions options,
+        bool isExec)
     {
         var fault = IncusTransientInfrastructure.TryClassifyMessage(
             stderr,
             options.TransientInfrastructureSignatures);
+        if (fault is not null
+            && isExec
+            && IncusTransientInfrastructure.IsDaemonConnectivityFault(fault))
+            return new InvalidOperationException(message);
         return fault is null
             ? new InvalidOperationException(message)
             : new IncusTransientInfrastructureException(message, fault);
@@ -1773,7 +1785,8 @@ public sealed class IncusSandboxProvider :
                         throw BuildAllowFailureException(
                             $"Failed to publish Incus baseline '{baselineName}' and no valid concurrent winner exists.",
                             publish.Stderr,
-                            options);
+                            options,
+                            isExec: false);
                     }
                     ClearBakeFailure(baselineName);
                     return baselineName;
@@ -2259,7 +2272,8 @@ public sealed class IncusSandboxProvider :
                 throw BuildAllowFailureException(
                     $"Incus restricted-project creation failed with exit code {create.ExitCode}.",
                     create.Stderr,
-                    options);
+                    options,
+                    isExec: false);
             }
         }
 
@@ -2442,11 +2456,14 @@ public sealed class IncusSandboxProvider :
             // never the raw stderr, which may carry secrets — as a typed
             // fault so an allowlisted daemon-connectivity signature still
             // reaches the transient-infrastructure classifier instead of
-            // going terminal.
+            // going terminal. This argv is `incus exec`, so daemon-loss
+            // signatures in the merged guest stderr stream are
+            // guest-forgeable and are excluded from transient classification.
             throw BuildAllowFailureException(
                 $"Incus cloud-init did not reach a non-fatal completed state (exit code {result.ExitCode}).",
                 result.Stderr,
-                options);
+                options,
+                isExec: true);
         }
         if (degraded)
         {
@@ -2941,11 +2958,14 @@ public sealed class IncusSandboxProvider :
             // The matched allowlisted signature (never raw stderr, which may
             // carry secrets) rides a typed fault so a daemon restart
             // mid-verification stays on the transient-infrastructure path
-            // instead of terminal.
+            // instead of terminal. This argv is `incus exec`, so
+            // daemon-loss signatures in the merged guest stderr stream are
+            // guest-forgeable and are excluded from transient classification.
             throw BuildAllowFailureException(
                 $"Incus VM provisioning verification '{verification.Label}' failed: {hint}.",
                 result.Stderr,
-                options);
+                options,
+                isExec: true);
         }
     }
 

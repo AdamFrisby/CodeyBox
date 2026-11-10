@@ -272,6 +272,71 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
             options));
     }
 
+    [Theory]
+    [InlineData("Error: Lost connection to the event listener and failed to reconnect: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: Lost connection to the event listener: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: connection refused")]
+    [InlineData("Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: no such file or directory")]
+    public void BuildAllowFailureException_ExecDaemonSignatures_StayTerminal(string stderr)
+    {
+        // `incus exec` merges guest-process stderr into the captured stream,
+        // so a guest printing a daemon-loss signature must never forge a
+        // transient deferral: the failure stays a plain terminal error.
+        var options = new IncusSandboxOptions();
+
+        var failure = IncusSandboxProvider.BuildAllowFailureException(
+            "Incus cloud-init did not reach a non-fatal completed state (exit code 1).",
+            stderr,
+            options,
+            isExec: true);
+
+        Assert.IsType<InvalidOperationException>(failure);
+        Assert.Null(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+    }
+
+    [Theory]
+    [InlineData("Error: Lost connection to the event listener and failed to reconnect: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: Lost connection to the event listener: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: connection refused")]
+    public void BuildAllowFailureException_NonExecDaemonSignatures_Defer(string stderr)
+    {
+        var options = new IncusSandboxOptions
+        {
+            ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(42),
+        };
+
+        var failure = IncusSandboxProvider.BuildAllowFailureException(
+            "Incus restricted-project creation failed with exit code 1.",
+            stderr,
+            options,
+            isExec: false);
+
+        var carrier = Assert.IsType<IncusTransientInfrastructureException>(failure);
+        Assert.True(IncusTransientInfrastructure.IsDaemonConnectivityFault(carrier.Fault));
+        var deferral = IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options);
+        Assert.NotNull(deferral);
+        Assert.Equal(carrier.Fault.FaultClass, deferral!.ErrorClass);
+    }
+
+    [Fact]
+    public void BuildAllowFailureException_ExecNonDaemonSignature_StillDefers()
+    {
+        var options = new IncusSandboxOptions
+        {
+            ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(42),
+        };
+
+        var failure = IncusSandboxProvider.BuildAllowFailureException(
+            "Incus VM provisioning verification 'check' failed.",
+            "Error: context deadline exceeded",
+            options,
+            isExec: true);
+
+        Assert.IsType<IncusTransientInfrastructureException>(failure);
+        Assert.NotNull(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+    }
+
     [Fact]
     public void OptionsValidate_DefaultSignatures_Pass()
     {
