@@ -185,9 +185,12 @@ public sealed partial class PipelineRunner
                 additionalCredentialMounts: credentialPlan.Mounts,
                 includeCredentialsTmpfs: credentialPlan.RequiresCredentialsTmpfs,
                 agentCredentialScope: true,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, rebaseTarget, baselineImageRef));
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, rebaseTarget, baselineImageRef),
+                sharedFolderProject: project,
+                sharedFolderScope: timingPhase,
+                sharedFolderIsAudit: false);
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await using var sandbox = await CreateSharedFolderSandboxAsync(spec, project, timingPhase, false, ct);
             await using (var cloneScope = await TimingScope.BeginAsync(
                 _timings, item.Id, timingPhase, "git.clone_into_sandbox",
                 activitySource: CodeyBoxActivities.Sandbox, log: _log))

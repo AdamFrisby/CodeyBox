@@ -55,9 +55,12 @@ public sealed partial class PipelineRunner
                 timingWorkItemId: item.Id,
                 timingPhase: "mechanical-edit",
                 flavor: sandboxTarget.Flavor,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
+                sharedFolderProject: project,
+                sharedFolderScope: "audit-tool",
+                sharedFolderIsAudit: true);
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, phaseCt);
+            await using var sandbox = await CreateSharedFolderSandboxAsync(spec, project, "audit-tool", true, phaseCt);
             await PipelineAgentExecutor.RunWithCancellation(sandbox, phaseCt, "git", "clone", readOnlyAccess.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             await PipelineAgentExecutor.RunWithCancellation(
                 sandbox,
@@ -287,9 +290,12 @@ public sealed partial class PipelineRunner
                 timingWorkItemId: item.Id,
                 timingPhase: "mechanical-edit",
                 flavor: sandboxTarget.Flavor,
-                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef));
+                baselineImageRef: SandboxTargetResolver.BaselineRefForTarget(project, sandboxTarget, item.BaselineImageRef),
+                sharedFolderProject: project,
+                sharedFolderScope: "audit-tool",
+                sharedFolderIsAudit: true);
 
-            await using var sandbox = await _sandboxes.CreateAsync(spec, ct);
+            await using var sandbox = await CreateSharedFolderSandboxAsync(spec, project, "audit-tool", true, ct);
             await PipelineAgentExecutor.RunWithCancellation(sandbox, ct, "git", "clone", access.CloneUrlInsideSandbox, SandboxConventions.WorkDir);
             await PipelineAgentExecutor.RunWithCancellation(
                 sandbox,

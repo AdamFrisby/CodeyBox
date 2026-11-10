@@ -50,7 +50,8 @@ internal sealed class PromptComposer
         IReadOnlyList<IAuditor>? auditors = null,
         bool selfReviewChecklistEnabled = false,
         string? approvedPlan = null,
-        CommitAttribution? attribution = null)
+        CommitAttribution? attribution = null,
+        string? sharedFolderSection = null)
     {
         attribution ??= CommitAttribution.Default;
         var sb = new System.Text.StringBuilder();
@@ -121,6 +122,8 @@ internal sealed class PromptComposer
         }
 
         sb.Append($"\n\n{userPrompt}");
+        if (!string.IsNullOrWhiteSpace(sharedFolderSection))
+            sb.Append(sharedFolderSection);
         return sb.ToString();
     }
 

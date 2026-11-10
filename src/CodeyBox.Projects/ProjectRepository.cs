@@ -46,6 +46,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
     private readonly PresetCatalogOptions? _presetCatalogOptions;
     private readonly IKnobRegistry _knobRegistry;
     private readonly IDeploymentDriverRegistry? _deploymentDrivers;
+    private readonly ProjectSharedFolderPolicy _sharedFolderPolicy;
     private readonly IDisposable? _changeSubscription;
     private readonly Lock _reloadGate = new();
     private Snapshot _snapshot;
@@ -70,12 +71,14 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions,
         IKnobRegistry? knobRegistry = null,
-        IDeploymentDriverRegistry? deploymentDrivers = null)
+        IDeploymentDriverRegistry? deploymentDrivers = null,
+        ProjectSharedFolderPolicy? sharedFolderPolicy = null)
     {
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
         _deploymentDrivers = deploymentDrivers;
+        _sharedFolderPolicy = sharedFolderPolicy ?? new ProjectSharedFolderPolicy();
         _snapshot = Build(options.Value, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(options.Value);
     }
@@ -85,13 +88,15 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         ILogger<ProjectRepository> logger,
         PresetCatalogOptions? presetCatalogOptions = null,
         IKnobRegistry? knobRegistry = null,
-        IDeploymentDriverRegistry? deploymentDrivers = null)
+        IDeploymentDriverRegistry? deploymentDrivers = null,
+        ProjectSharedFolderPolicy? sharedFolderPolicy = null)
     {
         ArgumentNullException.ThrowIfNull(monitor);
         _logger = logger;
         _presetCatalogOptions = presetCatalogOptions;
         _knobRegistry = knobRegistry ?? EmptyKnobRegistry;
         _deploymentDrivers = deploymentDrivers;
+        _sharedFolderPolicy = sharedFolderPolicy ?? new ProjectSharedFolderPolicy();
         var initial = monitor.CurrentValue;
         _snapshot = Build(initial, presetCatalogOptions);
         _lastObservedHash = ComputeContentHash(initial);
@@ -324,6 +329,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
         var sandboxSecrets = ResolveSandboxSecrets(pc.Id, pc.SandboxSecrets);
         var sandboxSecretGrants = ResolveSecretGrants(pc.Id, pc.SecretGrants, sandboxSecrets);
         ReportSandboxSecretAuthorisation(pc.Id, sandboxSecrets, sandboxSecretGrants);
+        var sharedFolders = ResolveSharedFolders(pc.Id, pc.SharedFolders);
 
         return new Project
         {
@@ -352,6 +358,7 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             JobTrackExport = ResolveJobTrackExport(pc.Id, pc.JobTrackExport),
             SandboxSecrets = sandboxSecrets,
             SandboxSecretGrants = sandboxSecretGrants,
+            SharedFolders = sharedFolders,
         };
     }
 
@@ -494,6 +501,130 @@ public sealed class ProjectRepository : IProjectRepository, IDisposable
             });
         }
         return resolved.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Binds and validates the operator-declared host-folder shares. Syntax
+    /// (names, modes, phases, policies) is validated here; host paths are
+    /// canonicalised and validated against the allow-list roots, sensitive
+    /// locations, and the workspace mount via
+    /// <see cref="SharedFolderValidator"/> — a misconfigured share fails
+    /// config load/reload here rather than silently mounting nothing at
+    /// pipeline time. An omitted sandbox path defaults to
+    /// <c>/shared/&lt;Name&gt;</c>.
+    /// </summary>
+    internal IReadOnlyList<ProjectSharedFolder> ResolveSharedFolders(
+        string projectId,
+        List<ProjectSharedFolderConfig>? configs)
+    {
+        if (configs is null || configs.Count == 0)
+            return [];
+        if (configs.Count > SharedFolderLimits.MaxSharesPerProject)
+            throw new InvalidOperationException(
+                $"Project '{projectId}' declares {configs.Count} SharedFolders; at most " +
+                $"{SharedFolderLimits.MaxSharesPerProject} are allowed.");
+        var folders = new List<ProjectSharedFolder>(configs.Count);
+        for (var index = 0; index < configs.Count; index++)
+        {
+            var config = configs[index];
+            var where = $"projects[{projectId}].SharedFolders[{index}]";
+            if (config is null)
+                throw new InvalidOperationException($"Project '{projectId}' SharedFolders[{index}] is null.");
+            var name = config.Name?.Trim() ?? string.Empty;
+            if (string.IsNullOrEmpty(name))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where}.Name is required: a short operator-chosen share name.");
+            var hostPath = config.HostPath?.Trim() ?? string.Empty;
+            if (string.IsNullOrEmpty(hostPath))
+                throw new InvalidOperationException(
+                    $"Project '{projectId}' {where}.HostPath is required: the absolute host path to share.");
+            var sandboxPath = string.IsNullOrWhiteSpace(config.SandboxPath)
+                ? $"/shared/{name}"
+                : config.SandboxPath.Trim();
+            var mode = ParseSharedFolderMode(projectId, where, config.Mode);
+            var phases = ParseSharedFolderPhases(projectId, where, config.Phases);
+            var writerPolicy = ParseSharedFolderWriterPolicy(projectId, where, config.WriterPolicy);
+            var fallback = ParseSharedFolderExclusiveFallback(projectId, where, config.ExclusiveFallback);
+            folders.Add(new ProjectSharedFolder
+            {
+                Name = name,
+                HostPath = hostPath,
+                SandboxPath = sandboxPath,
+                Mode = mode,
+                Phases = phases,
+                Required = config.Required ?? true,
+                WriterPolicy = writerPolicy,
+                ExclusiveFallback = fallback,
+            });
+        }
+        var canonicalHosts = SharedFolderValidator.ValidateAll(
+            projectId, folders, _sharedFolderPolicy.ToValidationContext());
+        return folders
+            .Select(f => f with
+            {
+                HostPath = canonicalHosts[f.Name],
+                SandboxPath = SharedFolderValidator.NormalizeSandboxPath(
+                    projectId, $"projects[{projectId}].SharedFolders[{f.Name}]", f.SandboxPath),
+            })
+            .ToList()
+            .AsReadOnly();
+    }
+
+    private static SharedFolderMode ParseSharedFolderMode(string projectId, string where, string? mode)
+    {
+        if (string.IsNullOrWhiteSpace(mode))
+            return SharedFolderMode.ReadOnly;
+        var normalized = mode.Trim();
+        if (string.Equals(normalized, nameof(SharedFolderMode.ReadOnly), StringComparison.OrdinalIgnoreCase))
+            return SharedFolderMode.ReadOnly;
+        if (string.Equals(normalized, nameof(SharedFolderMode.ReadWrite), StringComparison.OrdinalIgnoreCase))
+            return SharedFolderMode.ReadWrite;
+        throw new InvalidOperationException(
+            $"Project '{projectId}' {where}.Mode '{mode}' is invalid: use 'ReadOnly' or 'ReadWrite'.");
+    }
+
+    private static SharedFolderPhases ParseSharedFolderPhases(string projectId, string where, string? phases)
+    {
+        if (string.IsNullOrWhiteSpace(phases))
+            return SharedFolderPhases.All;
+        var normalized = ProjectSharedFolderPhaseNames.TryNormalize(phases);
+        if (normalized is null)
+        {
+            throw new InvalidOperationException(
+                $"Project '{projectId}' {where}.Phases '{phases}' is invalid: use 'work', 'audit', or 'all'.");
+        }
+        return normalized switch
+        {
+            ProjectSharedFolderPhaseNames.Work => SharedFolderPhases.Work,
+            ProjectSharedFolderPhaseNames.Audit => SharedFolderPhases.Audit,
+            _ => SharedFolderPhases.All,
+        };
+    }
+
+    private static SharedFolderWriterPolicy ParseSharedFolderWriterPolicy(string projectId, string where, string? policy)
+    {
+        if (string.IsNullOrWhiteSpace(policy))
+            return SharedFolderWriterPolicy.Exclusive;
+        var normalized = policy.Trim();
+        if (string.Equals(normalized, nameof(SharedFolderWriterPolicy.Shared), StringComparison.OrdinalIgnoreCase))
+            return SharedFolderWriterPolicy.Shared;
+        if (string.Equals(normalized, nameof(SharedFolderWriterPolicy.Exclusive), StringComparison.OrdinalIgnoreCase))
+            return SharedFolderWriterPolicy.Exclusive;
+        throw new InvalidOperationException(
+            $"Project '{projectId}' {where}.WriterPolicy '{policy}' is invalid: use 'Shared' or 'Exclusive'.");
+    }
+
+    private static SharedFolderExclusiveFallback ParseSharedFolderExclusiveFallback(string projectId, string where, string? fallback)
+    {
+        if (string.IsNullOrWhiteSpace(fallback))
+            return SharedFolderExclusiveFallback.Wait;
+        var normalized = fallback.Trim();
+        if (string.Equals(normalized, nameof(SharedFolderExclusiveFallback.Wait), StringComparison.OrdinalIgnoreCase))
+            return SharedFolderExclusiveFallback.Wait;
+        if (string.Equals(normalized, nameof(SharedFolderExclusiveFallback.ReadOnly), StringComparison.OrdinalIgnoreCase))
+            return SharedFolderExclusiveFallback.ReadOnly;
+        throw new InvalidOperationException(
+            $"Project '{projectId}' {where}.ExclusiveFallback '{fallback}' is invalid: use 'Wait' or 'ReadOnly'.");
     }
 
     /// <summary>

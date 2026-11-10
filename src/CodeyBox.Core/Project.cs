@@ -291,6 +291,19 @@ public sealed record Project
     /// <see cref="ProjectSandboxSecretGrant"/>.
     /// </summary>
     public IReadOnlyList<ProjectSandboxSecretGrant> SandboxSecretGrants { get; init; } = [];
+
+    /// <summary>
+    /// Operator-declared host folders shared into this project's sandboxes as
+    /// runtime mounts (never copied, never baked into baselines). Empty (the
+    /// default) means no shares and zero behaviour change. Host paths are
+    /// canonical (symlinks resolved) and validated at config load against the
+    /// allow-list roots; read-only is enforced at the VM/mount level, and
+    /// audit sandboxes always receive read-only mounts (see
+    /// <see cref="SharedFolderPolicy"/>). <c>ReadWrite</c> folders let agent
+    /// code modify host files — declare them only for data the agent is
+    /// meant to change.
+    /// </summary>
+    public IReadOnlyList<ProjectSharedFolder> SharedFolders { get; init; } = [];
 }
 
 /// <summary>

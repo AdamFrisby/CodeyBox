@@ -122,7 +122,11 @@ public sealed partial class PipelineRunner
                 item.BaselineImageRef),
             includeAgentTurnScratchpadTmpfs: true,
             credentialRunner: runner,
-            projectSecretEnvironment: leasedSecrets.Environment) with
+            projectSecretEnvironment: leasedSecrets.Environment,
+            sharedFolderProject: project,
+            sharedFolderScope: agentPhase,
+            sharedFolderIsAudit: false,
+            skipSharedFolderCapabilityCheck: true) with
         {
             RecoveryLease = item.AgentTurnRecoveryLease,
         };
@@ -190,7 +194,10 @@ public sealed partial class PipelineRunner
                     useClaudeSession = false;
                     var sandboxStartSw = Stopwatch.StartNew();
                     sandbox = await _agentExecutor.AcquireWorkPhaseSandboxAsync(
-                        item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, spec, ct);
+                        item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, spec, ct,
+                        sharedFolderProjectId: project.Id.Value, sharedFolders: project.SharedFolders,
+                        sharedFolderScope: agentPhase, sharedFolderIsAudit: false,
+                        sharedFolderWriterGate: _sharedFolderWriterGate);
                     sandboxStartSw.Stop();
                     CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
                     sandboxOwnedByPhase = true;
@@ -229,9 +236,15 @@ public sealed partial class PipelineRunner
                         spec,
                         ct,
                         acquireAsync: (s, token) => _agentExecutor.AcquireWorkPhaseSandboxAsync(
-                            item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, s, token))
+                            item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, s, token,
+                            sharedFolderProjectId: project.Id.Value, sharedFolders: project.SharedFolders,
+                            sharedFolderScope: agentPhase, sharedFolderIsAudit: false,
+                            sharedFolderWriterGate: _sharedFolderWriterGate))
                     : await _agentExecutor.AcquireWorkPhaseSandboxAsync(
-                        item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, spec, ct);
+                        item.Id, agentPhase, item.RequiredCapabilities, credential?.Agent.Value, networkProfile, spec, ct,
+                        sharedFolderProjectId: project.Id.Value, sharedFolders: project.SharedFolders,
+                        sharedFolderScope: agentPhase, sharedFolderIsAudit: false,
+                        sharedFolderWriterGate: _sharedFolderWriterGate);
                 sandboxStartSw.Stop();
                 CodeyBoxMeters.SandboxLifecycle.Record(sandboxStartSw.ElapsedMilliseconds, new KeyValuePair<string, object?>("step", "start"));
                 sandboxOwnedByPhase = true;

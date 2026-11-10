@@ -17,7 +17,8 @@ public static class ReworkPromptBuilder
         int maxIterations,
         IReadOnlyList<WorkItemQuestion>? answeredQuestions = null,
         bool allowAgentQuestions = false,
-        CodeyBox.Core.CommitAttribution? attribution = null)
+        CodeyBox.Core.CommitAttribution? attribution = null,
+        string? sharedFolderSection = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine("## Rework requested");
@@ -98,6 +99,8 @@ public static class ReworkPromptBuilder
         sb.AppendLine("## Original task");
         sb.AppendLine();
         sb.AppendLine(originalPrompt);
+        if (!string.IsNullOrWhiteSpace(sharedFolderSection))
+            sb.Append(sharedFolderSection);
         return sb.ToString();
     }
 

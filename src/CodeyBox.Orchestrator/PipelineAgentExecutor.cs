@@ -43,27 +43,123 @@ internal sealed class PipelineAgentExecutor
     /// throws <see cref="SandboxProvisioningDeferredException"/> so the item
     /// requeues under the existing backoff. Null placer keeps the legacy
     /// direct-provider path.
+    /// When <paramref name="sharedFolderProject"/> carries shares, their
+    /// placement capabilities join the requirements (routing-time refusal for
+    /// unsatisfiable providers), exclusive write leases are acquired before
+    /// creation, and the returned sandbox releases them on dispose.
     /// </summary>
-    public Task<ISandbox> AcquireWorkPhaseSandboxAsync(
+    public async Task<ISandbox> AcquireWorkPhaseSandboxAsync(
         WorkItemId workItemId,
         string phase,
         IReadOnlyList<string> requiredCapabilities,
         string? credentialName,
         string? networkProfile,
         SandboxSpec spec,
+        CancellationToken ct,
+        string? sharedFolderProjectId = null,
+        IReadOnlyList<ProjectSharedFolder>? sharedFolders = null,
+        string sharedFolderScope = "work",
+        bool sharedFolderIsAudit = false,
+        SharedFolderWriterGate? sharedFolderWriterGate = null)
+    {
+        sharedFolders ??= [];
+        if (string.IsNullOrWhiteSpace(sharedFolderProjectId) || sharedFolders.Count == 0)
+        {
+            if (_placer is null)
+                return _sandboxes.CreateAsync(spec, ct);
+            return _placer.AcquireAsync(
+                new SandboxPlacementAcquisition(
+                    workItemId,
+                    phase,
+                    requiredCapabilities,
+                    credentialName,
+                    networkProfile,
+                    spec),
+                ct);
+        }
+        var effectiveCapabilities = requiredCapabilities
+            .Concat(SharedFolderSandboxMapper.PlacementCapabilities(
+                sharedFolders, sharedFolderScope, sharedFolderIsAudit))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var plan = SharedFolderSandboxMapper.BuildPlan(
+            sharedFolderProjectId, sharedFolders, sharedFolderScope, sharedFolderIsAudit);
+        if (_placer is null)
+        {
+            SharedFolderSandboxMapper.ThrowIfProviderCannotServe(
+                sharedFolderProjectId,
+                sharedFolders,
+                sharedFolderScope,
+                sharedFolderIsAudit,
+                _sandboxes.DeclaredCapabilities,
+                _sandboxes.GetType().Name);
+            return await CreateDirectWithSharedFoldersAsync(
+                sharedFolderProjectId, plan, spec, sharedFolderWriterGate, ct).ConfigureAwait(false);
+        }
+        var acquisitions = await SharedFolderSandboxMapper.AcquireLeasesAsync(
+            sharedFolderProjectId, plan, sharedFolderWriterGate, "placement", ct: ct).ConfigureAwait(false);
+        try
+        {
+            var effectiveSpec = PatchDowngradedMounts(spec, acquisitions);
+            var sandbox = await _placer.AcquireAsync(
+                new SandboxPlacementAcquisition(
+                    workItemId,
+                    phase,
+                    effectiveCapabilities,
+                    credentialName,
+                    networkProfile,
+                    effectiveSpec),
+                ct).ConfigureAwait(false);
+            return acquisitions.Count == 0
+                ? sandbox
+                : new SharedFolderLeaseSandbox(sandbox, acquisitions.Select(a => a.Lease).ToList());
+        }
+        catch
+        {
+            foreach (var acquisition in acquisitions)
+                await acquisition.Lease.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private async Task<ISandbox> CreateDirectWithSharedFoldersAsync(
+        string projectId,
+        SharedFolderSandboxMapper.Plan plan,
+        SandboxSpec spec,
+        SharedFolderWriterGate? gate,
         CancellationToken ct)
     {
-        if (_placer is null)
-            return _sandboxes.CreateAsync(spec, ct);
-        return _placer.AcquireAsync(
-            new SandboxPlacementAcquisition(
-                workItemId,
-                phase,
-                requiredCapabilities,
-                credentialName,
-                networkProfile,
-                spec),
-            ct);
+        var acquisitions = await SharedFolderSandboxMapper.AcquireLeasesAsync(
+            projectId, plan, gate, _sandboxes.GetType().Name, ct: ct).ConfigureAwait(false);
+        try
+        {
+            var effectiveSpec = PatchDowngradedMounts(spec, acquisitions);
+            var sandbox = await _sandboxes.CreateAsync(effectiveSpec, ct).ConfigureAwait(false);
+            return acquisitions.Count == 0
+                ? sandbox
+                : new SharedFolderLeaseSandbox(sandbox, acquisitions.Select(a => a.Lease).ToList());
+        }
+        catch
+        {
+            foreach (var acquisition in acquisitions)
+                await acquisition.Lease.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static SandboxSpec PatchDowngradedMounts(
+        SandboxSpec spec,
+        IReadOnlyList<SharedFolderSandboxMapper.LeaseAcquisition> acquisitions)
+    {
+        var downgraded = acquisitions
+            .Where(a => a.Lease.DowngradedToReadOnly)
+            .Select(a => a.Folder.SandboxPath)
+            .ToHashSet(StringComparer.Ordinal);
+        if (downgraded.Count == 0)
+            return spec;
+        var mounts = spec.Mounts.ToList();
+        SharedFolderSandboxMapper.DowngradeToReadOnly(mounts, downgraded);
+        return spec with { Mounts = mounts };
     }
 
     public static async Task MaterialiseCredentialFilesAsync(ISandbox sandbox, AgentCredential credential, CancellationToken ct)
