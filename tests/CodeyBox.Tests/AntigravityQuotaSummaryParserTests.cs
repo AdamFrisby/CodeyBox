@@ -101,6 +101,31 @@ public sealed class AntigravityQuotaSummaryParserTests
         Assert.Equal(4, buckets.Count);
     }
 
+    [Fact]
+    public void BucketsForModel_PerModelRowAtZero_UsesMostRestrictiveRowForThatFamily()
+    {
+        // Real-shape snapshot from agy --print /usage (CLI 1.5.2, 2026-11-09): the pool reads
+        // fresh while the configured family is exhausted. The router must see 0% with the
+        // per-model reset, not the 100% pool row.
+        const string payload = """
+        {"groups":[
+          {"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","remainingFraction":1.0,"resetTime":"2026-11-16T00:00:00Z","window":"weekly"},
+            {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","remainingFraction":1.0,"resetTime":"2026-11-09T12:00:00Z","window":"5h"}]},
+          {"displayName":"Gemini 4 Argon","buckets":[
+            {"bucketId":"gemini-4-argon-weekly","displayName":"Gemini 4 Argon Weekly Limit","remainingFraction":0.0,"resetTime":"2026-11-14T00:16:26Z","window":"weekly"}]}
+        ]}
+        """;
+        var groups = AntigravityQuotaSummaryParser.Parse(payload);
+        var buckets = AntigravityQuotaSummaryParser.BucketsForModel(groups, "gemini-4-argon-high");
+
+        Assert.Contains(buckets, b => b.BucketId == "gemini-4-argon-weekly");
+        var binding = buckets.Min(b => b.AvailablePct);
+        Assert.Equal(0.0, binding);
+        var reset = buckets.Where(b => b.AvailablePct == binding).Min(b => b.ResetAt);
+        Assert.Equal(new DateTimeOffset(2026, 11, 14, 0, 16, 26, TimeSpan.Zero), reset);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]

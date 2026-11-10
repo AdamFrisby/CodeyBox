@@ -92,11 +92,217 @@ public sealed partial class PipelineRunner
         AgentFailureClassification? classification,
         CancellationToken ct)
     {
-        var resolved = classification ?? _authFailureClassifier.ClassifyFailure(runner, result);
+        // Quota-before-auth: agy surfaces quota exhaustion on stderr as the generic
+        // 'error: authentication failed or timed out' while the true cause
+        // (result.status ERROR 'Individual quota reached' / RESOURCE_EXHAUSTED / code 429,
+        // agy exit 3, cli.log 'Individual quota reached') sits in stdout result events
+        // and the CLI log folded into Stderr/TerminalDiagnostic. Check those quota
+        // surfaces BEFORE applying the generic stderr auth patterns so exhaustion routes
+        // through the quota path (fallback/park until reset), not auth_required.
+        // When the quota evidence is on the captured streams, return without throwing so
+        // the caller's normal quota path (checkpoint/refund/record/park) runs intact.
+        // Terminal-diagnostic-only evidence is invisible to that path, so throw here.
+        //
+        // Trust note: the composite scopes stdout to provider JSON error envelopes.
+        // Antigravity stderr is NEVER trusted provider-surface (its CLI-log
+        // terminal region folds glog bytes that interleave verbatim model/tool
+        // output into classifier-facing Stderr), so agy quota evidence always
+        // carries ProviderSurfaceMatch=false and the quota path parks it
+        // probe-corroborated (a healthy probe vetoes the park) instead of
+        // benching the fleet. Either way exhaustion — never an Unauthorized
+        // shape — is required before auth handling is skipped.
+        //
+        // Forgery caveat: a tool-output line echoing quota prose plus a genuine
+        // 'authentication failed or timed out' would otherwise park on a fake
+        // reset instead of benching compromised credentials. Untrusted quota
+        // evidence suppresses auth only on positive probe corroboration (a
+        // known-exhausted reading) when auth also signals — unknown, missing,
+        // or healthy probes fail closed to auth handling so forged prose
+        // cannot suppress credential exclusion. Without a concurrent auth
+        // signal there is nothing to suppress, so the quota path stands
+        // (genuine quota detection is preserved). Trusted evidence keeps the
+        // healthy-veto: a healthy reading contradicts quota, so fall through
+        // to auth handling instead of suppressing it.
+        var quotaBeforeAuth = _quotaClassifier.Classify(runner.Kind, result.Stderr, result.Stdout);
+        // ClassifyFailure is quota-first: forged quota prose hides a genuine
+        // auth signal behind QuotaExhausted. The gate must see auth
+        // independently of that ordering, or forged quota always suppresses it.
+        var authForQuotaGate = TryGetAuthClassificationIgnoringQuota(runner.Kind, result, classification);
+        if (TryGetExhaustionClassification(quotaBeforeAuth) is { } streamExhaustion)
+        {
+            if (!streamExhaustion.ProviderSurfaceMatch)
+            {
+                // Untrusted (stdout-only, or any Antigravity stderr): fail
+                // closed when auth also signals — only a known-exhausted
+                // probe reading corroborates forged-able prose.
+                if (authForQuotaGate is null)
+                {
+                    return;
+                }
+                if (await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, phase, ct).ConfigureAwait(false))
+                {
+                    return;
+                }
+            }
+            else
+            {
+                if (authForQuotaGate is null
+                    || !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, phase, ct).ConfigureAwait(false))
+                {
+                    return;
+                }
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(result.TerminalDiagnostic))
+        {
+            var terminalQuota = _quotaClassifier.Classify(runner.Kind, result.TerminalDiagnostic, null);
+            if (TryGetExhaustionClassification(terminalQuota) is { } terminalExhaustion)
+            {
+                // TerminalDiagnostic lifts the glog tail, which interleaves
+                // verbatim model/tool output: never trusted provider-surface.
+                // Fail closed when auth also signals: only throw (suppressing
+                // auth) on a known-exhausted probe reading; otherwise fall
+                // through to auth handling. Without auth, throw untrusted so
+                // the park transition corroborates against the live probe
+                // (a healthy probe vetoes the park) instead of parking on
+                // forged prose with a trusted bit.
+                var untrustedExhaustion = terminalExhaustion with { ProviderSurfaceMatch = false };
+                if (authForQuotaGate is null
+                    || await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, phase, ct).ConfigureAwait(false))
+                {
+                    await ThrowQuotaBeforeAuthAsync(item, project, runner, result, phase, untrustedExhaustion, ct).ConfigureAwait(false);
+                }
+            }
+        }
+
+        // Auth handling uses the quota-independent signal: when forged quota
+        // is present, ClassifyFailure reports QuotaExhausted and would hide
+        // the genuine auth failure if consulted here.
+        var resolved = authForQuotaGate ?? classification;
+        if (resolved is null)
+        {
+            var fallback = _authFailureClassifier.ClassifyFailure(runner, result);
+            if (fallback.Kind != AgentFailureKind.AuthError)
+                return;
+            resolved = fallback;
+        }
         if (resolved.Kind != AgentFailureKind.AuthError)
             return;
 
+        // Weak agy auth signal: 'authentication failed or timed out' on its own is not a
+        // definitive credential refusal. Probe auth (quota probe over /usage) before excluding
+        // the agent; a healthy reading means the credential just authenticated, so treat the
+        // blip as transient rather than benching the fleet.
+        if (IsWeakAgyAuthOnly(runner.Kind, result))
+        {
+            var contradicted = await IsAuthContradictedByHealthyQuotaProbeAsync(item, project, runner.Kind, item.ModelId, ct).ConfigureAwait(false);
+            if (contradicted)
+            {
+                var transientClassification = new AgentFailureClassification(
+                    AgentFailureKind.TransientNetwork,
+                    Reason: "agy 'authentication failed or timed out' with healthy credential probe; treating as transient");
+                throw new TerminalTransientNetworkError(
+                    runner.Kind,
+                    phase,
+                    transientClassification,
+                    $"Agent {runner.Kind} reported transient auth blip during {phase}: {RedactAndTruncateAgentDetail(result.Summary)} ({transientClassification.Reason})");
+            }
+        }
+
         await ThrowAuthErrorAgentFailureAsync(item, project, runner.Kind, phase, resolved, ct);
+    }
+
+    private async Task ThrowQuotaBeforeAuthAsync(
+        WorkItem item,
+        Project project,
+        IAgentRunner runner,
+        AgentResult result,
+        string phase,
+        QuotaFailureClassification quotaClassification,
+        CancellationToken ct)
+    {
+        var detection = quotaClassification.Detection!;
+        await _quotaClassifier.RecordIfQuotaFailureAsync(
+            _quotaFailures,
+            runner.Kind,
+            ResolveObservedModelId(runner, item.ModelId),
+            result.Summary,
+            result.Stderr,
+            _opts.TimeProvider.GetUtcNow(),
+            _auditQuotaOptions.ObservedFailureRetention,
+            ct,
+            projectId: item.ProjectId,
+            stdout: result.Stdout);
+        throw new TerminalQuotaError(
+            detection.Kind,
+            QuotaFailureMessage(
+                detection.Kind,
+                $"Agent {runner.Kind} reported quota failure",
+                SanitizedAgentDetail.FromRaw(result.Summary)),
+            detection.ResetAt,
+            providerSurfaceMatch: quotaClassification.ProviderSurfaceMatch);
+    }
+
+    /// <summary>
+    /// Single-sourced quota-before-auth guard: returns the classification only when
+    /// it carries an exhaustion signal (rate-limit/lockout with a reset semantic),
+    /// never for Unauthorized shapes. Every quota-beats-auth site calls this so a
+    /// future exhaustion kind cannot silently fork the runner paths.
+    /// </summary>
+    private static QuotaFailureClassification? TryGetExhaustionClassification(QuotaFailureClassification classification)
+        => classification is { Kind: QuotaFailureClassificationKind.Quota, Detection: not null } quota
+            && quota.Detection.Kind.IsExhaustionSignal()
+            ? quota
+            : null;
+
+    /// <summary>
+    /// Quota-independent auth signal for the quota-before-auth gate.
+    /// <see cref="AgentFailureClassifier.Classify(AgentKind,string?,string?,string?)"/>
+    /// is quota-first, so forged quota prose hides genuine auth behind
+    /// QuotaExhausted; consulting it here would let forged quota always
+    /// suppress auth. This checks the auth legs directly: an explicit
+    /// caller classification, a login-prompt detection, or an auth-error
+    /// pattern in stderr. Returns null when no auth signals.
+    /// </summary>
+    private static AgentFailureClassification? TryGetAuthClassificationIgnoringQuota(
+        AgentKind kind,
+        AgentResult result,
+        AgentFailureClassification? classification)
+    {
+        if (classification?.Kind is AgentFailureKind.AuthError or AgentFailureKind.AuthRequired)
+            return classification;
+        if (AgentFailureClassifier.DetectAuthRequired(kind, result.Stderr, result.Stdout) is { } authRequired)
+            return authRequired.Classification;
+        if (AgentFailureClassifier.ContainsAuthErrorPattern(result.Stderr))
+            return new AgentFailureClassification(AgentFailureKind.AuthError, Reason: "auth pattern matched in stderr");
+        return null;
+    }
+
+    /// <summary>
+    /// True when the only auth evidence for an Antigravity run is the weak sandbox phrase
+    /// 'authentication failed or timed out' — no login prompt, no 401/403, no other auth
+    /// pattern. Such a blip must be corroborated by a probe before any fleet-wide exclusion.
+    /// </summary>
+    internal static bool IsWeakAgyAuthOnly(AgentKind kind, AgentResult result)
+    {
+        if (!string.Equals(kind.Value, AgentKind.Antigravity.Value, StringComparison.OrdinalIgnoreCase))
+            return false;
+        var stderr = result.Stderr ?? "";
+        if (!stderr.Contains("authentication failed or timed out", StringComparison.OrdinalIgnoreCase))
+            return false;
+        // A CLI login transcript is strong evidence — not a weak-only blip.
+        if (AgentFailureClassifier.DetectAuthRequired(kind, result.Stderr, result.Stdout) is not null)
+            return false;
+        // Any auth pattern beyond the 'authentication failed' substring inside the weak phrase
+        // makes this a strong signal (e.g. an accompanying 401/403).
+        foreach (var pattern in AgentFailureClassifier.AuthPatterns)
+        {
+            if (string.Equals(pattern, "authentication failed", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return true;
     }
 
     private async Task ThrowAuthErrorAgentFailureAsync(

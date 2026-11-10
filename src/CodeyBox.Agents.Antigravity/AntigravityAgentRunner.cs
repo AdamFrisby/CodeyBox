@@ -484,7 +484,11 @@ public sealed class AntigravityAgentRunner : CliAgentRunnerBase, IStructuredStre
             // classifier-facing result.Stderr so the existing !Success quota/auth
             // routing sees agy's terminal RESOURCE_EXHAUSTED / API Error: 401 (agy
             // writes these ONLY to its glog; its process stderr is frequently
-            // ~0 bytes).
+            // ~0 bytes). The folded region interleaves verbatim model/tool
+            // output, so it is NEVER trusted provider-surface: the composite
+            // classifier forces ProviderSurfaceMatch=false for Antigravity and
+            // the pipeline probe-corroborates it (healthy probe vetoes the
+            // park) before quota may suppress auth.
             if (!result.Success)
             {
                 result = result with { Stderr = AppendDiagnostic(result.Stderr, terminalError) };

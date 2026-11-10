@@ -777,37 +777,85 @@ public sealed partial class PipelineRunner
         // "agent did not write result.json" finding instead).
         if (!string.IsNullOrEmpty(run.Result.AgentTerminalDiagnostic))
         {
-            var terminalQuota = _quotaClassifier.Detect(
+            var terminalClassification = _quotaClassifier.Classify(
                 run.Runner.Kind, run.Result.AgentTerminalDiagnostic, run.Result.AgentStdout);
-            if (IsParkableQuotaKind(terminalQuota))
+            if (TryGetExhaustionClassification(terminalClassification) is { } terminalExhaustion
+                && IsParkableQuotaKind(terminalExhaustion.Detection))
             {
-                // AgentTerminalDiagnostic is the runner-lifted terminal error
-                // region (CLI-owned, same trust as the no-diff CliOwned path):
-                // it is provider-emitted by construction, never agent prose.
-                // The trust flag travels on the exception so the park
-                // transition keeps this park even against a healthy probe.
-                _quotaAuditEmitter.EmitAdvisoryAuditEvents(
-                    run.Runner.Kind, run.Result.AgentTerminalDiagnostic, run.Result.AgentStdout, "audit", sandboxName: null);
-                await _quotaClassifier.RecordIfQuotaFailureAsync(
-                    _quotaFailures,
-                    run.Runner.Kind,
-                    ResolveObservedModelId(run.Runner, modelId: null),
-                    run.Result.AgentSummary,
-                    run.Result.AgentTerminalDiagnostic,
-                    DateTimeOffset.UtcNow,
-                    _auditQuotaOptions.ObservedFailureRetention,
-                    ct,
-                    projectId: project.Id,
-                    stdout: run.Result.AgentStdout,
-                    bypassExitedSummaryGuard: true);
-                throw new TerminalQuotaError(
-                    terminalQuota!.Kind,
-                    QuotaFailureMessage(
-                        terminalQuota.Kind,
-                        $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}",
-                        SanitizedAgentDetail.FromRaw(run.Result.AgentTerminalDiagnostic)),
-                    terminalQuota.ResetAt,
-                    providerSurfaceMatch: true);
+                var terminalDetection = terminalExhaustion.Detection!;
+                // Trust note: AgentTerminalDiagnostic lifts the runner's terminal
+                // error region out of the CLI log, which interleaves verbatim
+                // model/tool output — forged-able quota prose, never trusted
+                // provider-surface on its own. Pass Classify's bit through
+                // (Antigravity stderr-folded evidence yields false) so the park
+                // transition keeps the healthy-probe veto instead of parking
+                // trusted on text any tool output could have echoed.
+                // Fail closed mirroring the planning/work quota-before-auth gate:
+                // a co-occurring auth signal takes the quota path only with no
+                // auth signal, with positive probe corroboration (untrusted), or
+                // without a healthy-probe veto (trusted). Otherwise fall through
+                // to auth handling so forged quota prose cannot suppress
+                // credential benching.
+                var terminalGateResult = new AgentResult(
+                    Success: false,
+                    Summary: run.Result.AgentSummary ?? "agent failed",
+                    Stdout: run.Result.AgentStdout,
+                    Stderr: string.Join(
+                        "\n",
+                        new[] { run.Result.AgentStderr, run.Result.AgentTerminalDiagnostic }
+                            .Where(s => !string.IsNullOrWhiteSpace(s))));
+                var terminalAuthForGate = TryGetAuthClassificationIgnoringQuota(
+                    run.Runner.Kind, terminalGateResult, classification: null);
+                var takeTerminalQuotaPath = terminalAuthForGate is null
+                    ? true
+                    : !terminalExhaustion.ProviderSurfaceMatch
+                        ? await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, "audit", ct).ConfigureAwait(false)
+                        : !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, "audit", ct).ConfigureAwait(false);
+                if (!takeTerminalQuotaPath)
+                {
+                    // Fail closed through the full auth-failure pipeline over the
+                    // same terminal evidence: it re-applies the quota-before-auth
+                    // gate, treats a weak agy-only blip with a healthy credential
+                    // probe as transient, and otherwise fails with probe-aware
+                    // auth scope — so forged quota prose can neither park the
+                    // item nor suppress credential handling.
+                    await ThrowIfAuthErrorAgentFailureAsync(
+                        item,
+                        project,
+                        run.Runner,
+                        terminalGateResult with
+                        {
+                            TerminalDiagnostic = run.Result.AgentTerminalDiagnostic,
+                        },
+                        phase: "audit",
+                        classification: null,
+                        ct);
+                }
+                else
+                {
+                    _quotaAuditEmitter.EmitAdvisoryAuditEvents(
+                        run.Runner.Kind, run.Result.AgentTerminalDiagnostic, run.Result.AgentStdout, "audit", sandboxName: null);
+                    await _quotaClassifier.RecordIfQuotaFailureAsync(
+                        _quotaFailures,
+                        run.Runner.Kind,
+                        ResolveObservedModelId(run.Runner, modelId: null),
+                        run.Result.AgentSummary,
+                        run.Result.AgentTerminalDiagnostic,
+                        DateTimeOffset.UtcNow,
+                        _auditQuotaOptions.ObservedFailureRetention,
+                        ct,
+                        projectId: project.Id,
+                        stdout: run.Result.AgentStdout,
+                        bypassExitedSummaryGuard: true);
+                    throw new TerminalQuotaError(
+                        terminalDetection.Kind,
+                        QuotaFailureMessage(
+                            terminalDetection.Kind,
+                            $"Audit agent {run.Runner.Kind} reported quota failure on clean exit while running {run.Auditor.Name}",
+                            SanitizedAgentDetail.FromRaw(run.Result.AgentTerminalDiagnostic)),
+                        terminalDetection.ResetAt,
+                        providerSurfaceMatch: terminalExhaustion.ProviderSurfaceMatch);
+                }
             }
         }
 

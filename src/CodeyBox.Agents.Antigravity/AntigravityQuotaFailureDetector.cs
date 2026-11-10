@@ -71,6 +71,11 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         // own reset which QuotaResetParser already knows how to read. RateLimitExceeded rather than
         // LimitReached because this is a short rolling window (~1h), not a weekly lockout.
         ("individual quota reached", QuotaFailureKind.RateLimitExceeded),
+        // Host-side shape for the same exhaustion: "RESOURCE_EXHAUSTED (code 429):
+        // Individual quota reached ... Resets in 113h" with agy exit 3. The status
+        // token above already matches that line, but a rendering that carries only
+        // the numeric code must still route through the quota path — not auth.
+        ("code 429", QuotaFailureKind.RateLimitExceeded),
         ("too many requests", QuotaFailureKind.RateLimitExceeded),
         ("API Error: 401", QuotaFailureKind.Unauthorized),
         ("API Error: 403", QuotaFailureKind.Unauthorized),
@@ -122,9 +127,66 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
 
     private static bool LineContainsQuotaOrAuthMarker(string line)
     {
-        foreach (var (pattern, _) in Patterns)
+        foreach (var (pattern, kind) in Patterns)
         {
-            if (line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            if (!line.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // The glog interleaves verbatim model/tool output with provider
+            // errors, so a bare marker match here is forgeable: a tool-output
+            // line echoing 'individual quota reached' or 'code 429' would be
+            // lifted into the classifier-facing Stderr as trusted quota and
+            // suppress the auth gate. Bare numerics only count with a same-line
+            // exhaustion anchor (mirroring Detect), and quota phrases only count
+            // with provider error framing on the same line; Unauthorized shapes
+            // keep the raw match (already framed as 'API Error').
+            if (string.Equals(pattern, "code 429", StringComparison.OrdinalIgnoreCase))
+            {
+                if (ContainsExhaustionAnchor(line))
+                    return true;
+                continue;
+            }
+
+            if (kind is QuotaFailureKind.RateLimitExceeded or QuotaFailureKind.LimitReached
+                && !ContainsProviderErrorFraming(line))
+                continue;
+
+            return true;
+        }
+        return false;
+    }
+
+    // Provider-emission framing for glog marker lines: strong provider-rejection
+    // indicators a real agy terminal line carries and a bare tool-output echo
+    // lacks. Deliberately excludes the generic quota words themselves ('quota',
+    // 'reached', 'limit', 'exceeded') so a bare echo of 'individual quota
+    // reached' does not qualify — and deliberately excludes generic prose words
+    // ('error', 'failed', 'failure', 'exception', 'retry') because they are
+    // forgeable: an attacker can append 'error, resets in ...' — no, even the
+    // reset hint is forgeable, which is why folded glog evidence is NEVER
+    // trusted provider-surface (see CompositeQuotaFailureClassifier) and must
+    // be probe-corroborated. Real agy terminal lines carry one of the strong
+    // tokens below (RESOURCE_EXHAUSTED, 429, Resets in, locked/lockout, ...).
+    private static readonly string[] GlogProviderErrorFramingTokens =
+    [
+        "resource_exhausted",
+        "resourceexhausted",
+        "has been exhausted",
+        "429",
+        "529",
+        "401",
+        "403",
+        "resets in",
+        "reset at",
+        "locked",
+        "lockout",
+    ];
+
+    private static bool ContainsProviderErrorFraming(string line)
+    {
+        foreach (var token in GlogProviderErrorFramingTokens)
+        {
+            if (line.Contains(token, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
         return false;
@@ -210,6 +272,34 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
         {
             var inStderr = !string.IsNullOrEmpty(stderr) && stderr.Contains(pattern, StringComparison.OrdinalIgnoreCase);
             var inStream = streamMessages.Any(m => m.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+
+            // "code 429" is an 8-char substring that appears in ordinary prose
+            // (e.g. discussing HTTP 429 handling), so it only counts alongside an
+            // exhaustion anchor in the same surface. The host-side shape always
+            // carries one ("RESOURCE_EXHAUSTED (code 429): Individual quota
+            // reached"), while a bare code mention does not.
+            if (string.Equals(pattern, "code 429", StringComparison.OrdinalIgnoreCase))
+            {
+                inStderr = inStderr && ContainsExhaustionAnchor(stderr);
+                inStream = streamMessages.Any(m =>
+                    m.Contains(pattern, StringComparison.OrdinalIgnoreCase) && ContainsExhaustionAnchor(m));
+            }
+
+            // "individual quota reached" says "quota reached", not "quota
+            // exceeded", and appears verbatim in tool/model output echoes. Like
+            // the bare numerics it only counts alongside a strong
+            // provider-rejection anchor on the same surface (same stderr buffer
+            // line or same stream message): the real per-model refusal always
+            // carries one ("Resets in <duration>" and usually RESOURCE_EXHAUSTED
+            // / code 429), while a bare prose echo does not. Enforced here as
+            // well as in the glog marker scan so Detect and Classify agree and
+            // a forged echo cannot become trusted quota via the stderr leg.
+            if (string.Equals(pattern, "individual quota reached", StringComparison.OrdinalIgnoreCase))
+            {
+                inStderr = inStderr && ContainsStrongQuotaAnchorOnSameLine(stderr, pattern);
+                inStream = streamMessages.Any(m =>
+                    m.Contains(pattern, StringComparison.OrdinalIgnoreCase) && ContainsStrongQuotaAnchor(m));
+            }
 
             if (!inStderr && !inStream) continue;
 
@@ -305,6 +395,70 @@ public sealed class AntigravityQuotaFailureDetector : IAgentQuotaFailureDetector
     {
         try { return DateTimeOffset.FromUnixTimeSeconds(unix); }
         catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    private static readonly string[] Code429ExhaustionAnchors =
+    [
+        "resource_exhausted",
+        "quota",
+        "exhausted",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    ];
+
+    private static bool ContainsExhaustionAnchor(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var anchor in Code429ExhaustionAnchors)
+        {
+            if (text.Contains(anchor, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    // Strong provider-rejection anchors for the "individual quota reached"
+    // per-model refusal: the real refusal always carries one of these on the
+    // same line/message (usually "Resets in <duration>" plus RESOURCE_EXHAUSTED
+    // / code 429). The generic word "quota" itself is deliberately NOT an
+    // anchor here — the phrase already contains it, so it would trivially
+    // self-satisfy. Mirrors GlogProviderErrorFramingTokens (strong-only).
+    private static readonly string[] IndividualQuotaStrongAnchors =
+    [
+        "resource_exhausted",
+        "resourceexhausted",
+        "has been exhausted",
+        "429",
+        "529",
+        "resets in",
+        "reset at",
+        "locked",
+        "lockout",
+    ];
+
+    private static bool ContainsStrongQuotaAnchor(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (var anchor in IndividualQuotaStrongAnchors)
+        {
+            if (text.Contains(anchor, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool ContainsStrongQuotaAnchorOnSameLine(string? stderr, string pattern)
+    {
+        if (string.IsNullOrEmpty(stderr)) return false;
+        foreach (var rawLine in stderr.Split('\n'))
+        {
+            if (!rawLine.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (ContainsStrongQuotaAnchor(rawLine))
+                return true;
+        }
+        return false;
     }
 
     internal static DateTimeOffset? TryParseAbsoluteReset(string? text)

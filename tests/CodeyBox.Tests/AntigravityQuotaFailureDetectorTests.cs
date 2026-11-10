@@ -332,6 +332,45 @@ public sealed class AntigravityQuotaFailureDetectorTests
     }
 
     [Fact]
+    public void ExtractTerminalErrorRegion_BareCode429EchoWithoutAnchor_IsNotSurfaced()
+    {
+        // FORGERY guard: the glog interleaves verbatim tool output, so a bare
+        // 'code 429' echo with no same-line exhaustion anchor must not become
+        // a terminal region — otherwise it folds into Stderr as trusted quota
+        // and suppresses the auth gate.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "tool output: agy failed (code 429): try again later";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_BareQuotaPhraseEchoWithoutFraming_IsNotSurfaced()
+    {
+        // FORGERY guard: a tool-output line echoing 'individual quota reached'
+        // with no provider error framing (no error/429/Resets-in/lock context)
+        // must not surface — the real provider lines always carry framing.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "tool output: individual quota reached";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_QuotaPhraseWithResetFraming_IsSurfaced()
+    {
+        // The real per-model refusal carries its reset hint on the same line,
+        // which counts as provider framing — it must still surface.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h8m20s.";
+
+        var region = AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog);
+
+        Assert.NotNull(region);
+        Assert.Contains("Individual quota reached", region!);
+    }
+
+    [Fact]
     public void IndividualQuotaReached_IsDetected_AndCarriesItsOwnReset()
     {
         // Verbatim from a live agy result frame. It says "quota reached", not "quota exceeded", so it
@@ -360,5 +399,79 @@ public sealed class AntigravityQuotaFailureDetectorTests
 
         Assert.NotNull(detection);
         Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void Detect_HostSideExit3Shape_ResultErrorWith113hReset_ParsesPreciseReset()
+    {
+        // Host-side truth for the sandbox-masked failure: result status ERROR with
+        // 'RESOURCE_EXHAUSTED (code 429): Individual quota reached ... Resets in 113h',
+        // agy exit 3, cli.log 'Individual quota reached'. Must classify as quota-exhausted
+        // with the parsed reset — never auth_required.
+        const string stdout =
+            """{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 113h."}""";
+
+        var before = DateTimeOffset.UtcNow;
+        var detection = new AntigravityQuotaFailureDetector().Detect(null, stdout);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+        Assert.NotNull(detection.ResetAt);
+        Assert.InRange(detection.ResetAt!.Value, before.AddHours(113), after.AddHours(113));
+    }
+
+    [Fact]
+    public void Detect_Code429WithExhaustionAnchor_ClassifiesRateLimit()
+    {
+        // "code 429" only counts alongside an exhaustion anchor in the same surface,
+        // so prose discussing a bare code cannot force a quota verdict.
+        var detection = new AntigravityQuotaFailureDetector().Detect(
+            stderr: "agy failed (code 429): quota reset soon", stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void Detect_BareCode429WithoutExhaustionAnchor_IsNotQuota()
+    {
+        var detection = new AntigravityQuotaFailureDetector().Detect(
+            stderr: "agy failed (code 429): try again later", stdout: null);
+
+        Assert.Null(detection);
+    }
+
+    [Fact]
+    public void Detect_BareIndividualQuotaReachedWithoutAnchor_IsNotQuota()
+    {
+        // FORGERY guard: the per-model phrase only counts with a strong
+        // provider anchor on the same surface. A bare echo with no reset/429/
+        // RESOURCE_EXHAUSTED/lockout context is model-relayed prose.
+        Assert.Null(new AntigravityQuotaFailureDetector().Detect(
+            stderr: "tool output: individual quota reached", stdout: null));
+    }
+
+    [Fact]
+    public void Detect_IndividualQuotaReachedWithResetAnchor_IsQuota()
+    {
+        var detection = new AntigravityQuotaFailureDetector().Detect(
+            stderr: "Individual quota reached. Please upgrade your subscription. Resets in 1h8m20s.",
+            stdout: null);
+
+        Assert.NotNull(detection);
+        Assert.Equal(QuotaFailureKind.RateLimitExceeded, detection!.Kind);
+    }
+
+    [Fact]
+    public void ExtractTerminalErrorRegion_QuotaEchoWithOnlyGenericErrorFraming_IsNotSurfaced()
+    {
+        // Generic prose words ('error') are NOT provider framing: a forged
+        // tool-output line must carry a strong token (429, Resets in,
+        // RESOURCE_EXHAUSTED, lockout, ...) to surface.
+        var glog = "Model resolved: gemini-3.5-flash\n"
+            + "tool output: individual quota reached error";
+
+        Assert.Null(AntigravityQuotaFailureDetector.ExtractTerminalErrorRegion(glog));
     }
 }

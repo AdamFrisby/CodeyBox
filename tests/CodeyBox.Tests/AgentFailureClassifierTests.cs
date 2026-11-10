@@ -31,12 +31,75 @@ public sealed class AgentFailureClassifierTests
     [InlineData("RESOURCE_EXHAUSTED")]
     [InlineData("quota exceeded for project")]
     [InlineData("[API Error: You have exhausted your capacity on this model.]")]
+    [InlineData("Individual quota reached. Please upgrade your subscription. Resets in 1h8m20s.")]
     public void HardQuotaPatterns_Classified_AsHardQuota(string snippet)
     {
         var c = AgentFailureClassifier.Classify(stderr: snippet);
         Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
         Assert.Equal(AgentQuotaFailureKind.HardQuota, c.QuotaFailure);
         Assert.Equal(AgentFailureClassifier.HardQuotaReason, c.Reason);
+    }
+
+    [Fact]
+    public void Classify_AgyQuotaInStdoutResultEvent_WinsOverGenericStderrAuthText()
+    {
+        // Sandbox shape: stderr carries only the generic blip while stdout carries the
+        // true result-ERROR exhaustion. Must route quota, not auth.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "error: authentication failed or timed out",
+            stdout: """{"type":"result","status":"ERROR","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 113h."}""");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void Classify_BareCode429InStdoutProse_DoesNotSuppressAuth()
+    {
+        // Model-relayed prose mentioning "code 429" (e.g. discussing HTTP 429
+        // handling) must not force a quota verdict ahead of a genuine stderr
+        // auth signal.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "API Error: 401 Unauthorized",
+            stdout: "To handle HTTP 429, retry on code 429 after backoff.");
+        Assert.Equal(AgentFailureKind.AuthError, c.Kind);
+    }
+
+    [Fact]
+    public void Classify_BareCode429InForgedEnvelopeWithoutAnchor_IsNotQuota()
+    {
+        // Even a shaped envelope carrying only a bare code — with no exhaustion
+        // anchor in the same line — is not quota evidence.
+        var c = AgentFailureClassifier.Classify(
+            stderr: null,
+            stdout: """{"type":"result","status":"error","error":"discussing code 429 handling"}""");
+        Assert.Equal(AgentFailureKind.Normal, c.Kind);
+    }
+
+    [Fact]
+    public void Classify_QuotaEnvelopeInStdout_WithStderrAuthError_StaysQuota()
+    {
+        // A provider-shaped envelope still wins over stderr auth text: the
+        // envelope is the provider surface, prose is not.
+        var c = AgentFailureClassifier.Classify(
+            stderr: "API Error: 401 Unauthorized",
+            stdout: """{"type":"result","status":"error","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h."}""");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, c.Kind);
+    }
+
+    [Fact]
+    public void WeakAgyAuthAlone_IsWeakOnly_RequiresProbeBeforeExclusion()
+    {
+        var result = new AgentResult(false, "agent exited 3", Stdout: null, Stderr: "error: authentication failed or timed out");
+        Assert.True(PipelineRunner.IsWeakAgyAuthOnly(AgentKind.Antigravity, result));
+    }
+
+    [Fact]
+    public void WeakAgyAuth_WithStrongSignal_IsNotWeakOnly()
+    {
+        var with401 = new AgentResult(false, "agent exited 1", Stdout: null, Stderr: "error: authentication failed or timed out\nAPI Error: 401 Unauthorized");
+        Assert.False(PipelineRunner.IsWeakAgyAuthOnly(AgentKind.Antigravity, with401));
+
+        var otherAgent = new AgentResult(false, "agent exited 1", Stdout: null, Stderr: "error: authentication failed or timed out");
+        Assert.False(PipelineRunner.IsWeakAgyAuthOnly(AgentKind.Codex, otherAgent));
     }
 
     [Theory]
@@ -46,6 +109,7 @@ public sealed class AgentFailureClassifierTests
     [InlineData("HTTP 529")]
     [InlineData("HTTP 429")]
     [InlineData("API Error: 429")]
+    [InlineData("code 429")]
     [InlineData("status 529")]
     [InlineData("overloaded_error")]
     [InlineData("exceeded the rate limit")]
@@ -69,6 +133,21 @@ public sealed class AgentFailureClassifierTests
         Assert.Equal(AgentQuotaFailureKind.None, c.QuotaFailure);
     }
 
+    [Fact]
+    public void Classify_BareIndividualQuotaReachedWithoutAnchor_IsNotQuota()
+    {
+        // FORGERY guard: the per-model phrase needs a strong same-line anchor
+        // (Resets in / 429 / RESOURCE_EXHAUSTED / lockout). A bare echo is
+        // model-relayed prose, not a provider rejection, and must not win over
+        // a genuine auth signal.
+        var bare = AgentFailureClassifier.Classify(stderr: "tool output: individual quota reached");
+        Assert.Equal(AgentFailureKind.Normal, bare.Kind);
+
+        var anchored = AgentFailureClassifier.Classify(
+            stderr: "Individual quota reached. Please upgrade your subscription. Resets in 1h8m20s.");
+        Assert.Equal(AgentFailureKind.QuotaExhausted, anchored.Kind);
+    }
+
     /// <summary>
     /// A CLI that does not know the requested model (stale baked CLI after a
     /// model upgrade) must classify as configuration/infrastructure — never as
@@ -76,8 +155,7 @@ public sealed class AgentFailureClassifierTests
     /// fallback chains would burn budget on.
     /// </summary>
     [Theory]
-    [InlineData("Error: unknown model 'gemini-4-argon-high'")]
-    [InlineData("unsupported model: gemini-4-argon-high")]
+    [InlineData("Error: unknown model 'gemini-4-argon-high'")]    [InlineData("unsupported model: gemini-4-argon-high")]
     [InlineData("Invalid model 'gemini-4-argon-high' for this CLI version")]
     [InlineData("model 'gemini-4-argon-high' not found in the model list")]
     [InlineData("E1108 printmode.go:123] unknown --model flag value 'gemini-4-argon-high'")]

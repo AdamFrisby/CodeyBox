@@ -81,6 +81,7 @@ public sealed partial class PipelineRunner
 
     private async Task ThrowIfNoDiffTerminalDiagnosticQuotaFailureAsync(
         WorkItem item,
+        Project? project,
         AgentKind agent,
         string? observedModelId,
         AgentResult agentResult,
@@ -92,20 +93,101 @@ public sealed partial class PipelineRunner
         if (string.IsNullOrWhiteSpace(agentResult.TerminalDiagnostic))
             return;
 
-        await ThrowIfNoDiffQuotaFailureFromTextAsync(
-            item: item,
-            project: null,
-            agent: agent,
-            observedModelId: observedModelId,
-            summary: agentResult.Summary,
-            stderr: agentResult.TerminalDiagnostic,
+        var noChangeQuota = _quotaClassifier.Detect(agent, agentResult.TerminalDiagnostic, null);
+        if (noChangeQuota is null)
+            return;
+
+        if (noChangeQuota.Kind == QuotaFailureKind.Unauthorized && project is not null)
+        {
+            var authRequired = ToAuthRequiredClassification(new AgentFailureClassification(
+                AgentFailureKind.AuthError,
+                Reason: "auth pattern matched"));
+            await HandleAuthRequiredDetectionAsync(
+                item,
+                project,
+                agent,
+                phase,
+                authRequired,
+                throwOnMatch: true,
+                stdoutOnlyEvidence: false,
+                requireStdoutOnlyCorroboration: false,
+                requireAuthCorroboration: true,
+                ct: ct);
+        }
+
+        if (!IsParkableQuotaKind(noChangeQuota))
+            return;
+
+        // Fail-closed quota-before-auth mirroring the audit gate. The terminal
+        // region lifts the CLI log tail, which interleaves verbatim model/tool
+        // output: forged quota prose plus a genuine auth signal must neither
+        // park on a fake reset nor suppress credential handling. With no
+        // concurrent auth signal the quota path stands (a silent changeless
+        // turn is exactly what a quota block produces); otherwise only a
+        // positive known-exhausted probe reading corroborates the prose.
+        // The park below is always untrusted so a healthy probe still vetoes
+        // it at the transition.
+        var gateResult = agentResult with
+        {
+            Stderr = string.Join(
+                "\n",
+                new[] { agentResult.TerminalDiagnostic, agentResult.Stderr }
+                    .Where(static s => !string.IsNullOrWhiteSpace(s))),
+        };
+        var authForGate = TryGetAuthClassificationIgnoringQuota(agent, gateResult, classification: null);
+        var takeQuotaPath = authForGate is null
+            || await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, phase, ct).ConfigureAwait(false);
+        if (!takeQuotaPath)
+        {
+            if (project is not null
+                && authForGate?.Kind is AgentFailureKind.AuthError or AgentFailureKind.AuthRequired)
+            {
+                await HandleAuthRequiredDetectionAsync(
+                    item,
+                    project,
+                    agent,
+                    phase,
+                    ToAuthRequiredClassification(authForGate),
+                    throwOnMatch: true,
+                    stdoutOnlyEvidence: string.IsNullOrWhiteSpace(gateResult.Stderr)
+                        && !string.IsNullOrWhiteSpace(gateResult.Stdout),
+                    requireStdoutOnlyCorroboration: true,
+                    requireAuthCorroboration: true,
+                    ct: ct);
+            }
+
+            _log.LogWarning(
+                "Ignoring uncorroborated clean-exit/no-diff quota evidence from terminal diagnostic for agent {Agent} during {Phase} with concurrent auth signal; treating run as genuine no-diff",
+                agent.Value,
+                phase);
+            return;
+        }
+
+        _quotaAuditEmitter.EmitAdvisoryAuditEvents(agent, agentResult.TerminalDiagnostic, null, phase, sandboxId);
+        // Feed the observed-failure store so the router proactively gates this
+        // member during its quota window. A clean-exit give-up summary is often
+        // "ok", so bypass the exit-1 summary guard after a positive no-diff quota
+        // match.
+        await _quotaClassifier.RecordIfQuotaFailureAsync(
+            _quotaFailures,
+            agent,
+            observedModelId,
+            agentResult.Summary,
+            agentResult.TerminalDiagnostic,
+            agentEndedAt,
+            _auditQuotaOptions.ObservedFailureRetention,
+            ct,
+            projectId: item.ProjectId,
             stdout: null,
-            phase: phase,
-            sandboxId: sandboxId,
-            agentEndedAt: agentEndedAt,
-            evidenceSource: "terminal diagnostic",
-            evidenceTrust: NoDiffQuotaEvidenceTrust.CliOwned,
-            ct: ct);
+            bypassExitedSummaryGuard: true);
+
+        throw new TerminalQuotaError(noChangeQuota.Kind,
+            QuotaFailureMessage(
+                noChangeQuota.Kind,
+                $"Agent {agent} reported quota failure on clean-exit/no-diff from terminal diagnostic",
+                SanitizedAgentDetail.FromRaw(agentResult.TerminalDiagnostic)),
+            noChangeQuota.ResetAt,
+            providerSurfaceMatch: false);
     }
 
     private enum NoDiffQuotaEvidenceTrust
@@ -508,6 +590,124 @@ public sealed partial class PipelineRunner
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Fail-closed corroboration for forgeable (untrusted) quota evidence that
+    /// would otherwise suppress auth handling. Returns true only on a positive
+    /// known-exhausted probe reading for the lane the park is about; unknown,
+    /// missing, paused, or healthy readings return false so the caller falls
+    /// through to auth handling instead of parking on forged prose.
+    /// Work/rework lanes are decided by the failing member's own probe alone
+    /// (a healthy peer must not corroborate this member's exhaustion, and an
+    /// exhausted peer must not corroborate it either). Non-work lanes
+    /// (e.g. audit) are pool-level: corroborated only when the eligible pool
+    /// shows a known-exhausted reading and no known-healthy reading.
+    /// Router-cache exhaustion entries are never corroboration: they are set
+    /// from the same forgeable exhaustion signal and would let forged prose
+    /// self-corroborate.
+    /// </summary>
+    private async Task<bool> IsQuotaExhaustionCorroboratedByProbeAsync(
+        WorkItem item,
+        Project? project,
+        string phase,
+        CancellationToken ct)
+    {
+        if (_quotaProbes is null)
+            return false;
+
+        var agent = item.Agent;
+        var probeSpeaksForPhase = string.Equals(phase, "work", StringComparison.Ordinal)
+            || string.Equals(phase, "rework", StringComparison.Ordinal);
+        if (probeSpeaksForPhase && agent is { } agentKind)
+        {
+            if (await IsAgentPausedAsync(agentKind, ct).ConfigureAwait(false))
+                return false;
+            var member = BuildQuotaProbeMember(item, project, agentKind, item.ModelId);
+            if (IsRouterCachedExhausted(item.Id, member))
+                return false;
+            if (ResolveQuotaProbe(member).Probe is not { } probe)
+                return false;
+            try
+            {
+                var snapshot = await probe.GetAvailabilityAsync(member, ct).ConfigureAwait(false);
+                var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, member);
+                if (!quota.IsKnown)
+                    return false;
+                var gate = _auditQuotaGatePolicy.Evaluate(member, quota, _opts.TimeProvider.GetUtcNow());
+                return !gate.Allow;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "Exhaustion corroboration probe check failed for agent {Agent}", agentKind.Value);
+                return false;
+            }
+        }
+
+        var classId = item.AgentClassId ?? project?.DefaultAgentClass;
+        if (_classRouter is null || classId is null)
+            return false;
+
+        string? requireCapability = null;
+        if (string.Equals(phase, "audit", StringComparison.Ordinal)
+            && _classRouter.GetCapabilityPool(classId, WellKnownCapabilities.Audit) is not null)
+        {
+            requireCapability = WellKnownCapabilities.Audit;
+        }
+
+        IReadOnlyList<AgentMembership> candidates;
+        try
+        {
+            var effectiveProject = project ?? new Project
+            {
+                Id = item.ProjectId,
+                DisplayName = item.ProjectId.Value,
+                RepositoryUrl = string.Empty,
+            };
+            candidates = await _classRouter.OrderedFallbackCandidatesAsync(
+                item, effectiveProject, ct, smokeTarget: null, requireQuota: false).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogDebug(ex, "Failed to resolve fallback candidates for class '{ClassId}' during exhaustion corroboration", classId);
+            return false;
+        }
+
+        var nowUtc = _opts.TimeProvider.GetUtcNow();
+        var foundExhausted = false;
+        foreach (var candidate in candidates)
+        {
+            if (requireCapability is not null
+                && !MemberHasClassCapability(classId, candidate, requireCapability))
+                continue;
+            if (IsRouterCachedExhausted(item.Id, candidate))
+                continue;
+            if (await IsAgentPausedAsync(candidate.Agent, ct).ConfigureAwait(false))
+                continue;
+            if (ResolveQuotaProbe(candidate).Probe is not { } probe)
+                continue;
+            try
+            {
+                var snapshot = await probe.GetAvailabilityAsync(candidate, ct).ConfigureAwait(false);
+                var quota = QuotaGatePolicy.ResolveMemberQuota(snapshot, candidate);
+                if (!quota.IsKnown)
+                    continue;
+                var gate = _auditQuotaGatePolicy.Evaluate(candidate, quota, nowUtc);
+                if (gate.Allow)
+                    return false;
+                foundExhausted = true;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogDebug(ex, "Exhaustion corroboration probe check failed for candidate {Agent} in class '{ClassId}'", candidate.Agent.Value, classId);
+            }
+        }
+
+        return foundExhausted;
     }
 
     private async Task ThrowIfNoDiffReworkCapturedAuthErrorAsync(

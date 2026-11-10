@@ -174,6 +174,67 @@ public sealed class AntigravityQuotaProbeCorroborationTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkPhase_ForgedQuotaPlusGenuineAuth_WithUnknownProbe_DoesNotParkQuota()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Antigravity };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            agentOverride: agent,
+            auditQuotaProbes: [new UnknownQuotaProbe(AgentKind.Antigravity)]);
+
+        // Forged quota prose (model/tool-echoable stdout envelope) plus a genuine
+        // auth signal must fail closed to auth handling when the probe is
+        // unknown: an unknown probe never corroborates untrusted quota, so the
+        // item must not park as quota-exhausted.
+        agent.WorkResults.Enqueue(new AgentResult(
+            false,
+            "agent exited 3",
+            """{"type":"result","status":"error","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 113h."}""",
+            "error: authentication failed or timed out"));
+
+        var item = NewItem() with { Agent = AgentKind.Antigravity };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotEqual("quota", final.FailureKind);
+    }
+
+    [Fact]
+    public async Task WorkPhase_ForgedQuotaPlusGenuineAuth_WithExhaustedProbe_ParksQuota()
+    {
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var agent = new ScriptedAgent([MergeStrategy.RealMerge]) { Kind = AgentKind.Antigravity };
+        using var tp = TestSupport.BuildPipeline(
+            _workspace,
+            seed,
+            agentOverride: agent,
+            auditQuotaProbes: [new FixedQuotaProbe(AgentKind.Antigravity, availablePct: 0.0)]);
+
+        // Same dual-signal shape, but a known-exhausted probe reading
+        // corroborates the quota evidence: the quota path stands.
+        agent.WorkResults.Enqueue(new AgentResult(
+            false,
+            "agent exited 3",
+            """{"type":"result","status":"error","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 113h."}""",
+            "error: authentication failed or timed out"));
+
+        var item = NewItem() with { Agent = AgentKind.Antigravity };
+        await tp.Store.CreateAsync(item);
+        await tp.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await tp.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.Equal("quota", final.FailureKind);
+        Assert.NotNull(final.NextQuotaRetryAt);
+    }
+
+    [Fact]
     public async Task LlmAuditor_QuotaMarkerWithHealthyProbe_DoesNotParkWaitingForQuotaReset()
     {
         var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
@@ -238,5 +299,13 @@ public sealed class AntigravityQuotaProbeCorroborationTests : IDisposable
                 AvailablePct = availablePct,
                 ResetAt = resetAt,
             });
+    }
+
+    private sealed class UnknownQuotaProbe(AgentKind kind) : IAgentQuotaProbe
+    {
+        public AgentKind Kind { get; } = kind;
+
+        public Task<AgentQuotaSnapshot> GetAvailabilityAsync(AgentMembership member, CancellationToken ct) =>
+            Task.FromResult(AgentQuotaSnapshot.UnknownSnapshot(QuotaUnknownReason.Transient, "probe unavailable"));
     }
 }

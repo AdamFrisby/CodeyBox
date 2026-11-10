@@ -1252,6 +1252,7 @@ public sealed partial class PipelineRunner
                     {
                         await ThrowIfNoDiffTerminalDiagnosticQuotaFailureAsync(
                             item,
+                            project,
                             runner.Kind,
                             observedModelId,
                             agentResult,

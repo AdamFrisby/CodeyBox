@@ -1121,30 +1121,54 @@ public sealed partial class PipelineRunner
             result.Stdout,
             "planning",
             sandboxId);
-        var detection = _quotaClassifier.Detect(runner.Kind, result.Stderr, result.Stdout);
+        var planningQuotaClassification = _quotaClassifier.Classify(runner.Kind, result.Stderr, result.Stdout);
+        var classification = _authFailureClassifier.ClassifyFailure(runner, result);
         // Only genuine quota/rate-limit signals take the quota path — a
         // 401/403 (Unauthorized) falls through to the auth handling below and
         // must never bench the member or park for a reset.
-        if (detection is { Kind: var planningQuotaKind } && planningQuotaKind.IsExhaustionSignal())
+        // Fail-closed quota-before-auth: classifier-facing Stderr folds glog
+        // bytes that interleave verbatim model/tool output, so forged quota
+        // prose must not suppress a genuine auth signal. Untrusted evidence
+        // takes the quota path only with no concurrent auth signal or with
+        // positive probe corroboration (unknown/missing/healthy fail closed
+        // to auth handling). Trusted evidence keeps the healthy-veto.
+        if (TryGetExhaustionClassification(planningQuotaClassification) is { } planningExhaustion)
         {
-            await _quotaClassifier.RecordIfQuotaFailureAsync(
-                _quotaFailures,
-                runner.Kind,
-                observedModelId,
-                result.Summary,
-                result.Stderr,
-                endedAt,
-                _auditQuotaOptions.ObservedFailureRetention,
-                ct,
-                projectId: item.ProjectId,
-                stdout: result.Stdout);
-            throw new TerminalQuotaError(
-                detection.Kind,
-                QuotaFailureMessage(
-                    detection.Kind,
-                    $"Agent {runner.Kind} reported quota failure during planning",
-                    SanitizedAgentDetail.FromRaw(result.Summary)),
-                detection.ResetAt);
+            var planningAuthForQuotaGate = TryGetAuthClassificationIgnoringQuota(runner.Kind, result, classification);
+            bool takePlanningQuotaPath;
+            if (!planningExhaustion.ProviderSurfaceMatch)
+            {
+                takePlanningQuotaPath = planningAuthForQuotaGate is null
+                    || await IsQuotaExhaustionCorroboratedByProbeAsync(item, project, "planning", ct).ConfigureAwait(false);
+            }
+            else
+            {
+                takePlanningQuotaPath = planningAuthForQuotaGate is null
+                    || !await IsQuotaContradictedByProbeForWorkItemAsync(item, project, "planning", ct).ConfigureAwait(false);
+            }
+            if (takePlanningQuotaPath)
+            {
+                var planningDetection = planningExhaustion.Detection!;
+                await _quotaClassifier.RecordIfQuotaFailureAsync(
+                    _quotaFailures,
+                    runner.Kind,
+                    observedModelId,
+                    result.Summary,
+                    result.Stderr,
+                    endedAt,
+                    _auditQuotaOptions.ObservedFailureRetention,
+                    ct,
+                    projectId: item.ProjectId,
+                    stdout: result.Stdout);
+                throw new TerminalQuotaError(
+                    planningDetection.Kind,
+                    QuotaFailureMessage(
+                        planningDetection.Kind,
+                        $"Agent {runner.Kind} reported quota failure during planning",
+                        SanitizedAgentDetail.FromRaw(result.Summary)),
+                    planningDetection.ResetAt,
+                    providerSurfaceMatch: planningExhaustion.ProviderSurfaceMatch);
+            }
         }
 
         await ThrowIfAuthRequiredOutputAsync(
@@ -1155,7 +1179,6 @@ public sealed partial class PipelineRunner
             result,
             requireStdoutOnlyCorroboration: true,
             ct);
-        var classification = _authFailureClassifier.ClassifyFailure(runner, result);
         await ThrowIfAuthErrorAgentFailureAsync(
             item,
             project,

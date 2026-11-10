@@ -192,6 +192,90 @@ public sealed class AuditQuotaPauseTests : IDisposable
     }
 
     [Fact]
+    public async Task AuditExitZeroTerminalQuota_WithWeakAuthPhraseAndHealthyProbes_TreatsAsTransientNotQuotaPark()
+    {
+        // Forged-quota fail-closed: the terminal region lifts glog bytes that
+        // interleave verbatim model/tool output, so quota prose there is never
+        // trusted provider-surface for Antigravity. When the same region also
+        // carries an auth signal ('authentication failed or timed out') with no
+        // positive probe corroboration (probes read healthy), the item must NOT
+        // park for a forged reset window — and the weak agy-only blip with a
+        // healthy credential probe is transient, not an auth exclusion.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(
+            false,
+            [new AuditFinding("cheating:llm-review", AuditSeverity.Error, "agent did not write audit/result.json", "")],
+            AgentSummary: "ok")
+        {
+            AgentTerminalDiagnostic =
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)\n" +
+                "error: authentication failed or timed out",
+        });
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Antigravity],
+            auditAgent: AgentKind.Antigravity);
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        // Not a quota park: forged-able prose must not pin the item to a fake
+        // reset window while the credential probe reads healthy.
+        Assert.NotEqual(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.DoesNotContain(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+        // Weak agy-only blip + healthy probe reads as transient, not an
+        // auth-required fleet exclusion.
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, final.State);
+    }
+
+    [Fact]
+    public async Task AuditExitZeroTerminalQuota_WithWeakAuthPhraseAndExhaustedProbes_ParksForQuotaReset()
+    {
+        // Mirror of the genuine-quota park when the weak agy auth blip rides
+        // along: a positively corroborated (known-exhausted) probe reading
+        // means the exhaustion is real, so the quota path stands and the item
+        // parks for the reset instead of failing as auth.
+        var seed = await TestSupport.CreateSeedRepoAsync(_workspace);
+        var auditor = new RoutingLlmAuditor("cheating:llm-review", _ => new AuditResult(
+            false,
+            [new AuditFinding("cheating:llm-review", AuditSeverity.Error, "agent did not write audit/result.json", "")],
+            AgentSummary: "ok")
+        {
+            AgentTerminalDiagnostic =
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)\n" +
+                "error: authentication failed or timed out",
+        });
+        using var fix = BuildFixture(
+            seed,
+            auditor,
+            [AgentKind.Gemini, AgentKind.Antigravity],
+            auditAgent: AgentKind.Antigravity,
+            auditProbeAvailablePct: new Dictionary<AgentKind, double>
+            {
+                [AgentKind.Gemini] = 0.0,
+                [AgentKind.Antigravity] = 0.0,
+            });
+        fix.Gemini.WorkPlan.Enqueue(new FileWrite("work.txt", "done\n"));
+
+        var item = NewItem(AgentKind.Gemini);
+        await fix.Store.CreateAsync(item);
+
+        await fix.Pipeline.RunAsync(item, CancellationToken.None);
+
+        var final = await fix.Store.GetAsync(item.Id);
+        Assert.NotNull(final);
+        Assert.Equal(WorkItemState.WaitingForQuotaReset, final!.State);
+        Assert.NotNull(final.NextQuotaRetryAt);
+        Assert.Contains(fix.Webhooks.Events, e => e.Event == "work_item.waiting_for_quota_reset");
+    }
+
+    [Fact]
     public async Task AuditSuccessfulVerdict_WithQuotaTextInReviewOutput_DoesNotParkForQuota()
     {
         // Regression: a SUCCESSFUL audit that produced a valid verdict must NOT be

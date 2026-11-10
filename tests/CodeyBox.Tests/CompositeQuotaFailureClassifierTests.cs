@@ -140,6 +140,8 @@ public sealed class CompositeQuotaFailureClassifierTests
     [InlineData("agent exited 1: RESOURCE_EXHAUSTED quota exceeded")]
     [InlineData("agent exited 1: API Error: 401 Unauthorized")]
     [InlineData("agent exited 1: …<truncated tail>")]
+    [InlineData("agent exited 3")]
+    [InlineData("agent exited 3: RESOURCE_EXHAUSTED (code 429): Individual quota reached")]
     public void IsAgentExited1Summary_AcceptsBaseAndEnrichedForms(string summary)
     {
         Assert.True(QuotaFailureClassifierStoreExtensions.IsAgentExited1Summary(summary));
@@ -158,6 +160,26 @@ public sealed class CompositeQuotaFailureClassifierTests
     }
 
     private sealed record AdvisoryCall(string? Stderr, string? Stdout, string Phase, string? SandboxName);
+
+    [Fact]
+    public void Classify_AntigravityStderrQuota_IsNeverTrustedProviderSurface()
+    {
+        // The agy CLI-log terminal region is folded into classifier-facing
+        // Stderr and interleaves verbatim model/tool output, so Antigravity
+        // stderr quota evidence must always be probe-corroborated (untrusted),
+        // even when the stderr leg matches.
+        var classifier = new CompositeQuotaFailureClassifier(
+            new IAgentQuotaFailureDetector[] { new CodeyBox.Agents.Antigravity.AntigravityQuotaFailureDetector() });
+
+        var classification = classifier.Classify(
+            AgentKind.Antigravity,
+            "RESOURCE_EXHAUSTED (code 429): Individual quota reached (Resets in 8m14s)",
+            null);
+
+        Assert.Equal(QuotaFailureClassificationKind.Quota, classification.Kind);
+        Assert.NotNull(classification.Detection);
+        Assert.False(classification.ProviderSurfaceMatch);
+    }
 
     private sealed class RecordingDetector : IAgentQuotaFailureDetector
     {
