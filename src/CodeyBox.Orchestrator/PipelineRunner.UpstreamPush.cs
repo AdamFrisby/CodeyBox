@@ -175,6 +175,14 @@ public sealed partial class PipelineRunner
                 // even when the latest record went stale.
                 if (stored is not null && stored.PushedWorkBranchShaHistory.Count > 0)
                     request = request with { KnownWorkBranchShas = stored.PushedWorkBranchShaHistory };
+                // On a skip-merge resume the merge phase did not run this
+                // pickup, so mergeSha is null — but the durable repo still
+                // holds the merge commit the work branch was advanced to.
+                // LocalSquashSha carries that sha; forwarding it keeps the
+                // upstream head/base ancestry assertion meaningful on
+                // resumed items instead of silently skipping it.
+                if (request.MergeSha is null && !string.IsNullOrWhiteSpace(stored?.LocalSquashSha))
+                    request = request with { MergeSha = stored.LocalSquashSha };
             }
 
             // Pre-merge CI gate. The forge's textual `mergeable` flag does not
@@ -492,10 +500,35 @@ public sealed partial class PipelineRunner
                             $"upstream landing raced on base branch '{baseBranch}'; re-running merge against the fresh base",
                             bumpLandingAttempt: true,
                             ct);
-                        var raceRecovery = await ReRunMergeForRaceAsync(
-                            item, repoId, baseBranch, workBranch,
-                            reRunMergePhase,
-                            ct);
+                        AutoMergeRaceRecovery raceRecovery;
+                        try
+                        {
+                            raceRecovery = await ReRunMergeForRaceAsync(
+                                item, repoId, baseBranch, workBranch,
+                                reRunMergePhase,
+                                ct);
+                        }
+                        catch (MergeConflictResolutionFailedException remergeFailure)
+                        {
+                            // The re-merge against the fresh base hit a real
+                            // conflict the resolver could not settle — a
+                            // scope-fence rejection, resolver exhaustion, or
+                            // a semantic build failure (the Landgen #9
+                            // failure: the race-recovery re-merge bypassed
+                            // the merge section's guard-rework loop and
+                            // parked terminally). Route the semantic failure
+                            // into the bounded conflict-rework machine here;
+                            // infrastructure-classified failures (timeout,
+                            // base-moved exhaustion, infra kind) keep their
+                            // historical terminal park.
+                            if (MergeScopeFence.IsConflictReworkRoutableMergeFailure(remergeFailure)
+                                && await TryRouteStaleBasePushConflictAsync(item, ct) == StaleBaseReworkOutcome.Routed)
+                            {
+                                raceRecoveryParked = true;
+                                break;
+                            }
+                            throw;
+                        }
                         if (raceRecovery.ParkReason is not null)
                         {
                             _log.LogWarning(

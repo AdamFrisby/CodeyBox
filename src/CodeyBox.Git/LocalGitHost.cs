@@ -1262,16 +1262,7 @@ public sealed class LocalGitHost : IGitHost
         if (rc.ExitCode != 0)
             throw new InvalidOperationException($"git diff --name-status failed: {rc.Stderr}");
 
-        var changes = new List<GitChangedPath>();
-        foreach (var line in rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var parts = line.Split('\t', StringSplitOptions.None);
-            if (parts.Length == 2)
-                changes.Add(new GitChangedPath(parts[0], parts[1]));
-            else if (parts.Length == 3)
-                changes.Add(new GitChangedPath(parts[0], parts[2], parts[1]));
-        }
-        return changes;
+        return GitNameStatusParser.Parse(rc.Stdout);
     }
 
     public async Task<string> GetUnifiedDiffAsync(

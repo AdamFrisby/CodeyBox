@@ -365,6 +365,21 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
                 mergedSha = null;
                 autoMergeRaced = true;
             }
+            else if (await PushedMergeHeadMissesUpstreamBaseAsync(
+                request, repoUrl, askpass.Environment, pushedSha, ct))
+            {
+                // The pushed head IS the merge-phase result but does not
+                // contain the current upstream base tip — merging it would
+                // land (or conflict on) a head built against a stale base.
+                // Skip the PUT and surface as a race so the orchestrator
+                // refetches, re-merges, or routes to conflict rework.
+                mergeNotes = $"pushed head {SanitizeForLog(pushedSha)} does not contain the current upstream base tip for '{SanitizeForLog(request.BaseBranch)}'; skipping PUT /pulls/merge so the orchestrator re-merges against the fresh base";
+                _log.LogWarning(
+                    "Pushed head {Sha} misses the current upstream base tip for '{Branch}'; skipping merge call",
+                    SanitizeForLog(pushedSha), SanitizeForLog(request.BaseBranch));
+                mergedSha = null;
+                autoMergeRaced = true;
+            }
             else
             {
                 bool raced;
@@ -392,6 +407,102 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
             Mergeable = mergeable,
             MergeableState = mergeableState,
         };
+    }
+
+    /// <summary>
+    /// Correctness gate evaluated after the mergeability settle and before
+    /// PUT /pulls/merge: when the pushed PR head IS the merge-phase result —
+    /// the orchestrator advances the work branch to the merge commit so the
+    /// PR carries the resolved tree — that head must contain the CURRENT
+    /// upstream base tip. A head built on a stale base would either conflict
+    /// against the moved base or merge a tree the merge phase never
+    /// verified. Returns true only on a PROVABLE miss; unevaluable cases
+    /// (no merge sha recorded, a plain work tip pushed — which legitimately
+    /// lacks base ancestry because the PR merge itself supplies it — an
+    /// unadvertised base, or transport failures) return false so the
+    /// historical PUT path, with the forge's own mergeability verdict as
+    /// backstop, is preserved.
+    /// </summary>
+    private async Task<bool> PushedMergeHeadMissesUpstreamBaseAsync(
+        UpstreamCompletionRequest request,
+        string repoUrl,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        string? pushedSha,
+        CancellationToken ct)
+    {
+        if (pushedSha is null || request.MergeSha is null
+            || !string.Equals(pushedSha.Trim(), request.MergeSha.Trim(), StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string? upstreamBaseSha;
+        try
+        {
+            upstreamBaseSha = await _gitHost.GetUpstreamBranchShaAsync(
+                request.RepositoryId, repoUrl, request.BaseBranch, upstreamEnv, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Could not read upstream base tip for '{Branch}'; skipping pushed-head ancestry assertion",
+                SanitizeForLog(request.BaseBranch));
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(upstreamBaseSha))
+            return false;
+
+        var baseTip = upstreamBaseSha.Trim();
+        var headSha = pushedSha.Trim();
+
+        // If the upstream tip object is absent from the local bare repo the
+        // pushed head cannot contain it: every ancestor of a local commit is
+        // itself local, so an unresolvable base tip is a definitive miss —
+        // the base moved to something this repo has never fetched.
+        try
+        {
+            await _gitHost.ResolveCommitAsync(request.RepositoryId, baseTip, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            _log.LogWarning(
+                "Pushed head {Sha} cannot contain upstream base tip {Base} for '{Branch}': the base tip is not present in the local repo; skipping merge call",
+                headSha, baseTip, SanitizeForLog(request.BaseBranch));
+            return true;
+        }
+
+        bool containsBase;
+        try
+        {
+            containsBase = await _gitHost.IsAncestorAsync(
+                request.RepositoryId, baseTip, headSha, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex,
+                "Could not evaluate pushed-head ancestry for '{Branch}'; skipping assertion",
+                SanitizeForLog(request.BaseBranch));
+            return false;
+        }
+
+        if (containsBase)
+            return false;
+
+        _log.LogWarning(
+            "Pushed head {Sha} does not contain current upstream base tip {Base} for '{Branch}'; skipping merge call",
+            headSha, baseTip, SanitizeForLog(request.BaseBranch));
+        return true;
     }
 
     /// <summary>

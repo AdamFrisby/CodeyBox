@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
+using CodeyBox.Sandbox;
 
 namespace CodeyBox.Orchestrator;
 
@@ -146,6 +147,31 @@ internal static partial class MergeScopeFence
             || ex.Message.Contains("returned non-conflicted file", StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// True when a <see cref="MergeConflictResolutionFailedException"/> raised
+    /// while (re)running the merge phase describes a REAL conflict the
+    /// conflict-rework machine can act on — resolver guard trips, resolver
+    /// exhaustion, and semantic build failures — rather than infrastructure.
+    /// Excluded: verification timeouts (own infra budget), base-moved
+    /// exhaustion chained inside (environmental), and failures already
+    /// classified <see cref="WorkItemFailureKinds.Infrastructure"/>. Used by
+    /// the upstream-push race-recovery path, which re-invokes the merge
+    /// phase outside the merge section's own guard-rework loop: a semantic
+    /// failure there must route into bounded conflict-rework instead of
+    /// parking terminally.
+    /// </summary>
+    internal static bool IsConflictReworkRoutableMergeFailure(MergeConflictResolutionFailedException ex)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        for (var current = (Exception?)ex; current is not null; current = current.InnerException)
+        {
+            if (current is MergeBaseMovedException or MergeResultBuildVerificationTimeoutException)
+                return false;
+        }
+
+        return ex.FailureKind != WorkItemFailureKinds.Infrastructure;
+    }
+
     public static IReadOnlyList<ConflictHunk> ExtractConflictHunks(string path, string conflictedContent)
     {
         var hunks = new List<ConflictHunk>();
@@ -207,9 +233,7 @@ internal static partial class MergeScopeFence
         if (bufferLines < 0)
             throw new ArgumentOutOfRangeException(nameof(bufferLines), "buffer must be non-negative");
 
-        var hunksByPath = hunks
-            .GroupBy(h => h.Path, StringComparer.Ordinal)
-            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+        var hunksByPath = GroupHunksByPath(hunks);
         var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
         var violations = new List<string>();
 
@@ -218,41 +242,77 @@ internal static partial class MergeScopeFence
         // coordinates in the same file shape as the captured conflict hunks
         // and excludes clean work-branch changes that git already merged.
         var resolvedChanges = await gitHost.GetChangedPathsAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, ct);
-        var changedFiles = resolvedChanges.Select(c => c.Path).ToHashSet(StringComparer.Ordinal);
-        foreach (var missing in conflictFiles.Except(changedFiles, StringComparer.Ordinal))
-            violations.Add($"{missing}:1 conflicted file was not part of the resolved diff");
-
-        foreach (var change in resolvedChanges)
-        {
-            if (!conflictFiles.Contains(change.Path))
-            {
-                violations.Add(change.Status.StartsWith('R') || change.Status.StartsWith('A') || change.Status.StartsWith('D')
-                    ? $"{change.Path}:1 {DescribeStatus(change)}"
-                    : $"{change.Path}:1 changed non-conflicted file");
-                continue;
-            }
-
-            if (change.Status.StartsWith('R') || change.Status.StartsWith('A') || change.Status.StartsWith('D'))
-            {
-                violations.Add($"{change.Path}:1 {DescribeStatus(change)}");
-                continue;
-            }
-
-            if (!change.Status.StartsWith('M'))
-            {
-                violations.Add($"{change.Path}:1 unsupported change status {change.Status}");
-                continue;
-            }
-        }
+        AddTreeChangeViolations(violations, resolvedChanges, conflictFiles);
 
         foreach (var (path, fileHunks) in hunksByPath)
         {
             var diff = await gitHost.GetUnifiedDiffAsync(repositoryId, conflictBaselineTreeish, resolvedTreeish, path, ct);
-            foreach (var lineNumber in ChangedOldLineCoordinates(diff))
+            AddDiffLineViolations(violations, path, diff, fileHunks, bufferLines);
+        }
+
+        if (violations.Count > 0)
+            throw new ScopeFenceViolation(violations);
+    }
+
+    /// <summary>
+    /// Sandbox-side twin of <see cref="VerifyAsync"/>: evaluates the same
+    /// scope fence against trees that live inside the merge sandbox's clone —
+    /// the conflict-baseline merge tree (recomputed in-sandbox via
+    /// <c>git merge-tree --write-tree</c> against the same commit SHAs, since
+    /// the host-side tree object never crosses the <c>--no-local</c> clone
+    /// boundary) and the resolver's staged-but-uncommitted resolution
+    /// (<c>git write-tree</c>). The merge
+    /// phase runs this inside the resolver's verification loop so a fence
+    /// rejection consumes the attempt it was earned on — the resolver retries
+    /// with the violation as feedback or escalates to the next candidate —
+    /// instead of surfacing only after the resolver already reported success.
+    /// Both treeishes must resolve inside <paramref name="sandbox"/>.
+    /// </summary>
+    public static async Task VerifySandboxAsync(
+        ISandbox sandbox,
+        string workingDirectory,
+        string conflictBaselineTreeish,
+        string resolvedTreeish,
+        IReadOnlyList<ConflictHunk> hunks,
+        int bufferLines,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(sandbox);
+        ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conflictBaselineTreeish);
+        ArgumentException.ThrowIfNullOrWhiteSpace(resolvedTreeish);
+        if (bufferLines < 0)
+            throw new ArgumentOutOfRangeException(nameof(bufferLines), "buffer must be non-negative");
+
+        var hunksByPath = GroupHunksByPath(hunks);
+        var conflictFiles = hunksByPath.Keys.ToHashSet(StringComparer.Ordinal);
+        var violations = new List<string>();
+
+        var nameStatus = await sandbox.ExecAsync(new SandboxExec
+        {
+            Argv = ["git", "-C", workingDirectory, "diff", "--name-status", "-M",
+                conflictBaselineTreeish, resolvedTreeish],
+        }, ct);
+        if (!nameStatus.Success)
+            throw new InvalidOperationException(
+                $"merge scope fence git diff --name-status failed: {nameStatus.Stderr.Trim()}");
+        var resolvedChanges = GitNameStatusParser.Parse(nameStatus.Stdout);
+        AddTreeChangeViolations(violations, resolvedChanges, conflictFiles);
+
+        foreach (var (path, fileHunks) in hunksByPath)
+        {
+            MergeConflictPathInspector.ValidateRelativeWorkPath(path);
+            var diff = await sandbox.ExecAsync(new SandboxExec
             {
-                if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))
-                    violations.Add($"{path}:{lineNumber}");
-            }
+                Argv = ["git", "-C", workingDirectory, "diff",
+                    "--no-ext-diff", "--no-color", "--unified=0",
+                    conflictBaselineTreeish, resolvedTreeish, "--", path],
+                ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
+            }, ct);
+            if (!diff.Success)
+                throw new InvalidOperationException(
+                    $"merge scope fence git diff for '{path}' failed: {diff.Stderr.Trim()}");
+            AddDiffLineViolations(violations, path, diff.Stdout, fileHunks, bufferLines);
         }
 
         if (violations.Count > 0)
@@ -297,6 +357,70 @@ internal static partial class MergeScopeFence
 
         if (violations.Count > 0)
             throw new ScopeFenceViolation(violations);
+    }
+
+    private static Dictionary<string, List<ConflictHunk>> GroupHunksByPath(IReadOnlyList<ConflictHunk> hunks)
+        => hunks
+            .GroupBy(h => h.Path, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
+    /// <summary>
+    /// The change-set half of the fence, shared by the host and sandbox
+    /// verifiers: every conflicted file must appear in the resolved diff, no
+    /// non-conflicted file may change, and conflicted files may only be
+    /// modified (no add/delete/rename).
+    /// </summary>
+    private static void AddTreeChangeViolations(
+        List<string> violations,
+        IReadOnlyList<GitChangedPath> resolvedChanges,
+        ISet<string> conflictFiles)
+    {
+        var changedFiles = resolvedChanges.Select(c => c.Path).ToHashSet(StringComparer.Ordinal);
+        foreach (var missing in conflictFiles.Except(changedFiles, StringComparer.Ordinal))
+            violations.Add($"{missing}:1 conflicted file was not part of the resolved diff");
+
+        foreach (var change in resolvedChanges)
+        {
+            if (!conflictFiles.Contains(change.Path))
+            {
+                violations.Add(change.Status.StartsWith('R') || change.Status.StartsWith('A') || change.Status.StartsWith('D')
+                    ? $"{change.Path}:1 {DescribeStatus(change)}"
+                    : $"{change.Path}:1 changed non-conflicted file");
+                continue;
+            }
+
+            if (change.Status.StartsWith('R') || change.Status.StartsWith('A') || change.Status.StartsWith('D'))
+            {
+                violations.Add($"{change.Path}:1 {DescribeStatus(change)}");
+                continue;
+            }
+
+            if (!change.Status.StartsWith('M'))
+            {
+                violations.Add($"{change.Path}:1 unsupported change status {change.Status}");
+                continue;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The per-file line-coordinate half of the fence: every old-side line a
+    /// zero-context diff touches must sit inside a permitted conflict hunk
+    /// (plus buffer). Shared by the host and sandbox verifiers so both
+    /// project diff hunks onto baseline coordinates identically.
+    /// </summary>
+    private static void AddDiffLineViolations(
+        List<string> violations,
+        string path,
+        string diff,
+        IReadOnlyList<ConflictHunk> fileHunks,
+        int bufferLines)
+    {
+        foreach (var lineNumber in ChangedOldLineCoordinates(diff))
+        {
+            if (!IsInsideAnyHunk(lineNumber, fileHunks, bufferLines))
+                violations.Add($"{path}:{lineNumber}");
+        }
     }
 
     private static IEnumerable<int> ChangedLineCoordinates(string before, string after)

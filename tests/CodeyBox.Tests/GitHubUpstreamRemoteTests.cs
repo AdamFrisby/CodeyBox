@@ -172,6 +172,117 @@ public sealed class GitHubUpstreamRemoteTests
         Assert.Equal("abc123sha", outcome.MergedSha);
     }
 
+    // -------------------------------------------------------------------------
+    // Pushed-head/base ancestry gate (evaluated after mergeability settle,
+    // before PUT /pulls/merge). When the pushed PR head IS the merge-phase
+    // result it must contain the current upstream base tip; a provable miss
+    // skips the merge call and surfaces as AutoMergeRaced so the orchestrator
+    // refetches/re-merges instead of landing a stale-base head.
+    // -------------------------------------------------------------------------
+
+    private const string MergeHeadSha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    private const string UpstreamBaseSha = "cafe0123cafe0123cafe0123cafe0123cafe0123";
+
+    private static FakeGitHost MergeHeadGitHost()
+    {
+        var gitHost = new FakeGitHost();
+        // The pushed work-branch tip resolves to the merge-phase sha, so the
+        // ancestry gate evaluates (pushedSha == request.MergeSha).
+        gitHost.ResolveCommits[SampleRequest.WorkBranch] = MergeHeadSha;
+        gitHost.ResolveCommits[UpstreamBaseSha] = UpstreamBaseSha;
+        gitHost.UpstreamBranchShas[SampleRequest.BaseBranch] = UpstreamBaseSha;
+        return gitHost;
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadMissesUpstreamBase_SkipsMergeCallAndFlagsRace()
+    {
+        var gitHost = MergeHeadGitHost();
+        // Base tip resolvable locally but NOT an ancestor of the pushed head:
+        // the merge was composed against a stale base.
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(11, "https://github.com/myorg/myrepo/pull/11"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        var outcome = await remote.CompleteAsync(
+            SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None);
+
+        // Only the PR-create call happened — PUT /pulls/merge was skipped.
+        Assert.Single(handler.Requests);
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
+        Assert.True(outcome.AutoMergeRaced);
+        Assert.Null(outcome.MergedSha);
+        Assert.Equal(11, outcome.PullRequestNumber);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadContainsUpstreamBase_Merges()
+    {
+        var gitHost = MergeHeadGitHost();
+        gitHost.Ancestors.Add((UpstreamBaseSha, MergeHeadSha));
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(12, "https://github.com/myorg/myrepo/pull/12"));
+        handler.Enqueue(MergeOkResponse("forge-merge-sha"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        var outcome = await remote.CompleteAsync(
+            SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None);
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Put, handler.Requests[1].Method);
+        Assert.Contains("/pulls/12/merge", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.False(outcome.AutoMergeRaced);
+        Assert.Equal("forge-merge-sha", outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_PlainWorkTipPush_SkipsAncestryGate()
+    {
+        // A pushed head that is NOT the merge-phase sha (ordinary work tip —
+        // clean merges and non-merge pushes) legitimately lacks base ancestry:
+        // the PR merge itself supplies it. The gate must not fire.
+        var gitHost = MergeHeadGitHost();
+        gitHost.ResolveCommits[SampleRequest.WorkBranch] = "feedfacefeedfacefeedfacefeedfacefeedface";
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(13, "https://github.com/myorg/myrepo/pull/13"));
+        handler.Enqueue(MergeOkResponse("plain-tip-merge-sha"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        var outcome = await remote.CompleteAsync(
+            SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None);
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(HttpMethod.Put, handler.Requests[1].Method);
+        Assert.False(outcome.AutoMergeRaced);
+        Assert.Equal("plain-tip-merge-sha", outcome.MergedSha);
+    }
+
+    [Fact]
+    public async Task CompleteAsync_MergeHeadBaseTipNotLocal_SkipsMergeCall()
+    {
+        // The upstream base tip is not present in the local bare repo: every
+        // ancestor of a local commit is itself local, so the pushed head
+        // provably cannot contain it — a definitive miss, not an
+        // unevaluable case.
+        var gitHost = new FakeGitHost();
+        gitHost.ResolveCommits[SampleRequest.WorkBranch] = MergeHeadSha;
+        gitHost.UpstreamBranchShas[SampleRequest.BaseBranch] = UpstreamBaseSha;
+        // ResolveCommits deliberately lacks UpstreamBaseSha.
+        var handler = new FakeHttpMessageHandler();
+        handler.Enqueue(PrCreatedResponse(14, "https://github.com/myorg/myrepo/pull/14"));
+
+        var remote = BuildRemote(gitHost, handler, DefaultOpts with { AutoMerge = true, MergeMethod = "merge" });
+        var outcome = await remote.CompleteAsync(
+            SampleRequest with { MergeSha = MergeHeadSha }, CancellationToken.None);
+
+        Assert.Single(handler.Requests);
+        Assert.DoesNotContain(handler.Requests, r =>
+            r.RequestUri!.PathAndQuery.Contains("/merge", StringComparison.Ordinal));
+        Assert.True(outcome.AutoMergeRaced);
+        Assert.Null(outcome.MergedSha);
+    }
+
     [Fact]
     public async Task CompleteAsync_NonSquashMerge_DoesNotSendSquashTitleOrMessage()
     {
@@ -1810,6 +1921,19 @@ internal sealed class FakeGitHost : IGitHost
     /// </summary>
     public Dictionary<string, string> ResolveCommits { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Upstream branch tips for <see cref="GetUpstreamBranchShaAsync"/>,
+    /// keyed by branch name. Empty (default) advertises no branches — the
+    /// historical "branch not found" answer.
+    /// </summary>
+    public Dictionary<string, string> UpstreamBranchShas { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// (ancestor, descendant) commit pairs <see cref="IsAncestorAsync"/>
+    /// reports as reachable. Anything absent answers false.
+    /// </summary>
+    public HashSet<(string Ancestor, string Descendant)> Ancestors { get; } = new();
+
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, CancellationToken ct = default)
         => Task.FromResult(id.ToString());
     public Task<string> EnsureRepositoryAsync(WorkItemId id, string? seedFromUrl, string? baseBranch, CancellationToken ct = default)
@@ -1848,6 +1972,17 @@ internal sealed class FakeGitHost : IGitHost
         => ResolveCommits.TryGetValue(commitish, out var sha)
             ? Task.FromResult(sha)
             : throw new NotSupportedException($"FakeGitHost has no commit for '{commitish}'.");
+
+    public Task<string?> GetUpstreamBranchShaAsync(
+        string repositoryId,
+        string upstreamUrl,
+        string branch,
+        IReadOnlyDictionary<string, string> upstreamEnv,
+        CancellationToken ct = default)
+        => Task.FromResult(UpstreamBranchShas.TryGetValue(branch, out var sha) ? sha : null);
+
+    public Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
+        => Task.FromResult(Ancestors.Contains((ancestorCommit, descendantCommit)));
 
     public Task DisposeRepositoryAsync(string repositoryId, CancellationToken ct = default)
         => Task.CompletedTask;

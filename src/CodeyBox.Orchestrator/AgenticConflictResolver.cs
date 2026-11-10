@@ -263,13 +263,25 @@ public sealed class AgenticConflictResolver
     /// attempts. Returns success on the first attempt whose post-run
     /// verification passes, failure with a concrete reason otherwise.
     /// </summary>
+    /// <param name="postVerificationAsync">
+    /// Optional caller-supplied check run after <see cref="VerifyResolutionAsync"/>
+    /// passes. Returns null when the resolution is acceptable, or a failure
+    /// reason consumed exactly like a verification failure — the attempt is
+    /// charged and the next attempt/escalation sees the reason as feedback.
+    /// The merge phase uses it to evaluate the scope fence inside the loop
+    /// (the fence otherwise only runs after the resolver reports success,
+    /// which burned the whole attempt budget on a rejection the agent could
+    /// have repaired). Must not throw except <see cref="OperationCanceledException"/>;
+    /// unexpected exceptions are folded into a verification failure.
+    /// </param>
     public async Task<AgenticConflictResolverResult> ResolveAsync(
         ISandbox sandbox,
         string workingDirectory,
         WorkItemId workItemId,
         AgenticConflictResolverContext context,
         IReadOnlyList<AgenticConflictResolverCandidate> candidates,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<ISandbox, string, CancellationToken, Task<string?>>? postVerificationAsync = null)
     {
         if (sandbox is null) throw new ArgumentNullException(nameof(sandbox));
         if (string.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory must be non-empty", nameof(workingDirectory));
@@ -758,6 +770,26 @@ public sealed class AgenticConflictResolver
 
                 var verification = await VerifyResolutionAsync(
                     sandbox, workingDirectory, conflictFiles, options, ct);
+                if (verification.Success && postVerificationAsync is not null)
+                {
+                    string? postFailure;
+                    try
+                    {
+                        postFailure = await postVerificationAsync(sandbox, workingDirectory, ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception postEx)
+                    {
+                        postFailure = $"post-resolution verification failed: {postEx.Message}";
+                    }
+
+                    if (postFailure is not null)
+                        verification = new VerificationOutcome(false, postFailure);
+                }
+
                 if (verification.Success)
                 {
                     return new AgenticConflictResolverResult(
