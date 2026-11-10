@@ -906,6 +906,25 @@ public sealed class LocalGitHost : IGitHost
         return rc.Stdout.Trim();
     }
 
+    public async Task<bool> CommitExistsAsync(string repositoryId, string commitish, CancellationToken ct = default)
+    {
+        var path = GetRepoPath(repositoryId);
+        SanitizeBareRepositoryConfig(path);
+        // `rev-parse --verify --quiet` exits 1 (silently) only when the
+        // expression does not resolve to a commit — a missing object, an
+        // unknown name, or a non-commit type. Fatal conditions (repo path
+        // gone, corrupt object store) exit non-1 and surface as stderr, so
+        // they throw instead of masquerading as "object absent".
+        var rc = await RunGitAsync(path, ct, "rev-parse", "--verify", "--quiet", $"{commitish}^{{commit}}");
+        return rc.ExitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => throw new InvalidOperationException(
+                $"git rev-parse existence probe for '{commitish}' failed: {rc.Stderr}"),
+        };
+    }
+
     public async Task<bool> IsAncestorAsync(string repositoryId, string ancestorCommit, string descendantCommit, CancellationToken ct = default)
     {
         if (!LooksLikeSha(ancestorCommit))
@@ -1258,20 +1277,11 @@ public sealed class LocalGitHost : IGitHost
     {
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
-        var rc = await RunGitAsync(path, ct, "diff", "--name-status", "-M", fromTreeish, toTreeish);
+        var rc = await RunGitAsync(path, ct, MergeScopeFenceDiffContract.NameStatusArguments(fromTreeish, toTreeish));
         if (rc.ExitCode != 0)
             throw new InvalidOperationException($"git diff --name-status failed: {rc.Stderr}");
 
-        var changes = new List<GitChangedPath>();
-        foreach (var line in rc.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var parts = line.Split('\t', StringSplitOptions.None);
-            if (parts.Length == 2)
-                changes.Add(new GitChangedPath(parts[0], parts[1]));
-            else if (parts.Length == 3)
-                changes.Add(new GitChangedPath(parts[0], parts[2], parts[1]));
-        }
-        return changes;
+        return GitNameStatusParser.Parse(rc.Stdout);
     }
 
     public async Task<string> GetUnifiedDiffAsync(
@@ -1284,8 +1294,10 @@ public sealed class LocalGitHost : IGitHost
         ValidateRepositoryRelativePath(filePath);
         var path = GetRepoPath(repositoryId);
         SanitizeBareRepositoryConfig(path);
+        // Attribute-proofing flags live in the shared fence contract so the
+        // host and sandbox diffs cannot drift apart.
         var rc = await RunGitAsync(
-            path, ct, "diff", "--no-ext-diff", "--no-color", "--unified=0", fromTreeish, toTreeish, "--", filePath);
+            path, ct, MergeScopeFenceDiffContract.FileContentArguments(fromTreeish, toTreeish, filePath));
         if (rc.ExitCode != 0)
             throw new InvalidOperationException($"git diff for '{filePath}' failed: {rc.Stderr}");
         return rc.Stdout;

@@ -135,6 +135,18 @@ public sealed class ValidationTests
         Assert.DoesNotContain(cutInsidePair, char.IsSurrogate);
     }
 
+    [Theory]
+    [InlineData("0123456789abcdef0123456789abcdef01234567", true)]   // SHA-1
+    [InlineData("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", true)] // SHA-256
+    [InlineData("0123456789abcdef0123456789abcdef0123456", false)]   // 39 chars
+    [InlineData("0123456789abcdef0123456789abcdef012345678", false)] // 41 chars — not a git object id
+    [InlineData("0123456789abcdef0123456789abcdef0123456789abcde", false)] // 61 chars
+    [InlineData("0123456789ABCDEF0123456789ABCDEF01234567", false)]  // uppercase
+    [InlineData("0123456789abcdef0123456789abcdef0123456g", false)]  // non-hex
+    [InlineData("", false)]
+    public void IsGitObjectId_AcceptsOnlyExactSha1OrSha256Lengths(string value, bool expected)
+        => Assert.Equal(expected, Validation.IsGitObjectId(value));
+
     [Fact]
     public void RejectedBranchName_ErrorEchoIsBoundedAndControlFree()
     {

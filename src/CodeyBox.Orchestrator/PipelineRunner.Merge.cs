@@ -178,6 +178,7 @@ public sealed partial class PipelineRunner
                     $"sandbox checked out {preMerge.Stdout.Trim()}, but host base '{baseBranch}' resolved to {preMergeSha}");
 
             IReadOnlyList<ConflictHunk> conflictHunks = [];
+            string sandboxMergeBaselineTree = string.Empty;
             if (hostMerge.HasConflicts)
             {
                 conflictHunks = await ExtractHostConflictHunksAsync(repoId, hostMerge, ct);
@@ -188,6 +189,130 @@ public sealed partial class PipelineRunner
                 if (hostConflict.Success)
                     throw new MergePhaseInconsistentResultException(
                         "host git reported conflicts but sandbox git merged the same commits cleanly");
+
+                // The scope fence needs the conflict-baseline merge tree as a
+                // diff base, but hostMerge.TreeSha lives only in the durable
+                // repo's object store: merge/staging clones run `--no-local`,
+                // so unreachable objects (a merge-tree result has no ref)
+                // never reach the sandbox. Recompute the identical tree
+                // inside the sandbox against the same commit SHAs — same
+                // inputs, same tree, objects already local.
+                var sandboxMergeTree = await sandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", SandboxConventions.WorkDir,
+                        "merge-tree", "--write-tree", "--no-messages", preMergeSha, workTipSha],
+                }, ct);
+                var baselineLines = sandboxMergeTree.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                if (baselineLines.Length == 0
+                    || !Validation.IsGitObjectId(baselineLines[0].Trim()))
+                    throw new MergePhaseInconsistentResultException(
+                        $"sandbox git merge-tree did not return a baseline tree: {sandboxMergeTree.Stderr}{sandboxMergeTree.Stdout}");
+                sandboxMergeBaselineTree = baselineLines[0].Trim();
+            }
+
+            // Scope-fence check evaluated INSIDE the resolver's attempt loop:
+            // a rejection is fed back as a verification failure so the current
+            // candidate gets its remaining attempts and later candidates still
+            // run, instead of the fence only firing after the resolver already
+            // reported success (which discarded the whole attempt budget —
+            // the Landgen #9 failure). `git write-tree` must produce exactly
+            // the tree the merge commit will carry, so the index is prepared
+            // the same way the finalize + suggestions-pickup steps do:
+            // suggestions.json is unstaged (its worktree copy is still read
+            // after the resolver returns) and the conflict files are staged
+            // from the worktree.
+            //
+            // Contract: return null on pass, a defect reason on a genuine
+            // scope-fence violation (fed back to the agent), and throw
+            // <see cref="PostResolutionVerificationInfrastructureException"/>
+            // for sandbox/git plumbing failures — those abort the resolver
+            // as infrastructure instead of burning agent attempts on a
+            // failure no agent turn can repair.
+            async Task<string?> VerifyResolvedMergeScopeAsync(
+                ISandbox verifySandbox, string verifyWorkDir,
+                string baselineTree, IReadOnlyList<ConflictHunk> hunks,
+                CancellationToken verifyCt)
+            {
+                // --ignore-unmatch: suggestions.json is legitimately absent
+                // from the index on resolutions that never wrote it; real
+                // git failures must still surface — an unchecked failure
+                // here would let write-tree measure a tree the merge commit
+                // path later strips, corrupting the fence's verdict.
+                var unstage = await verifySandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", verifyWorkDir, "rm", "--cached", "--force", "--ignore-unmatch", "--",
+                        ".codeybox/suggestions.json"],
+                }, verifyCt);
+                if (!unstage.Success)
+                    throw new PostResolutionVerificationInfrastructureException(
+                        $"could not unstage suggestions.json: {unstage.Stderr.Trim()}");
+                var conflictPaths = hunks
+                    .Select(h => h.Path)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray();
+                foreach (var conflictPath in conflictPaths)
+                    MergeConflictPathInspector.ValidateRelativeWorkPath(conflictPath);
+                if (conflictPaths.Length > 0)
+                {
+                    // -A so a resolution that removed a conflicted file stages
+                    // the deletion too — write-tree then reflects it and the
+                    // fence reports the real verdict instead of a staging error.
+                    var addArgv = new List<string> { "git", "-C", verifyWorkDir, "add", "-A", "--" };
+                    addArgv.AddRange(conflictPaths);
+                    var add = await verifySandbox.ExecAsync(new SandboxExec
+                    {
+                        Argv = addArgv,
+                        ExtraEnvironment = MergeConflictPathInspector.GitLiteralPathspecEnvironment,
+                    }, verifyCt);
+                    if (!add.Success)
+                        throw new PostResolutionVerificationInfrastructureException(
+                            $"could not stage resolved conflict files: {add.Stderr.Trim()}");
+                }
+
+                var tree = await verifySandbox.ExecAsync(new SandboxExec
+                {
+                    Argv = ["git", "-C", verifyWorkDir, "write-tree"],
+                }, verifyCt);
+                var resolvedTree = tree.Stdout.Trim();
+                if (!tree.Success)
+                    throw new PostResolutionVerificationInfrastructureException(
+                        $"could not compute resolved merge tree: {tree.Stderr.Trim()}");
+                // The resolved treeish is fed back into sandbox git argv by
+                // the fence — validate it is a real object id before reuse,
+                // same contract as the merge-tree baseline above.
+                if (!Validation.IsGitObjectId(resolvedTree))
+                    throw new PostResolutionVerificationInfrastructureException(
+                        "could not compute resolved merge tree: git write-tree did not return a valid object id");
+
+                try
+                {
+                    await MergeScopeFence.VerifySandboxAsync(
+                        verifySandbox,
+                        verifyWorkDir,
+                        baselineTree,
+                        resolvedTree,
+                        hunks,
+                        project.Audit.MergeScopeBufferLines,
+                        verifyCt);
+                    return null;
+                }
+                catch (ScopeFenceViolation ex)
+                {
+                    return ex.Message;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (ex is not IExecutionTransportLoss)
+                {
+                    // Fence plumbing failures (sandbox exec, git diff) are
+                    // infrastructure, not resolution defects. Transport-loss
+                    // signals stay unwrapped so SandboxDeferralGuard still
+                    // recognizes them.
+                    throw new PostResolutionVerificationInfrastructureException(
+                        $"merge scope fence verification could not run: {ex.Message}", ex);
+                }
             }
 
             // Clean-merge prompt is only meaningful when there are no conflicts.
@@ -240,7 +365,11 @@ public sealed partial class PipelineRunner
                             MergeScope = mergeScope,
                         },
                         candidates,
-                        ct);
+                        ct,
+                        postVerificationAsync: (verifySandbox, verifyWorkDir, verifyCt) =>
+                            VerifyResolvedMergeScopeAsync(
+                                verifySandbox, verifyWorkDir,
+                                sandboxMergeBaselineTree, conflictHunks, verifyCt));
                     await HandleAgenticResolverAuthRequiredOutputAsync(
                         item, project, "merge-resolver", resolverResult, ct);
                     agentResult = new AgentResult(
@@ -390,7 +519,7 @@ public sealed partial class PipelineRunner
                 if (mergeFailureClassification.Kind == AgentFailureKind.Infrastructure && hostMerge.HasConflicts)
                 {
                     throw new MergeConflictResolutionFailedException(
-                        $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}",
+                        MergeResolverConflictFailureMessage(hostMerge, agentResult),
                         failureKind: WorkItemFailureKinds.Infrastructure,
                         agent: chosenMergeRunner.Kind,
                         phase: "merge");
@@ -415,8 +544,12 @@ public sealed partial class PipelineRunner
                     stdout: classificationResult.Stdout);
 
                 if (hostMerge.HasConflicts)
+                    // Carry the resolver's per-attempt trail (verification
+                    // reasons incl. scope-fence violations) into the failure:
+                    // the guard-rework brief and operator-facing LastError
+                    // must name WHY resolution failed, not just that it did.
                     throw new MergeConflictResolutionFailedException(
-                        $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}");
+                        MergeResolverConflictFailureMessage(hostMerge, agentResult));
                 var detail = BuildAgentFailureDetail($"Merge agent {chosenMergeRunner.Kind} reported failure", agentResult, _opts.MaxFailureDetailBytes);
                 throw new InvalidOperationException(detail);
             }
@@ -426,11 +559,13 @@ public sealed partial class PipelineRunner
             // Mirror the work-phase pattern: strip from the git index first so a staged
             // suggestions.json doesn't leave a deletion entry that confuses git status.
             var mergeSuggestionsJson = await TryReadSuggestionsFileAsync(sandbox, ct);
-            await sandbox.ExecAsync(new SandboxExec
+            var unstageSuggestions = await sandbox.ExecAsync(new SandboxExec
             {
-                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--",
+                Argv = ["git", "-C", SandboxConventions.WorkDir, "rm", "--cached", "--force", "--ignore-unmatch", "--",
                 ".codeybox/suggestions.json"],
             }, ct);
+            if (!unstageSuggestions.Success)
+                throw new InvalidOperationException($"could not unstage suggestions.json: {unstageSuggestions.Stderr.Trim()}");
             await sandbox.ExecAsync(new SandboxExec
             {
                 Argv = ["rm", "-f", $"{SandboxConventions.WorkDir}/.codeybox/suggestions.json"],
@@ -481,6 +616,22 @@ public sealed partial class PipelineRunner
                 {
                     throw new MergeConflictResolutionFailedException(ex.Message, ex);
                 }
+
+                // Publish the resolved merge result as the work-branch tip:
+                // the PR head must BE this merge commit — it carries the
+                // base ancestry plus the fence-verified resolution — not
+                // the pre-merge work tip. Pushing the latter leaves GitHub
+                // looking at a stale, divergent head whose tree lacks the
+                // resolution entirely (the Foligen #43 failure: the merge
+                // agent resolved locally, the original work commit was
+                // pushed instead, and the PR went dirty against an
+                // unchanged base). Fast-forward by construction: the
+                // merge commit's second parent is the prior work tip.
+                // Deliberately OUTSIDE the try above: advancing the durable
+                // ref is host-git infrastructure, not a resolution verdict —
+                // wrapping it would misroute an infra failure into bounded
+                // conflict rework.
+                await _gitHost.SetBranchToCommitAsync(repoId, workBranch, mergeSha, ct);
             }
             else
             {
@@ -511,6 +662,14 @@ public sealed partial class PipelineRunner
                 await _gitHost.DisposeIsolatedMergeCloneAsync(repoId, isolatedMergeRepoPath, CancellationToken.None);
         }
     }
+
+    /// <summary>
+    /// Single source for the merge-resolver conflict failure text: the
+    /// infrastructure-classified and generic conflict throws must not drift
+    /// apart, so both build the message here.
+    /// </summary>
+    private static string MergeResolverConflictFailureMessage(GitMergeTreeResult hostMerge, AgentResult agentResult)
+        => $"merge resolver failed while host git reported conflicts in {string.Join(", ", hostMerge.ConflictedFiles)}: {RedactAndTruncateAgentDetail(agentResult.Summary)}";
 
     /// <summary>
     /// Sanity-check the agent's merge before letting the orchestrator push:

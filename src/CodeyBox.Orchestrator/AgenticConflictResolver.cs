@@ -65,6 +65,24 @@ public sealed class AgentCredentialSandboxPoisonedException : Exception
 }
 
 /// <summary>
+/// Infrastructure failure inside a caller-supplied post-resolution
+/// verification hook — sandbox/git plumbing that could not run (a failed
+/// <c>git rm --cached</c>/<c>git add</c>/<c>write-tree</c>, a dead exec
+/// channel), NOT a verdict on the agent's resolution. The resolver lets
+/// this propagate instead of folding it into per-attempt agent feedback:
+/// no additional agent turn can repair a plumbing failure, so it must
+/// abort resolution and surface to the caller's infrastructure handling.
+/// A genuine resolution defect still travels as the hook's string reason.
+/// </summary>
+internal sealed class PostResolutionVerificationInfrastructureException : Exception
+{
+    public PostResolutionVerificationInfrastructureException(string message, Exception? innerException = null)
+        : base(message, innerException)
+    {
+    }
+}
+
+/// <summary>
 /// Mutable hot-reload holder for <see cref="AgenticConflictResolverOptions"/>.
 /// Construction-time DI binds a single instance; operators swap the underlying
 /// options via <see cref="Apply"/>. Mirrors the
@@ -263,13 +281,29 @@ public sealed class AgenticConflictResolver
     /// attempts. Returns success on the first attempt whose post-run
     /// verification passes, failure with a concrete reason otherwise.
     /// </summary>
+    /// <param name="postVerificationAsync">
+    /// Optional caller-supplied check run after <see cref="VerifyResolutionAsync"/>
+    /// passes. Returns null when the resolution is acceptable, or a failure
+    /// reason consumed exactly like a verification failure — the attempt is
+    /// charged and the next attempt/escalation sees the reason as feedback.
+    /// The merge phase uses it to evaluate the scope fence inside the loop
+    /// (the fence otherwise only runs after the resolver reports success,
+    /// which burned the whole attempt budget on a rejection the agent could
+    /// have repaired). Throw
+    /// <see cref="PostResolutionVerificationInfrastructureException"/> for
+    /// infrastructure failures (sandbox/git plumbing): those propagate
+    /// rather than burning attempts, because no agent turn can repair them.
+    /// <see cref="IExecutionTransportLoss"/> exceptions likewise propagate.
+    /// Any other unexpected exception is folded into a verification failure.
+    /// </param>
     public async Task<AgenticConflictResolverResult> ResolveAsync(
         ISandbox sandbox,
         string workingDirectory,
         WorkItemId workItemId,
         AgenticConflictResolverContext context,
         IReadOnlyList<AgenticConflictResolverCandidate> candidates,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<ISandbox, string, CancellationToken, Task<string?>>? postVerificationAsync = null)
     {
         if (sandbox is null) throw new ArgumentNullException(nameof(sandbox));
         if (string.IsNullOrWhiteSpace(workingDirectory)) throw new ArgumentException("workingDirectory must be non-empty", nameof(workingDirectory));
@@ -758,6 +792,40 @@ public sealed class AgenticConflictResolver
 
                 var verification = await VerifyResolutionAsync(
                     sandbox, workingDirectory, conflictFiles, options, ct);
+                if (verification.Success && postVerificationAsync is not null)
+                {
+                    string? postFailure;
+                    try
+                    {
+                        postFailure = await postVerificationAsync(sandbox, workingDirectory, ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (PostResolutionVerificationInfrastructureException)
+                    {
+                        // Plumbing failure, not a resolution defect: abort
+                        // the resolver so the caller's infrastructure path
+                        // handles it instead of feeding it back as if the
+                        // agent could repair it.
+                        throw;
+                    }
+                    catch (Exception postEx) when (postEx is IExecutionTransportLoss)
+                    {
+                        // A dead exec transport is infrastructure too — never
+                        // fold it into agent feedback.
+                        throw;
+                    }
+                    catch (Exception postEx)
+                    {
+                        postFailure = $"post-resolution verification failed: {postEx.Message}";
+                    }
+
+                    if (postFailure is not null)
+                        verification = new VerificationOutcome(false, postFailure);
+                }
+
                 if (verification.Success)
                 {
                     return new AgenticConflictResolverResult(
