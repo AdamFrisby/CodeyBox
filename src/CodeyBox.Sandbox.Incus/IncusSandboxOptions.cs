@@ -69,6 +69,18 @@ public sealed record IncusSandboxOptions
     /// <summary>Every effective mount root plus the provider-owned staging root.</summary>
     public const int MaximumRestrictedProjectRoots = MaximumEffectiveHostPathEntries + 1;
     public const int MaximumExecRetryAttempts = 100;
+    /// <summary>Default bound for waiting out an incusd restart before retrying a failed CLI step.</summary>
+    public static readonly TimeSpan DefaultDaemonReadyTimeout = TimeSpan.FromMinutes(2);
+    /// <summary>Maximum operator-configured <see cref="DaemonReadyTimeout"/>.</summary>
+    public static readonly TimeSpan MaximumDaemonReadyTimeout = TimeSpan.FromMinutes(15);
+    /// <summary>Default cadence of the daemon-readiness probe between retries.</summary>
+    public static readonly TimeSpan DefaultDaemonReadyPollInterval = TimeSpan.FromSeconds(2);
+    /// <summary>Default per-probe deadline inside the daemon-readiness wait.</summary>
+    public static readonly TimeSpan DefaultDaemonReadyProbeTimeout = TimeSpan.FromSeconds(15);
+    /// <summary>Default extra in-place retries for one CLI step after a daemon-connectivity loss.</summary>
+    public const int DefaultDaemonUnavailableRetryAttempts = 2;
+    /// <summary>Maximum operator-configured <see cref="DaemonUnavailableRetryAttempts"/>.</summary>
+    public const int MaximumDaemonUnavailableRetryAttempts = 16;
     /// <summary>Maximum entries in the transient-infrastructure signature allowlist.</summary>
     public const int MaximumTransientInfrastructureSignatures = 32;
     /// <summary>Maximum UTF-8 bytes per transient-infrastructure signature.</summary>
@@ -206,6 +218,34 @@ public sealed record IncusSandboxOptions
     /// retries soon after the boot storm clears rather than being parked.
     /// </summary>
     public TimeSpan ProvisioningRetryRecheckIn { get; init; } = DefaultProvisioningRetryRecheckIn;
+    /// <summary>
+    /// Extra in-place retries for one Incus CLI step (copy, init, start,
+    /// exec, file push/pull, delete, and every other shelled-out operation)
+    /// after the CLI reports a lost daemon connection. Before each retry the
+    /// provider waits — bounded by <see cref="DaemonReadyTimeout"/> — for the
+    /// daemon to answer a lightweight probe again, so the retry does not
+    /// immediately hit the same restart window. Zero disables in-place
+    /// retries; the failure still classifies as transient infrastructure and
+    /// defers through <see cref="ProvisioningRetryRecheckIn"/>. Hot-reloadable.
+    /// </summary>
+    public int DaemonUnavailableRetryAttempts { get; init; } = DefaultDaemonUnavailableRetryAttempts;
+    /// <summary>
+    /// Total bounded wait for the daemon to answer a readiness probe before
+    /// each in-place retry of a daemon-connectivity failure. Must be positive
+    /// and at most 15 minutes. Hot-reloadable.
+    /// </summary>
+    public TimeSpan DaemonReadyTimeout { get; init; } = DefaultDaemonReadyTimeout;
+    /// <summary>
+    /// Delay between daemon-readiness probes while waiting out a restart.
+    /// Must be positive and no greater than <see cref="DaemonReadyTimeout"/>.
+    /// Hot-reloadable.
+    /// </summary>
+    public TimeSpan DaemonReadyPollInterval { get; init; } = DefaultDaemonReadyPollInterval;
+    /// <summary>
+    /// Per-probe deadline inside the daemon-readiness wait. Must be positive
+    /// and no greater than <see cref="DaemonReadyTimeout"/>. Hot-reloadable.
+    /// </summary>
+    public TimeSpan DaemonReadyProbeTimeout { get; init; } = DefaultDaemonReadyProbeTimeout;
     /// <summary>
     /// Base delay for the exponential backoff applied to repeated deterministic
     /// baseline-bake failures. The first bake-failure deferral rechecks after
@@ -392,6 +432,20 @@ public sealed record IncusSandboxOptions
         if (options.MaxReadinessPollInterval < options.ReadinessPollInterval)
             errors.Add($"{nameof(MaxReadinessPollInterval)} must be at least {nameof(ReadinessPollInterval)}.");
         RequirePositiveDuration(options.ProvisioningRetryRecheckIn, nameof(ProvisioningRetryRecheckIn), errors);
+        if (options.DaemonUnavailableRetryAttempts is < 0 or > MaximumDaemonUnavailableRetryAttempts)
+        {
+            errors.Add(
+                $"{nameof(DaemonUnavailableRetryAttempts)} must be between 0 and {MaximumDaemonUnavailableRetryAttempts}.");
+        }
+        RequirePositiveDuration(options.DaemonReadyTimeout, nameof(DaemonReadyTimeout), errors);
+        if (options.DaemonReadyTimeout > MaximumDaemonReadyTimeout)
+            errors.Add($"{nameof(DaemonReadyTimeout)} must be no greater than {MaximumDaemonReadyTimeout}.");
+        RequirePositiveDuration(options.DaemonReadyPollInterval, nameof(DaemonReadyPollInterval), errors);
+        if (options.DaemonReadyPollInterval > options.DaemonReadyTimeout)
+            errors.Add($"{nameof(DaemonReadyPollInterval)} must be no greater than {nameof(DaemonReadyTimeout)}.");
+        RequirePositiveDuration(options.DaemonReadyProbeTimeout, nameof(DaemonReadyProbeTimeout), errors);
+        if (options.DaemonReadyProbeTimeout > options.DaemonReadyTimeout)
+            errors.Add($"{nameof(DaemonReadyProbeTimeout)} must be no greater than {nameof(DaemonReadyTimeout)}.");
         RequirePositiveDuration(options.BaselineBakeRetryBaseDelay, nameof(BaselineBakeRetryBaseDelay), errors);
         RequirePositiveDuration(options.BaselineBakeRetryMaxDelay, nameof(BaselineBakeRetryMaxDelay), errors);
         if (options.BaselineBakeRetryMaxDelay < options.BaselineBakeRetryBaseDelay)

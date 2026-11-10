@@ -48,6 +48,26 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
         "Incus exec completed, but transient guest control-file cleanup could not be verified; the VM was stopped and must be disposed.",
         IncusTransientInfrastructure.ExecCleanupFaultClass,
         false)]
+    [InlineData(
+        "Incus COW baseline copy failed with exit code 1: Error: Lost connection to the event listener and failed to reconnect: websocket: close 1006 (abnormal closure): unexpected EOF",
+        IncusTransientInfrastructure.DaemonConnectionLostFaultClass,
+        false)]
+    [InlineData(
+        "Incus exec completed with exit code 1: Error: Lost connection to the event listener: websocket: close 1006 (abnormal closure): unexpected EOF",
+        IncusTransientInfrastructure.DaemonConnectionLostFaultClass,
+        false)]
+    [InlineData(
+        "Incus start VM failed with exit code 1: Error: websocket: close 1006 (abnormal closure): unexpected EOF",
+        IncusTransientInfrastructure.DaemonConnectionLostFaultClass,
+        false)]
+    [InlineData(
+        "Incus copy failed with exit code 1: Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: connection refused",
+        IncusTransientInfrastructure.DaemonUnreachableFaultClass,
+        false)]
+    [InlineData(
+        "Incus query failed with exit code 1: Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: no such file or directory",
+        IncusTransientInfrastructure.DaemonUnreachableFaultClass,
+        false)]
     public void TryClassifyMessage_EvidenceSignatures_AreTransient(
         string message,
         string expectedFaultClass,
@@ -68,6 +88,8 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
     [InlineData("Incus delete sandbox VM failed with exit code 1: Error: Device or resource busy")]
     [InlineData("Incus stop returned success without a positively verified STOPPED state.")]
     [InlineData("some unrelated failure without any known marker")]
+    [InlineData("Error: failed to reach the unix.socket helper endpoint")]
+    [InlineData("Error: websocket: close 1001 (going away)")]
     [InlineData("")]
     public void TryClassifyMessage_UnrelatedErrors_StayTerminal(string message)
     {
@@ -139,6 +161,12 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
     [InlineData(
         "Incus delete sandbox VM failed with exit code 1: Error: Failed unmounting instance: Failed to unmount \"/pool\"",
         IncusTransientInfrastructure.TeardownUnmountFaultClass)]
+    [InlineData(
+        "Incus COW baseline copy failed with exit code 1: Error: Lost connection to the event listener and failed to reconnect: websocket: close 1006 (abnormal closure): unexpected EOF",
+        IncusTransientInfrastructure.DaemonConnectionLostFaultClass)]
+    [InlineData(
+        "Incus file push failed with exit code 1: Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: connection refused",
+        IncusTransientInfrastructure.DaemonUnreachableFaultClass)]
     public void TryBuildTransientProvisioningDeferral_SignatureErrors_Defer(
         string message,
         string expectedErrorClass)

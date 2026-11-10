@@ -5748,6 +5748,18 @@ namespace CodeyBox.Api
         /// <summary>Delay before the recovery stack re-attempts a sandbox creation deferred because an Incus liveness deadline tripped under concurrent boot load.</summary>
         public TimeSpan ProvisioningRetryRecheckIn { get; set; } = Defaults.ProvisioningRetryRecheckIn;
 
+        /// <summary>Extra in-place retries for one Incus CLI step after the CLI reports a lost daemon connection; each retry first waits for the daemon to answer a probe again. Zero disables in-place retries (the failure still defers as transient infrastructure).</summary>
+        public int DaemonUnavailableRetryAttempts { get; set; } = Defaults.DaemonUnavailableRetryAttempts;
+
+        /// <summary>Total bounded wait for the daemon to answer a readiness probe before each in-place retry of a daemon-connectivity failure.</summary>
+        public TimeSpan DaemonReadyTimeout { get; set; } = Defaults.DaemonReadyTimeout;
+
+        /// <summary>Delay between daemon-readiness probes while waiting out an incusd restart.</summary>
+        public TimeSpan DaemonReadyPollInterval { get; set; } = Defaults.DaemonReadyPollInterval;
+
+        /// <summary>Per-probe deadline inside the daemon-readiness wait.</summary>
+        public TimeSpan DaemonReadyProbeTimeout { get; set; } = Defaults.DaemonReadyProbeTimeout;
+
         /// <summary>Allowlisted exact Incus error signatures classified as transient host infrastructure. Hot-reloadable.</summary>
         public List<string> TransientInfrastructureSignatures { get; set; } = [.. Defaults.TransientInfrastructureSignatures];
 

@@ -40,53 +40,99 @@ internal sealed class IncusCliRunner
 
         try
         {
-            var operationTimeout = timeout ?? options.OperationTimeout;
-            using var timeoutCancellation = new CancellationTokenSource(operationTimeout, _timeProvider);
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
-            ProcessRunResult result;
-            try
+            for (var retry = 0; ; retry++)
             {
-                result = await _runner.RunAsync(
-                    argv,
-                    stdin,
-                    deadline.Token,
-                    stdoutChunkCallback,
-                    stderrChunkCallback,
-                    maxStdoutBytes ?? options.MaxCliStdoutBytes,
-                    maxStderrBytes ?? options.MaxCliStderrBytes,
-                    environment: null,
-                    killOnOutputLimit).ConfigureAwait(false);
+                try
+                {
+                    return await InvokeCheckedAsync(
+                        operation,
+                        options,
+                        argv,
+                        stdin,
+                        timeout,
+                        ct,
+                        stdoutChunkCallback,
+                        stderrChunkCallback,
+                        maxStdoutBytes,
+                        maxStderrBytes,
+                        killOnOutputLimit).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (
+                    retry < options.DaemonUnavailableRetryAttempts
+                    && ex is not OperationCanceledException
+                    && IsDaemonConnectivityFailure(ex, options))
+                {
+                    // The daemon is restarting: wait — bounded by
+                    // DaemonReadyTimeout — for it to answer a probe again so
+                    // the retry does not hit the same restart window. When it
+                    // never answers, surface the original failure; the
+                    // transient classifier defers the step for re-check.
+                    if (!await WaitForDaemonReadyAsync(options, ct).ConfigureAwait(false))
+                        throw;
+                }
             }
-            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
-            {
-                throw new IncusTransientTimeoutException(
-                    operation,
-                    $"Incus {operation} exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
-                    ex);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                throw new InvalidOperationException($"Incus {operation} could not be executed.", ex);
-            }
-
-            if (result.StdoutLimitExceeded || result.StderrLimitExceeded)
-                throw new IncusOutputBoundException(
-                    operation,
-                    $"Incus {operation} exceeded its configured output bound (output-bound).");
-            if (result.StartFailed || result.ExecutionUnavailable)
-                throw new InvalidOperationException($"Incus {operation} could not start the configured CLI.");
-            if (result.ExitCode != 0)
-            {
-                var error = SanitizeError(result.Stderr);
-                throw new InvalidOperationException(
-                    $"Incus {operation} failed with exit code {result.ExitCode}: {error}");
-            }
-            return result;
         }
         finally
         {
             gateLease?.Dispose();
         }
+    }
+
+    private async Task<ProcessRunResult> InvokeCheckedAsync(
+        string operation,
+        IncusSandboxOptions options,
+        IReadOnlyList<string> argv,
+        string? stdin,
+        TimeSpan? timeout,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback,
+        Action<string>? stderrChunkCallback,
+        int? maxStdoutBytes,
+        int? maxStderrBytes,
+        bool killOnOutputLimit)
+    {
+        var operationTimeout = timeout ?? options.OperationTimeout;
+        using var timeoutCancellation = new CancellationTokenSource(operationTimeout, _timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
+        ProcessRunResult result;
+        try
+        {
+            result = await _runner.RunAsync(
+                argv,
+                stdin,
+                deadline.Token,
+                stdoutChunkCallback,
+                stderrChunkCallback,
+                maxStdoutBytes ?? options.MaxCliStdoutBytes,
+                maxStderrBytes ?? options.MaxCliStderrBytes,
+                environment: null,
+                killOnOutputLimit).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
+        {
+            throw new IncusTransientTimeoutException(
+                operation,
+                $"Incus {operation} exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
+                ex);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new InvalidOperationException($"Incus {operation} could not be executed.", ex);
+        }
+
+        if (result.StdoutLimitExceeded || result.StderrLimitExceeded)
+            throw new IncusOutputBoundException(
+                operation,
+                $"Incus {operation} exceeded its configured output bound (output-bound).");
+        if (result.StartFailed || result.ExecutionUnavailable)
+            throw new InvalidOperationException($"Incus {operation} could not start the configured CLI.");
+        if (result.ExitCode != 0)
+        {
+            var error = SanitizeError(result.Stderr);
+            throw new InvalidOperationException(
+                $"Incus {operation} failed with exit code {result.ExitCode}: {error}");
+        }
+        return result;
     }
 
     internal async Task<ProcessRunResult> RunAllowFailureAsync(
@@ -112,43 +158,154 @@ internal sealed class IncusCliRunner
             gateLease = await _operationGate.EnterAsync(options.MaxConcurrentOperations, ct).ConfigureAwait(false);
         try
         {
-            var operationTimeout = timeout ?? options.OperationTimeout;
-            using var timeoutCancellation = new CancellationTokenSource(operationTimeout, _timeProvider);
-            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
-            try
+            var result = await InvokeAllowFailureAsync(
+                options,
+                argv,
+                stdin,
+                timeout,
+                ct,
+                stdoutChunkCallback,
+                stderrChunkCallback,
+                maxStdoutBytes,
+                maxStderrBytes,
+                killOnOutputLimit).ConfigureAwait(false);
+            if (result.ExitCode != 0
+                && !result.StartFailed
+                && !result.ExecutionUnavailable
+                && IsDaemonConnectivityMessage(result.Stderr, options))
             {
-                var result = await _runner.RunAsync(
-                    argv,
-                    stdin,
-                    deadline.Token,
-                    stdoutChunkCallback,
-                    stderrChunkCallback,
-                    maxStdoutBytes: maxStdoutBytes ?? options.MaxCliStdoutBytes,
-                    maxStderrBytes: maxStderrBytes ?? options.MaxCliStderrBytes,
-                    environment: null,
-                    killOnOutputLimit).ConfigureAwait(false);
-                return result;
+                // The CLI lost its daemon connection mid-call, so the
+                // in-guest outcome is ambiguous — never a definitive command
+                // result. Report transport loss and let the caller's
+                // interrupted-exec/recovery handling decide; allow-failure
+                // steps are deliberately not retried in-band here because an
+                // `incus exec` may already have run (part of) its command.
+                result = result with { ExecutionUnavailable = true };
             }
-            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
-            {
-                var subcommand = DescribeSubcommand(argv);
-                throw new IncusTransientTimeoutException(
-                    subcommand,
-                    $"Incus CLI operation [{subcommand}] exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
-                    ex);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                throw new InvalidOperationException(
-                    "Incus CLI operation could not be executed.",
-                    ex);
-            }
+            return result;
         }
         finally
         {
             gateLease?.Dispose();
         }
     }
+
+    private async Task<ProcessRunResult> InvokeAllowFailureAsync(
+        IncusSandboxOptions options,
+        IReadOnlyList<string> argv,
+        string? stdin,
+        TimeSpan? timeout,
+        CancellationToken ct,
+        Action<string>? stdoutChunkCallback,
+        Action<string>? stderrChunkCallback,
+        int? maxStdoutBytes,
+        int? maxStderrBytes,
+        bool killOnOutputLimit)
+    {
+        var operationTimeout = timeout ?? options.OperationTimeout;
+        using var timeoutCancellation = new CancellationTokenSource(operationTimeout, _timeProvider);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCancellation.Token);
+        try
+        {
+            var result = await _runner.RunAsync(
+                argv,
+                stdin,
+                deadline.Token,
+                stdoutChunkCallback,
+                stderrChunkCallback,
+                maxStdoutBytes: maxStdoutBytes ?? options.MaxCliStdoutBytes,
+                maxStderrBytes: maxStderrBytes ?? options.MaxCliStderrBytes,
+                environment: null,
+                killOnOutputLimit).ConfigureAwait(false);
+            return result;
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCancellation.IsCancellationRequested)
+        {
+            var subcommand = DescribeSubcommand(argv);
+            throw new IncusTransientTimeoutException(
+                subcommand,
+                $"Incus CLI operation [{subcommand}] exceeded its {operationTimeout.TotalSeconds:F0}-second deadline.",
+                ex);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new InvalidOperationException(
+                "Incus CLI operation could not be executed.",
+                ex);
+        }
+    }
+
+    private const int DaemonProbeMaxStdoutBytes = 64 * 1024;
+    private const int DaemonProbeMaxStderrBytes = 4096;
+
+    /// <summary>
+    /// Polls <c>incus query /1.0</c> until the daemon answers or
+    /// <see cref="IncusSandboxOptions.DaemonReadyTimeout"/> elapses. Returns
+    /// true when the daemon answered; false when the bounded wait expired.
+    /// Never throws for daemon-side failures — only caller cancellation
+    /// propagates.
+    /// </summary>
+    private async Task<bool> WaitForDaemonReadyAsync(IncusSandboxOptions options, CancellationToken ct)
+    {
+        var deadline = _timeProvider.GetUtcNow() + options.DaemonReadyTimeout;
+        var pollInterval = options.DaemonReadyPollInterval;
+        var probeTimeout = options.DaemonReadyProbeTimeout;
+        var probeArgv = new[] { options.BinaryPath, "query", "/1.0" };
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var remaining = deadline - _timeProvider.GetUtcNow();
+            if (remaining <= TimeSpan.Zero)
+                return false;
+            var slice = remaining < probeTimeout ? remaining : probeTimeout;
+            using var probeDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            // CancelAfter is hard-wired to the system clock; an ITimer on the
+            // injected TimeProvider keeps the probe deadline on the same clock
+            // as the readiness wait (a fake-clock Advance() then fires both).
+            using var probeTimer = _timeProvider.CreateTimer(
+                static state =>
+                {
+                    try
+                    {
+                        ((CancellationTokenSource)state!).Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The probe completed and disposed the CTS first.
+                    }
+                },
+                probeDeadline,
+                slice,
+                Timeout.InfiniteTimeSpan);
+            ProcessRunResult? probe = null;
+            try
+            {
+                probe = await _runner.RunAsync(
+                    probeArgv,
+                    stdin: null,
+                    probeDeadline.Token,
+                    maxStdoutBytes: DaemonProbeMaxStdoutBytes,
+                    maxStderrBytes: DaemonProbeMaxStderrBytes).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                // A refused socket, a timed-out probe, or a spawn failure all
+                // mean "not ready yet" — keep polling inside the bound.
+            }
+            if (probe is { ExitCode: 0, StartFailed: false, ExecutionUnavailable: false })
+                return true;
+            var delay = pollInterval < remaining ? pollInterval : remaining;
+            await Task.Delay(delay, _timeProvider, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsDaemonConnectivityFailure(Exception ex, IncusSandboxOptions options) =>
+        IncusTransientInfrastructure.IsDaemonConnectivityFault(
+            IncusTransientInfrastructure.TryClassify(ex, options.TransientInfrastructureSignatures));
+
+    private static bool IsDaemonConnectivityMessage(string? message, IncusSandboxOptions options) =>
+        IncusTransientInfrastructure.IsDaemonConnectivityFault(
+            IncusTransientInfrastructure.TryClassifyMessage(message, options.TransientInfrastructureSignatures));
 
     // incus command groups whose second token is part of the subcommand
     // (e.g. `incus file push`, `incus config device`). Kept small and matched

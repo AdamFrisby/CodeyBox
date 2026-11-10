@@ -295,6 +295,145 @@ public sealed class IncusCliRunnerTests
         Assert.Equal("Incus CLI operation could not be executed.", exception.Message);
     }
 
+    [Fact]
+    public async Task RunCheckedAsync_DaemonConnectionLoss_WaitsForProbeThenRetries()
+    {
+        var options = Options with
+        {
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+            DaemonReadyTimeout = TimeSpan.FromSeconds(5),
+            DaemonReadyProbeTimeout = TimeSpan.FromSeconds(5),
+        };
+        var invocations = new List<IReadOnlyList<string>>();
+        var runner = new IncusCliRunner(new StubProcessRunner((argv, _, _) =>
+        {
+            invocations.Add(argv);
+            if (argv.Contains("copy", StringComparer.Ordinal) && invocations.Count == 1)
+            {
+                return Task.FromResult(new ProcessRunResult(
+                    1,
+                    string.Empty,
+                    "Error: Lost connection to the event listener and failed to reconnect: " +
+                    "websocket: close 1006 (abnormal closure): unexpected EOF"));
+            }
+            return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+        }));
+
+        var result = await runner.RunCheckedAsync(
+            "copy baseline",
+            options,
+            ["incus", "copy", "source/ready", "target"],
+            stdin: null,
+            timeout: null,
+            CancellationToken.None);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal(3, invocations.Count);
+        Assert.Equal(new[] { "incus", "query", "/1.0" }, invocations[1]);
+        Assert.Contains("copy", invocations[2], StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunCheckedAsync_DaemonNeverReady_SurfacesOriginalFailure()
+    {
+        var options = Options with
+        {
+            DaemonUnavailableRetryAttempts = 1,
+            DaemonReadyTimeout = TimeSpan.FromMilliseconds(40),
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(5),
+            DaemonReadyProbeTimeout = TimeSpan.FromMilliseconds(10),
+        };
+        var copyAttempts = 0;
+        var probeAttempts = 0;
+        var runner = new IncusCliRunner(new StubProcessRunner((argv, _, _) =>
+        {
+            if (argv.Contains("copy", StringComparer.Ordinal))
+            {
+                copyAttempts++;
+                return Task.FromResult(new ProcessRunResult(
+                    1,
+                    string.Empty,
+                    "Error: Lost connection to the event listener and failed to reconnect: " +
+                    "websocket: close 1006 (abnormal closure): unexpected EOF"));
+            }
+            probeAttempts++;
+            return Task.FromResult(new ProcessRunResult(1, string.Empty, "connection refused"));
+        }));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            runner.RunCheckedAsync(
+                "copy baseline",
+                options,
+                ["incus", "copy", "source/ready", "target"],
+                stdin: null,
+                timeout: null,
+                CancellationToken.None));
+
+        Assert.Contains("Lost connection to the event listener", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(1, copyAttempts);
+        Assert.True(probeAttempts >= 2, "the bounded readiness wait must poll more than once");
+    }
+
+    [Fact]
+    public async Task RunCheckedAsync_NonDaemonFailure_IsNotRetried()
+    {
+        var invocations = 0;
+        var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) =>
+        {
+            invocations++;
+            return Task.FromResult(new ProcessRunResult(1, string.Empty, "Error: instance already exists"));
+        }));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            runner.RunCheckedAsync(
+                "copy baseline",
+                Options,
+                ["incus", "copy", "source/ready", "target"],
+                stdin: null,
+                timeout: null,
+                CancellationToken.None));
+
+        Assert.Equal(1, invocations);
+    }
+
+    [Fact]
+    public async Task RunAllowFailureAsync_DaemonConnectionLoss_ReportsExecutionUnavailable()
+    {
+        var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(
+                1,
+                string.Empty,
+                "Error: Lost connection to the event listener: websocket: close 1006 (abnormal closure): unexpected EOF"))));
+
+        var result = await runner.RunAllowFailureAsync(
+            Options,
+            ["incus", "exec", "codeybox-test", "--", "/bin/true"],
+            stdin: null,
+            timeout: null,
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(result.ExecutionUnavailable);
+    }
+
+    [Fact]
+    public async Task RunAllowFailureAsync_NonDaemonFailure_KeepsDefinitiveResult()
+    {
+        var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(3, string.Empty, "Error: command exited 3"))));
+
+        var result = await runner.RunAllowFailureAsync(
+            Options,
+            ["incus", "exec", "codeybox-test", "--", "/bin/false"],
+            stdin: null,
+            timeout: null,
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.False(result.ExecutionUnavailable);
+        Assert.Equal(3, result.ExitCode);
+    }
+
     private sealed class StubProcessRunner(
         Func<IReadOnlyList<string>, string?, CancellationToken, Task<ProcessRunResult>> handler)
         : IProcessRunner

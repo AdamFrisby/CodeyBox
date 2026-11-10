@@ -661,6 +661,23 @@ public sealed class IncusSandboxProvider :
 
     private static string SingleLineDetail(Exception ex) => SingleLineText(ex.Message);
 
+    /// <summary>
+    /// Renders the allowlisted transient signature an allow-failure result's
+    /// stderr matched — never the raw stderr, which may carry secrets — so a
+    /// terminal throw site still lets <see cref="IncusTransientInfrastructure"/>
+    /// classify daemon-restart losses instead of surfacing them as work
+    /// faults. Empty when nothing allowlisted matches.
+    /// </summary>
+    private static string TransientSignatureSuffix(string? stderr, IncusSandboxOptions options)
+    {
+        var fault = IncusTransientInfrastructure.TryClassifyMessage(
+            stderr,
+            options.TransientInfrastructureSignatures);
+        return fault is null
+            ? string.Empty
+            : $" [transient signature matched: {fault.MatchedSignature}]";
+    }
+
     private async Task<ISandbox> AdoptRetainedSandboxAsync(
         SandboxSpec spec,
         IncusSandboxOptions options,
@@ -1733,7 +1750,10 @@ public sealed class IncusSandboxProvider :
                         || GetConfig(winner.Config, BaselinePoolKey) != options.StoragePoolName
                         || !string.Equals(winner.Status, "STOPPED", StringComparison.OrdinalIgnoreCase)
                         || !await SnapshotExistsAsync(options, baselineName, ReadySnapshot, ct).ConfigureAwait(false))
-                        throw new InvalidOperationException($"Failed to publish Incus baseline '{baselineName}' and no valid concurrent winner exists.");
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed to publish Incus baseline '{baselineName}' and no valid concurrent winner exists{TransientSignatureSuffix(publish.Stderr, options)}.");
+                    }
                     ClearBakeFailure(baselineName);
                     return baselineName;
                 }
@@ -2212,7 +2232,7 @@ public sealed class IncusSandboxProvider :
             if (!create.Success && !await ProjectExistsAsync(options, ct).ConfigureAwait(false))
             {
                 throw new InvalidOperationException(
-                    $"Incus restricted-project creation failed with exit code {create.ExitCode}.");
+                    $"Incus restricted-project creation failed with exit code {create.ExitCode}{TransientSignatureSuffix(create.Stderr, options)}.");
             }
         }
 
@@ -2388,8 +2408,12 @@ public sealed class IncusSandboxProvider :
             || result.StderrLimitExceeded
             || !TryAcceptCloudInitStatus(result.Stdout, result.ExitCode, out var degraded))
         {
+            // Surface only the allowlisted signature the stderr matched —
+            // never the raw stderr, which may carry secrets — so an
+            // allowlisted daemon-connectivity signature still reaches the
+            // transient-infrastructure classifier instead of going terminal.
             throw new InvalidOperationException(
-                $"Incus cloud-init did not reach a non-fatal completed state (exit code {result.ExitCode}).");
+                $"Incus cloud-init did not reach a non-fatal completed state (exit code {result.ExitCode}){TransientSignatureSuffix(result.Stderr, options)}.");
         }
         if (degraded)
         {
@@ -2880,8 +2904,11 @@ public sealed class IncusSandboxProvider :
             var hint = string.IsNullOrWhiteSpace(verification.FailureHint)
                 ? "the required command is not runnable by the configured sandbox identity on its non-login PATH"
                 : verification.FailureHint;
+            // The matched allowlisted signature (never raw stderr, which may
+            // carry secrets) keeps a daemon restart mid-verification on the
+            // transient-infrastructure path instead of terminal.
             throw new InvalidOperationException(
-                $"Incus VM provisioning verification '{verification.Label}' failed: {hint}.");
+                $"Incus VM provisioning verification '{verification.Label}' failed: {hint}{TransientSignatureSuffix(result.Stderr, options)}.");
         }
     }
 

@@ -45,11 +45,23 @@ public static class IncusTransientInfrastructure
     public const string UnmountingSignature = "Failed unmounting instance";
     public const string UnmountSignature = "Failed to unmount";
     public const string ControlFileCleanupSignature = "transient guest control-file cleanup could not be verified";
+    // Daemon-restart connectivity losses. "Lost connection to the event
+    // listener" covers both the provisioning variant ("...and failed to
+    // reconnect: websocket: close 1006 ...") and the bare exec-path variant;
+    // the websocket signature catches the same drop reported without the
+    // prefix. "unix.socket: connect:" scopes dial failures ("connection
+    // refused", "no such file or directory") to the local incus daemon
+    // socket — that path+op pair only appears in the CLI's daemon endpoint.
+    public const string DaemonConnectionLostSignature = "Lost connection to the event listener";
+    public const string DaemonWebsocketCloseSignature = "websocket: close 1006";
+    public const string DaemonSocketSignature = "unix.socket: connect:";
 
     public const string BeginTransactionFaultClass = "incus-db-transaction-deadline";
     public const string CliDeadlineFaultClass = "incus-cli-deadline";
     public const string TeardownUnmountFaultClass = "incus-teardown-unmount";
     public const string ExecCleanupFaultClass = "incus-exec-cleanup-unverified";
+    public const string DaemonConnectionLostFaultClass = "incus-daemon-connection-lost";
+    public const string DaemonUnreachableFaultClass = "incus-daemon-unreachable";
 
     private const int MaxScannedChars = 8 * 1024;
     private const int MaxExceptionChainDepth = 8;
@@ -61,6 +73,9 @@ public static class IncusTransientInfrastructure
         UnmountingSignature,
         UnmountSignature,
         ControlFileCleanupSignature,
+        DaemonConnectionLostSignature,
+        DaemonWebsocketCloseSignature,
+        DaemonSocketSignature,
     ];
 
     /// <summary>
@@ -123,6 +138,18 @@ public static class IncusTransientInfrastructure
     public static bool IsTeardownFault(IncusTransientInfrastructureFault? fault) =>
         fault is not null && fault.IsTeardown;
 
+    /// <summary>
+    /// True when <paramref name="fault"/> is a lost-daemon-connection class —
+    /// the only transient faults worth waiting out in-band (bounded, via
+    /// <see cref="IncusSandboxOptions.DaemonReadyTimeout"/>) before retrying
+    /// the failed CLI step. Other transient faults (deadline misses, teardown
+    /// unmount races) keep their existing defer-and-recheck handling.
+    /// </summary>
+    public static bool IsDaemonConnectivityFault(IncusTransientInfrastructureFault? fault) =>
+        fault is not null
+        && (fault.FaultClass == DaemonConnectionLostFaultClass
+            || fault.FaultClass == DaemonUnreachableFaultClass);
+
     private static IEnumerable<string> OrderedSignatures(IReadOnlyList<string>? signatures)
     {
         if (signatures is null || signatures.Count == 0)
@@ -149,6 +176,9 @@ public static class IncusTransientInfrastructure
             UnmountingSignature => new(TeardownUnmountFaultClass, matchedSignature, IsTeardown: true),
             UnmountSignature => new(TeardownUnmountFaultClass, matchedSignature, IsTeardown: true),
             ControlFileCleanupSignature => new(ExecCleanupFaultClass, matchedSignature, IsTeardown: false),
+            DaemonConnectionLostSignature => new(DaemonConnectionLostFaultClass, matchedSignature, IsTeardown: false),
+            DaemonWebsocketCloseSignature => new(DaemonConnectionLostFaultClass, matchedSignature, IsTeardown: false),
+            DaemonSocketSignature => new(DaemonUnreachableFaultClass, matchedSignature, IsTeardown: false),
             _ => new("incus-transient-infrastructure", matchedSignature, IsTeardown: false),
         };
 }
