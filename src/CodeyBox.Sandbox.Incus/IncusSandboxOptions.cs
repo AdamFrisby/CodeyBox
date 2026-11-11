@@ -226,11 +226,14 @@ public sealed record IncusSandboxOptions
     /// push of fixed content), and instance-creating steps (init/copy) that
     /// first prove any half-created target instance absent. <c>incus exec</c>
     /// argv and other guest-side-effect or existence-sensitive steps (start,
-    /// stop, delete, move, snapshot create, device add, exec) are never
+    /// stop, delete, move, snapshot create, device add) are never
     /// retried in-band — exec stderr is guest-controlled and must not drive
-    /// transport-loss classification either — but they still classify as
-    /// transient infrastructure and defer through
-    /// <see cref="ProvisioningRetryRecheckIn"/>. Before each retry the runner
+    /// transport-loss classification either. The non-exec steps in that set
+    /// still classify as transient infrastructure and defer through
+    /// <see cref="ProvisioningRetryRecheckIn"/>; <c>incus exec</c>
+    /// daemon-signature matches stay terminal by design (genuine exec
+    /// transport loss is reported out-of-band via ExecutionUnavailable and
+    /// the guest completion-sentinel check). Before each retry the runner
     /// waits — bounded by <see cref="DaemonReadyTimeout"/> — for the daemon
     /// to answer a probe again, so the retry does not immediately hit the
     /// same restart window. Zero disables in-place retries. Hot-reloadable.

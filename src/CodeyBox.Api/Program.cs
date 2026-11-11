@@ -5748,7 +5748,7 @@ namespace CodeyBox.Api
         /// <summary>Delay before the recovery stack re-attempts a sandbox creation deferred because an Incus liveness deadline tripped under concurrent boot load.</summary>
         public TimeSpan ProvisioningRetryRecheckIn { get; set; } = Defaults.ProvisioningRetryRecheckIn;
 
-        /// <summary>Extra in-place retries for one checked Incus CLI step the call site marks safe to re-run (idempotent reads/writes and instance-creating init/copy with half-created-target cleanup) after the CLI reports a lost daemon connection; each retry first waits for the daemon to answer a probe again. Exec and other non-idempotent steps are never retried in-band — they defer as transient infrastructure instead. Zero disables in-place retries.</summary>
+        /// <summary>Extra in-place retries for one checked Incus CLI step the call site marks safe to re-run (idempotent reads/writes and instance-creating init/copy with half-created-target cleanup) after the CLI reports a lost daemon connection; each retry first waits for the daemon to answer a probe again. Exec and other non-idempotent steps are never retried in-band — non-exec steps defer as transient infrastructure; incus exec daemon-signature matches stay terminal by design (genuine exec transport loss is reported out-of-band via ExecutionUnavailable and the guest completion-sentinel check). Zero disables in-place retries.</summary>
         public int DaemonUnavailableRetryAttempts { get; set; } = Defaults.DaemonUnavailableRetryAttempts;
 
         /// <summary>Total bounded wait for the daemon to answer a readiness probe before each in-place retry of a daemon-connectivity failure.</summary>
