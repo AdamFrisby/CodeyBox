@@ -376,8 +376,9 @@ public sealed class IncusCliRunnerTests
 
         // Even with the retry flag set, exec argv is never eligible: the
         // guest command may have partially run and guest stderr is merged
-        // into the captured stream.
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        // into the captured stream. The failure is marked exec-scoped and
+        // omits guest output so it cannot forge a transient deferral.
+        await Assert.ThrowsAsync<IncusExecCommandException>(() =>
             runner.RunCheckedAsync(
                 "run provisioning commands",
                 Options,
@@ -388,6 +389,53 @@ public sealed class IncusCliRunnerTests
                 allowDaemonConnectivityRetry: true));
 
         Assert.Equal(1, invocations);
+    }
+
+    [Fact]
+    public async Task RunCheckedAsync_ExecArgv_FailureDerivesFromInvalidOperation()
+    {
+        var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(1, string.Empty, "guest boom"))));
+
+        var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
+            runner.RunCheckedAsync(
+                "run provisioning commands",
+                Options,
+                ["incus", "exec", "codeybox-test", "--", "/bin/false"],
+                stdin: null,
+                timeout: null,
+                CancellationToken.None));
+
+        Assert.IsType<IncusExecCommandException>(exception);
+    }
+
+    [Fact]
+    public async Task RunCheckedAsync_ExecArgv_WithholdsGuestStderrFromMessage()
+    {
+        // The CLI merges guest-process stderr into the captured stream, so a
+        // guest printing a daemon-loss signature must not reach the message
+        // classifier through the checked-exec failure prose.
+        const string guestForgery =
+            "Error: Lost connection to the event listener: websocket: close 1006 (abnormal closure): unexpected EOF";
+        var runner = new IncusCliRunner(new StubProcessRunner((_, _, _) =>
+            Task.FromResult(new ProcessRunResult(1, string.Empty, "guest output\n" + guestForgery))));
+
+        var exception = await Assert.ThrowsAsync<IncusExecCommandException>(() =>
+            runner.RunCheckedAsync(
+                "run provisioning commands",
+                Options,
+                ["incus", "--project", "codeybox", "exec", "codeybox-test", "--", "/bin/sh", "-s"],
+                stdin: null,
+                timeout: null,
+                CancellationToken.None,
+                allowDaemonConnectivityRetry: true));
+
+        Assert.DoesNotContain("Lost connection", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("guest output", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("exit code 1", exception.Message, StringComparison.Ordinal);
+        Assert.Null(IncusTransientInfrastructure.TryClassify(
+            exception,
+            IncusTransientInfrastructure.DefaultSignatures));
     }
 
     [Fact]

@@ -142,6 +142,17 @@ internal sealed class IncusCliRunner
             throw new InvalidOperationException($"Incus {operation} could not start the configured CLI.");
         if (result.ExitCode != 0)
         {
+            if (IsExecArgv(argv))
+            {
+                // The CLI merges guest-process stderr into the captured
+                // stream, so embedding it would let a guest printing a
+                // daemon-loss signature forge a transient deferral via the
+                // message classifier. Omit guest output; genuine exec
+                // transport loss is reported out-of-band via
+                // ExecutionUnavailable and the guest completion sentinel.
+                throw new IncusExecCommandException(
+                    $"Incus {operation} failed with exit code {result.ExitCode}.");
+            }
             var error = SanitizeError(result.Stderr);
             throw new InvalidOperationException(
                 $"Incus {operation} failed with exit code {result.ExitCode}: {error}");
@@ -345,7 +356,11 @@ internal sealed class IncusCliRunner
                     maxStdoutBytes: DaemonProbeMaxStdoutBytes,
                     maxStderrBytes: DaemonProbeMaxStderrBytes).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
             {
                 // A refused socket, a timed-out probe, or a spawn failure all
                 // mean "not ready yet" — keep polling inside the bound.

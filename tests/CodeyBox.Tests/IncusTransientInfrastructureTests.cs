@@ -337,6 +337,63 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
         Assert.NotNull(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
     }
 
+    [Theory]
+    [InlineData("Error: Lost connection to the event listener and failed to reconnect: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: Lost connection to the event listener: websocket: close 1006 (abnormal closure): unexpected EOF")]
+    [InlineData("Error: Get \"http://unix.socket/1.0\": dial unix /var/lib/incus/unix.socket: connect: connection refused")]
+    public void TryClassify_ExecMarkedChain_SuppressesDaemonFaults(string daemonText)
+    {
+        // A guest printing a daemon-loss signature inside a checked-exec step
+        // must not forge a transient deferral, even when that text reaches
+        // the classifier through wrapping rather than the (now withheld)
+        // checked-exec message itself.
+        var options = new IncusSandboxOptions();
+        Exception failure = new IncusExecCommandException(
+            "Incus run provisioning commands failed with exit code 1.",
+            new InvalidOperationException(daemonText));
+
+        Assert.Null(IncusTransientInfrastructure.TryClassify(failure, options.TransientInfrastructureSignatures));
+        Assert.Null(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+        Assert.False(IncusSandboxProvider.IsTransientBakeFailure(failure, options));
+    }
+
+    [Fact]
+    public void TryClassify_ExecMarkedChain_SuppressesTypedDaemonCarrier()
+    {
+        var options = new IncusSandboxOptions();
+        var fault = new IncusTransientInfrastructureFault(
+            IncusTransientInfrastructure.DaemonConnectionLostFaultClass,
+            IncusTransientInfrastructure.DaemonConnectionLostSignature,
+            IsTeardown: false);
+        Exception failure = new IncusExecCommandException(
+            "Incus run provisioning commands failed with exit code 1.",
+            new IncusTransientInfrastructureException("wrapped carrier", fault));
+
+        Assert.Null(IncusTransientInfrastructure.TryClassify(failure, options.TransientInfrastructureSignatures));
+        Assert.Null(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+        Assert.False(IncusSandboxProvider.IsTransientBakeFailure(failure, options));
+    }
+
+    [Fact]
+    public void TryClassify_ExecMarkedChain_NonDaemonFaultStillDefers()
+    {
+        var options = new IncusSandboxOptions
+        {
+            ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(42),
+        };
+        Exception failure = new IncusExecCommandException(
+            "Incus run provisioning commands failed with exit code 1.",
+            new InvalidOperationException("Error: context deadline exceeded"));
+
+        var classified = IncusTransientInfrastructure.TryClassify(
+            failure,
+            options.TransientInfrastructureSignatures);
+        Assert.NotNull(classified);
+        Assert.False(IncusTransientInfrastructure.IsDaemonConnectivityFault(classified));
+        Assert.NotNull(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+        Assert.True(IncusSandboxProvider.IsTransientBakeFailure(failure, options));
+    }
+
     [Fact]
     public void OptionsValidate_DefaultSignatures_Pass()
     {

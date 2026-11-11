@@ -109,6 +109,13 @@ public static class IncusTransientInfrastructure
     /// the fault on the first allowlisted signature found, most-specific
     /// signatures first regardless of configured order; null when nothing
     /// allowlisted matches. Never throws.
+    /// A chain containing <see cref="IncusExecCommandException"/> never
+    /// classifies as a daemon-connectivity fault: checked <c>incus exec</c>
+    /// failures omit guest-controlled stderr from their message, and any
+    /// daemon-loss text reaching the classifier through another path (wrapping,
+    /// manual construction) is indistinguishable from guest output, so it
+    /// stays terminal. Non-daemon faults still classify, mirroring
+    /// <c>isExec</c> in <c>BuildAllowFailureException</c>.
     /// </summary>
     public static IncusTransientInfrastructureFault? TryClassify(
         Exception? exception,
@@ -118,6 +125,7 @@ public static class IncusTransientInfrastructure
             return null;
         try
         {
+            var suppressDaemonFaults = ContainsExecMarker(exception);
             var current = exception;
             for (var depth = 0; depth < MaxExceptionChainDepth && current is not null; depth++)
             {
@@ -126,13 +134,20 @@ public static class IncusTransientInfrastructure
                 // a hot-reload that removed the signature must re-terminal
                 // the fault just like a message match would.
                 if (current is IncusTransientInfrastructureException classified
-                    && SignatureAllowlisted(classified.Fault.MatchedSignature, signatures))
+                    && SignatureAllowlisted(classified.Fault.MatchedSignature, signatures)
+                    && !(suppressDaemonFaults && IsDaemonConnectivityFault(classified.Fault)))
                 {
                     return classified.Fault;
                 }
-                var fault = TryClassifyMessage(current.Message, signatures);
-                if (fault is not null)
-                    return fault;
+                var messageFault = TryClassifyMessage(current.Message, signatures);
+                if (messageFault is not null
+                    && !(suppressDaemonFaults && IsDaemonConnectivityFault(messageFault)))
+                {
+                    return messageFault;
+                }
+                // A daemon-connectivity match skipped above (guest-forgeable
+                // on exec chains) keeps walking for a non-daemon fault
+                // instead of deferring.
                 current = current.InnerException;
             }
             return null;
@@ -187,6 +202,25 @@ public static class IncusTransientInfrastructure
     private static bool SignatureAllowlisted(string signature, IReadOnlyList<string>? signatures) =>
         signatures is { Count: > 0 }
         && signatures.Contains(signature, StringComparer.Ordinal);
+
+    private static bool ContainsExecMarker(Exception exception)
+    {
+        try
+        {
+            var current = exception;
+            for (var depth = 0; depth < MaxExceptionChainDepth && current is not null; depth++)
+            {
+                if (current is IncusExecCommandException)
+                    return true;
+                current = current.InnerException;
+            }
+            return false;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
 
     private static IEnumerable<string> OrderedSignatures(IReadOnlyList<string>? signatures)
     {
