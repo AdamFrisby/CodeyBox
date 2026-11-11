@@ -320,8 +320,12 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
     }
 
     [Fact]
-    public void BuildAllowFailureException_ExecNonDaemonSignature_StillDefers()
+    public void BuildAllowFailureException_ExecNonDaemonSignature_StaysTerminal()
     {
+        // `incus exec` merges guest-process stderr into the captured stream,
+        // so a guest printing any allowlisted signature — including a
+        // non-daemon one such as a deadline miss — must never forge a
+        // transient deferral.
         var options = new IncusSandboxOptions
         {
             ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(42),
@@ -333,8 +337,8 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
             options,
             isExec: true);
 
-        Assert.IsType<IncusTransientInfrastructureException>(failure);
-        Assert.NotNull(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+        Assert.IsType<InvalidOperationException>(failure);
+        Assert.Null(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
     }
 
     [Theory]
@@ -375,8 +379,31 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
     }
 
     [Fact]
-    public void TryClassify_ExecMarkedChain_NonDaemonFaultStillDefers()
+    public void TryClassify_ExecMarkedChain_SuppressesTypedNonDaemonCarrier()
     {
+        // A typed carrier wrapped in an exec-marked chain is still
+        // indistinguishable from guest output, so it stays terminal too.
+        var options = new IncusSandboxOptions();
+        var fault = new IncusTransientInfrastructureFault(
+            IncusTransientInfrastructure.CliDeadlineFaultClass,
+            IncusTransientInfrastructure.CliDeadlineSignature,
+            IsTeardown: false);
+        Exception failure = new IncusExecCommandException(
+            "Incus run provisioning commands failed with exit code 1.",
+            new IncusTransientInfrastructureException("wrapped carrier", fault));
+
+        Assert.Null(IncusTransientInfrastructure.TryClassify(failure, options.TransientInfrastructureSignatures));
+        Assert.Null(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+        Assert.False(IncusSandboxProvider.IsTransientBakeFailure(failure, options));
+    }
+
+    [Fact]
+    public void TryClassify_ExecMarkedChain_NonDaemonFaultStaysTerminal()
+    {
+        // A guest printing any allowlisted signature inside an exec step —
+        // including a non-daemon deadline miss — must not forge a transient
+        // deferral, even when that text reaches the classifier through
+        // wrapping rather than the (now withheld) checked-exec message.
         var options = new IncusSandboxOptions
         {
             ProvisioningRetryRecheckIn = TimeSpan.FromSeconds(42),
@@ -385,13 +412,11 @@ public sealed class IncusTransientInfrastructureTests : IDisposable
             "Incus run provisioning commands failed with exit code 1.",
             new InvalidOperationException("Error: context deadline exceeded"));
 
-        var classified = IncusTransientInfrastructure.TryClassify(
+        Assert.Null(IncusTransientInfrastructure.TryClassify(
             failure,
-            options.TransientInfrastructureSignatures);
-        Assert.NotNull(classified);
-        Assert.False(IncusTransientInfrastructure.IsDaemonConnectivityFault(classified));
-        Assert.NotNull(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
-        Assert.True(IncusSandboxProvider.IsTransientBakeFailure(failure, options));
+            options.TransientInfrastructureSignatures));
+        Assert.Null(IncusSandboxProvider.TryBuildTransientProvisioningDeferral(failure, options));
+        Assert.False(IncusSandboxProvider.IsTransientBakeFailure(failure, options));
     }
 
     [Fact]

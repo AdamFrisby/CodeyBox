@@ -110,12 +110,16 @@ public static class IncusTransientInfrastructure
     /// signatures first regardless of configured order; null when nothing
     /// allowlisted matches. Never throws.
     /// A chain containing <see cref="IncusExecCommandException"/> never
-    /// classifies as a daemon-connectivity fault: checked <c>incus exec</c>
-    /// failures omit guest-controlled stderr from their message, and any
-    /// daemon-loss text reaching the classifier through another path (wrapping,
-    /// manual construction) is indistinguishable from guest output, so it
-    /// stays terminal. Non-daemon faults still classify, mirroring
-    /// <c>isExec</c> in <c>BuildAllowFailureException</c>.
+    /// classifies as transient: checked <c>incus exec</c> failures omit
+    /// guest-controlled stderr from their message, and any allowlisted text
+    /// reaching the classifier through another path (wrapping, manual
+    /// construction) is indistinguishable from guest output, so it stays
+    /// terminal. This covers every signature — including non-daemon ones
+    /// such as deadline misses, which a guest can print just as easily as
+    /// daemon-loss text — mirroring <c>isExec</c> in
+    /// <c>BuildAllowFailureException</c>. Genuine exec transport loss is
+    /// reported out-of-band via <c>ExecutionUnavailable</c> and the guest
+    /// completion-sentinel check instead.
     /// </summary>
     public static IncusTransientInfrastructureFault? TryClassify(
         Exception? exception,
@@ -125,7 +129,7 @@ public static class IncusTransientInfrastructure
             return null;
         try
         {
-            var suppressDaemonFaults = ContainsExecMarker(exception);
+            var suppressExecFaults = ContainsExecMarker(exception);
             var current = exception;
             for (var depth = 0; depth < MaxExceptionChainDepth && current is not null; depth++)
             {
@@ -133,21 +137,24 @@ public static class IncusTransientInfrastructure
                 // its matched signature is still on the operator allowlist —
                 // a hot-reload that removed the signature must re-terminal
                 // the fault just like a message match would.
+                // Any match on an exec-marked chain stays terminal: the
+                // merged guest stderr stream is guest-controlled, so every
+                // signature is forgeable there.
                 if (current is IncusTransientInfrastructureException classified
                     && SignatureAllowlisted(classified.Fault.MatchedSignature, signatures)
-                    && !(suppressDaemonFaults && IsDaemonConnectivityFault(classified.Fault)))
+                    && !suppressExecFaults)
                 {
                     return classified.Fault;
                 }
                 var messageFault = TryClassifyMessage(current.Message, signatures);
                 if (messageFault is not null
-                    && !(suppressDaemonFaults && IsDaemonConnectivityFault(messageFault)))
+                    && !suppressExecFaults)
                 {
                     return messageFault;
                 }
-                // A daemon-connectivity match skipped above (guest-forgeable
-                // on exec chains) keeps walking for a non-daemon fault
-                // instead of deferring.
+                // An exec-marked match skipped above keeps walking but can
+                // never defer: every signature is guest-forgeable on exec
+                // chains, so the walk always ends terminal.
                 current = current.InnerException;
             }
             return null;

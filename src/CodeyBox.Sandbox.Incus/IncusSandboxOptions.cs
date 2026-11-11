@@ -269,7 +269,8 @@ public sealed record IncusSandboxOptions
     /// <summary>
     /// Allowlisted exact Incus error signatures classified as transient host
     /// infrastructure (incusd DB/storage contention, teardown unmount races,
-    /// unverifiable guest control-file cleanup). Only these signatures ever
+    /// unverifiable guest control-file cleanup, daemon-restart connection
+    /// losses). Only these signatures ever
     /// match — arbitrary CLI output never does. Hot-reloadable.
     /// </summary>
     public IReadOnlyList<string> TransientInfrastructureSignatures { get; init; } =

@@ -602,7 +602,8 @@ public sealed class IncusSandboxProvider :
     /// would publish a bake deadline as <c>incus-liveness-timeout</c>. The
     /// liveness branch is the remaining CLI and guest-agent deadlines. An
     /// allowlisted signature (incusd DB/storage deadline, teardown unmount
-    /// race, unverifiable guest control-file cleanup) is last. Returns
+    /// race, unverifiable guest control-file cleanup, daemon-restart
+    /// connection losses) is last. Returns
     /// <c>null</c> for any non-transient failure, which is rethrown unchanged.
     /// </summary>
     internal static SandboxProvisioningDeferredException? TryBuildTransientProvisioningDeferral(
@@ -680,9 +681,9 @@ public sealed class IncusSandboxProvider :
     /// Raw stderr is never embedded: it may carry secrets.
     /// <paramref name="isExec"/> must be true when the argv ran
     /// <c>incus exec</c>: the CLI merges guest-process stderr into the
-    /// captured stream, so a guest printing a daemon-loss signature must
-    /// never forge a transient deferral. Daemon-connectivity faults from exec
-    /// stderr therefore stay terminal; genuine exec transport loss is
+    /// captured stream, so a guest printing any allowlisted signature must
+    /// never forge a transient deferral. Every fault matched from exec
+    /// stderr therefore stays terminal; genuine exec transport loss is
     /// reported out-of-band via <c>ExecutionUnavailable</c> and the guest
     /// completion-sentinel check instead.
     /// </summary>
@@ -696,8 +697,7 @@ public sealed class IncusSandboxProvider :
             stderr,
             options.TransientInfrastructureSignatures);
         if (fault is not null
-            && isExec
-            && IncusTransientInfrastructure.IsDaemonConnectivityFault(fault))
+            && isExec)
             return new InvalidOperationException(message);
         return fault is null
             ? new InvalidOperationException(message)
@@ -2454,11 +2454,11 @@ public sealed class IncusSandboxProvider :
         {
             // Surface only the allowlisted signature the stderr matched —
             // never the raw stderr, which may carry secrets — as a typed
-            // fault so an allowlisted daemon-connectivity signature still
-            // reaches the transient-infrastructure classifier instead of
-            // going terminal. This argv is `incus exec`, so daemon-loss
-            // signatures in the merged guest stderr stream are
-            // guest-forgeable and are excluded from transient classification.
+            // fault on non-exec steps. This argv is `incus exec`, so every
+            // signature in the merged guest stderr stream is guest-forgeable
+            // and stays terminal by design; genuine exec transport loss is
+            // reported out-of-band via ExecutionUnavailable and the guest
+            // completion-sentinel check instead.
             throw BuildAllowFailureException(
                 $"Incus cloud-init did not reach a non-fatal completed state (exit code {result.ExitCode}).",
                 result.Stderr,
@@ -2956,11 +2956,12 @@ public sealed class IncusSandboxProvider :
                 ? "the required command is not runnable by the configured sandbox identity on its non-login PATH"
                 : verification.FailureHint;
             // The matched allowlisted signature (never raw stderr, which may
-            // carry secrets) rides a typed fault so a daemon restart
-            // mid-verification stays on the transient-infrastructure path
-            // instead of terminal. This argv is `incus exec`, so
-            // daemon-loss signatures in the merged guest stderr stream are
-            // guest-forgeable and are excluded from transient classification.
+            // carry secrets) would ride a typed fault on non-exec steps.
+            // This argv is `incus exec`, so every signature in the merged
+            // guest stderr stream is guest-forgeable and stays terminal by
+            // design; genuine exec transport loss is reported out-of-band
+            // via ExecutionUnavailable and the guest completion-sentinel
+            // check instead.
             throw BuildAllowFailureException(
                 $"Incus VM provisioning verification '{verification.Label}' failed: {hint}.",
                 result.Stderr,
