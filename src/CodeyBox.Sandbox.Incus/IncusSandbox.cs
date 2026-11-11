@@ -942,7 +942,8 @@ internal sealed class IncusSandbox :
                 "--gid=0"),
             payload,
             _options.OperationTimeout,
-            ct).ConfigureAwait(false);
+            ct,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
     }
 
     private async Task<bool> KillRunAsync(string runId, CancellationToken ct)
@@ -1502,6 +1503,7 @@ internal sealed class IncusSandbox :
             ct,
             heavyOperation: false,
             maxStdoutBytes: _options.MaxCliStdoutBytes,
+            allowDaemonConnectivityRetry: true,
             maxStderrBytes: 4096).ConfigureAwait(false);
         IncusDeviceTopology.Verify(
             topology.Stdout,
@@ -1772,6 +1774,7 @@ internal sealed class IncusSandbox :
             _options.OperationTimeout,
             ct,
             heavyOperation: false,
+            allowDaemonConnectivityRetry: true,
             maxStdoutBytes: _options.MaxCliStdoutBytes,
             maxStderrBytes: 4096).ConfigureAwait(false);
         return ParseOwnedInstanceStatus(
@@ -1851,7 +1854,8 @@ internal sealed class IncusSandbox :
             IncusCommandBuilder.Prefix(_options, "config", "set", Id, $"{key}={value}"),
             stdin: null,
             _options.OperationTimeout,
-            ct).ConfigureAwait(false);
+            ct,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
     }
 
     private async Task EnsureLifecycleBindingAsync(CancellationToken ct)

@@ -738,6 +738,493 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
     }
 
     [Fact]
+    public async Task CowCopy_DaemonConnectionLoss_WaitsForReadinessProbeThenRetries()
+    {
+        const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
+        var stagingRoot = Path.Combine(_root, "cow-daemon-retry-staging");
+        var options = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+            DaemonReadyProbeTimeout = TimeSpan.FromSeconds(5),
+        };
+        var copyAttempts = 0;
+        var readinessProbes = 0;
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            existingPinnedName: pinned,
+            onInvocation: (argv, _) =>
+            {
+                if (argv.Contains("copy", StringComparer.Ordinal))
+                {
+                    copyAttempts++;
+                    if (copyAttempts == 1)
+                    {
+                        return Task.FromResult(new ProcessRunResult(
+                            1,
+                            string.Empty,
+                            "Error: Lost connection to the event listener and failed to reconnect: " +
+                            "websocket: close 1006 (abnormal closure): unexpected EOF"));
+                    }
+                    return null;
+                }
+                // The preflight "server API probe" issues the same argv before
+                // the copy fails; only probes after the first copy failure are
+                // the daemon-readiness wait. The first still sees the
+                // restarting daemon; the next answers.
+                if (copyAttempts > 0
+                    && argv.SequenceEqual(new[] { "incus", "query", "/1.0" }))
+                {
+                    readinessProbes++;
+                    return Task.FromResult(readinessProbes == 1
+                        ? new ProcessRunResult(
+                            1,
+                            string.Empty,
+                            "Error: Get \"http://unix.socket/1.0\": dial unix " +
+                            "/var/lib/incus/unix.socket: connect: connection refused")
+                        : new ProcessRunResult(0, "{\"metadata\":{}}", string.Empty));
+                }
+                return null;
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = options.DefaultImage,
+            BaselineImageRef = pinned,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        });
+
+        Assert.NotNull(sandbox);
+        Assert.Equal(2, copyAttempts);
+        Assert.True(readinessProbes >= 2, "expected a failing probe then a successful readiness probe");
+        var argvList = runner.Invocations.Select(static invocation => invocation.Argv).ToList();
+        var copyIndexes = argvList
+            .Select((argv, index) => (argv, index))
+            .Where(pair => pair.argv.Contains("copy", StringComparer.Ordinal))
+            .Select(pair => pair.index)
+            .ToArray();
+        var firstProbeIndex = -1;
+        for (var i = copyIndexes[0] + 1; i < argvList.Count; i++)
+        {
+            if (argvList[i].SequenceEqual(new[] { "incus", "query", "/1.0" }))
+            {
+                firstProbeIndex = i;
+                break;
+            }
+        }
+        Assert.True(
+            copyIndexes.Length == 2
+            && firstProbeIndex > copyIndexes[0]
+            && firstProbeIndex < copyIndexes[1],
+            "the retried COW copy must be preceded by a daemon-readiness probe");
+    }
+
+    [Fact]
+    public async Task CowCopy_DaemonConnectionLoss_DeletesHalfCreatedInstanceBeforeRetry()
+    {
+        const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
+        var stagingRoot = Path.Combine(_root, "cow-daemon-retry-cleanup-staging");
+        var options = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+            DaemonReadyProbeTimeout = TimeSpan.FromSeconds(5),
+        };
+        var fixedGuid = new Guid("22222222-3333-4444-5555-666666666666");
+        var sandboxName = $"{options.InstanceNamePrefix}{fixedGuid.ToString("N")[..20]}";
+        var copyAttempts = 0;
+        var sandboxExists = false;
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            existingPinnedName: pinned,
+            onInvocation: (argv, _) =>
+            {
+                if (argv.Contains("copy", StringComparer.Ordinal))
+                {
+                    copyAttempts++;
+                    if (copyAttempts == 1)
+                    {
+                        // The daemon completed the copy server-side before the
+                        // connection dropped.
+                        sandboxExists = true;
+                        return Task.FromResult(new ProcessRunResult(
+                            1,
+                            string.Empty,
+                            "Error: Lost connection to the event listener and failed to reconnect: " +
+                            "websocket: close 1006 (abnormal closure): unexpected EOF"));
+                    }
+                    return null;
+                }
+                var deleteIndex = argv.ToList().IndexOf("delete");
+                if (deleteIndex >= 0
+                    && deleteIndex + 1 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[deleteIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    // Only the pre-retry cleanup is intercepted; later deletes
+                    // (e.g. sandbox disposal) fall through to the fake's default
+                    // handler so it can drop the instance from its listings.
+                    sandboxExists = false;
+                    return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+                }
+                var getIndex = argv.ToList().IndexOf("get");
+                if (getIndex > 0
+                    && getIndex + 2 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[getIndex - 1], "config", StringComparison.Ordinal)
+                    && string.Equals(argv[getIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    // The verified-delete path re-reads ownership metadata per
+                    // instance at delete time; answer for the half-created
+                    // sandbox the way incusd would.
+                    var value = argv[^1] switch
+                    {
+                        IncusSandboxProvider.ManagedKey => "true",
+                        IncusSandboxProvider.KindKey => IncusSandboxProvider.SandboxKind,
+                        _ => string.Empty,
+                    };
+                    return Task.FromResult(new ProcessRunResult(0, value + "\n", string.Empty));
+                }
+                if (argv.Contains("list", StringComparer.Ordinal)
+                    && argv.Contains("--format=json", StringComparer.Ordinal)
+                    && !argv.Contains("snapshot", StringComparer.Ordinal)
+                    && sandboxExists)
+                {
+                    var entries = new List<object>
+                    {
+                        new
+                        {
+                            name = pinned,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.BaselineKind,
+                            },
+                        },
+                        new
+                        {
+                            name = sandboxName,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.SandboxKind,
+                            },
+                        },
+                    };
+                    return Task.FromResult(new ProcessRunResult(
+                        0, JsonSerializer.Serialize(entries), string.Empty));
+                }
+                return null;
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: TimeProvider.System,
+            newGuid: () => fixedGuid,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = options.DefaultImage,
+            BaselineImageRef = pinned,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        });
+
+        Assert.NotNull(sandbox);
+        Assert.Equal(2, copyAttempts);
+        Assert.False(sandboxExists, "the retried copy requires the half-created instance to be deleted first");
+        var argvList = runner.Invocations.Select(static invocation => invocation.Argv).ToList();
+        var copyIndexes = argvList
+            .Select((argv, index) => (argv, index))
+            .Where(pair => pair.argv.Contains("copy", StringComparer.Ordinal))
+            .Select(pair => pair.index)
+            .ToArray();
+        var deleteIndex = argvList.FindIndex(argv =>
+            argv.Contains("delete", StringComparer.Ordinal)
+            && argv.Contains(sandboxName, StringComparer.Ordinal));
+        Assert.True(
+            copyIndexes.Length == 2
+            && deleteIndex > copyIndexes[0]
+            && deleteIndex < copyIndexes[1],
+            "the half-created instance must be deleted between the failed copy and its retry");
+    }
+
+    [Fact]
+    public async Task CowCopy_DaemonConnectionLoss_SingleFlightCleanupDoesNotDeadlock()
+    {
+        // At MaxConcurrentOperations 1 the failed copy holds the operation-gate
+        // lease across its pre-retry cleanup, so the cleanup delete must not
+        // re-enter the gate: without gate-free cleanup this provisioning hangs
+        // until cancellation instead of retrying. The bounded cancellation
+        // turns that hang into a failure rather than a stuck suite.
+        const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
+        var stagingRoot = Path.Combine(_root, "cow-daemon-retry-singleflight-staging");
+        var options = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            MaxConcurrentOperations = 1,
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(1),
+            DaemonReadyProbeTimeout = TimeSpan.FromSeconds(5),
+        };
+        var fixedGuid = new Guid("33333333-4444-5555-6666-777777777777");
+        var sandboxName = $"{options.InstanceNamePrefix}{fixedGuid.ToString("N")[..20]}";
+        var copyAttempts = 0;
+        var sandboxExists = false;
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            existingPinnedName: pinned,
+            onInvocation: (argv, _) =>
+            {
+                if (argv.Contains("copy", StringComparer.Ordinal))
+                {
+                    copyAttempts++;
+                    if (copyAttempts == 1)
+                    {
+                        sandboxExists = true;
+                        return Task.FromResult(new ProcessRunResult(
+                            1,
+                            string.Empty,
+                            "Error: Lost connection to the event listener and failed to reconnect: " +
+                            "websocket: close 1006 (abnormal closure): unexpected EOF"));
+                    }
+                    return null;
+                }
+                var deleteIndex = argv.ToList().IndexOf("delete");
+                if (deleteIndex >= 0
+                    && deleteIndex + 1 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[deleteIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    sandboxExists = false;
+                    return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+                }
+                var getIndex = argv.ToList().IndexOf("get");
+                if (getIndex > 0
+                    && getIndex + 2 < argv.Count
+                    && sandboxExists
+                    && string.Equals(argv[getIndex - 1], "config", StringComparison.Ordinal)
+                    && string.Equals(argv[getIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    var value = argv[^1] switch
+                    {
+                        IncusSandboxProvider.ManagedKey => "true",
+                        IncusSandboxProvider.KindKey => IncusSandboxProvider.SandboxKind,
+                        _ => string.Empty,
+                    };
+                    return Task.FromResult(new ProcessRunResult(0, value + "\n", string.Empty));
+                }
+                if (argv.Contains("list", StringComparer.Ordinal)
+                    && argv.Contains("--format=json", StringComparer.Ordinal)
+                    && !argv.Contains("snapshot", StringComparer.Ordinal)
+                    && sandboxExists)
+                {
+                    var entries = new List<object>
+                    {
+                        new
+                        {
+                            name = pinned,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.BaselineKind,
+                            },
+                        },
+                        new
+                        {
+                            name = sandboxName,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.SandboxKind,
+                            },
+                        },
+                    };
+                    return Task.FromResult(new ProcessRunResult(
+                        0, JsonSerializer.Serialize(entries), string.Empty));
+                }
+                return null;
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: TimeProvider.System,
+            newGuid: () => fixedGuid,
+            environmentVariableReader: EnvironmentReader(_root));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+        await using var sandbox = await provider.CreateAsync(new SandboxSpec
+        {
+            ImageReference = options.DefaultImage,
+            BaselineImageRef = pinned,
+            Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+        }, timeout.Token);
+
+        Assert.NotNull(sandbox);
+        Assert.Equal(2, copyAttempts);
+        Assert.False(sandboxExists, "the retried copy requires the half-created instance to be deleted first");
+    }
+
+    [Fact]
+    public async Task CowCopy_DaemonNeverRecovers_DefersAsTransientInfrastructureAndCleansUp()
+    {
+        const string pinned = "cb-incus-baseline-internet-headless-123456789abc";
+        var stagingRoot = Path.Combine(_root, "cow-daemon-down-staging");
+        var options = BaseOptions() with
+        {
+            StagingDirectory = stagingRoot,
+            DaemonUnavailableRetryAttempts = 1,
+            DaemonReadyTimeout = TimeSpan.FromMilliseconds(60),
+            DaemonReadyPollInterval = TimeSpan.FromMilliseconds(5),
+            DaemonReadyProbeTimeout = TimeSpan.FromMilliseconds(20),
+        };
+        // Deterministic instance name so the fake can model the half-created
+        // sandbox the failed copy left behind.
+        var fixedGuid = new Guid("11111111-2222-3333-4444-555555555555");
+        var sandboxName = $"{options.InstanceNamePrefix}{fixedGuid.ToString("N")[..20]}";
+        var copyAttempts = 0;
+        var sandboxDeleted = false;
+        var runner = new BaselineBakeRunner(
+            stagingRoot,
+            verificationExitCode: 0,
+            existingPinnedName: pinned,
+            onInvocation: (argv, _) =>
+            {
+                if (argv.Contains("copy", StringComparer.Ordinal))
+                {
+                    copyAttempts++;
+                    return Task.FromResult(new ProcessRunResult(
+                        1,
+                        string.Empty,
+                        "Error: Lost connection to the event listener and failed to reconnect: " +
+                        "websocket: close 1006 (abnormal closure): unexpected EOF"));
+                }
+                if (copyAttempts == 0)
+                    return null;
+                // After the failed copy the daemon stays down for readiness
+                // probes, but the CLI itself answers lifecycle queries again —
+                // modelling a daemon that finished restarting while the copy
+                // outcome was still being reconciled.
+                if (argv.SequenceEqual(new[] { "incus", "query", "/1.0" }))
+                {
+                    return Task.FromResult(new ProcessRunResult(
+                        1,
+                        string.Empty,
+                        "Error: Get \"http://unix.socket/1.0\": dial unix " +
+                        "/var/lib/incus/unix.socket: connect: no such file or directory"));
+                }
+                if (argv.Contains("list", StringComparer.Ordinal)
+                    && argv.Contains("--format=json", StringComparer.Ordinal)
+                    && !argv.Contains("project", StringComparer.Ordinal)
+                    && !argv.Contains("snapshot", StringComparer.Ordinal))
+                {
+                    var entries = new List<object>
+                    {
+                        new
+                        {
+                            name = pinned,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.BaselineKind,
+                            },
+                        },
+                    };
+                    if (!sandboxDeleted)
+                    {
+                        entries.Add(new
+                        {
+                            name = sandboxName,
+                            type = "virtual-machine",
+                            status = "STOPPED",
+                            config = new Dictionary<string, string>
+                            {
+                                [IncusSandboxProvider.ManagedKey] = "true",
+                                [IncusSandboxProvider.KindKey] = IncusSandboxProvider.SandboxKind,
+                            },
+                        });
+                    }
+                    return Task.FromResult(new ProcessRunResult(
+                        0, JsonSerializer.Serialize(entries), string.Empty));
+                }
+                if (argv.Contains("config", StringComparer.Ordinal)
+                    && argv.Contains("get", StringComparer.Ordinal))
+                {
+                    var getIndex = argv.ToList().IndexOf("get");
+                    if (getIndex + 2 < argv.Count
+                        && string.Equals(argv[getIndex + 1], sandboxName, StringComparison.Ordinal))
+                    {
+                        var key = argv[^1];
+                        var value = key switch
+                        {
+                            IncusSandboxProvider.ManagedKey => "true",
+                            IncusSandboxProvider.KindKey => IncusSandboxProvider.SandboxKind,
+                            _ => string.Empty,
+                        };
+                        return Task.FromResult(new ProcessRunResult(0, value + "\n", string.Empty));
+                    }
+                    return null;
+                }
+                var deleteIndex = argv.ToList().IndexOf("delete");
+                if (deleteIndex >= 0
+                    && deleteIndex + 1 < argv.Count
+                    && string.Equals(argv[deleteIndex + 1], sandboxName, StringComparison.Ordinal))
+                {
+                    sandboxDeleted = true;
+                    return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+                }
+                return null;
+            });
+        var provider = new IncusSandboxProvider(
+            () => options,
+            NullLogger<IncusSandboxProvider>.Instance,
+            timings: null,
+            runner,
+            timeProvider: TimeProvider.System,
+            newGuid: () => fixedGuid,
+            environmentVariableReader: EnvironmentReader(_root));
+
+        var exception = await Assert.ThrowsAsync<SandboxProvisioningDeferredException>(() =>
+            provider.CreateAsync(new SandboxSpec
+            {
+                ImageReference = options.DefaultImage,
+                BaselineImageRef = pinned,
+                Network = new SandboxNetworkPolicy { ProfileName = "internet-only" },
+            }));
+
+        Assert.Equal(IncusTransientInfrastructure.DaemonConnectionLostFaultClass, exception.ErrorClass);
+        Assert.Contains("Lost connection to the event listener", exception.Detail, StringComparison.Ordinal);
+        Assert.Equal(1, copyAttempts);
+        Assert.True(sandboxDeleted, "the half-created instance must be deleted before deferring");
+        var argvList = runner.Invocations.Select(static invocation => invocation.Argv).ToList();
+        var copyIndex = argvList.FindIndex(argv => argv.Contains("copy", StringComparer.Ordinal));
+        var deleteIndex = argvList.FindIndex(argv => argv.Contains("delete", StringComparer.Ordinal));
+        Assert.True(copyIndex >= 0 && deleteIndex > copyIndex, "cleanup delete must follow the failed copy");
+    }
+
+    [Fact]
     public async Task FullLaunch_RejectsCanonicalMountAliasBeforeHostDeviceAttachmentWithoutProvisioning()
     {
         var stagingRoot = Path.Combine(_root, "full-launch-alias-staging");
@@ -2691,6 +3178,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         private readonly Action? _onCloudInitStatus;
         private readonly Func<string?, CancellationToken, Task<ProcessRunResult>?>? _onProvisioningShell;
         private readonly Func<CancellationToken, Task<ProcessRunResult>?>? _onBakeRuncmdProgress;
+        private readonly Func<IReadOnlyList<string>, CancellationToken, Task<ProcessRunResult>?>? _onInvocation;
         private string? _instanceName;
         private string _instanceStatus = "STOPPED";
         private Dictionary<string, string> _instanceConfig = new(StringComparer.Ordinal);
@@ -2711,7 +3199,8 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             Func<string, string?>? readSymlinkTarget = null,
             Action? onCloudInitStatus = null,
             Func<string?, CancellationToken, Task<ProcessRunResult>?>? onProvisioningShell = null,
-            Func<CancellationToken, Task<ProcessRunResult>?>? onBakeRuncmdProgress = null)
+            Func<CancellationToken, Task<ProcessRunResult>?>? onBakeRuncmdProgress = null,
+            Func<IReadOnlyList<string>, CancellationToken, Task<ProcessRunResult>?>? onInvocation = null)
         {
             _stagingRoot = stagingRoot;
             _verificationExitCode = verificationExitCode;
@@ -2725,6 +3214,7 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
             _onCloudInitStatus = onCloudInitStatus;
             _onProvisioningShell = onProvisioningShell;
             _onBakeRuncmdProgress = onBakeRuncmdProgress;
+            _onInvocation = onInvocation;
             if (existingPinnedName is not null)
             {
                 _instanceName = existingPinnedName;
@@ -2755,6 +3245,9 @@ public sealed class IncusBaselineProvisioningTests : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             Invocations.Add(new Invocation(argv.ToArray(), stdin));
+            var intercepted = _onInvocation?.Invoke(argv, ct);
+            if (intercepted is not null)
+                return intercepted;
             if (argv.SequenceEqual(["incus", "query", "/1.0"]))
             {
                 return Success("{\"metadata\":{\"api_extensions\":[\"disk_io_bus_cache_filesystem\",\"projects_restrictions\"],\"environment\":{\"kernel_version\":\"6.14.0-test\"}}}");

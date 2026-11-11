@@ -362,7 +362,12 @@ public sealed class IncusSandboxProvider :
                     copyArgs,
                     stdin: null,
                     options.OperationTimeout,
-                    ct).ConfigureAwait(false);
+                    ct,
+                    allowDaemonConnectivityRetry: true,
+                    prepareForDaemonRetryAsync: retryCt =>
+                        PrepareInstanceAbsentForRetryAsync(
+                            options, name, SandboxKind, expectedBakeToken: null, retryCt))
+                    .ConfigureAwait(false);
                 await ApplyCloneLimitsAsync(options, name, spec.Limits, ct).ConfigureAwait(false);
             }
             else
@@ -378,7 +383,12 @@ public sealed class IncusSandboxProvider :
                     initArgs,
                     stdin: null,
                     options.ImageProvisioningTimeout,
-                    ct).ConfigureAwait(false);
+                    ct,
+                    allowDaemonConnectivityRetry: true,
+                    prepareForDaemonRetryAsync: retryCt =>
+                        PrepareInstanceAbsentForRetryAsync(
+                            options, name, SandboxKind, expectedBakeToken: null, retryCt))
+                    .ConfigureAwait(false);
                 if (bridge is not null)
                     await AddNicAsync(options, name, bridge, ct).ConfigureAwait(false);
                 await SetCloudInitAsync(options, name, IncusCloudInit.Build(options, spec.Flavor), ct).ConfigureAwait(false);
@@ -592,7 +602,8 @@ public sealed class IncusSandboxProvider :
     /// would publish a bake deadline as <c>incus-liveness-timeout</c>. The
     /// liveness branch is the remaining CLI and guest-agent deadlines. An
     /// allowlisted signature (incusd DB/storage deadline, teardown unmount
-    /// race, unverifiable guest control-file cleanup) is last. Returns
+    /// race, unverifiable guest control-file cleanup, daemon-restart
+    /// connection losses) is last. Returns
     /// <c>null</c> for any non-transient failure, which is rethrown unchanged.
     /// </summary>
     internal static SandboxProvisioningDeferredException? TryBuildTransientProvisioningDeferral(
@@ -660,6 +671,38 @@ public sealed class IncusSandboxProvider :
     }
 
     private static string SingleLineDetail(Exception ex) => SingleLineText(ex.Message);
+
+    /// <summary>
+    /// Builds the failure exception for an allow-failure CLI result. When the
+    /// result's stderr matches an allowlisted transient signature, the
+    /// classified fault rides on a typed
+    /// <see cref="IncusTransientInfrastructureException"/> so the downstream
+    /// classifier reads it directly — never re-parsed out of message prose.
+    /// Raw stderr is never embedded: it may carry secrets.
+    /// <paramref name="isExec"/> must be true when the argv ran
+    /// <c>incus exec</c>: the CLI merges guest-process stderr into the
+    /// captured stream, so a guest printing any allowlisted signature must
+    /// never forge a transient deferral. Every fault matched from exec
+    /// stderr therefore stays terminal; genuine exec transport loss is
+    /// reported out-of-band via <c>ExecutionUnavailable</c> and the guest
+    /// completion-sentinel check instead.
+    /// </summary>
+    internal static Exception BuildAllowFailureException(
+        string message,
+        string? stderr,
+        IncusSandboxOptions options,
+        bool isExec)
+    {
+        var fault = IncusTransientInfrastructure.TryClassifyMessage(
+            stderr,
+            options.TransientInfrastructureSignatures);
+        if (fault is not null
+            && isExec)
+            return new InvalidOperationException(message);
+        return fault is null
+            ? new InvalidOperationException(message)
+            : new IncusTransientInfrastructureException(message, fault);
+    }
 
     private async Task<ISandbox> AdoptRetainedSandboxAsync(
         SandboxSpec spec,
@@ -1682,7 +1725,12 @@ public sealed class IncusSandboxProvider :
                     initArgs,
                     stdin: null,
                     options.ImageProvisioningTimeout,
-                    ct).ConfigureAwait(false);
+                    ct,
+                    allowDaemonConnectivityRetry: true,
+                    prepareForDaemonRetryAsync: retryCt =>
+                        PrepareInstanceAbsentForRetryAsync(
+                            options, candidateName, BaselineKind, bakeToken, retryCt))
+                    .ConfigureAwait(false);
                 var bridge = ResolveBridge(options, profileName)
                     ?? throw new InvalidOperationException("A baseline requires a mapped network profile.");
                 await AddNicAsync(options, candidateName, bridge, ct).ConfigureAwait(false);
@@ -1733,7 +1781,13 @@ public sealed class IncusSandboxProvider :
                         || GetConfig(winner.Config, BaselinePoolKey) != options.StoragePoolName
                         || !string.Equals(winner.Status, "STOPPED", StringComparison.OrdinalIgnoreCase)
                         || !await SnapshotExistsAsync(options, baselineName, ReadySnapshot, ct).ConfigureAwait(false))
-                        throw new InvalidOperationException($"Failed to publish Incus baseline '{baselineName}' and no valid concurrent winner exists.");
+                    {
+                        throw BuildAllowFailureException(
+                            $"Failed to publish Incus baseline '{baselineName}' and no valid concurrent winner exists.",
+                            publish.Stderr,
+                            options,
+                            isExec: false);
+                    }
                     ClearBakeFailure(baselineName);
                     return baselineName;
                 }
@@ -2092,7 +2146,8 @@ public sealed class IncusSandboxProvider :
                 stdin: null,
                 options.OperationTimeout,
                 ct,
-                heavyOperation: false).ConfigureAwait(false);
+                heavyOperation: false,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
             IncusProjectSecurity.EnsureServerCapabilities(server.Stdout);
             await EnsureProjectAsync(options, ct).ConfigureAwait(false);
             await PreflightStorageAsync(options, ct).ConfigureAwait(false);
@@ -2112,7 +2167,8 @@ public sealed class IncusSandboxProvider :
                 stdin: null,
                 options.OperationTimeout,
                 ct,
-                heavyOperation: false).ConfigureAwait(false);
+                heavyOperation: false,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         var pool = ParseStoragePool(pools.Stdout, options.StoragePoolName)
             ?? throw new InvalidOperationException($"Configured Incus storage pool '{options.StoragePoolName}' does not exist.");
         if (pool.Driver is not ("zfs" or "btrfs"))
@@ -2134,7 +2190,8 @@ public sealed class IncusSandboxProvider :
                 ct,
                 heavyOperation: false,
                 maxStdoutBytes: 64 * 1024,
-                maxStderrBytes: 4096).ConfigureAwait(false);
+                maxStderrBytes: 4096,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         using var document = JsonDocument.Parse(resources.Stdout);
         var space = document.RootElement.GetProperty("space");
         var total = space.GetProperty("total").GetInt64();
@@ -2182,7 +2239,8 @@ public sealed class IncusSandboxProvider :
             ct,
             heavyOperation: false,
             maxStdoutBytes: 256,
-            maxStderrBytes: 4096).ConfigureAwait(false);
+            maxStderrBytes: 4096,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         EnsurePoolLocalClone(actualPool.Stdout, options.StoragePoolName);
     }
 
@@ -2211,8 +2269,11 @@ public sealed class IncusSandboxProvider :
                 heavyOperation: true).ConfigureAwait(false);
             if (!create.Success && !await ProjectExistsAsync(options, ct).ConfigureAwait(false))
             {
-                throw new InvalidOperationException(
-                    $"Incus restricted-project creation failed with exit code {create.ExitCode}.");
+                throw BuildAllowFailureException(
+                    $"Incus restricted-project creation failed with exit code {create.ExitCode}.",
+                    create.Stderr,
+                    options,
+                    isExec: false);
             }
         }
 
@@ -2232,7 +2293,8 @@ public sealed class IncusSandboxProvider :
                 IncusProjectSecurity.BuildSetArguments(options, requiredRoots),
                 stdin: null,
                 options.OperationTimeout,
-                ct).ConfigureAwait(false);
+                ct,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
             project = await ReadProjectSecurityAsync(options, ct).ConfigureAwait(false);
         }
 
@@ -2252,7 +2314,8 @@ public sealed class IncusSandboxProvider :
             ct,
             heavyOperation: false,
             maxStdoutBytes: 64 * 1024,
-            maxStderrBytes: 4096).ConfigureAwait(false);
+            maxStderrBytes: 4096,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         return IncusProjectSecurity.ParseProjectQuery(result.Stdout, options.ProjectName);
     }
 
@@ -2285,7 +2348,8 @@ public sealed class IncusSandboxProvider :
             stdin: null,
             options.OperationTimeout,
             ct,
-            heavyOperation: false).ConfigureAwait(false);
+            heavyOperation: false,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         return ProjectListContains(list.Stdout, options.ProjectName);
     }
 
@@ -2388,8 +2452,18 @@ public sealed class IncusSandboxProvider :
             || result.StderrLimitExceeded
             || !TryAcceptCloudInitStatus(result.Stdout, result.ExitCode, out var degraded))
         {
-            throw new InvalidOperationException(
-                $"Incus cloud-init did not reach a non-fatal completed state (exit code {result.ExitCode}).");
+            // Surface only the allowlisted signature the stderr matched —
+            // never the raw stderr, which may carry secrets — as a typed
+            // fault on non-exec steps. This argv is `incus exec`, so every
+            // signature in the merged guest stderr stream is guest-forgeable
+            // and stays terminal by design; genuine exec transport loss is
+            // reported out-of-band via ExecutionUnavailable and the guest
+            // completion-sentinel check instead.
+            throw BuildAllowFailureException(
+                $"Incus cloud-init did not reach a non-fatal completed state (exit code {result.ExitCode}).",
+                result.Stderr,
+                options,
+                isExec: true);
         }
         if (degraded)
         {
@@ -2804,7 +2878,8 @@ public sealed class IncusSandboxProvider :
                 BuildFilePush(options, name, executable.StagedPath, guestStagePath),
                 stdin: null,
                 options.ImageProvisioningTimeout,
-                ct).ConfigureAwait(false);
+                ct,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
 
             var destinationParent = GetGuestParent(provision.VmDestPath);
             await PrepareGuestDirectoryAsync(
@@ -2880,8 +2955,18 @@ public sealed class IncusSandboxProvider :
             var hint = string.IsNullOrWhiteSpace(verification.FailureHint)
                 ? "the required command is not runnable by the configured sandbox identity on its non-login PATH"
                 : verification.FailureHint;
-            throw new InvalidOperationException(
-                $"Incus VM provisioning verification '{verification.Label}' failed: {hint}.");
+            // The matched allowlisted signature (never raw stderr, which may
+            // carry secrets) would ride a typed fault on non-exec steps.
+            // This argv is `incus exec`, so every signature in the merged
+            // guest stderr stream is guest-forgeable and stays terminal by
+            // design; genuine exec transport loss is reported out-of-band
+            // via ExecutionUnavailable and the guest completion-sentinel
+            // check instead.
+            throw BuildAllowFailureException(
+                $"Incus VM provisioning verification '{verification.Label}' failed: {hint}.",
+                result.Stderr,
+                options,
+                isExec: true);
         }
     }
 
@@ -2930,7 +3015,8 @@ public sealed class IncusSandboxProvider :
                 BuildFilePush(options, name, archivePath, guestArchivePath),
                 stdin: null,
                 options.ImageProvisioningTimeout,
-                ct).ConfigureAwait(false);
+                ct,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
             await PrepareGuestDirectoryAsync(
                 options,
                 name,
@@ -3485,7 +3571,8 @@ public sealed class IncusSandboxProvider :
             ct,
             heavyOperation: false,
             maxStdoutBytes: options.MaxCliStdoutBytes,
-            maxStderrBytes: 4096).ConfigureAwait(false);
+            maxStderrBytes: 4096,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         IncusDeviceTopology.Verify(query.Stdout, options, bridge, mounts);
     }
 
@@ -3529,7 +3616,8 @@ public sealed class IncusSandboxProvider :
                     "config", "device", "set", name, "root", $"size={requestedDisk.ToString(CultureInfo.InvariantCulture)}B"),
                 stdin: null,
                 options.OperationTimeout,
-                ct).ConfigureAwait(false);
+                ct,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         }
     }
 
@@ -3553,7 +3641,8 @@ public sealed class IncusSandboxProvider :
             IncusCommandBuilder.Prefix(options, "config", "set", name, "user.user-data", "-"),
             cloudInit,
             options.OperationTimeout,
-            ct).ConfigureAwait(false);
+            ct,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
 
     private void AppendCreationMetadata(
         ICollection<string> argv,
@@ -3588,7 +3677,8 @@ public sealed class IncusSandboxProvider :
             IncusCommandBuilder.Prefix(options, "config", "set", name, $"{key}={value}"),
             stdin: null,
             options.OperationTimeout,
-            ct).ConfigureAwait(false);
+            ct,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
 
     /// <summary>
     /// Stops an Incus instance. Internal (not private) so teardown-resilience
@@ -3648,21 +3738,27 @@ public sealed class IncusSandboxProvider :
         }
     }
 
-    private async Task DeleteInstanceAsync(IncusSandboxOptions options, string name, CancellationToken ct) =>
+    private async Task DeleteInstanceAsync(
+        IncusSandboxOptions options,
+        string name,
+        CancellationToken ct,
+        bool callerHoldsOperationGate = false) =>
         await _cli.RunCheckedAsync(
             "delete VM",
             options,
             IncusCommandBuilder.Prefix(options, "delete", name, "--force"),
             stdin: null,
             options.OperationTimeout,
-            ct).ConfigureAwait(false);
+            ct,
+            heavyOperation: !callerHoldsOperationGate).ConfigureAwait(false);
 
     private async Task DeleteVerifiedOwnedInstanceAsync(
         IncusSandboxOptions options,
         string name,
         string expectedKind,
         string? expectedBakeToken,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool callerHoldsOperationGate = false)
     {
         var managed = await _cli.RunCheckedAsync(
             "verify managed instance before delete",
@@ -3673,7 +3769,8 @@ public sealed class IncusSandboxProvider :
             ct,
             heavyOperation: false,
             maxStdoutBytes: 64,
-            maxStderrBytes: 4096).ConfigureAwait(false);
+            maxStderrBytes: 4096,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         var kind = await _cli.RunCheckedAsync(
             "verify instance kind before delete",
             options,
@@ -3683,7 +3780,8 @@ public sealed class IncusSandboxProvider :
             ct,
             heavyOperation: false,
             maxStdoutBytes: 64,
-            maxStderrBytes: 4096).ConfigureAwait(false);
+            maxStderrBytes: 4096,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         if (!string.Equals(managed.Stdout.Trim(), "true", StringComparison.Ordinal)
             || !string.Equals(kind.Stdout.Trim(), expectedKind, StringComparison.Ordinal))
             throw new InvalidOperationException("Refusing to delete an Incus instance whose ownership metadata changed.");
@@ -3698,11 +3796,12 @@ public sealed class IncusSandboxProvider :
                 ct,
                 heavyOperation: false,
                 maxStdoutBytes: 128,
-                maxStderrBytes: 4096).ConfigureAwait(false);
+                maxStderrBytes: 4096,
+                allowDaemonConnectivityRetry: true).ConfigureAwait(false);
             if (!string.Equals(token.Stdout.Trim(), expectedBakeToken, StringComparison.Ordinal))
                 throw new InvalidOperationException("Refusing to delete an Incus baseline candidate whose bake token changed.");
         }
-        await DeleteInstanceAsync(options, name, ct).ConfigureAwait(false);
+        await DeleteInstanceAsync(options, name, ct, callerHoldsOperationGate).ConfigureAwait(false);
         await WaitForInstanceAbsenceAsync(options, name, ct).ConfigureAwait(false);
     }
 
@@ -3742,6 +3841,47 @@ public sealed class IncusSandboxProvider :
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Failed to clean up owned Incus instance {InstanceName}", name);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Pre-retry preparation for instance-creating CLI steps (init/copy):
+    /// proves the step's target instance absent before the identical argv
+    /// runs again, deleting a half-created instance the failed attempt left
+    /// behind through the same verified-ownership delete path teardown uses.
+    /// Returns false — so the runner surfaces the original transient failure
+    /// and the deferred recheck recreates the step — whenever absence cannot
+    /// be proven. Runs inside the caller's operation-gate lease, so every CLI
+    /// call it makes is heavyOperation:false to avoid self-deadlock at
+    /// capacity 1.
+    /// </summary>
+    private async Task<bool> PrepareInstanceAbsentForRetryAsync(
+        IncusSandboxOptions options,
+        string name,
+        string kind,
+        string? expectedBakeToken,
+        CancellationToken ct)
+    {
+        try
+        {
+            if (await FindInstanceAsync(options, name, ct).ConfigureAwait(false) is null)
+                return true;
+            await DeleteVerifiedOwnedInstanceAsync(
+                options,
+                name,
+                kind,
+                expectedBakeToken,
+                ct,
+                callerHoldsOperationGate: true).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(
+                ex,
+                "Could not prove Incus instance {InstanceName} absent before daemon-loss retry",
+                name);
             return false;
         }
     }
@@ -3813,7 +3953,8 @@ public sealed class IncusSandboxProvider :
             stdin: null,
             options.OperationTimeout,
             ct,
-            heavyOperation: false).ConfigureAwait(false);
+            heavyOperation: false,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         return ParseInstances(result.Stdout, requiredInstanceName);
     }
 
@@ -3830,7 +3971,8 @@ public sealed class IncusSandboxProvider :
             stdin: null,
             options.OperationTimeout,
             ct,
-            heavyOperation: false).ConfigureAwait(false);
+            heavyOperation: false,
+            allowDaemonConnectivityRetry: true).ConfigureAwait(false);
         using var document = JsonDocument.Parse(result.Stdout);
         return document.RootElement.EnumerateArray().Any(element =>
             element.TryGetProperty("name", out var value)
