@@ -528,6 +528,92 @@ public sealed class AgentCircuitBreakerTests
         Assert.Contains("circuit breaker", dispatchDecision.Reason, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public void GetMemberStatus_ClosedMember_ReportsClosedWithZeroFailures()
+    {
+        var breaker = NewBreaker(new AgentCircuitBreakerOptions
+        {
+            Enabled = true,
+            FailureThreshold = 2,
+            Window = TimeSpan.FromMinutes(5),
+            Cooldown = TimeSpan.FromMinutes(2),
+        });
+        var member = Sub(AgentKind.Claude);
+
+        var status = breaker.GetMemberStatus(member, T0);
+
+        Assert.NotNull(status);
+        Assert.Equal(member.RouteKey, status!.RouteKey);
+        Assert.Equal(CircuitPhase.Closed, status.Phase);
+        Assert.Equal(0, status.FailureCount);
+        Assert.Null(status.OpenedAt);
+        Assert.True(status.DispatchAllowed);
+        Assert.Equal("closed", status.Reason);
+    }
+
+    [Fact]
+    public void GetMemberStatus_OpenBreaker_ExposesStateCountOpenedAtAndReason()
+    {
+        var breaker = NewBreaker(new AgentCircuitBreakerOptions
+        {
+            Enabled = true,
+            FailureThreshold = 2,
+            Window = TimeSpan.FromMinutes(5),
+            Cooldown = TimeSpan.FromMinutes(2),
+        });
+        var member = Sub(AgentKind.Claude);
+
+        breaker.RecordOutcome(member, false, T0);
+        breaker.RecordOutcome(member, false, T0.AddSeconds(1));
+
+        var status = breaker.GetMemberStatus(member, T0.AddSeconds(2));
+
+        Assert.NotNull(status);
+        Assert.Equal(CircuitPhase.Open, status!.Phase);
+        Assert.Equal(2, status.FailureCount);
+        Assert.Equal(T0.AddSeconds(1), status.OpenedAt);
+        Assert.False(status.DispatchAllowed);
+        Assert.Equal(T0.AddSeconds(1).AddMinutes(2), status.NextRetryAt);
+        Assert.Contains("open", status.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("2 failure", status.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GetMemberStatus_NeverDispatchedMember_DoesNotCreateState()
+    {
+        // A status read must not materialize breaker state: SnapshotStatuses
+        // stays empty for members that were never dispatched.
+        var breaker = NewBreaker(new AgentCircuitBreakerOptions { Enabled = true });
+        var member = Sub(AgentKind.Claude);
+
+        Assert.NotNull(breaker.GetMemberStatus(member, T0));
+        Assert.Empty(breaker.SnapshotStatuses(T0));
+    }
+
+    [Fact]
+    public void SnapshotStatuses_ReturnsOnlyTouchedBreakers_SortedByRouteKey()
+    {
+        var breaker = NewBreaker(new AgentCircuitBreakerOptions
+        {
+            Enabled = true,
+            FailureThreshold = 1,
+            Window = TimeSpan.FromMinutes(5),
+            Cooldown = TimeSpan.FromMinutes(2),
+        });
+        var claude = Sub(AgentKind.Claude);
+        var codex = Sub(AgentKind.Codex);
+
+        breaker.RecordOutcome(codex, false, T0);
+        breaker.RecordOutcome(claude, false, T0);
+
+        var statuses = breaker.SnapshotStatuses(T0.AddSeconds(1));
+
+        Assert.Equal(2, statuses.Count);
+        Assert.Equal("claude", statuses[0].RouteKey);
+        Assert.Equal("codex", statuses[1].RouteKey);
+        Assert.All(statuses, s => Assert.Equal(CircuitPhase.Open, s.Phase));
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static AgentCircuitBreaker NewBreaker(AgentCircuitBreakerOptions opts) =>
@@ -638,6 +724,38 @@ public sealed class ClassifyDispatchOutcomeTests
         Assert.Null(
             PipelineRunner.ClassifyDispatchOutcome(
                 new TaskCanceledException(), genuineAttemptTimeout: false));
+    }
+
+    [Fact]
+    public void DiskDeferredException_IsSkipped()
+    {
+        // The disk guard refused provisioning before the agent CLI ran — a host
+        // condition, not an agent fault. Counting it fed every eligible agent's
+        // breaker during the 2026-11-21 host disk event.
+        var disk = new SandboxDiskDeferredException(
+            "/var/lib/codeybox", freeBytes: 100, thresholdBytes: 10_000, TimeSpan.FromMinutes(5));
+        Assert.Null(PipelineRunner.ClassifyDispatchOutcome(disk, genuineAttemptTimeout: false));
+    }
+
+    [Fact]
+    public void ProvisioningDeferredException_IsSkipped()
+    {
+        // Any host-level provisioning precondition in the deferral family is
+        // likewise not the agent's fault.
+        var prov = new SandboxProvisioningDeferredException(
+            "incus", "create", "incus-db-transaction-deadline", "deadline", TimeSpan.FromMinutes(1));
+        Assert.Null(PipelineRunner.ClassifyDispatchOutcome(prov, genuineAttemptTimeout: false));
+    }
+
+    [Fact]
+    public void WrappedProvisioningDeferral_IsSkipped()
+    {
+        // An intermediate layer may wrap the deferral; the classifier walks the
+        // inner-exception chain so the skip still applies.
+        var inner = new SandboxDiskDeferredException(
+            "/data", freeBytes: 1, thresholdBytes: 2, TimeSpan.FromMinutes(1));
+        var wrapped = new InvalidOperationException("phase failed", inner);
+        Assert.Null(PipelineRunner.ClassifyDispatchOutcome(wrapped, genuineAttemptTimeout: false));
     }
 }
 

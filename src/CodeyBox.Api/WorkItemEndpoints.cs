@@ -1430,6 +1430,32 @@ internal static class WorkItemEndpoints
                 })
                 .ToArray() ?? []
             : [];
+        // Optional: host-level resource blocks (disk guard, provisioning
+        // deferrals) recorded by the orchestrator's park paths. A
+        // dispatch-blocking entry means the dispatcher is deliberately not
+        // picking up work — surfaced here so a host disk event reads as a
+        // host block, never as quota starvation.
+        var hostResourceBlocks = context.RequestServices
+            .GetService<IHostResourceBlockStatusProvider>()
+            ?.GetActiveHostBlocks()
+            .Select(b => new
+            {
+                key = b.Key,
+                kind = b.Kind,
+                reason = b.Reason,
+                mountPath = b.MountPath,
+                provider = b.Provider,
+                operation = b.Operation,
+                errorClass = b.ErrorClass,
+                freeBytes = b.FreeBytes,
+                thresholdBytes = b.ThresholdBytes,
+                detail = b.Detail,
+                blockedSince = b.BlockedSince,
+                blockedUntil = b.BlockedUntil,
+                lastObservedAt = b.LastObservedAt,
+                dispatchBlocking = b.DispatchBlocking,
+            })
+            .ToArray() ?? [];
         return Results.Ok(new
         {
             state = queueController.State.ToString(),
@@ -1437,6 +1463,7 @@ internal static class WorkItemEndpoints
             pausedReason = queueController.PausedReason,
             quotaWaiting,
             baseBroken,
+            hostResourceBlocks,
             provisioningBlocked = context.RequestServices
                 .GetService<IBaselineProvisioningBlockedStatusProvider>()
                 ?.GetProvisioningBlockedStatus() is { } blocked

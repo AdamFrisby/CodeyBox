@@ -1224,7 +1224,10 @@ public sealed partial class PipelineRunner
     ///     per-attempt timeout, resume-exhaustion, or any agent/quota/infrastructure
     ///     error); feeds the windowed failure counter that opens the breaker.</item>
     ///   <item><c>null</c> — a host/operator/phase cancellation that is not the agent's
-    ///     fault; it neither opens nor resets the breaker and must be skipped.</item>
+    ///     fault; it neither opens nor resets the breaker and must be skipped. Host-level
+    ///     provisioning preconditions (disk guard, baseline bake, placement deferrals —
+    ///     the <see cref="SandboxProvisioningDeferredException"/> family) are skipped the
+    ///     same way: the agent CLI never ran, so the condition is not an agent fault.</item>
     /// </list>
     /// Pure: a total function of the terminal exception (<c>null</c> on success) and
     /// whether it was a genuine per-attempt timeout (as opposed to a host/phase
@@ -1255,6 +1258,21 @@ public sealed partial class PipelineRunner
         // attempt counting toward the breaker. Test-red parks identically.
         if (error is BaseBuildBrokenException or BaseTestBrokenException)
             return null;
+        // Host-level provisioning preconditions — the disk guard
+        // (SandboxDiskDeferredException derives from this), baseline-bake and
+        // placement/capacity deferrals — refused the sandbox before the agent
+        // CLI ever ran. They are host conditions, not agent faults: counting
+        // them would bench every eligible agent during a host disk event and
+        // leave the quota router reporting phantom exhaustion. Skip them (and
+        // the same deferral wrapped by an intermediate layer) so the attempt
+        // neither opens nor resets the breaker. The deferral is still parked
+        // and requeued by the orchestrator's dedicated catch sites, and the
+        // host block is surfaced via HostResourceBlockTracker.
+        for (var ex = error; ex is not null; ex = ex.InnerException)
+        {
+            if (ex is SandboxProvisioningDeferredException)
+                return null;
+        }
         // Every other terminal exception is a real dispatch failure.
         return false;
     }

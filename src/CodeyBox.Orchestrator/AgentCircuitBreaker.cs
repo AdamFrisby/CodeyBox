@@ -99,6 +99,14 @@ public sealed record CircuitBreakerState
     /// <summary>When the current half-open probe window began — anchors stale-trial expiry.</summary>
     public DateTimeOffset? HalfOpenSince { get; init; }
 
+    /// <summary>
+    /// Windowed failure count behind the current phase: live count while
+    /// <see cref="CircuitPhase.Closed"/>, the count that opened the breaker
+    /// while <see cref="CircuitPhase.Open"/>/<see cref="CircuitPhase.HalfOpen"/>.
+    /// Surfaced for operator diagnostics; 0 after any success.
+    /// </summary>
+    public int FailureCount { get; init; }
+
     /// <summary>The initial closed state a never-seen agent starts from.</summary>
     public static CircuitBreakerState Initial { get; } = new();
 }
@@ -193,7 +201,7 @@ public static class CircuitBreakerLogic
             if (s.Phase == CircuitPhase.Closed)
                 // Reset the consecutive-failure window; stay closed, no transition.
                 return new CircuitOutcome(
-                    s with { RecentFailures = ImmutableArray<DateTimeOffset>.Empty },
+                    s with { RecentFailures = ImmutableArray<DateTimeOffset>.Empty, FailureCount = 0 },
                     CircuitTransition.None, Allowed: true, FailureCount: 0);
 
             // A trial (or lingering) success closes the breaker.
@@ -206,15 +214,21 @@ public static class CircuitBreakerLogic
                 var failures = PruneWindow(s.RecentFailures, now, cfg.Window).Add(now);
                 if (failures.Length >= cfg.FailureThreshold)
                     return new CircuitOutcome(
-                        new CircuitBreakerState { Phase = CircuitPhase.Open, OpenedAt = now },
+                        new CircuitBreakerState
+                        {
+                            Phase = CircuitPhase.Open,
+                            OpenedAt = now,
+                            FailureCount = failures.Length,
+                        },
                         CircuitTransition.Opened, Allowed: false, failures.Length);
                 return new CircuitOutcome(
-                    s with { RecentFailures = failures }, CircuitTransition.None, Allowed: true, failures.Length);
+                    s with { RecentFailures = failures, FailureCount = failures.Length },
+                    CircuitTransition.None, Allowed: true, failures.Length);
 
             case CircuitPhase.HalfOpen:
                 // A trial failed — re-open with a fresh cooldown.
                 return new CircuitOutcome(
-                    new CircuitBreakerState { Phase = CircuitPhase.Open, OpenedAt = now },
+                    new CircuitBreakerState { Phase = CircuitPhase.Open, OpenedAt = now, FailureCount = 1 },
                     CircuitTransition.ReOpened, Allowed: false, 1);
 
             case CircuitPhase.Open:
@@ -290,6 +304,7 @@ public sealed class AgentCircuitBreaker
     private sealed class Box
     {
         public CircuitBreakerState State = CircuitBreakerState.Initial;
+        public AgentKind? Agent;
     }
 
     private readonly AgentCircuitBreakerSnapshot _options;
@@ -313,7 +328,7 @@ public sealed class AgentCircuitBreaker
         var cfg = _options.Current;
         if (!cfg.Enabled) return true;
         var settings = cfg.ResolveSettings(member.Agent);
-        var box = GetBox(member.RouteKey);
+        var box = GetBox(member.RouteKey, member.Agent);
         lock (box) return CircuitBreakerLogic.CanDispatch(box.State, now, settings);
     }
 
@@ -329,7 +344,7 @@ public sealed class AgentCircuitBreaker
         var cfg = _options.Current;
         if (!cfg.Enabled) return true;
         var settings = cfg.ResolveSettings(member.Agent);
-        var box = GetBox(member.RouteKey);
+        var box = GetBox(member.RouteKey, member.Agent);
         CircuitOutcome outcome;
         lock (box)
         {
@@ -360,7 +375,7 @@ public sealed class AgentCircuitBreaker
         var cfg = _options.Current;
         if (!cfg.Enabled) return;
         var settings = cfg.ResolveSettings(agent);
-        var box = GetBox(routeKey);
+        var box = GetBox(routeKey, agent);
         CircuitOutcome outcome;
         lock (box)
         {
@@ -380,7 +395,7 @@ public sealed class AgentCircuitBreaker
         var cfg = _options.Current;
         if (!cfg.Enabled) return null;
         var settings = cfg.ResolveSettings(member.Agent);
-        var box = GetBox(member.RouteKey);
+        var box = GetBox(member.RouteKey, member.Agent);
         lock (box) return CircuitBreakerLogic.NextRetryAt(box.State, now, settings);
     }
 
@@ -388,12 +403,118 @@ public sealed class AgentCircuitBreaker
     public CircuitPhase PhaseOf(AgentMembership member)
     {
         ArgumentNullException.ThrowIfNull(member);
-        var box = GetBox(member.RouteKey);
+        var box = GetBox(member.RouteKey, member.Agent);
         lock (box) return box.State.Phase;
     }
 
-    private Box GetBox(string routeKey) =>
-        _states.GetOrAdd(AgentQuotaMemberKey.NormalizeRouteKey(routeKey), static _ => new Box());
+    /// <summary>
+    /// Read-only breaker status for one member at <paramref name="now"/>:
+    /// phase, windowed failure count, opened-at, next retry, whether dispatch
+    /// is currently admitted, and an operator-facing reason. Returns null when
+    /// the breaker is disabled (it can never block, so there is nothing to
+    /// surface). Never mutates state — safe for readiness/status reads.
+    /// </summary>
+    public CircuitBreakerMemberStatus? GetMemberStatus(AgentMembership member, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(member);
+        var cfg = _options.Current;
+        if (!cfg.Enabled) return null;
+        var settings = cfg.ResolveSettings(member.Agent);
+        // TryGetValue — a status read must not create breaker state for a
+        // member that has never been dispatched.
+        if (!_states.TryGetValue(AgentQuotaMemberKey.NormalizeRouteKey(member.RouteKey), out var box))
+        {
+            return new CircuitBreakerMemberStatus(
+                member.RouteKey, member.Agent, CircuitPhase.Closed, 0, null, null, true, "closed");
+        }
+        lock (box)
+        {
+            var allowed = CircuitBreakerLogic.CanDispatch(box.State, now, settings);
+            var nextRetry = CircuitBreakerLogic.NextRetryAt(box.State, now, settings);
+            return new CircuitBreakerMemberStatus(
+                member.RouteKey,
+                member.Agent,
+                box.State.Phase,
+                box.State.FailureCount,
+                box.State.OpenedAt,
+                nextRetry,
+                allowed,
+                DescribeStatus(box.State, settings, allowed, nextRetry));
+        }
+    }
+
+    /// <summary>
+    /// Status for every breaker that has been touched and is not pristine
+    /// (closed with no recorded failures). Used by operator surfaces that
+    /// enumerate agents rather than resolve a single member. Non-mutating.
+    /// </summary>
+    public IReadOnlyList<CircuitBreakerMemberStatus> SnapshotStatuses(DateTimeOffset now)
+    {
+        var cfg = _options.Current;
+        if (!cfg.Enabled) return [];
+        var result = new List<CircuitBreakerMemberStatus>();
+        foreach (var (routeKey, box) in _states)
+        {
+            CircuitBreakerState state;
+            AgentKind? agent;
+            lock (box)
+            {
+                state = box.State;
+                agent = box.Agent;
+            }
+            if (state.Phase == CircuitPhase.Closed
+                && state.FailureCount == 0
+                && state.RecentFailures.IsEmpty
+                && state.HalfOpenInFlight == 0)
+                continue;
+            var kind = agent ?? new AgentKind(AgentInstanceIds.KindFromRouteKey(routeKey));
+            var settings = cfg.ResolveSettings(kind);
+            var allowed = CircuitBreakerLogic.CanDispatch(state, now, settings);
+            var nextRetry = CircuitBreakerLogic.NextRetryAt(state, now, settings);
+            result.Add(new CircuitBreakerMemberStatus(
+                routeKey,
+                kind,
+                state.Phase,
+                state.FailureCount,
+                state.OpenedAt,
+                nextRetry,
+                allowed,
+                DescribeStatus(state, settings, allowed, nextRetry)));
+        }
+        result.Sort(static (a, b) => string.CompareOrdinal(a.RouteKey, b.RouteKey));
+        return result;
+    }
+
+    private static string DescribeStatus(
+        CircuitBreakerState state,
+        CircuitBreakerSettings settings,
+        bool allowed,
+        DateTimeOffset? nextRetry)
+    {
+        return state.Phase switch
+        {
+            CircuitPhase.Open when !allowed =>
+                $"open: {state.FailureCount} failure(s) within {settings.Window}; " +
+                $"opened {state.OpenedAt:O}; next trial at {nextRetry:O}",
+            CircuitPhase.Open =>
+                $"open: cooldown elapsed; half-open trial available (opened {state.OpenedAt:O})",
+            CircuitPhase.HalfOpen when allowed =>
+                $"half-open: {Math.Max(0, settings.HalfOpenTrials - state.HalfOpenInFlight)} trial slot(s) available",
+            CircuitPhase.HalfOpen =>
+                "half-open: all trial dispatch slots in flight",
+            _ when state.FailureCount > 0 =>
+                $"closed: {state.FailureCount} failure(s) in the current {settings.Window} window",
+            _ => "closed",
+        };
+    }
+
+    private Box GetBox(string routeKey, AgentKind? agent = null)
+    {
+        var box = _states.GetOrAdd(AgentQuotaMemberKey.NormalizeRouteKey(routeKey), static _ => new Box());
+        if (agent is { } kind)
+            box.Agent ??= kind;
+        return box;
+    }
 
     private void EmitTransition(AgentMembership member, CircuitOutcome outcome, CircuitBreakerSettings settings) =>
         EmitTransition(member.Agent, member.RouteKey, outcome, settings);
@@ -420,3 +541,27 @@ public sealed class AgentCircuitBreaker
             routeKey, from, to, reason);
     }
 }
+
+/// <summary>
+/// Read-only snapshot of one agent route key's circuit-breaker state for
+/// operator surfaces (<c>/quota</c>, <c>/admin/agents/availability</c>).
+/// Produced by <see cref="AgentCircuitBreaker.GetMemberStatus"/> /
+/// <see cref="AgentCircuitBreaker.SnapshotStatuses"/>; never mutates state.
+/// </summary>
+public sealed record CircuitBreakerMemberStatus(
+    /// <summary>Canonical route key (e.g. <c>devin</c> or <c>devin/acct-a</c>).</summary>
+    string RouteKey,
+    /// <summary>Agent kind the route key belongs to.</summary>
+    AgentKind Agent,
+    /// <summary>Current breaker phase.</summary>
+    CircuitPhase Phase,
+    /// <summary>Windowed failure count behind the current phase.</summary>
+    int FailureCount,
+    /// <summary>When the breaker last opened; null while closed.</summary>
+    DateTimeOffset? OpenedAt,
+    /// <summary>When the breaker next admits a dispatch; null when allowed now.</summary>
+    DateTimeOffset? NextRetryAt,
+    /// <summary>True when a dispatch would be admitted right now.</summary>
+    bool DispatchAllowed,
+    /// <summary>Single-line operator-facing description of the state.</summary>
+    string Reason);
