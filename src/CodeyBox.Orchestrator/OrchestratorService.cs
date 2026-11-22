@@ -187,6 +187,13 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     // membership is answered live from _deferredItems so the two cannot drift.
     private readonly DispatchItemLivenessTracker? _dispatchLiveness;
     private readonly ProviderTransientCorrelationTracker? _hostTransientPause;
+    // Host-level resource blocks (disk guard, provisioning deferrals)
+    // recorded by the park paths below. While a dispatch-blocking entry is
+    // active the pickup loop holds new work instead of churning
+    // pick-up/defer cycles; the tracker re-probes live disk state and lapses
+    // entries on the deferral's own RecheckIn so dispatch resumes on its own.
+    // Optional; null disables the gate (narrow test bootstraps).
+    private readonly HostResourceBlockTracker? _hostResourceBlocks;
     private readonly BaseBrokenConditionTracker? _baseBrokenConditions;
 
     /// <summary>Test/diagnostic hook for the dispatch-liveness record.</summary>
@@ -279,6 +286,15 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
     /// </summary>
     private static readonly TimeSpan HostTransientPauseRecheckDelay = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// Maximum single sleep while a host resource block holds dispatch. The
+    /// block's own <c>RecheckIn</c> can be hours; capping the sleep keeps the
+    /// loop re-probing live disk state (the tracker revalidates samples on
+    /// every read) so freed space resumes dispatch promptly instead of
+    /// waiting out the full deferral interval.
+    /// </summary>
+    private static readonly TimeSpan HostResourceBlockRecheckCap = TimeSpan.FromSeconds(15);
+
     private enum SpawnPacingWaitResult
     {
         Completed,
@@ -354,6 +370,10 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         // null disables the gate. Production DI shares the process-wide
         // instance the PipelineRunner observes into.
         ProviderTransientCorrelationTracker? hostTransientPause = null,
+        // Host-level resource blocks (disk guard + provisioning deferrals):
+        // recorded by the park paths, consulted by the pickup gate, and
+        // surfaced via /queue/status. Optional; null disables the gate.
+        HostResourceBlockTracker? hostResourceBlocks = null,
         // Project-level base-broken hold: while a condition is active for a
         // project, build-dependent candidates are skipped at pickup (the
         // filed fix item is exempt). Optional; null disables the gate.
@@ -392,6 +412,7 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         _time = timeProvider ?? TimeProvider.System;
         _dispatchLiveness = dispatchLiveness;
         _hostTransientPause = hostTransientPause;
+        _hostResourceBlocks = hostResourceBlocks;
         _baseBrokenConditions = baseBrokenConditions;
         if (_dispatchLiveness is not null)
             _dispatchLiveness.IsDeferredProvider = id => _deferredItems.Contains(id);
@@ -1579,6 +1600,31 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
 
             while (!stoppingToken.IsCancellationRequested)
             {
+                // Host resource gate: while a host-wide provisioning
+                // precondition holds (disk below the guard threshold), every
+                // pickup would only defer again — hold new work instead of
+                // churning pick-up/defer cycles. The tracker re-probes live
+                // disk samples on each read and lapses entries on the
+                // deferral's own RecheckIn, so the hold self-releases on
+                // recovery; the capped sleep keeps that re-probe prompt.
+                // Checked BEFORE the concurrency gate so a held block does
+                // not pin a pool slot.
+                if (_hostResourceBlocks?.GetBlockingBlock() is { } hostBlock)
+                {
+                    var hold = hostBlock.BlockedUntil - _time.GetUtcNow();
+                    var delay = hold < HostResourceBlockRecheckCap ? hold : HostResourceBlockRecheckCap;
+                    if (delay > TimeSpan.Zero)
+                    {
+                        _log.LogDebug(
+                            "Dispatch held by host resource block ({Kind}: {Reason}); re-checking in {Delay}",
+                            hostBlock.Kind, hostBlock.Reason, delay);
+                        try { await Task.Delay(delay, _time, stoppingToken); }
+                        catch (OperationCanceledException) { stopDispatchLoop = true; break; }
+                    }
+                    await RequeueDispatchWakeAsync(stoppingToken);
+                    break;
+                }
+
                 // Acquire the gate BEFORE resolving which item to pick up so the
                 // pickup decision uses the freshest store state. The first pass
                 // may block because a buffered kick can arrive while the pool is
@@ -4261,6 +4307,12 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         CancellationToken scheduleCt)
     {
         var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+        // Record the host-level block so the pickup gate holds new work while
+        // the disk condition persists (instead of pick-up/defer churn) and
+        // /queue/status can name the real cause. RecheckIn is the provider's
+        // configured disk-guard cadence — no new threshold or interval here.
+        _hostResourceBlocks?.RecordDiskBlock(
+            dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes, dskEx.RecheckIn);
         AuditLog.DiskDeferred(deferredItem.Id, dskEx.MountPath, dskEx.FreeBytes, dskEx.ThresholdBytes);
         if (_webhooks is not null)
         {
@@ -4298,6 +4350,11 @@ public sealed partial class OrchestratorService : BackgroundService, IAgentRunni
         CancellationToken scheduleCt)
     {
         var deferredItem = await ResetInfrastructureDeferredItemAsync(item, CancellationToken.None);
+        // Surface the deferral as a host-resource block for /queue/status.
+        // Provisioning blocks are visibility-only (DispatchBlocking=false):
+        // they can be item/project-scoped, so they never hold the queue.
+        _hostResourceBlocks?.RecordProvisioningBlock(
+            provEx.Provider, provEx.Operation, provEx.ErrorClass, provEx.Detail, provEx.RecheckIn);
         AuditLog.SandboxProvisioningDeferred(
             deferredItem.Id,
             provEx.Provider,

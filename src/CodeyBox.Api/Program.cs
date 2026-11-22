@@ -3371,6 +3371,33 @@ builder.Services.AddSingleton<BaselineProvisioningBlockedTracker>();
 builder.Services.AddSingleton<IBaselineProvisioningBlockedStatusProvider>(
     sp => sp.GetRequiredService<BaselineProvisioningBlockedTracker>());
 
+// Shared host-resource block tracker: the orchestrator records disk-guard and
+// sandbox-provisioning deferrals here; the dispatch pickup gate holds new work
+// while a dispatch-blocking entry is active, and /queue/status surfaces the
+// blocks so a host disk event is never mistaken for quota starvation. The disk
+// sampler revalidates blocks against live IDiskGuardedSandboxProvider samples
+// (registry members plus the selected singleton provider) so freed space
+// releases the hold before the deferral's RecheckIn elapses.
+builder.Services.AddSingleton<HostResourceBlockTracker>(sp => new HostResourceBlockTracker(
+    timeProvider: sp.GetRequiredService<TimeProvider>(),
+    diskSampler: () =>
+    {
+        var samples = new List<DiskGuardSample>();
+        if (sp.GetService<ISandboxProviderRegistry>() is { } registry)
+        {
+            foreach (var registration in registry.ListRegistered())
+            {
+                if (registration.Provider is IDiskGuardedSandboxProvider guarded)
+                    samples.AddRange(guarded.SampleDiskGuardState());
+            }
+        }
+        if (sp.GetService<ISandboxProvider>() is IDiskGuardedSandboxProvider selected)
+            samples.AddRange(selected.SampleDiskGuardState());
+        return samples;
+    }));
+builder.Services.AddSingleton<IHostResourceBlockStatusProvider>(
+    sp => sp.GetRequiredService<HostResourceBlockTracker>());
+
 // ICondition registrations — one per supported condition.
 builder.Services.AddSingleton<ICondition, QueueEmptyCondition>();
 builder.Services.AddSingleton<ICondition>(sp => new AllQuotasExhaustedCondition(
@@ -4575,6 +4602,7 @@ builder.Services.AddSingleton<OrchestratorService>(sp => new OrchestratorService
     burnEstimatorOptions: sp.GetService<AgentBurnEstimatorOptions>(),
     dispatchLiveness: sp.GetRequiredService<DispatchItemLivenessTracker>(),
     hostTransientPause: sp.GetRequiredService<ProviderTransientCorrelationTracker>(),
+    hostResourceBlocks: sp.GetRequiredService<HostResourceBlockTracker>(),
     baseBrokenConditions: sp.GetRequiredService<BaseBrokenConditionTracker>(),
     stalePinOptions: () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.BaselineStalePin));
 builder.Services.AddSingleton<IInfrastructureDeferralScheduler>(
@@ -5113,6 +5141,7 @@ app.MapGet("/quota", async (
     IAgentQuotaGate quotaGate,
     IAgentBudgetProvider? budgetProvider,
     IAgentPauseController? agentPauses,
+    AgentCircuitBreaker? circuitBreaker,
     ILoggerFactory loggerFactory,
     CancellationToken ct) =>
 {
@@ -5194,9 +5223,26 @@ app.MapGet("/quota", async (
         // come from ONE verdict so they cannot diverge.
         var defaultVerdict = paused ? null : await EvaluateGateAsync(defaultMember, recentFailure);
         var defaultModelVerdict = paused ? null : await EvaluateGateAsync(defaultMember, recentDefaultFailure);
-        var dispatchReason = paused
-            ? $"paused by operator: {pause?.PausedReason}"
-            : defaultVerdict?.RefusalReason;
+        // Per-agent dispatch failure breaker state for THIS route key. An open
+        // breaker is a dispatch exclusion, not quota exhaustion — surface it
+        // distinctly so "exhausted" is never reported for an agent whose quota
+        // probe is healthy but whose breaker benched it after real failures.
+        var breakerStatus = circuitBreaker?.GetMemberStatus(member, now);
+        var breakerBlocking = breakerStatus is { DispatchAllowed: false };
+        string? dispatchReason;
+        if (paused)
+        {
+            dispatchReason = $"paused by operator: {pause?.PausedReason}";
+        }
+        else
+        {
+            var reasons = new List<string>(2);
+            if (breakerStatus is { DispatchAllowed: false } blocking)
+                reasons.Add(blocking.Reason);
+            if (defaultVerdict?.RefusalReason is { } refusal)
+                reasons.Add($"quota: {refusal}");
+            dispatchReason = reasons.Count == 0 ? null : string.Join("; ", reasons);
+        }
         var perModelWouldAllow = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         foreach (var modelId in modelKeys)
         {
@@ -5241,8 +5287,19 @@ app.MapGet("/quota", async (
             pausedAt = pause?.PausedAt,
             pausedBy = pause?.PausedBy,
             pauseExpiresAt = pause?.ExpiresAt,
-            dispatchStatus = paused ? "paused" : "quota",
+            dispatchStatus = paused ? "paused" : breakerBlocking ? "circuit-breaker" : "quota",
             dispatchReason,
+            circuitBreaker = breakerStatus is null
+                ? null
+                : new
+                {
+                    state = breakerStatus.Phase.ToString(),
+                    failureCount = breakerStatus.FailureCount,
+                    openedAt = breakerStatus.OpenedAt,
+                    nextRetryAt = breakerStatus.NextRetryAt,
+                    dispatchAllowed = breakerStatus.DispatchAllowed,
+                    reason = breakerStatus.Reason,
+                },
             bindingWindow = snapshot.BindingWindow,
             windowSummary = QuotaWindowBinding.FormatWindowSummary(
                 snapshot.Windows, snapshot.AvailablePct),
@@ -5544,23 +5601,84 @@ app.MapPost("/admin/agent/{name}/reset", (
     });
 });
 
-app.MapGet("/admin/agents/availability", (IAgentAvailabilityRegistry registry) =>
+app.MapGet("/admin/agents/availability", (IAgentAvailabilityRegistry registry, AgentCircuitBreaker? circuitBreaker) =>
 {
+    var now = DateTimeOffset.UtcNow;
+    var breakerStatuses = circuitBreaker?.SnapshotStatuses(now) ?? [];
     return Results.Ok(new
     {
-        agents = registry.Snapshot().Select(s => new
+        // Every touched breaker route key, including agents the availability
+        // registry has never seen — an open breaker must be visible even when
+        // fast-fail/smoke counters are all zero.
+        circuitBreakers = breakerStatuses.Select(b => new
         {
-            agent = s.Agent.Value,
-            excluded = s.Excluded,
-            reason = s.Reason,
-            consecutiveFastFails = s.ConsecutiveFastFails,
-            consecutiveNoChanges = s.ConsecutiveNoChanges,
-            lastSmokePassedAt = s.LastSmokePassedAt,
-            lastSmokeFailedAt = s.LastSmokeFailedAt,
-            lastFastFailAt = s.LastFastFailAt,
-            lastNoChangesAt = s.LastNoChangesAt,
+            routeKey = b.RouteKey,
+            agent = b.Agent.Value,
+            state = b.Phase.ToString(),
+            failureCount = b.FailureCount,
+            openedAt = b.OpenedAt,
+            nextRetryAt = b.NextRetryAt,
+            dispatchAllowed = b.DispatchAllowed,
+            reason = b.Reason,
+        }).ToList(),
+        agents = registry.Snapshot().Select(s =>
+        {
+            // Worst breaker state across this agent's route keys: an open
+            // breaker is a dispatch exclusion, so surface it next to the
+            // availability verdict instead of letting the agent read as
+            // merely quota-starved.
+            var agentBreakers = breakerStatuses
+                .Where(b => b.Agent == s.Agent)
+                .OrderByDescending(b => BreakerSeverity(b))
+                .ThenBy(b => b.RouteKey, StringComparer.Ordinal)
+                .ToList();
+            return new
+            {
+                agent = s.Agent.Value,
+                excluded = s.Excluded,
+                reason = s.Reason,
+                consecutiveFastFails = s.ConsecutiveFastFails,
+                consecutiveNoChanges = s.ConsecutiveNoChanges,
+                lastSmokePassedAt = s.LastSmokePassedAt,
+                lastSmokeFailedAt = s.LastSmokeFailedAt,
+                lastFastFailAt = s.LastFastFailAt,
+                lastNoChangesAt = s.LastNoChangesAt,
+                circuitBreaker = agentBreakers.Count == 0
+                    ? null
+                    : new
+                    {
+                        state = agentBreakers[0].Phase.ToString(),
+                        failureCount = agentBreakers[0].FailureCount,
+                        openedAt = agentBreakers[0].OpenedAt,
+                        nextRetryAt = agentBreakers[0].NextRetryAt,
+                        dispatchAllowed = agentBreakers[0].DispatchAllowed,
+                        reason = agentBreakers[0].Reason,
+                        routes = agentBreakers.Select(b => new
+                        {
+                            routeKey = b.RouteKey,
+                            state = b.Phase.ToString(),
+                            failureCount = b.FailureCount,
+                            openedAt = b.OpenedAt,
+                            nextRetryAt = b.NextRetryAt,
+                            dispatchAllowed = b.DispatchAllowed,
+                            reason = b.Reason,
+                        }).ToList(),
+                    },
+            };
         }),
     });
+
+    // Open-and-blocking outranks open-in-trial outranks half-open outranks
+    // closed-with-failures; ties keep catalogue order via RouteKey.
+    static int BreakerSeverity(CircuitBreakerMemberStatus status) =>
+        status.Phase switch
+        {
+            CircuitPhase.Open when !status.DispatchAllowed => 4,
+            CircuitPhase.Open => 3,
+            CircuitPhase.HalfOpen => 2,
+            _ when status.FailureCount > 0 => 1,
+            _ => 0,
+        };
 });
 
 app.MapGet("/events/schema", () => Results.Ok(EventSchema.GetSchema()));

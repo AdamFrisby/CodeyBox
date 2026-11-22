@@ -375,6 +375,92 @@ public sealed class QueueStatusHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task GetQueueStatus_HostResourceBlock_ExposesDiskBlock()
+    {
+        // A disk-guard deferral recorded against the shared tracker must
+        // surface in /queue/status with the resource, free bytes, threshold,
+        // and since — the visibility that was missing during the host disk
+        // incident.
+        var tracker = _factory.Services.GetRequiredService<HostResourceBlockTracker>();
+        tracker.RecordDiskBlock(
+            "/var/lib/codeybox", freeBytes: 1_000, thresholdBytes: 10_000,
+            recheckIn: TimeSpan.FromMinutes(5));
+
+        var resp = await _client.GetAsync("/queue/status");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var block = Assert.Single(doc.RootElement.GetProperty("hostResourceBlocks").EnumerateArray());
+        Assert.Equal("disk-space", block.GetProperty("kind").GetString());
+        Assert.Equal("/var/lib/codeybox", block.GetProperty("mountPath").GetString());
+        Assert.Equal(1_000, block.GetProperty("freeBytes").GetInt64());
+        Assert.Equal(10_000, block.GetProperty("thresholdBytes").GetInt64());
+        Assert.True(block.GetProperty("dispatchBlocking").GetBoolean());
+        Assert.False(string.IsNullOrWhiteSpace(block.GetProperty("blockedSince").GetString()));
+        Assert.Contains("bytes free", block.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
+    public async Task QuotaEndpoint_OpenCircuitBreaker_DistinguishesFromQuotaExhaustion()
+    {
+        // Three dispatch failures open claude's breaker while its quota probe
+        // stays healthy: /quota must report the breaker, not "quota".
+        var breaker = _factory.Services.GetRequiredService<AgentCircuitBreaker>();
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Claude,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 100,
+        };
+        var now = DateTimeOffset.UtcNow;
+        breaker.RecordOutcome(member, false, now);
+        breaker.RecordOutcome(member, false, now.AddSeconds(1));
+        breaker.RecordOutcome(member, false, now.AddSeconds(2));
+
+        var quota = await _client.GetAsync("/quota");
+        Assert.Equal(HttpStatusCode.OK, quota.StatusCode);
+        using var doc = JsonDocument.Parse(await quota.Content.ReadAsStringAsync());
+        var claude = doc.RootElement.GetProperty("probes").EnumerateArray()
+            .First(e => e.GetProperty("agentInstanceId").GetString() == "claude");
+
+        Assert.Equal("circuit-breaker", claude.GetProperty("dispatchStatus").GetString());
+        Assert.True(claude.GetProperty("wouldAllow").GetBoolean());
+        var cb = claude.GetProperty("circuitBreaker");
+        Assert.Equal("Open", cb.GetProperty("state").GetString());
+        Assert.Equal(3, cb.GetProperty("failureCount").GetInt32());
+        Assert.False(cb.GetProperty("dispatchAllowed").GetBoolean());
+        Assert.Contains("failure", cb.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
+    public async Task AvailabilityEndpoint_OpenCircuitBreaker_ExposesStateAndReason()
+    {
+        var breaker = _factory.Services.GetRequiredService<AgentCircuitBreaker>();
+        var member = new AgentMembership
+        {
+            Agent = AgentKind.Codex,
+            Billing = AgentBilling.Subscription,
+            QualityScore = 90,
+        };
+        var now = DateTimeOffset.UtcNow;
+        breaker.RecordOutcome(member, false, now);
+        breaker.RecordOutcome(member, false, now.AddSeconds(1));
+        breaker.RecordOutcome(member, false, now.AddSeconds(2));
+
+        var resp = await _client.GetAsync("/admin/agents/availability");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var entry = Assert.Single(
+            doc.RootElement.GetProperty("circuitBreakers").EnumerateArray(),
+            e => e.GetProperty("routeKey").GetString() == "codex");
+        Assert.Equal("Open", entry.GetProperty("state").GetString());
+        Assert.Equal(3, entry.GetProperty("failureCount").GetInt32());
+        Assert.False(entry.GetProperty("dispatchAllowed").GetBoolean());
+        Assert.False(string.IsNullOrWhiteSpace(entry.GetProperty("openedAt").GetString()));
+        Assert.Contains("failure", entry.GetProperty("reason").GetString() ?? "");
+    }
+
+    [Fact]
     public async Task PauseQueue_EmptyReason_Returns400()
     {
         var resp = await _client.PostAsJsonAsync("/queue/pause", new { reason = "" });
