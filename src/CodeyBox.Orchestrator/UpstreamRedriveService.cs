@@ -62,7 +62,23 @@ public sealed class UpstreamRedriveService
         string? LastPushedWorkBranchSha,
         string Reason);
 
-    public async Task<IReadOnlyList<UpstreamRedriveCandidate>> ListCandidatesAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Latency-tolerant candidate scan for background detection. Forge reads
+    /// may defer while the shared request budget is below reserve.
+    /// </summary>
+    public Task<IReadOnlyList<UpstreamRedriveCandidate>> ListCandidatesAsync(CancellationToken ct = default)
+        => ListCandidatesCoreAsync(ct, operatorInitiated: false);
+
+    /// <summary>
+    /// Operator-facing candidate scan. Uses the remote's operator read path so
+    /// the background budget reserve does not make the endpoint silently omit
+    /// projects (hard rate-limit blocks still apply).
+    /// </summary>
+    public Task<IReadOnlyList<UpstreamRedriveCandidate>> ListCandidatesForOperatorAsync(CancellationToken ct = default)
+        => ListCandidatesCoreAsync(ct, operatorInitiated: true);
+
+    private async Task<IReadOnlyList<UpstreamRedriveCandidate>> ListCandidatesCoreAsync(
+        CancellationToken ct, bool operatorInitiated)
     {
         var candidates = new List<UpstreamRedriveCandidate>();
         var projects = await _projects.ListAsync(ct);
@@ -74,7 +90,9 @@ public sealed class UpstreamRedriveService
             try
             {
                 var upstream = _upstreamFactory.Create(project);
-                openPrs = await upstream.ListOpenPullRequestsAsync(CodeyBoxBranchPolicy.OwnedBranchPrefix, ct);
+                openPrs = operatorInitiated
+                    ? await upstream.ListOpenPullRequestsForOperatorAsync(CodeyBoxBranchPolicy.OwnedBranchPrefix, ct)
+                    : await upstream.ListOpenPullRequestsAsync(CodeyBoxBranchPolicy.OwnedBranchPrefix, ct);
             }
             catch (Exception ex)
             {
@@ -138,10 +156,13 @@ public sealed class UpstreamRedriveService
             {
                 continue;
             }
-            // Candidate scans are latency-tolerant: when the forge's shared
-            // request budget is below reserve, skip the remote-tip read this
-            // round rather than spend pipeline budget on detection.
-            if (itemUpstream is IUpstreamBackgroundReadGate gate
+            // Background candidate scans are latency-tolerant: when the forge's
+            // shared request budget is below reserve, skip the remote-tip read
+            // this round rather than spend pipeline budget on detection.
+            // Operator scans omit the gate because their reads use the
+            // pipeline request class.
+            if (!operatorInitiated
+                && itemUpstream is IUpstreamBackgroundReadGate gate
                 && await gate.GetBackgroundReadDeferralAsync(ct).ConfigureAwait(false) is not null)
                 continue;
             var remoteHead = await SafeGetBranchHeadAsync(itemUpstream, workBranch, ct).ConfigureAwait(false);
@@ -261,7 +282,7 @@ public sealed class UpstreamRedriveService
         IReadOnlyList<UpstreamPullRequest> openPrs;
         try
         {
-            openPrs = await upstream.ListOpenPullRequestsAsync(CodeyBoxBranchPolicy.OwnedBranchPrefix, ct);
+            openPrs = await upstream.ListOpenPullRequestsForOperatorAsync(CodeyBoxBranchPolicy.OwnedBranchPrefix, ct);
         }
         catch (Exception ex)
         {

@@ -456,7 +456,7 @@ internal static class WorkItemEndpoints
         UpstreamRedriveService redrive,
         CancellationToken ct)
     {
-        var candidates = await redrive.ListCandidatesAsync(ct);
+        var candidates = await redrive.ListCandidatesForOperatorAsync(ct);
         return Results.Ok(new
         {
             candidates = candidates.Select(c => new

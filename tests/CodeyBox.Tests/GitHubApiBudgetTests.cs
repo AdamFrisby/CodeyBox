@@ -323,6 +323,30 @@ public sealed class GitHubApiBudgetTests
     }
 
     [Fact]
+    public async Task Budget_OperatorPullRequestList_IgnoresBackgroundReserve()
+    {
+        var time = new ControllableTimeProvider(T0);
+        var (tracker, handler, inner) = BuildBudgetStack(time, reserve: 100);
+        var remote = BuildRemote(handler, apiBudget: tracker, clock: time);
+
+        inner.Enqueue(RateLimitHeaders(
+            JsonResponse(HttpStatusCode.OK, $$$"""{"commit":{"sha":"{{{ShaA}}}"}}"""),
+            remaining: 50, reset: T0 + TimeSpan.FromHours(1)));
+        await remote.GetBranchHeadShaAsync("main", CancellationToken.None);
+        Assert.Single(inner.Requests);
+
+        await Assert.ThrowsAsync<UpstreamApiDeferredException>(
+            () => remote.ListOpenPullRequestsAsync("codeybox/", CancellationToken.None));
+        Assert.Single(inner.Requests);
+
+        inner.Enqueue(JsonResponse(HttpStatusCode.OK, "[]"));
+        var prs = await remote.ListOpenPullRequestsForOperatorAsync("codeybox/", CancellationToken.None);
+
+        Assert.Empty(prs);
+        Assert.Equal(2, inner.Requests.Count);
+    }
+
+    [Fact]
     public async Task Budget_403WithRemainingZero_DefersUntilReset()
     {
         var time = new ControllableTimeProvider(T0);

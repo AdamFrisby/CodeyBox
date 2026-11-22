@@ -548,8 +548,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     /// and PAT as the rest of this class; failures throw so the caller can
     /// log and back off.</para>
     /// </summary>
-    public async Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
+    public Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
         string branchPrefix, CancellationToken ct = default)
+        => ListOpenPullRequestsCoreAsync(branchPrefix, ct, GitHubRequestClass.Background);
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsForOperatorAsync(
+        string branchPrefix, CancellationToken ct = default)
+        => ListOpenPullRequestsCoreAsync(branchPrefix, ct, GitHubRequestClass.Pipeline);
+
+    private async Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsCoreAsync(
+        string branchPrefix, CancellationToken ct, GitHubRequestClass requestClass)
     {
         if (string.IsNullOrEmpty(branchPrefix))
             throw new ArgumentException("branchPrefix must be non-empty", nameof(branchPrefix));
@@ -566,7 +575,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
         {
             var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls" +
                 $"?state=open&per_page={perPage}&page={page}";
-            var pageSummaries = await FetchOpenPullListPageAsync(url, ct);
+            var pageSummaries = await FetchOpenPullListPageAsync(url, ct, requestClass);
             if (pageSummaries.Length == 0) break;
             summaries.AddRange(pageSummaries);
             if (pageSummaries.Length < perPage) break;
@@ -584,7 +593,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
         // once per sweep — mergeability is a pure function of (head sha,
         // base tip), so the detail cache can skip the per-PR fetch entirely
         // while both are unchanged. Branch-tip reads are conditional too.
-        var baseTips = await ResolveBaseTipsAsync(matching, ct);
+        var baseTips = await ResolveBaseTipsAsync(matching, ct, requestClass);
 
         var listed = new List<UpstreamPullRequest>(matching.Count);
         foreach (var summary in matching)
@@ -597,7 +606,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
                     : summary.Base?.Sha;
 
             var detail = await FetchProbePullRequestDetailAsync(
-                summary.Number, summary.Head.Sha, baseTip, ct);
+                summary.Number, summary.Head.Sha, baseTip, ct, requestClass);
             if (detail is null) continue;
 
             // `mergeable` null means GitHub is still computing — skip.
@@ -625,13 +634,14 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     /// sends <c>If-None-Match</c> when an ETag is known and replays the cached
     /// body on 304. Throws on non-2xx/non-304 so the sweeper backs off.
     /// </summary>
-    private async Task<GitHubPrSummary[]> FetchOpenPullListPageAsync(string url, CancellationToken ct)
+    private async Task<GitHubPrSummary[]> FetchOpenPullListPageAsync(
+        string url, CancellationToken ct, GitHubRequestClass requestClass)
     {
         var cached = _readCache?.GetPage(RepoKey(), url);
         using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
         if (cached?.ETag is { } etag)
             req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(etag));
-        using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
+        using var resp = await SendAsync(req, ct, requestClass);
 
         if (resp.StatusCode == HttpStatusCode.NotModified)
         {
@@ -671,7 +681,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     /// silently-stale reuse.
     /// </summary>
     private async Task<IReadOnlyDictionary<string, string>> ResolveBaseTipsAsync(
-        IReadOnlyList<GitHubPrSummary> matching, CancellationToken ct)
+        IReadOnlyList<GitHubPrSummary> matching, CancellationToken ct, GitHubRequestClass requestClass)
     {
         var tips = new Dictionary<string, string>(StringComparer.Ordinal);
         var baseRefs = matching
@@ -681,7 +691,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
             .ToList();
         foreach (var baseRef in baseRefs)
         {
-            var tip = await TryGetBranchTipShaAsync(baseRef!, ct);
+            var tip = await TryGetBranchTipShaAsync(baseRef!, ct, requestClass);
             // Only resolved tips are stored: an unreadable branch must look
             // absent so callers fall back to the summary's recorded base sha.
             if (tip is not null)
@@ -690,11 +700,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
         return tips;
     }
 
-    private async Task<string?> TryGetBranchTipShaAsync(string branch, CancellationToken ct)
+    private async Task<string?> TryGetBranchTipShaAsync(
+        string branch, CancellationToken ct, GitHubRequestClass requestClass)
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/branches/{Uri.EscapeDataString(branch)}";
         var cached = _readCache?.GetBranchTip(RepoKey(), branch);
-        var result = await SendConditionalGetAsync(url, cached?.ETag, ct);
+        var result = await SendConditionalGetAsync(url, cached?.ETag, ct, requestClass);
 
         string? body;
         string? etag = null;
@@ -744,7 +755,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     /// pinned out of the sweep until its revisions moved.
     /// </summary>
     private async Task<GitHubPrDetailMergeable?> FetchProbePullRequestDetailAsync(
-        int number, string? headSha, string? baseSha, CancellationToken ct)
+        int number, string? headSha, string? baseSha, CancellationToken ct, GitHubRequestClass requestClass)
     {
         var cached = _readCache?.GetPullRequest(RepoKey(), number);
         if (cached is not null
@@ -764,7 +775,7 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
         }
 
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{number}";
-        var result = await SendConditionalGetAsync(url, cached?.ETag, ct);
+        var result = await SendConditionalGetAsync(url, cached?.ETag, ct, requestClass);
 
         string? body;
         var notModified = result.Status == ConditionalGetStatus.NotModified;
@@ -834,12 +845,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     /// each status (log, fall back, skip).
     /// </summary>
     private async Task<ConditionalGetResult> SendConditionalGetAsync(
-        string url, string? etag, CancellationToken ct)
+        string url, string? etag, CancellationToken ct, GitHubRequestClass requestClass)
     {
         using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
         if (etag is { } known)
             req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(known));
-        using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
+        using var resp = await SendAsync(req, ct, requestClass);
         if (resp.StatusCode == HttpStatusCode.NotModified)
             return new(ConditionalGetStatus.NotModified, (int)resp.StatusCode, null, null);
         if (resp.StatusCode == HttpStatusCode.NotFound)

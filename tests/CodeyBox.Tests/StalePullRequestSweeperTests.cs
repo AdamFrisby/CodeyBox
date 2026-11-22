@@ -112,6 +112,39 @@ public sealed class StalePullRequestSweeperTests
     }
 
     [Fact]
+    public async Task Sweep_DeferredProject_PreservesDedupStateAcrossRecovery()
+    {
+        // A budget-deferred project has no PR snapshot for this tick. Its
+        // dedup entries must survive so the already-reported stale PR does
+        // not fire upstream.pr_stale_base again after the budget recovers.
+        var project = BuildGitHubProject();
+        var dirtyPr = new UpstreamPullRequest
+        {
+            Number = 77,
+            Url = "https://github.com/example/repo/pull/77",
+            HeadBranch = "codeybox/deferred",
+            HeadSha = "tip-deferred",
+            BaseBranch = "main",
+            HasMergeConflict = true,
+        };
+        var remote = new ScriptedUpstreamRemote(new[] { dirtyPr });
+        var factory = new ScriptedUpstreamFactory(remote);
+        var webhooks = new CapturingWebhookDispatcher();
+        var sweeper = BuildSweeper(project, factory, webhooks);
+
+        await sweeper.RunSweepAsync(CancellationToken.None);
+        Assert.Single(webhooks.Events);
+
+        remote.ExceptionsToThrow.Enqueue(new UpstreamApiDeferredException(
+            "budget deferred", DateTimeOffset.UtcNow.AddMinutes(30)));
+        await sweeper.RunSweepAsync(CancellationToken.None);
+        await sweeper.RunSweepAsync(CancellationToken.None);
+
+        Assert.Single(webhooks.Events);
+        Assert.Equal(3, remote.ListCallCount);
+    }
+
+    [Fact]
     public async Task Sweep_PrHeadShaChanges_RefiresEvent()
     {
         // Operator pushes a partial rebase that still conflicts. The dedup
@@ -431,6 +464,7 @@ internal sealed class ScriptedUpstreamRemote : IUpstreamRemote
     private readonly object _listSignalGate = new();
     private TaskCompletionSource _listSignal = NewListSignal();
     public int ListCallCount { get; private set; }
+    public Queue<Exception> ExceptionsToThrow { get; } = new();
 
     private static TaskCompletionSource NewListSignal() =>
         new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -489,6 +523,7 @@ internal sealed class ScriptedUpstreamRemote : IUpstreamRemote
             _listSignal = NewListSignal();
         }
         signal.TrySetResult();
+        if (ExceptionsToThrow.Count > 0) throw ExceptionsToThrow.Dequeue();
         if (_throwOnList is not null) throw _throwOnList;
         var next = _responses.Count > 0 ? _responses.Dequeue() : _last;
         _last = next;

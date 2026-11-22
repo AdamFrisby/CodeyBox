@@ -212,24 +212,28 @@ public sealed class StalePullRequestSweeper : BackgroundService
         }
 
         var observedIdentities = new HashSet<StalePrIdentity>();
+        var sweptProjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var project in projects)
         {
             if (!string.Equals(project.Upstream.Kind, "github", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            await SweepProjectAsync(project, prefix, observedIdentities, ct);
+            if (await SweepProjectAsync(project, prefix, observedIdentities, ct))
+                sweptProjectIds.Add(project.Id.Value);
         }
 
-        // Prune dedup entries for PRs that have disappeared from the sweep
-        // (closed, merged, or rebased into mergeable). Without this, the
-        // dictionary would accumulate forever; with it, a PR that re-enters
-        // a dirty state after being fixed gets a fresh event correctly.
-        var stale = _firstSeenAt.Keys.Where(k => !observedIdentities.Contains(k)).ToList();
+        // Prune dedup entries only for projects whose PR list was observed
+        // this sweep. A deferred or failed project has no current snapshot:
+        // treating it as empty would erase dedup state and refire events for
+        // PRs that are still stale once the budget recovers.
+        var stale = _firstSeenAt.Keys
+            .Where(k => sweptProjectIds.Contains(k.ProjectId) && !observedIdentities.Contains(k))
+            .ToList();
         foreach (var key in stale) _firstSeenAt.Remove(key);
     }
 
-    private async Task SweepProjectAsync(
+    private async Task<bool> SweepProjectAsync(
         Project project,
         string prefix,
         HashSet<StalePrIdentity> observedIdentities,
@@ -245,7 +249,7 @@ public sealed class StalePullRequestSweeper : BackgroundService
             _log.LogDebug(ex,
                 "StalePullRequestSweeper: skipping project {ProjectId}; upstream factory threw",
                 project.Id.Value);
-            return;
+            return false;
         }
 
         IReadOnlyList<UpstreamPullRequest> openPrs;
@@ -261,14 +265,14 @@ public sealed class StalePullRequestSweeper : BackgroundService
             _log.LogInformation(
                 "StalePullRequestSweeper: GitHub API budget deferred for project {ProjectId} until {DeferredUntil}; skipping this tick",
                 project.Id.Value, ex.DeferredUntil);
-            return;
+            return false;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex,
                 "StalePullRequestSweeper: ListOpenPullRequestsAsync failed for project {ProjectId}",
                 project.Id.Value);
-            return;
+            return false;
         }
 
         foreach (var pr in openPrs)
@@ -314,6 +318,8 @@ public sealed class StalePullRequestSweeper : BackgroundService
             // conflict-rework state machine (gated by RouteToConflictRework).
             await TryRouteToReworkAsync(project, pr, ct);
         }
+
+        return true;
     }
 
     /// <summary>

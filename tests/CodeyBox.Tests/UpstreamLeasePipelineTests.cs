@@ -81,6 +81,33 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
         Assert.Equal(item.Id.ToString(), candidate.WorkItemId);
         Assert.Equal(612, candidate.PullRequestNumber);
         Assert.Contains("lease", candidate.Reason);
+        Assert.Equal(1, fixture.Remote.BackgroundListCallCount);
+        Assert.Equal(0, fixture.Remote.OperatorListCallCount);
+    }
+
+    [Fact]
+    public async Task OperatorCandidateScan_UsesOperatorListingPath()
+    {
+        using var fixture = CreateRedriveFixture();
+        var item = NewItem("codeybox/operator-scan", fixture.Project.Id);
+        item = item.With(WorkItemState.Failed, "refusing to overwrite", failureKind: WorkItemFailureKinds.UpstreamBlocked)
+            with { MergedPrNumber = 614 };
+        await fixture.Store.CreateAsync(item);
+        fixture.Remote.OpenPullRequests.Add(new UpstreamPullRequest
+        {
+            Number = 614,
+            Url = "https://github.com/o/r/pull/614",
+            HeadBranch = "codeybox/operator-scan",
+            HeadSha = new string('e', 40),
+            BaseBranch = "main",
+            HasMergeConflict = false,
+        });
+
+        var candidates = await fixture.Redrive.ListCandidatesForOperatorAsync(CancellationToken.None);
+
+        Assert.Single(candidates);
+        Assert.Equal(1, fixture.Remote.OperatorListCallCount);
+        Assert.Equal(0, fixture.Remote.BackgroundListCallCount);
     }
 
     [Fact]
@@ -166,6 +193,8 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
         Assert.False(result.Success);
         var stored = (await fixture.Store.GetAsync(item.Id))!;
         Assert.Equal(headSha, stored.LastPushedWorkBranchSha);
+        Assert.Equal(1, fixture.Remote.OperatorListCallCount);
+        Assert.Equal(0, fixture.Remote.BackgroundListCallCount);
     }
 
     [Fact]
@@ -381,6 +410,8 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
         public List<UpstreamPullRequest> OpenPullRequests { get; } = new();
         public IReadOnlyList<string>? BranchCommitMessages { get; set; }
         public string? BranchHeadSha { get; set; }
+        public int BackgroundListCallCount { get; private set; }
+        public int OperatorListCallCount { get; private set; }
         public string Name => "stub-listing-upstream";
 
         public Task<UpstreamPushResult> PushAsync(string repositoryId, string branch, CancellationToken ct = default)
@@ -393,7 +424,19 @@ public sealed class UpstreamLeasePipelineTests : IDisposable
             => Task.FromResult(true);
 
         public Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(string branchPrefix, CancellationToken ct = default)
-            => Task.FromResult<IReadOnlyList<UpstreamPullRequest>>(
+        {
+            BackgroundListCallCount++;
+            return ListOpenPullRequestsCore(branchPrefix);
+        }
+
+        public Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsForOperatorAsync(string branchPrefix, CancellationToken ct = default)
+        {
+            OperatorListCallCount++;
+            return ListOpenPullRequestsCore(branchPrefix);
+        }
+
+        private Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsCore(string branchPrefix) =>
+            Task.FromResult<IReadOnlyList<UpstreamPullRequest>>(
                 OpenPullRequests.Where(p => p.HeadBranch.StartsWith(branchPrefix, StringComparison.Ordinal)).ToList());
 
         public Task<string?> GetBranchHeadShaAsync(string branch, CancellationToken ct = default)
