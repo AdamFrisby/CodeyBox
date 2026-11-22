@@ -194,9 +194,22 @@ internal static class WorkItemEndpoints
             iterations: iterations.Count > 0 ? iterations : null);
         if (project is not null && item.MergedPrNumber is > 0)
         {
-            try
+            var remote = upstreams.Create(project);
+            // Status enrichment is latency-tolerant: when the forge's shared
+            // request budget is below reserve, skip the read entirely rather
+            // than spend pipeline budget on it.
+            var deferred = remote is IUpstreamBackgroundReadGate gate
+                ? await gate.GetBackgroundReadDeferralAsync(ct)
+                : null;
+            if (deferred is not null)
             {
-                var pullRequest = await upstreams.Create(project).GetPullRequestAsync(item.MergedPrNumber.Value, ct);
+                loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints").LogDebug(
+                    "Skipping upstream PR {PullRequestNumber} read for work item {WorkItemId}: {Reason}",
+                    item.MergedPrNumber, item.Id, deferred.Reason);
+            }
+            else try
+            {
+                var pullRequest = await remote.GetPullRequestAsync(item.MergedPrNumber.Value, ct);
                 if (pullRequest is not null)
                 {
                     dto = dto with

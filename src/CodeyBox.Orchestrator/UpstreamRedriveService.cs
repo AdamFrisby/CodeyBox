@@ -138,6 +138,12 @@ public sealed class UpstreamRedriveService
             {
                 continue;
             }
+            // Candidate scans are latency-tolerant: when the forge's shared
+            // request budget is below reserve, skip the remote-tip read this
+            // round rather than spend pipeline budget on detection.
+            if (itemUpstream is IUpstreamBackgroundReadGate gate
+                && await gate.GetBackgroundReadDeferralAsync(ct).ConfigureAwait(false) is not null)
+                continue;
             var remoteHead = await SafeGetBranchHeadAsync(itemUpstream, workBranch, ct).ConfigureAwait(false);
             if (remoteHead is null)
                 continue;

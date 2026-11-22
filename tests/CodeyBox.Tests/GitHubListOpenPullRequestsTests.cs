@@ -22,18 +22,38 @@ public sealed class GitHubListOpenPullRequestsTests
         AutoMerge = false,
     };
 
-    private static GitHubUpstreamRemote BuildRemote(FakeHttpMessageHandler handler)
+    private static GitHubUpstreamRemote BuildRemote(
+        FakeHttpMessageHandler handler,
+        GitHubUpstreamReadCache? readCache = null,
+        GitHubApiBudgetTracker? apiBudget = null)
     {
         var factory = new FakeHttpClientFactory(handler, userAgent: "codeybox");
         return new GitHubUpstreamRemote(
             new FakeGitHost(),
             factory,
             NullLogger<GitHubUpstreamRemote>.Instance,
-            DefaultOpts);
+            DefaultOpts,
+            apiBudget: apiBudget,
+            readCache: readCache);
     }
 
     private static HttpResponseMessage JsonResponse(HttpStatusCode status, string json) =>
         new(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+
+    private static HttpResponseMessage JsonResponseWithETag(HttpStatusCode status, string json, string etag)
+    {
+        var response = JsonResponse(status, json);
+        response.Headers.ETag = new System.Net.Http.Headers.EntityTagHeaderValue($"\"{etag}\"");
+        return response;
+    }
+
+    /// <summary>
+    /// The probe resolves each distinct base branch's live tip once per sweep
+    /// (GET /branches/{ref}) so detail reads can key on (head sha, base tip).
+    /// Enqueue this between the /pulls list response and the detail responses.
+    /// </summary>
+    private static HttpResponseMessage BranchTipResponse(string sha) =>
+        JsonResponse(HttpStatusCode.OK, $$$"""{"commit":{"sha":"{{{sha}}}"}}""");
 
     [Theory]
     [InlineData("open", false, PullRequestStatus.Open, "github-test-sha", null)]
@@ -74,6 +94,7 @@ public sealed class GitHubListOpenPullRequestsTests
         ]
         """));
         // Detail for the codeybox/ PR — dirty (mergeable=false).
+        handler.Enqueue(BranchTipResponse("base-tip-1"));
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
         {"number": 112, "html_url": "https://github.com/myorg/myrepo/pull/112",
          "mergeable": false, "mergeable_state": "dirty"}
@@ -89,10 +110,12 @@ public sealed class GitHubListOpenPullRequestsTests
         Assert.Equal("main", pr.BaseBranch);
         Assert.True(pr.HasMergeConflict);
 
-        // Two HTTP calls: list + one detail (only for the matching prefix).
-        Assert.Equal(2, handler.Requests.Count);
+        // Three HTTP calls: list + one base-tip read + one detail (only for
+        // the matching prefix).
+        Assert.Equal(3, handler.Requests.Count);
         Assert.Contains("/pulls?state=open", handler.Requests[0].RequestUri!.PathAndQuery);
-        Assert.Contains("/pulls/112", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Contains("/branches/main", handler.Requests[1].RequestUri!.PathAndQuery);
+        Assert.Contains("/pulls/112", handler.Requests[2].RequestUri!.PathAndQuery);
     }
 
     [Fact]
@@ -105,6 +128,7 @@ public sealed class GitHubListOpenPullRequestsTests
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
         [{ "number": 5, "head": {"ref": "codeybox/x", "sha": "tip"}, "base": {"ref": "main"} }]
         """));
+        handler.Enqueue(BranchTipResponse("base-tip-1"));
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
         {"number": 5, "html_url": "https://github.com/myorg/myrepo/pull/5",
          "mergeable": null, "mergeable_state": "unknown"}
@@ -127,6 +151,7 @@ public sealed class GitHubListOpenPullRequestsTests
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
         [{ "number": 11, "head": {"ref": "codeybox/y", "sha": "tip"}, "base": {"ref": "main"} }]
         """));
+        handler.Enqueue(BranchTipResponse("base-tip-1"));
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
         {"number": 11, "html_url": "https://github.com/myorg/myrepo/pull/11",
          "mergeable": true, "mergeable_state": "blocked"}
@@ -149,6 +174,7 @@ public sealed class GitHubListOpenPullRequestsTests
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
         [{ "number": 21, "head": {"ref": "codeybox/d", "sha": "tip"}, "base": {"ref": "main"} }]
         """));
+        handler.Enqueue(BranchTipResponse("base-tip-1"));
         // `mergeable: false` is the primary signal — checked here in
         // combination with the "dirty" state.
         handler.Enqueue(JsonResponse(HttpStatusCode.OK, """
@@ -244,6 +270,8 @@ public sealed class GitHubListOpenPullRequestsTests
           { "number": 51, "head": {"ref": "codeybox/ok", "sha": "y"}, "base": {"ref": "main"} }
         ]
         """));
+        // Both PRs share base "main" → one branch-tip read, then the details.
+        handler.Enqueue(BranchTipResponse("base-tip-1"));
         // First detail fetch: 404 — that PR is skipped.
         handler.Enqueue(JsonResponse(HttpStatusCode.NotFound, "{\"message\":\"Not Found\"}"));
         // Second detail fetch: 200, dirty — included.
@@ -258,7 +286,7 @@ public sealed class GitHubListOpenPullRequestsTests
         var pr = Assert.Single(prs);
         Assert.Equal(51, pr.Number);
         Assert.True(pr.HasMergeConflict);
-        // Three HTTP calls: list + two details.
-        Assert.Equal(3, handler.Requests.Count);
+        // Four HTTP calls: list + one base-tip read + two details.
+        Assert.Equal(4, handler.Requests.Count);
     }
 }

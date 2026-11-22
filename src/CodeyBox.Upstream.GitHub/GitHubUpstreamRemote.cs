@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using CodeyBox.Core;
@@ -32,7 +33,7 @@ namespace CodeyBox.Upstream.GitHub;
 ///   On timeout or any generator failure the static template is used instead.
 ///   The generator call is bounded by <see cref="PrDescriptionOptions.Timeout"/>.
 /// </summary>
-public sealed class GitHubUpstreamRemote : IUpstreamRemote
+public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundReadGate
 {
     private readonly IGitHost _gitHost;
     private readonly IHttpClientFactory _httpClientFactory;
@@ -44,6 +45,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
     private readonly CommitAttribution _attribution;
     private readonly UpstreamBranchOwnershipSnapshot _ownership;
     private readonly TimeProvider _clock;
+    private readonly GitHubApiBudgetTracker? _apiBudget;
+    private readonly GitHubUpstreamReadCache? _readCache;
 
     public GitHubUpstreamRemote(
         IGitHost gitHost,
@@ -54,7 +57,9 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         IPullRequestDescriptionGenerator? descriptionGenerator = null,
         CommitAttribution? attribution = null,
         UpstreamBranchOwnershipSnapshot? ownership = null,
-        TimeProvider? clock = null)
+        TimeProvider? clock = null,
+        GitHubApiBudgetTracker? apiBudget = null,
+        GitHubUpstreamReadCache? readCache = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -69,6 +74,8 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         _attribution = attribution ?? CommitAttribution.Default;
         _ownership = ownership ?? new UpstreamBranchOwnershipSnapshot(new UpstreamBranchOwnershipOptions());
         _clock = clock ?? TimeProvider.System;
+        _apiBudget = apiBudget;
+        _readCache = readCache;
         if (!IsValidRemoteName(_opts.Owner))
             throw new ArgumentException($"GitHub Owner contains invalid characters: '{_opts.Owner}'", nameof(opts));
         if (!IsValidRemoteName(_opts.Repository))
@@ -547,61 +554,274 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         if (string.IsNullOrEmpty(branchPrefix))
             throw new ArgumentException("branchPrefix must be non-empty", nameof(branchPrefix));
 
-        var listed = new List<UpstreamPullRequest>();
         // Page through /pulls?state=open until the first page returns fewer
         // than per_page entries. Cap to a sane safety limit so a broken/very
-        // large repo cannot stall the sweep indefinitely.
+        // large repo cannot stall the sweep indefinitely. Pages are fetched
+        // conditionally (If-None-Match): a 304 costs nothing against the rate
+        // limit and replays the cached page body.
         const int perPage = 100;
         const int maxPages = 10;
+        var summaries = new List<GitHubPrSummary>();
         for (var page = 1; page <= maxPages; page++)
         {
             var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls" +
                 $"?state=open&per_page={perPage}&page={page}";
-            using var listReq = await BuildRequestAsync(HttpMethod.Get, url, ct);
-            using var listResp = await SendAsync(listReq, ct);
-            if (!listResp.IsSuccessStatusCode)
+            var pageSummaries = await FetchOpenPullListPageAsync(url, ct);
+            if (pageSummaries.Length == 0) break;
+            summaries.AddRange(pageSummaries);
+            if (pageSummaries.Length < perPage) break;
+        }
+
+        var matching = summaries
+            .Where(s => !string.IsNullOrEmpty(s.Head?.Ref)
+                && s.Head.Ref.StartsWith(branchPrefix, StringComparison.Ordinal))
+            .ToList();
+        if (matching.Count == 0)
+            return [];
+
+        // /pulls (list) returns a thin object without `mergeable`; the full
+        // PR detail carries it. Resolve each distinct base branch's live tip
+        // once per sweep — mergeability is a pure function of (head sha,
+        // base tip), so the detail cache can skip the per-PR fetch entirely
+        // while both are unchanged. Branch-tip reads are conditional too.
+        var baseTips = await ResolveBaseTipsAsync(matching, ct);
+
+        var listed = new List<UpstreamPullRequest>(matching.Count);
+        foreach (var summary in matching)
+        {
+            var headRef = summary.Head!.Ref!;
+            var baseRef = summary.Base?.Ref;
+            var baseTip = baseRef is not null
+                && baseTips.TryGetValue(baseRef, out var tip)
+                    ? tip
+                    : summary.Base?.Sha;
+
+            var detail = await FetchProbePullRequestDetailAsync(
+                summary.Number, summary.Head.Sha, baseTip, ct);
+            if (detail is null) continue;
+
+            // `mergeable` null means GitHub is still computing — skip.
+            // The sweeper will reconsider on the next tick.
+            if (detail.Mergeable is null) continue;
+
+            var hasConflict = detail.Mergeable == false
+                || string.Equals(detail.MergeableState, "dirty", StringComparison.Ordinal);
+
+            listed.Add(new UpstreamPullRequest
             {
-                AuditLog.UpstreamApiCallFailed("GET /pulls", (int)listResp.StatusCode, _opts.Owner, _opts.Repository);
-                listResp.EnsureSuccessStatusCode();
-            }
-            var summaries = await listResp.Content.ReadFromJsonAsync<GitHubPrSummary[]>(ct);
-            if (summaries is null || summaries.Length == 0) break;
-
-            foreach (var summary in summaries)
-            {
-                var headRef = summary.Head?.Ref;
-                if (string.IsNullOrEmpty(headRef)) continue;
-                if (!headRef.StartsWith(branchPrefix, StringComparison.Ordinal)) continue;
-
-                // /pulls (list) returns a thin object without `mergeable`;
-                // we have to fetch the full PR detail to read it. Restricting
-                // the fetch to PRs whose head matches the prefix keeps the
-                // per-sweep API-call count proportional to the
-                // CodeyBox-authored PR set rather than the full open-PR set.
-                var detail = await FetchPullRequestDetailAsync(summary.Number, ct);
-                if (detail is null) continue;
-
-                // `mergeable` null means GitHub is still computing — skip.
-                // The sweeper will reconsider on the next tick.
-                if (detail.Mergeable is null) continue;
-
-                var hasConflict = detail.Mergeable == false
-                    || string.Equals(detail.MergeableState, "dirty", StringComparison.Ordinal);
-
-                listed.Add(new UpstreamPullRequest
-                {
-                    Number = detail.Number,
-                    Url = detail.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{detail.Number}",
-                    HeadBranch = headRef,
-                    HeadSha = summary.Head?.Sha ?? string.Empty,
-                    BaseBranch = summary.Base?.Ref ?? string.Empty,
-                    HasMergeConflict = hasConflict,
-                });
-            }
-
-            if (summaries.Length < perPage) break;
+                Number = detail.Number,
+                Url = detail.HtmlUrl ?? $"https://github.com/{_opts.Owner}/{_opts.Repository}/pull/{detail.Number}",
+                HeadBranch = headRef,
+                HeadSha = summary.Head.Sha ?? string.Empty,
+                BaseBranch = baseRef ?? string.Empty,
+                HasMergeConflict = hasConflict,
+            });
         }
         return listed;
+    }
+
+    /// <summary>
+    /// Fetches one page of the open-PR list, honouring the shared read cache:
+    /// sends <c>If-None-Match</c> when an ETag is known and replays the cached
+    /// body on 304. Throws on non-2xx/non-304 so the sweeper backs off.
+    /// </summary>
+    private async Task<GitHubPrSummary[]> FetchOpenPullListPageAsync(string url, CancellationToken ct)
+    {
+        var cached = _readCache?.GetPage(RepoKey(), url);
+        using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
+        if (cached?.ETag is { } etag)
+            req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(etag));
+        using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
+
+        if (resp.StatusCode == HttpStatusCode.NotModified)
+        {
+            if (cached is null)
+            {
+                // A 304 without a stored body cannot happen through this code
+                // path (we only send If-None-Match with a cache entry), but a
+                // misbehaving intermediary must not wedge the sweep.
+                AuditLog.UpstreamApiCallFailed("GET /pulls", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                throw new HttpRequestException($"GitHub GET /pulls returned 304 with no cached body for {SanitizeForLog(url)}");
+            }
+            return DeserializeListPage(cached.Body);
+        }
+
+        if (!resp.IsSuccessStatusCode)
+        {
+            AuditLog.UpstreamApiCallFailed("GET /pulls", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+            resp.EnsureSuccessStatusCode();
+        }
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (_readCache is not null)
+            _readCache.SetPage(RepoKey(), url, new GitHubUpstreamReadCache.CachedResponse(resp.Headers.ETag?.Tag, body));
+        return DeserializeListPage(body);
+    }
+
+    private static GitHubPrSummary[] DeserializeListPage(string body) =>
+        JsonSerializer.Deserialize<GitHubPrSummary[]>(body, CachedBodyJson) ?? [];
+
+    /// <summary>
+    /// Resolves the live tip sha of every distinct base branch referenced by
+    /// the matching summaries, via conditional <c>GET /branches/{ref}</c>
+    /// reads. A branch that cannot be read yields no entry; callers then fall
+    /// back to the summary's recorded base sha and refetch details — never a
+    /// silently-stale reuse.
+    /// </summary>
+    private async Task<IReadOnlyDictionary<string, string?>> ResolveBaseTipsAsync(
+        IReadOnlyList<GitHubPrSummary> matching, CancellationToken ct)
+    {
+        var tips = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var baseRefs = matching
+            .Select(s => s.Base?.Ref)
+            .Where(r => !string.IsNullOrEmpty(r))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        foreach (var baseRef in baseRefs)
+            tips[baseRef!] = await TryGetBranchTipShaAsync(baseRef!, ct);
+        return tips;
+    }
+
+    private async Task<string?> TryGetBranchTipShaAsync(string branch, CancellationToken ct)
+    {
+        var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/branches/{Uri.EscapeDataString(branch)}";
+        var cached = _readCache?.GetBranchTip(RepoKey(), branch);
+        string? body = null;
+        string? etag = null;
+        var notModified = false;
+        using (var req = await BuildRequestAsync(HttpMethod.Get, url, ct))
+        {
+            if (cached?.ETag is { } cachedEtag)
+                req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(cachedEtag));
+            using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
+            if (resp.StatusCode == HttpStatusCode.NotModified)
+            {
+                if (cached is null) return null;
+                notModified = true;
+                body = cached.Body;
+            }
+            else if (resp.StatusCode == HttpStatusCode.NotFound)
+            {
+                return null;
+            }
+            else if (!resp.IsSuccessStatusCode)
+            {
+                AuditLog.UpstreamApiCallFailed("GET /branches", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                return null;
+            }
+            else
+            {
+                body = await resp.Content.ReadAsStringAsync(ct);
+                etag = resp.Headers.ETag?.Tag;
+            }
+        }
+
+        if (!notModified && _readCache is not null && body is not null)
+            _readCache.SetBranchTip(RepoKey(), branch, new GitHubUpstreamReadCache.CachedResponse(etag, body));
+        if (body is null)
+            return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<GitHubBranchDetail>(body, CachedBodyJson)?.Commit?.Sha;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Detail read for the stale-PR probe. Reuses the cached detail body when
+    /// the head sha and resolved base tip are unchanged (zero requests); on a
+    /// revision change sends a conditional GET so an unchanged forge-side
+    /// document still answers 304. Details whose <c>mergeable</c> is still
+    /// being computed are never cached — otherwise a computing PR would be
+    /// pinned out of the sweep until its revisions moved.
+    /// </summary>
+    private async Task<GitHubPrDetailMergeable?> FetchProbePullRequestDetailAsync(
+        int number, string? headSha, string? baseSha, CancellationToken ct)
+    {
+        var cached = _readCache?.GetPullRequest(RepoKey(), number);
+        if (cached is not null
+            && headSha is not null
+            && baseSha is not null
+            && string.Equals(cached.HeadSha, headSha, StringComparison.Ordinal)
+            && string.Equals(cached.BaseSha, baseSha, StringComparison.Ordinal))
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<GitHubPrDetailMergeable>(cached.Body, CachedBodyJson);
+            }
+            catch (JsonException)
+            {
+                // Corrupt cache entry: fall through and refetch.
+            }
+        }
+
+        var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{number}";
+        string? body = null;
+        string? etag = null;
+        var notModified = false;
+        using (var req = await BuildRequestAsync(HttpMethod.Get, url, ct))
+        {
+            if (cached?.ETag is { } cachedEtag)
+                req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(cachedEtag));
+            using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
+            if (resp.StatusCode == HttpStatusCode.NotModified)
+            {
+                if (cached is null)
+                {
+                    AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                    return null;
+                }
+                notModified = true;
+                body = cached.Body;
+                // The ETag matched but the (head, base) revisions may have
+                // moved — refresh the entry so the next sweep reuses the body
+                // without re-asking.
+                if (_readCache is not null && headSha is not null && baseSha is not null)
+                {
+                    _readCache.SetPullRequest(RepoKey(), number,
+                        new GitHubUpstreamReadCache.CachedPullRequest(headSha, baseSha, cached.ETag, cached.Body));
+                }
+            }
+            else if (!resp.IsSuccessStatusCode)
+            {
+                AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                return null;
+            }
+            else
+            {
+                body = await resp.Content.ReadAsStringAsync(ct);
+                etag = resp.Headers.ETag?.Tag;
+            }
+        }
+
+        if (body is null)
+            return null;
+        GitHubPrDetailMergeable? detail;
+        try
+        {
+            detail = JsonSerializer.Deserialize<GitHubPrDetailMergeable>(body, CachedBodyJson);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        if (detail is null)
+            return null;
+
+        if (!notModified
+            && detail.Mergeable is not null
+            && _readCache is not null
+            && headSha is not null
+            && baseSha is not null
+            && body is not null)
+        {
+            _readCache.SetPullRequest(RepoKey(), number,
+                new GitHubUpstreamReadCache.CachedPullRequest(headSha, baseSha, etag, body));
+        }
+        return detail;
     }
 
     private async Task<GitHubPrDetailMergeable?> FetchPullRequestDetailAsync(int number, CancellationToken ct)
@@ -2820,6 +3040,21 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return new GitHubAuditCheckPublisher(client).PublishAsync(request, options, ct);
     }
 
+    /// <inheritdoc />
+    public async Task<UpstreamReadDeferral?> GetBackgroundReadDeferralAsync(CancellationToken ct = default)
+    {
+        if (_apiBudget is null)
+            return null;
+        var token = await _tokenProvider.GetTokenAsync(ct);
+        return _apiBudget.CheckBackgroundRead(GitHubApiBudgetTracker.BudgetKeyForToken(token));
+    }
+
+    private string RepoKey() => $"{_opts.Owner}/{_opts.Repository}";
+
+    // Web defaults (case-insensitive) match ReadFromJsonAsync, which the
+    // uncached read paths still use.
+    private static readonly JsonSerializerOptions CachedBodyJson = new(JsonSerializerDefaults.Web);
+
     private async Task<HttpRequestMessage> BuildRequestAsync(
         HttpMethod method,
         string url,
@@ -2831,8 +3066,21 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote
         return req;
     }
 
-    private Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
-        => _httpClientFactory.CreateClient("github-upstream").SendAsync(req, ct);
+    private async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage req,
+        CancellationToken ct,
+        GitHubRequestClass requestClass = GitHubRequestClass.Pipeline)
+    {
+        if (_apiBudget is not null)
+        {
+            var deferred = _apiBudget.CheckForSend(
+                GitHubApiBudgetTracker.BudgetKeyForToken(req.Headers.Authorization?.Parameter),
+                requestClass);
+            if (deferred is not null)
+                throw deferred;
+        }
+        return await _httpClientFactory.CreateClient("github-upstream").SendAsync(req, ct);
+    }
 
     private string RepoUrl() => $"https://github.com/{_opts.Owner}/{_opts.Repository}.git";
 

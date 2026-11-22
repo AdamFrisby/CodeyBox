@@ -1681,6 +1681,19 @@ builder.Services.AddSingleton<CodeyBox.Agents.Claude.ClaudeSessionWorker>(sp =>
 
 
 // --- HTTP clients ------------------------------------------------------------
+// Shared GitHub REST budget: every response on the github-upstream client
+// feeds the tracker (per-credential x-ratelimit-* / Retry-After state), and
+// sends into a known-exhausted window are refused before they can 403.
+// GitHubUpstreamRemote additionally consults the tracker so background
+// sweeps defer while remaining budget is at/below the configured reserve.
+builder.Services.AddSingleton<GitHubApiBudgetTracker>(sp => new GitHubApiBudgetTracker(
+    () => sp.GetRequiredService<IOptionsMonitor<CodeyBoxOptions>>().CurrentValue.GitHubApiBudget,
+    sp.GetService<TimeProvider>() ?? TimeProvider.System,
+    sp.GetRequiredService<ILogger<GitHubApiBudgetTracker>>()));
+builder.Services.AddSingleton<GitHubUpstreamReadCache>(sp =>
+    new GitHubUpstreamReadCache(sp.GetService<TimeProvider>() ?? TimeProvider.System));
+builder.Services.AddTransient<GitHubRateLimitHandler>();
+
 // Named client for GitHub upstream. GitHub requires a User-Agent header.
 // Authorization is added per-request in GitHubUpstreamRemote (per-project PAT).
 builder.Services.AddHttpClient("github-upstream", client =>
@@ -1689,7 +1702,7 @@ builder.Services.AddHttpClient("github-upstream", client =>
     // Shorter timeout than the 100 s .NET default: bounds the stall window per
     // attempt given the orchestrator retries up to UpstreamPushMaxAttempts times.
     client.Timeout = TimeSpan.FromSeconds(30);
-});
+}).AddHttpMessageHandler<GitHubRateLimitHandler>();
 
 // Named client for quota probes. Short timeout — quota probes are on the hot
 // path and must not stall the worker pickup loop. Authorization is added per-
@@ -5105,6 +5118,7 @@ ExecutorPhaseEndpoints.Map(app);
 AgentSupervisionEndpoints.Map(app);
 SandboxEndpoints.Map(app);
 SandboxResourceUsageEndpoints.Map(app);
+GitHubApiBudgetEndpoints.Map(app);
 BaselineEndpoints.Map(app);
 QuotaRetryStatusEndpoints.Map(app);
 QuotaHistoryEndpoints.Map(app);
@@ -7152,6 +7166,14 @@ namespace CodeyBox.Api
         /// orphan PR within minutes. See <see cref="StalePullRequestSweeper"/>.
         /// </summary>
         public StalePullRequestSweeperOptions StalePullRequestSweep { get; set; } = new();
+
+        /// <summary>
+        /// Shared GitHub REST request-budget policy. Background reads defer
+        /// while remaining budget is at/below the configured reserve so
+        /// pipeline-critical calls always have budget. Bound from
+        /// <c>CodeyBox:GitHubApiBudget</c>; hot-reloadable.
+        /// </summary>
+        public GitHubApiBudgetOptions GitHubApiBudget { get; set; } = new();
 
         /// <summary>
         /// Startup config-validation knobs. Controls whether AgentClass ModelId

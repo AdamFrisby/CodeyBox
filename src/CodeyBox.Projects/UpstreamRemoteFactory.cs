@@ -40,6 +40,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
     private readonly ILogger<CompletionPullRequestDescriptionGenerator>? _completionLog;
     private readonly CodeyBox.Core.CommitAttributionPolicy? _attributionPolicy;
     private readonly CodeyBox.Core.UpstreamBranchOwnershipSnapshot? _ownership;
+    private readonly GitHubApiBudgetTracker? _apiBudget;
+    private readonly GitHubUpstreamReadCache? _readCache;
 
     public UpstreamRemoteFactory(
         IGitHost gitHost,
@@ -56,7 +58,9 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         ICompletionClient? completionClient = null,
         ILogger<CompletionPullRequestDescriptionGenerator>? completionLog = null,
         CodeyBox.Core.CommitAttributionPolicy? attributionPolicy = null,
-        CodeyBox.Core.UpstreamBranchOwnershipSnapshot? ownership = null)
+        CodeyBox.Core.UpstreamBranchOwnershipSnapshot? ownership = null,
+        GitHubApiBudgetTracker? apiBudget = null,
+        GitHubUpstreamReadCache? readCache = null)
     {
         _gitHost = gitHost;
         _httpClientFactory = httpClientFactory;
@@ -72,6 +76,8 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
         _completionLog = completionLog;
         _attributionPolicy = attributionPolicy;
         _ownership = ownership;
+        _apiBudget = apiBudget;
+        _readCache = readCache;
 
         var remotes = new List<IUpstreamRemote>();
         foreach (var remote in pluginRemotes ?? [])
@@ -119,7 +125,9 @@ public sealed class UpstreamRemoteFactory : IUpstreamRemoteFactory
                     PrDescription = MapPrDescriptionOptions(u.PrDescription),
                 }, _timings, BuildDescriptionGenerator(u.PrDescription),
                     _attributionPolicy?.Resolve(project),
-                    _ownership);
+                    _ownership,
+                    apiBudget: _apiBudget,
+                    readCache: _readCache);
 
             case "git-generic":
                 return new GitGenericUpstreamRemote(_gitHost, new GitGenericUpstreamOptions
