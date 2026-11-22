@@ -24,7 +24,8 @@ public sealed class StalePullRequestSweeperOptions
     /// <summary>
     /// How often the sweeper polls open PRs. Default: 60 s. The 5-minute SLA
     /// in the bug spec is met comfortably at this cadence. Clamped to a 30-s
-    /// minimum at startup to avoid hammering the GitHub API.
+    /// minimum on every sweep wait, so edits hot-reload without a restart and
+    /// a misconfigured value cannot hammer the GitHub API.
     /// </summary>
     public TimeSpan CheckInterval { get; set; } = TimeSpan.FromSeconds(60);
 

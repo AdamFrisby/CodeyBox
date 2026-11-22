@@ -75,9 +75,8 @@ public interface IUpstreamRemote
 
     /// <summary>
     /// Lists open pull requests whose head branch starts with <paramref name="branchPrefix"/>
-    /// and whose mergeability is known. Used by the stale-base PR sweeper to
-    /// detect CodeyBox-authored PRs whose base branch has moved and produced a
-    /// conflict the auto-merger can no longer resolve.
+    /// and whose mergeability is known. Used by latency-tolerant detection paths
+    /// such as the stale-base PR sweeper and background re-drive scans.
     ///
     /// <para>Implementations only need to return PRs whose mergeability has
     /// been computed by the forge (i.e. <c>mergeable</c> is not null on
@@ -90,6 +89,19 @@ public interface IUpstreamRemote
     Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
         string branchPrefix, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<UpstreamPullRequest>>([]);
+
+    /// <summary>
+    /// Lists open pull requests for an operator-initiated read or remediation
+    /// step. This is the latency-sensitive counterpart to
+    /// <see cref="ListOpenPullRequestsAsync"/>: implementations with a shared
+    /// request budget must not defer it for the background reserve (hard
+    /// rate-limit blocks still apply). The default delegates to
+    /// <see cref="ListOpenPullRequestsAsync"/> for upstream kinds without a
+    /// background/pipeline distinction.
+    /// </summary>
+    Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsForOperatorAsync(
+        string branchPrefix, CancellationToken ct = default)
+        => ListOpenPullRequestsAsync(branchPrefix, ct);
 
     /// <summary>
     /// Reads a pull request by forge-assigned number. Returns <c>null</c> when

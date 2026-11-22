@@ -36,6 +36,8 @@ public sealed class GitHubAuditCheckPublisherTests
 
     private sealed class FixedTokenProvider(string token) : IGitHubTokenProvider
     {
+        public string CredentialFingerprint => "test-fixed";
+
         public ValueTask<string> GetTokenAsync(CancellationToken cancellationToken = default) =>
             ValueTask.FromResult(token);
     }

@@ -196,14 +196,30 @@ internal static class WorkItemEndpoints
         {
             try
             {
-                var pullRequest = await upstreams.Create(project).GetPullRequestAsync(item.MergedPrNumber.Value, ct);
-                if (pullRequest is not null)
+                var remote = upstreams.Create(project);
+                // Status enrichment is latency-tolerant: when the forge's
+                // shared request budget is below reserve, skip the read
+                // entirely rather than spend pipeline budget on it.
+                var deferred = remote is IUpstreamBackgroundReadGate gate
+                    ? await gate.GetBackgroundReadDeferralAsync(ct)
+                    : null;
+                if (deferred is not null)
                 {
-                    dto = dto with
+                    loggerFactory.CreateLogger("CodeyBox.Api.WorkItemEndpoints").LogDebug(
+                        "Skipping upstream PR {PullRequestNumber} read for work item {WorkItemId}: {Reason}",
+                        item.MergedPrNumber, item.Id, deferred.Reason);
+                }
+                else
+                {
+                    var pullRequest = await remote.GetPullRequestAsync(item.MergedPrNumber.Value, ct);
+                    if (pullRequest is not null)
                     {
-                        PullRequestState = pullRequest.Status.ToString().ToLowerInvariant(),
-                        PullRequestMergeSha = pullRequest.MergeCommitSha,
-                    };
+                        dto = dto with
+                        {
+                            PullRequestState = pullRequest.Status.ToString().ToLowerInvariant(),
+                            PullRequestMergeSha = pullRequest.MergeCommitSha,
+                        };
+                    }
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -440,7 +456,7 @@ internal static class WorkItemEndpoints
         UpstreamRedriveService redrive,
         CancellationToken ct)
     {
-        var candidates = await redrive.ListCandidatesAsync(ct);
+        var candidates = await redrive.ListCandidatesForOperatorAsync(ct);
         return Results.Ok(new
         {
             candidates = candidates.Select(c => new

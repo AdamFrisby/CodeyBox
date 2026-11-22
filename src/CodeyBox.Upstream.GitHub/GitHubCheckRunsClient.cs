@@ -233,6 +233,20 @@ public sealed class GitHubCheckRunsClient
             throw new AuditCheckTransientException(
                 "GitHub Checks request timed out; the write may or may not have landed.", ex);
         }
+        catch (UpstreamApiDeferredException ex)
+        {
+            // The shared budget tracker refused to send into a known
+            // rate-limit window: nothing was transmitted, so this is a
+            // bounded retry-until-reset — not an unclassified failure.
+            var retryAfter = ex.DeferredUntil is { } until
+                ? until - DateTimeOffset.UtcNow
+                : (TimeSpan?)null;
+            if (retryAfter < TimeSpan.Zero)
+                retryAfter = TimeSpan.Zero;
+            throw new AuditCheckRateLimitedException(
+                $"GitHub Checks request deferred by the shared API budget: {ex.Message}",
+                retryAfter, ex);
+        }
         catch (HttpRequestException ex)
         {
             throw new AuditCheckTransientException(

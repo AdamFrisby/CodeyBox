@@ -10,6 +10,14 @@ namespace CodeyBox.Upstream.GitHub;
 public interface IGitHubTokenProvider
 {
     ValueTask<string> GetTokenAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Stable, non-secret identifier for the credential this provider
+    /// resolves (e.g. <c>github-app:{appId}:{installationId}</c>). Used to
+    /// correlate shared-budget observations across short-lived remote
+    /// instances without resolving the token. Never logged, never persisted.
+    /// </summary>
+    string CredentialFingerprint { get; }
 }
 
 public sealed class GitHubAppTokenProvider : IGitHubTokenProvider, IDisposable
@@ -21,6 +29,9 @@ public sealed class GitHubAppTokenProvider : IGitHubTokenProvider, IDisposable
     private readonly SemaphoreSlim _refreshLock = new(1, 1);
     private string? _cachedToken;
     private DateTimeOffset _refreshAt;
+
+    /// <inheritdoc />
+    public string CredentialFingerprint => $"github-app:{_options.AppId}:{_options.InstallationId}";
 
     public GitHubAppTokenProvider(
         IHttpClientFactory clients,

@@ -124,44 +124,67 @@ public sealed class StalePullRequestSweeper : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!_opts.Enabled)
-        {
-            _log.LogInformation("StalePullRequestSweeper disabled via configuration; skipping");
-            return;
-        }
+        // Stagger the first tick a little so we don't race the rest of the
+        // hosted-service startup (project repo cold reads, etc.).
+        try { await Task.Delay(TimeSpan.FromSeconds(5), _time, stoppingToken); }
+        catch (OperationCanceledException) { return; }
 
+        // The interval is re-read from the live options throughout the wait
+        // (in bounded slices), so CheckInterval edits hot-reload without a
+        // restart — a single fixed PeriodicTimer/Task.Delay would pin the
+        // startup value until it elapsed.
+        var cycleStart = _time.GetUtcNow();
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            if (_opts.Enabled)
+            {
+                try
+                {
+                    await RunSweepAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (UpstreamApiDeferredException)
+                {
+                    // The shared GitHub budget tracker already logged the
+                    // single low-budget warning with reset time and top
+                    // consumers; per-tick deferrals stay quiet.
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "StalePullRequestSweeper sweep failed; will retry next tick");
+                }
+            }
+
+            // Wait until cycleStart + current CheckInterval, re-evaluating the
+            // due time every slice so a shorter configured interval takes
+            // effect within one slice rather than after the old delay ends.
+            while (true)
+            {
+                var due = cycleStart + ClampInterval(_opts.CheckInterval);
+                var remaining = due - _time.GetUtcNow();
+                if (remaining <= TimeSpan.Zero)
+                    break;
+                var slice = remaining < WaitSlice ? remaining : WaitSlice;
+                try { await Task.Delay(slice, _time, stoppingToken); }
+                catch (OperationCanceledException) { return; }
+            }
+            cycleStart = _time.GetUtcNow();
+        }
+    }
+
+    /// <summary>Upper bound on a single options re-read while waiting between sweeps.</summary>
+    private static readonly TimeSpan WaitSlice = TimeSpan.FromSeconds(5);
+
+    private static TimeSpan ClampInterval(TimeSpan configured)
+    {
         // Floor the polling cadence at 30 s so a misconfigured value cannot
         // hammer the GitHub API. The 5-minute SLA in the bug spec is met
         // comfortably by the default 60 s.
         var minInterval = TimeSpan.FromSeconds(30);
-        var interval = _opts.CheckInterval < minInterval ? minInterval : _opts.CheckInterval;
-        if (_opts.CheckInterval < minInterval)
-            _log.LogWarning(
-                "StalePullRequestSweeper: CheckInterval {Configured} is below the 30-second minimum; clamped to 30 s",
-                _opts.CheckInterval);
-
-        // Stagger the first tick a little so we don't race the rest of the
-        // hosted-service startup (project repo cold reads, etc.).
-        try { await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); }
-        catch (OperationCanceledException) { return; }
-
-        using var timer = new PeriodicTimer(interval);
-        do
-        {
-            try
-            {
-                await RunSweepAsync(stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "StalePullRequestSweeper sweep failed; will retry next tick");
-            }
-        }
-        while (await timer.WaitForNextTickAsync(stoppingToken));
+        return configured < minInterval ? minInterval : configured;
     }
 
     /// <summary>
@@ -189,24 +212,28 @@ public sealed class StalePullRequestSweeper : BackgroundService
         }
 
         var observedIdentities = new HashSet<StalePrIdentity>();
+        var sweptProjectIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var project in projects)
         {
             if (!string.Equals(project.Upstream.Kind, "github", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            await SweepProjectAsync(project, prefix, observedIdentities, ct);
+            if (await SweepProjectAsync(project, prefix, observedIdentities, ct))
+                sweptProjectIds.Add(project.Id.Value);
         }
 
-        // Prune dedup entries for PRs that have disappeared from the sweep
-        // (closed, merged, or rebased into mergeable). Without this, the
-        // dictionary would accumulate forever; with it, a PR that re-enters
-        // a dirty state after being fixed gets a fresh event correctly.
-        var stale = _firstSeenAt.Keys.Where(k => !observedIdentities.Contains(k)).ToList();
+        // Prune dedup entries only for projects whose PR list was observed
+        // this sweep. A deferred or failed project has no current snapshot:
+        // treating it as empty would erase dedup state and refire events for
+        // PRs that are still stale once the budget recovers.
+        var stale = _firstSeenAt.Keys
+            .Where(k => sweptProjectIds.Contains(k.ProjectId) && !observedIdentities.Contains(k))
+            .ToList();
         foreach (var key in stale) _firstSeenAt.Remove(key);
     }
 
-    private async Task SweepProjectAsync(
+    private async Task<bool> SweepProjectAsync(
         Project project,
         string prefix,
         HashSet<StalePrIdentity> observedIdentities,
@@ -222,7 +249,7 @@ public sealed class StalePullRequestSweeper : BackgroundService
             _log.LogDebug(ex,
                 "StalePullRequestSweeper: skipping project {ProjectId}; upstream factory threw",
                 project.Id.Value);
-            return;
+            return false;
         }
 
         IReadOnlyList<UpstreamPullRequest> openPrs;
@@ -230,12 +257,22 @@ public sealed class StalePullRequestSweeper : BackgroundService
         {
             openPrs = await upstream.ListOpenPullRequestsAsync(prefix, ct);
         }
+        catch (UpstreamApiDeferredException ex)
+        {
+            // Shared GitHub budget is below reserve or inside a known
+            // rate-limit window: skip this project until the next tick. The
+            // tracker already emitted the single low-budget warning.
+            _log.LogInformation(
+                "StalePullRequestSweeper: GitHub API budget deferred for project {ProjectId} until {DeferredUntil}; skipping this tick",
+                project.Id.Value, ex.DeferredUntil);
+            return false;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _log.LogWarning(ex,
                 "StalePullRequestSweeper: ListOpenPullRequestsAsync failed for project {ProjectId}",
                 project.Id.Value);
-            return;
+            return false;
         }
 
         foreach (var pr in openPrs)
@@ -281,6 +318,8 @@ public sealed class StalePullRequestSweeper : BackgroundService
             // conflict-rework state machine (gated by RouteToConflictRework).
             await TryRouteToReworkAsync(project, pr, ct);
         }
+
+        return true;
     }
 
     /// <summary>
