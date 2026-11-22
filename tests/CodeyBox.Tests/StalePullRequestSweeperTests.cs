@@ -428,7 +428,32 @@ internal sealed class ScriptedUpstreamRemote : IUpstreamRemote
     private readonly Queue<IReadOnlyList<UpstreamPullRequest>> _responses = new();
     private IReadOnlyList<UpstreamPullRequest> _last;
     private readonly Exception? _throwOnList;
+    private readonly object _listSignalGate = new();
+    private TaskCompletionSource _listSignal = NewListSignal();
     public int ListCallCount { get; private set; }
+
+    private static TaskCompletionSource NewListSignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// Completes once <see cref="ListCallCount"/> reaches <paramref name="count"/>.
+    /// Push-based signalling for tests driving the sweeper on a fake clock:
+    /// awaiting this is deterministic, unlike polling a wall-clock deadline
+    /// that competes with the code under test for the thread pool.
+    /// </summary>
+    public async Task WaitForListCallAsync(int count, CancellationToken ct = default)
+    {
+        while (true)
+        {
+            Task signal;
+            lock (_listSignalGate)
+            {
+                if (ListCallCount >= count) return;
+                signal = _listSignal.Task;
+            }
+            await signal.WaitAsync(ct);
+        }
+    }
 
     public ScriptedUpstreamRemote(params IReadOnlyList<UpstreamPullRequest>[] responses)
     {
@@ -456,7 +481,14 @@ internal sealed class ScriptedUpstreamRemote : IUpstreamRemote
     public Task<IReadOnlyList<UpstreamPullRequest>> ListOpenPullRequestsAsync(
         string branchPrefix, CancellationToken ct = default)
     {
-        ListCallCount++;
+        TaskCompletionSource signal;
+        lock (_listSignalGate)
+        {
+            ListCallCount++;
+            signal = _listSignal;
+            _listSignal = NewListSignal();
+        }
+        signal.TrySetResult();
         if (_throwOnList is not null) throw _throwOnList;
         var next = _responses.Count > 0 ? _responses.Dequeue() : _last;
         _last = next;

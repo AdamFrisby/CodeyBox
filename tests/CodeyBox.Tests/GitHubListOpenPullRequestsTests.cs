@@ -255,6 +255,46 @@ public sealed class GitHubListOpenPullRequestsTests
     }
 
     [Fact]
+    public async Task ListOpenPullRequestsAsync_UnreadableBaseBranch_FallsBackToSummarySha_AndReusesDetailCache()
+    {
+        // When GET /branches/{ref} fails, the probe must fall back to the
+        // base sha recorded in the /pulls summary — otherwise the detail
+        // cache key (head sha, base tip) is never satisfiable and every
+        // sweep refetches every PR detail.
+        var handler = new FakeHttpMessageHandler();
+        var readCache = new GitHubUpstreamReadCache();
+        const string listBody = """
+        [{ "number": 7, "head": {"ref": "codeybox/x", "sha": "tip"}, "base": {"ref": "main", "sha": "base-from-list"} }]
+        """;
+        const string detailBody = """
+        {"number": 7, "html_url": "https://github.com/myorg/myrepo/pull/7",
+         "mergeable": true, "mergeable_state": "clean"}
+        """;
+
+        // Sweep 1: list + branch 404 + detail.
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, listBody));
+        handler.Enqueue(JsonResponse(HttpStatusCode.NotFound, "{}"));
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, detailBody));
+        var prs = await BuildRemote(handler, readCache: readCache)
+            .ListOpenPullRequestsAsync("codeybox/", CancellationToken.None);
+        Assert.Single(prs);
+
+        // Sweep 2 through a NEW remote sharing only the read cache (what the
+        // factory produces per tick): list + branch 404 again, and the
+        // detail must be served from cache — keyed on the summary's base
+        // sha — with zero detail requests.
+        handler.Enqueue(JsonResponse(HttpStatusCode.OK, listBody));
+        handler.Enqueue(JsonResponse(HttpStatusCode.NotFound, "{}"));
+        var prs2 = await BuildRemote(handler, readCache: readCache)
+            .ListOpenPullRequestsAsync("codeybox/", CancellationToken.None);
+        Assert.Single(prs2);
+
+        Assert.Equal(5, handler.Requests.Count);
+        Assert.Equal(1, handler.Requests.Count(r =>
+            r.RequestUri!.AbsolutePath.Contains("/pulls/7", StringComparison.Ordinal)));
+    }
+
+    [Fact]
     public async Task ListOpenPullRequestsAsync_PullsDetailReturnsNotFound_SkipsPr()
     {
         // Per-PR detail fetch may fail (404 on a just-closed PR, transient 5xx,

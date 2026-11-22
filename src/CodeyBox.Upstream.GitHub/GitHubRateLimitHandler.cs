@@ -34,7 +34,19 @@ public sealed class GitHubRateLimitHandler : DelegatingHandler
             throw deferred;
 
         var response = await base.SendAsync(request, cancellationToken);
-        _tracker.ObserveResponse(budgetKey, response, request.RequestUri?.AbsolutePath);
+        _tracker.ObserveResponse(budgetKey, response, BudgetPathLabel(request));
         return response;
+    }
+
+    private static string? BudgetPathLabel(HttpRequestMessage request)
+    {
+        // Unauthenticated calls — e.g. the GitHub App manifest-conversion
+        // exchange, whose path carries the caller-supplied `code` — never
+        // feed request paths into the tracker: those segments are
+        // credential-bearing and would surface in logs and the admin
+        // budget endpoint.
+        if (request.Headers.Authorization is null)
+            return null;
+        return request.RequestUri?.AbsolutePath;
     }
 }

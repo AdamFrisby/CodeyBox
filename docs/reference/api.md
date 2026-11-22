@@ -1665,6 +1665,34 @@ Response: `200 OK`
 }
 ```
 
+### `GET /admin/github-api-budget`
+
+Returns the current shared GitHub REST budget per credential, as last
+reported by `x-ratelimit-*`/`Retry-After` response headers across every
+caller of the `github-upstream` client. `budgetKey` is a truncated SHA-256
+of the credential — never the token itself. `topConsumers` lists the
+highest-count normalized endpoint paths observed for that credential.
+
+Response: `200 OK`
+
+```json
+{
+  "credentials": [
+    {
+      "budgetKey": "sha256:9f86d081884c",
+      "requestsObserved": 5123,
+      "remaining": 37,
+      "resetAt": "2026-11-22T13:00:00+00:00",
+      "blockedUntil": null,
+      "blockedReason": null,
+      "topConsumers": [
+        { "path": "/repos/myorg/myrepo/pulls/#", "requests": 4810 }
+      ]
+    }
+  ]
+}
+```
+
 ### `GET /baselines`
 
 Returns the most recent baseline-image-reaper sweep. Each entry is one

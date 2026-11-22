@@ -56,26 +56,29 @@ internal static class WorkItemDossierEndpoints
             var project = await projects.GetAsync(item.ProjectId, ct);
             if (project is not null)
             {
-                var remote = upstreams.Create(project);
-                // Dossier enrichment is latency-tolerant: when the forge's
-                // shared request budget is below reserve, skip the read
-                // rather than spend pipeline budget on it.
-                var deferred = remote is IUpstreamBackgroundReadGate gate
-                    ? await gate.GetBackgroundReadDeferralAsync(ct)
-                    : null;
-                if (deferred is not null)
+                try
                 {
-                    loggerFactory.CreateLogger("CodeyBox.Api.WorkItemDossierEndpoints").LogDebug(
-                        "Skipping upstream PR {PullRequestNumber} read for dossier {WorkItemId}: {Reason}",
-                        item.MergedPrNumber, item.Id, deferred.Reason);
-                }
-                else try
-                {
-                    var pr = await remote.GetPullRequestAsync(item.MergedPrNumber.Value, ct);
-                    if (pr is not null)
+                    var remote = upstreams.Create(project);
+                    // Dossier enrichment is latency-tolerant: when the forge's
+                    // shared request budget is below reserve, skip the read
+                    // rather than spend pipeline budget on it.
+                    var deferred = remote is IUpstreamBackgroundReadGate gate
+                        ? await gate.GetBackgroundReadDeferralAsync(ct)
+                        : null;
+                    if (deferred is not null)
                     {
-                        prStatus = pr.Status.ToString().ToLowerInvariant();
-                        prMergeSha = pr.MergeCommitSha;
+                        loggerFactory.CreateLogger("CodeyBox.Api.WorkItemDossierEndpoints").LogDebug(
+                            "Skipping upstream PR {PullRequestNumber} read for dossier {WorkItemId}: {Reason}",
+                            item.MergedPrNumber, item.Id, deferred.Reason);
+                    }
+                    else
+                    {
+                        var pr = await remote.GetPullRequestAsync(item.MergedPrNumber.Value, ct);
+                        if (pr is not null)
+                        {
+                            prStatus = pr.Status.ToString().ToLowerInvariant();
+                            prMergeSha = pr.MergeCommitSha;
+                        }
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)

@@ -4,7 +4,8 @@ namespace CodeyBox.Core;
 /// Latency-tolerant upstream reads may implement this optional capability to
 /// report when the forge's shared request budget is too low to spend on
 /// enrichment (status/dossier reads, background scans). Pipeline-critical
-/// calls never consult it — they always attempt the request.
+/// calls never consult it — they skip only the background reserve and still
+/// honor hard rate-limit blocks at send time.
 ///
 /// <para>Implementations must be cheap to call: no network I/O, only a lookup
 /// against already-observed rate-limit state.</para>

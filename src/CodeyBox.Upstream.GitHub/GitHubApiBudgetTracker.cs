@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
@@ -52,19 +53,28 @@ public sealed record GitHubApiBudgetSnapshot(
 /// <para>Budgets are keyed by a truncated hash of the bearer token, matching
 /// GitHub's per-token accounting. Buckets are bounded and evicted oldest-first;
 /// state is per-process and rebuilt from the next response after a restart —
-/// conservative, since an unknown budget never blocks a call.</para>
+/// deliberately optimistic: an unknown budget never blocks a call, so sends
+/// may 403 until the next response supplies headers.</para>
 /// </summary>
 public sealed class GitHubApiBudgetTracker
 {
     private const int MaxBuckets = 128;
     private const int MaxTopPaths = 16;
     private const int MaxPathLength = 120;
+    private const int MaxCredentialKeys = 1024;
 
     private readonly Func<GitHubApiBudgetOptions> _optionsAccessor;
     private readonly TimeProvider _time;
     private readonly ILogger<GitHubApiBudgetTracker> _log;
     private readonly object _gate = new();
     private readonly Dictionary<string, Bucket> _buckets = new(StringComparer.Ordinal);
+
+    // Credential fingerprint → current budget key. Remote instances are
+    // created per call, so the background-read gate cannot re-derive the
+    // token hash cheaply; sends register the mapping here after resolving
+    // the token, and the gate reuses it without any network I/O.
+    private readonly ConcurrentDictionary<string, string> _credentialBudgetKeys =
+        new(StringComparer.Ordinal);
 
     public GitHubApiBudgetTracker(
         Func<GitHubApiBudgetOptions>? optionsAccessor = null,
@@ -87,6 +97,35 @@ public sealed class GitHubApiBudgetTracker
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(token));
         return "sha256:" + Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
     }
+
+    /// <summary>
+    /// Records which budget bucket a credential currently maps to. Called by
+    /// senders after resolving their token; the fingerprint comes from
+    /// <see cref="IGitHubTokenProvider.CredentialFingerprint"/> and is never
+    /// the token itself.
+    /// </summary>
+    public void RegisterCredentialToken(string credentialFingerprint, string token)
+    {
+        if (string.IsNullOrEmpty(credentialFingerprint) || string.IsNullOrEmpty(token))
+            return;
+        if (_credentialBudgetKeys.Count >= MaxCredentialKeys
+            && !_credentialBudgetKeys.ContainsKey(credentialFingerprint))
+        {
+            // Bound the map: drop an arbitrary stale entry rather than grow forever.
+            _credentialBudgetKeys.TryRemove(_credentialBudgetKeys.Keys.First(), out _);
+        }
+        _credentialBudgetKeys[credentialFingerprint] = BudgetKeyForToken(token);
+    }
+
+    /// <summary>
+    /// Budget key last registered for <paramref name="credentialFingerprint"/>,
+    /// or <c>null</c> when no send has resolved that credential yet. Lookup
+    /// only — never triggers credential resolution.
+    /// </summary>
+    public string? BudgetKeyForCredential(string credentialFingerprint) =>
+        string.IsNullOrEmpty(credentialFingerprint)
+            ? null
+            : _credentialBudgetKeys.TryGetValue(credentialFingerprint, out var key) ? key : null;
 
     /// <summary>
     /// Records the rate-limit evidence carried by one response. Safe to call
@@ -199,7 +238,14 @@ public sealed class GitHubApiBudgetTracker
             if (requestClass == GitHubRequestClass.Background)
             {
                 var reserve = Math.Max(0, _optionsAccessor().BackgroundReserveRemaining);
-                if (reserve > 0 && bucket.Remaining is { } remaining && remaining <= reserve)
+                // Remaining/ResetAt describe the window they were observed in.
+                // Once ResetAt has passed the stored Remaining is stale — the
+                // real budget is unknown until the next response — so it must
+                // not keep deferring reads (matching EffectiveBlockedUntil,
+                // which only honors a block while its reset is still ahead).
+                var windowLive = bucket.ResetAt is not { } observedReset || observedReset > now;
+                if (reserve > 0 && windowLive
+                    && bucket.Remaining is { } remaining && remaining <= reserve)
                 {
                     var reset = bucket.ResetAt is { } r && r > now ? r : (DateTimeOffset?)null;
                     return new UpstreamApiDeferredException(
@@ -266,8 +312,10 @@ public sealed class GitHubApiBudgetTracker
 
     private void WarnIfDegraded(Bucket bucket, DateTimeOffset now)
     {
+        var windowLive = bucket.ResetAt is not { } observedReset || observedReset > now;
         var degraded = EffectiveBlockedUntil(bucket, now) is not null
-            || (bucket.Remaining is { } remaining
+            || (windowLive
+                && bucket.Remaining is { } remaining
                 && remaining <= Math.Max(0, _optionsAccessor().BackgroundReserveRemaining));
         if (!degraded)
         {
@@ -323,37 +371,64 @@ public sealed class GitHubApiBudgetTracker
             return;
         }
         if (bucket.TopPaths.Count >= MaxTopPaths)
-            return;
+        {
+            // Evict the least-used entry so a flood of distinct paths cannot
+            // freeze the consumer list shown in the low-budget warning.
+            var coldest = bucket.TopPaths.MinBy(kv => kv.Value);
+            bucket.TopPaths.Remove(coldest.Key);
+        }
         bucket.TopPaths[normalized] = 1;
     }
 
     /// <summary>
-    /// Collapses high-cardinality segments (PR numbers, shas) so per-path
-    /// consumer stats stay bounded and readable.
+    /// Reduces a request path to a bounded, low-cardinality endpoint label.
+    /// High-cardinality segments — numeric ids (PR numbers, installation
+    /// ids), hex shas, manifest/branch tokens, and anything id-like —
+    /// collapse to <c>#</c> so per-path consumer stats stay bounded, readable,
+    /// and free of credential-bearing values (e.g. the
+    /// <c>/app-manifests/{code}/conversions</c> exchange code).
     /// </summary>
     private static string NormalizePath(string path)
     {
         var builder = new StringBuilder(Math.Min(path.Length, MaxPathLength));
-        var inDigits = false;
-        foreach (var c in path)
+        var segments = path.Split('/');
+        for (var i = 0; i < segments.Length && builder.Length < MaxPathLength; i++)
         {
-            if (char.IsDigit(c))
+            if (i > 0 && builder.Length < MaxPathLength)
+                builder.Append('/');
+            var segment = segments[i];
+            if (IsHighCardinalitySegment(segment))
             {
-                if (!inDigits)
-                {
+                if (builder.Length < MaxPathLength)
                     builder.Append('#');
-                    inDigits = true;
-                }
+                continue;
             }
-            else
+            foreach (var c in segment)
             {
+                if (builder.Length >= MaxPathLength)
+                    break;
                 builder.Append(c);
-                inDigits = false;
             }
-            if (builder.Length >= MaxPathLength)
-                break;
         }
         return builder.ToString();
+    }
+
+    private static bool IsHighCardinalitySegment(string segment)
+    {
+        if (segment.Length == 0)
+            return false;
+        // Pure-numeric ids: PR numbers, installation ids.
+        if (segment.All(char.IsDigit))
+            return true;
+        // Endpoint names are short words; anything this long is a token,
+        // sha, or percent-escaped branch ref — never a route segment.
+        if (segment.Length >= 24)
+            return true;
+        // Mixed letter/digit ids at id-like lengths (hex shas, app-manifest
+        // codes, owner/repo names containing digits, escaped branch refs).
+        return segment.Length >= 8
+            && segment.Any(char.IsLetter)
+            && segment.Any(char.IsDigit);
     }
 
     private sealed class Bucket

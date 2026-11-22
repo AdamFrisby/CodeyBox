@@ -363,6 +363,124 @@ public sealed class GitHubApiBudgetTests
     }
 
     [Fact]
+    public async Task Budget_ReserveIgnoredOnceWindowReset()
+    {
+        var time = new ControllableTimeProvider(T0);
+        var (tracker, handler, inner) = BuildBudgetStack(time, reserve: 100);
+        var remote = BuildRemote(handler, apiBudget: tracker, clock: time);
+
+        // Prime the budget: 50 remaining (below the 100 reserve) in a window
+        // that resets at T0+30m.
+        inner.Enqueue(RateLimitHeaders(
+            JsonResponse(HttpStatusCode.OK, """{"commit":{"sha":"x"}}"""),
+            remaining: 50, reset: T0 + TimeSpan.FromMinutes(30)));
+        await remote.GetBranchHeadShaAsync("main", CancellationToken.None);
+
+        // While the window is live the background read defers.
+        await Assert.ThrowsAsync<UpstreamApiDeferredException>(
+            () => remote.ListOpenPullRequestsAsync("codeybox/", CancellationToken.None));
+
+        // Past the reset the stored Remaining is stale — the real budget is
+        // unknown until the next response — so background reads must proceed
+        // rather than defer forever.
+        time.Advance(TimeSpan.FromMinutes(31));
+        inner.Enqueue(JsonResponse(HttpStatusCode.OK, "[]"));
+        var prs = await remote.ListOpenPullRequestsAsync("codeybox/", CancellationToken.None);
+        Assert.Empty(prs);
+
+        var gate = Assert.IsAssignableFrom<IUpstreamBackgroundReadGate>(remote);
+        Assert.Null(await gate.GetBackgroundReadDeferralAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Budget_BackgroundGate_NeverResolvesToken_AndSharesAcrossRemoteInstances()
+    {
+        var time = new ControllableTimeProvider(T0);
+        var (tracker, handler, inner) = BuildBudgetStack(time, reserve: 100);
+        var provider = new CountingTokenProvider("gate-token");
+        var opts = DefaultOpts with { TokenProvider = provider };
+        var remote = new GitHubUpstreamRemote(
+            new FakeGitHost(),
+            new FakeHttpClientFactory(handler, userAgent: "codeybox"),
+            NullLogger<GitHubUpstreamRemote>.Instance,
+            opts,
+            apiBudget: tracker,
+            clock: time);
+
+        // Before any send the gate reports "proceed" WITHOUT resolving the
+        // token — GetTokenAsync can POST an App installation-token exchange,
+        // which the gate contract forbids.
+        var gate = Assert.IsAssignableFrom<IUpstreamBackgroundReadGate>(remote);
+        Assert.Null(await gate.GetBackgroundReadDeferralAsync(CancellationToken.None));
+        Assert.Equal(0, provider.Calls);
+
+        // A pipeline send registers the credential→budget-key mapping.
+        inner.Enqueue(RateLimitHeaders(
+            JsonResponse(HttpStatusCode.OK, """{"commit":{"sha":"x"}}"""),
+            remaining: 50, reset: T0 + TimeSpan.FromHours(1)));
+        await remote.GetBranchHeadShaAsync("main", CancellationToken.None);
+        Assert.Equal(1, provider.Calls);
+
+        // The gate now reports the deferral — still without touching the
+        // token provider.
+        var deferral = await gate.GetBackgroundReadDeferralAsync(CancellationToken.None);
+        Assert.NotNull(deferral);
+        Assert.Equal(T0 + TimeSpan.FromHours(1), deferral!.DeferredUntil);
+        Assert.Equal(1, provider.Calls);
+
+        // A NEW remote instance for the same credential (what the factory
+        // produces per call) sees the same deferral — the mapping lives in
+        // the shared tracker, not the remote.
+        var provider2 = new CountingTokenProvider("gate-token");
+        var remote2 = new GitHubUpstreamRemote(
+            new FakeGitHost(),
+            new FakeHttpClientFactory(handler, userAgent: "codeybox"),
+            NullLogger<GitHubUpstreamRemote>.Instance,
+            DefaultOpts with { TokenProvider = provider2 },
+            apiBudget: tracker,
+            clock: time);
+        var gate2 = Assert.IsAssignableFrom<IUpstreamBackgroundReadGate>(remote2);
+        Assert.NotNull(await gate2.GetBackgroundReadDeferralAsync(CancellationToken.None));
+        Assert.Equal(0, provider2.Calls);
+    }
+
+    private sealed class CountingTokenProvider(string token) : IGitHubTokenProvider
+    {
+        public int Calls;
+        public string CredentialFingerprint => "counting-provider";
+        public ValueTask<string> GetTokenAsync(CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            return ValueTask.FromResult(token);
+        }
+    }
+
+    [Fact]
+    public void Budget_ObservedPaths_RedactCredentialAndIdSegments()
+    {
+        var tracker = new GitHubApiBudgetTracker();
+        var response = new HttpResponseMessage(HttpStatusCode.OK);
+
+        // The App-manifest conversion exchange puts a caller-supplied code
+        // in the path; it must never reach TopConsumers, logs, or the admin
+        // endpoint.
+        tracker.ObserveResponse("k", response, "/app-manifests/S3cr3tM4n1f3stC0d3XyZ9/conversions");
+        // A commit sha path collapses the same way.
+        tracker.ObserveResponse("k", response,
+            "/repos/myorg/myrepo/commits/0123456789abcdef0123456789abcdef01234567/check-runs");
+        // Ordinary endpoints keep their readable shape.
+        tracker.ObserveResponse("k", response, "/repos/myorg/myrepo/pulls/112");
+
+        var snapshot = Assert.Single(tracker.Snapshot());
+        var paths = snapshot.TopConsumers.Select(kv => kv.Key).ToList();
+        Assert.Contains("/app-manifests/#/conversions", paths);
+        Assert.Contains("/repos/myorg/myrepo/commits/#/check-runs", paths);
+        Assert.Contains("/repos/myorg/myrepo/pulls/#", paths);
+        Assert.All(paths, p => Assert.DoesNotContain("S3cr3tM4n1f3stC0d3XyZ9", p));
+        Assert.All(paths, p => Assert.DoesNotContain("0123456789abcdef", p));
+    }
+
+    [Fact]
     public async Task Budget_SecondaryLimit_RetryAfter_Defers()
     {
         var time = new ControllableTimeProvider(T0);
@@ -472,11 +590,11 @@ public sealed class GitHubApiBudgetTests
         await sweeper.StartAsync(cts.Token);
         try
         {
-            // Stagger (5 s) then first sweep. The clock advances in 5 s
-            // slices with a real-time yield between them so the
-            // BackgroundService's async continuations can schedule their
-            // next delay before the following slice fires.
-            await AdvanceUntilAsync(time, () => remote.ListCallCount >= 1);
+            // Stagger (5 s) then first sweep. The clock advances in 1 s
+            // slices and each slice waits on the remote's call signal —
+            // push-based, so a starved thread pool cannot race fake time
+            // ahead of the sweep it is meant to observe.
+            await AdvanceUntilAsync(time, remote.WaitForListCallAsync(1, cts.Token));
             Assert.Equal(1, remote.ListCallCount);
 
             // Shrink the interval mid-flight: the in-progress wait re-reads
@@ -485,26 +603,16 @@ public sealed class GitHubApiBudgetTests
             // the fake-clock instant the second sweep ran — a stale-interval
             // regression would land ~25 s later.
             opts.CheckInterval = TimeSpan.FromSeconds(30);
-            DateTimeOffset secondSweepAt = default;
-            await AdvanceUntilAsync(time, () =>
-            {
-                if (remote.ListCallCount < 2) return false;
-                secondSweepAt = time.GetUtcNow();
-                return true;
-            });
+            await AdvanceUntilAsync(time, remote.WaitForListCallAsync(2, cts.Token));
+            var secondSweepAt = time.GetUtcNow();
             Assert.True(
                 secondSweepAt <= T0 + TimeSpan.FromSeconds(45),
                 $"second sweep ran at {secondSweepAt:O}, expected ≤ {T0 + TimeSpan.FromSeconds(45):O} " +
                 "(a stale 60 s interval would land near T0+65s)");
 
             // And it keeps the NEW cadence: another ~30 s → third sweep.
-            DateTimeOffset thirdSweepAt = default;
-            await AdvanceUntilAsync(time, () =>
-            {
-                if (remote.ListCallCount < 3) return false;
-                thirdSweepAt = time.GetUtcNow();
-                return true;
-            });
+            await AdvanceUntilAsync(time, remote.WaitForListCallAsync(3, cts.Token));
+            var thirdSweepAt = time.GetUtcNow();
             Assert.True(
                 thirdSweepAt - secondSweepAt <= TimeSpan.FromSeconds(40),
                 $"sweep cadence {(thirdSweepAt - secondSweepAt).TotalSeconds:F0}s exceeds the reloaded 30 s interval");
@@ -516,20 +624,22 @@ public sealed class GitHubApiBudgetTests
     }
 
     /// <summary>
-    /// Advances the fake clock in small slices until <paramref name="done"/>
-    /// holds, yielding real time between slices so timer continuations can
-    /// run and schedule the next delay.
+    /// Advances the fake clock in 1 s slices until <paramref name="signal"/>
+    /// completes, yielding a short real-time window each slice so timer
+    /// continuations can run and schedule their next delay. Stops advancing
+    /// the moment the signal fires, so the fake instant observed afterwards
+    /// is the one the code under test actually ran at.
     /// </summary>
     private static async Task AdvanceUntilAsync(
-        ControllableTimeProvider time, Func<bool> done, int maxSteps = 60)
+        ControllableTimeProvider time, Task signal, int maxSteps = 400)
     {
         for (var i = 0; i < maxSteps; i++)
         {
-            if (done()) return;
-            time.Advance(TimeSpan.FromSeconds(5));
-            await Task.Delay(25);
+            if (signal.IsCompleted) return;
+            time.Advance(TimeSpan.FromSeconds(1));
+            await Task.WhenAny(signal, Task.Delay(50));
         }
-        if (!done())
-            throw new TimeoutException("Condition was not met within the advanced fake-time window");
+        if (!signal.IsCompleted)
+            throw new TimeoutException("Signal was not observed within the advanced fake-time window");
     }
 }

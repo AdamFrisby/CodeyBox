@@ -649,6 +649,33 @@ Proves a stale CodeyBox-owned branch tip is CodeyBox's own history when no prior
 | `MaxCommitsToVerify` | `100` | Upper bound on the exclusive commits examined, enforced before buffering. A larger exclusive set is unverifiable and refused unless the operator passes `{"confirmOwnership": true}` on the re-drive. |
 | `MaxPushHistoryEntries` | `20` | Upper bound on the per-item history of pushed work-branch tips. Every successful push is recorded (latest sha plus this bounded history); a diverged remote tip matching ANY retained entry is accepted as CodeyBox's own history without consulting commit trailers — the only proof available when trailers are disabled or the exclusive range is unverifiable. Oldest entries drop first; values below 1 behave as 1. |
 
+## `GitHubApiBudget`
+
+Shared GitHub REST request-budget tracking for every caller of the
+`github-upstream` HTTP client (upstream remotes, the check-runs publisher,
+the App token provider, and the App-connect endpoints). Response headers
+(`x-ratelimit-remaining`, `x-ratelimit-reset`, `Retry-After`) feed a
+per-credential tracker; latency-tolerant background reads (stale-PR sweeps,
+redrive detection, dossier/status enrichment) defer while remaining budget
+is at or below the reserve so pipeline-critical calls (PR create, merge,
+push-related checks) always have budget. Exhausted windows and
+`Retry-After` cooldowns block every caller until the reset — nothing retries
+into a known 403. Read live through `IOptionsMonitor`, so edits hot-reload.
+
+```json
+"GitHubApiBudget": {
+  "BackgroundReserveRemaining": 500
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `BackgroundReserveRemaining` | `500` | Remaining primary-rate-limit requests at or below which background reads defer (roughly 10% of the 5,000 requests/hour primary budget). Values below 0 are treated as 0 (no reserve). The reserve applies only while the observed rate-limit window is still live; once its reset has passed the stored remaining count is stale and ignored until the next response. |
+
+Current per-credential budget (remaining, reset, active blocks, top
+consumers) is exposed at `GET /admin/github-api-budget`; budget keys are
+truncated token hashes, never tokens.
+
 ## `WorkerPoolHealthWatchdog`
 
 Detects a dispatcher/pool stall where worker slots are free, dependency-ready

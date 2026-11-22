@@ -652,9 +652,12 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
             resp.EnsureSuccessStatusCode();
         }
         var body = await resp.Content.ReadAsStringAsync(ct);
+        // Validate before caching: a malformed 200 stored under its ETag
+        // would be replayed by the next sweep's If-None-Match 304 forever.
+        var summaries = DeserializeListPage(body);
         if (_readCache is not null)
             _readCache.SetPage(RepoKey(), url, new GitHubUpstreamReadCache.CachedResponse(resp.Headers.ETag?.Tag, body));
-        return DeserializeListPage(body);
+        return summaries;
     }
 
     private static GitHubPrSummary[] DeserializeListPage(string body) =>
@@ -667,17 +670,23 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     /// back to the summary's recorded base sha and refetch details — never a
     /// silently-stale reuse.
     /// </summary>
-    private async Task<IReadOnlyDictionary<string, string?>> ResolveBaseTipsAsync(
+    private async Task<IReadOnlyDictionary<string, string>> ResolveBaseTipsAsync(
         IReadOnlyList<GitHubPrSummary> matching, CancellationToken ct)
     {
-        var tips = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var tips = new Dictionary<string, string>(StringComparer.Ordinal);
         var baseRefs = matching
             .Select(s => s.Base?.Ref)
             .Where(r => !string.IsNullOrEmpty(r))
             .Distinct(StringComparer.Ordinal)
             .ToList();
         foreach (var baseRef in baseRefs)
-            tips[baseRef!] = await TryGetBranchTipShaAsync(baseRef!, ct);
+        {
+            var tip = await TryGetBranchTipShaAsync(baseRef!, ct);
+            // Only resolved tips are stored: an unreadable branch must look
+            // absent so callers fall back to the summary's recorded base sha.
+            if (tip is not null)
+                tips[baseRef!] = tip;
+        }
         return tips;
     }
 
@@ -685,49 +694,45 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     {
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/branches/{Uri.EscapeDataString(branch)}";
         var cached = _readCache?.GetBranchTip(RepoKey(), branch);
-        string? body = null;
-        string? etag = null;
-        var notModified = false;
-        using (var req = await BuildRequestAsync(HttpMethod.Get, url, ct))
-        {
-            if (cached?.ETag is { } cachedEtag)
-                req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(cachedEtag));
-            using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
-            if (resp.StatusCode == HttpStatusCode.NotModified)
-            {
-                if (cached is null) return null;
-                notModified = true;
-                body = cached.Body;
-            }
-            else if (resp.StatusCode == HttpStatusCode.NotFound)
-            {
-                return null;
-            }
-            else if (!resp.IsSuccessStatusCode)
-            {
-                AuditLog.UpstreamApiCallFailed("GET /branches", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
-                return null;
-            }
-            else
-            {
-                body = await resp.Content.ReadAsStringAsync(ct);
-                etag = resp.Headers.ETag?.Tag;
-            }
-        }
+        var result = await SendConditionalGetAsync(url, cached?.ETag, ct);
 
-        if (!notModified && _readCache is not null && body is not null)
-            _readCache.SetBranchTip(RepoKey(), branch, new GitHubUpstreamReadCache.CachedResponse(etag, body));
+        string? body;
+        string? etag = null;
+        var notModified = result.Status == ConditionalGetStatus.NotModified;
+        switch (result.Status)
+        {
+            case ConditionalGetStatus.NotModified:
+                if (cached is null) return null;
+                body = cached.Body;
+                break;
+            case ConditionalGetStatus.NotFound:
+                return null;
+            case ConditionalGetStatus.Failed:
+                AuditLog.UpstreamApiCallFailed("GET /branches", result.StatusCode, _opts.Owner, _opts.Repository);
+                return null;
+            default:
+                body = result.Body;
+                etag = result.ETag;
+                break;
+        }
         if (body is null)
             return null;
 
+        GitHubBranchDetail? detail;
         try
         {
-            return JsonSerializer.Deserialize<GitHubBranchDetail>(body, CachedBodyJson)?.Commit?.Sha;
+            detail = JsonSerializer.Deserialize<GitHubBranchDetail>(body, CachedBodyJson);
         }
         catch (JsonException)
         {
+            // A malformed 200 must not be cached: its ETag would keep
+            // replaying the corrupt body via 304 until GitHub changes the
+            // validator.
             return null;
         }
+        if (!notModified && _readCache is not null)
+            _readCache.SetBranchTip(RepoKey(), branch, new GitHubUpstreamReadCache.CachedResponse(etag, body));
+        return detail?.Commit?.Sha;
     }
 
     /// <summary>
@@ -759,22 +764,18 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
         }
 
         var url = $"https://api.github.com/repos/{_opts.Owner}/{_opts.Repository}/pulls/{number}";
-        string? body = null;
-        string? etag = null;
-        var notModified = false;
-        using (var req = await BuildRequestAsync(HttpMethod.Get, url, ct))
+        var result = await SendConditionalGetAsync(url, cached?.ETag, ct);
+
+        string? body;
+        var notModified = result.Status == ConditionalGetStatus.NotModified;
+        switch (result.Status)
         {
-            if (cached?.ETag is { } cachedEtag)
-                req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(cachedEtag));
-            using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
-            if (resp.StatusCode == HttpStatusCode.NotModified)
-            {
+            case ConditionalGetStatus.NotModified:
                 if (cached is null)
                 {
-                    AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                    AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", result.StatusCode, _opts.Owner, _opts.Repository);
                     return null;
                 }
-                notModified = true;
                 body = cached.Body;
                 // The ETag matched but the (head, base) revisions may have
                 // moved — refresh the entry so the next sweep reuses the body
@@ -784,21 +785,17 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
                     _readCache.SetPullRequest(RepoKey(), number,
                         new GitHubUpstreamReadCache.CachedPullRequest(headSha, baseSha, cached.ETag, cached.Body));
                 }
-            }
-            else if (!resp.IsSuccessStatusCode)
-            {
-                AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", (int)resp.StatusCode, _opts.Owner, _opts.Repository);
+                break;
+            case ConditionalGetStatus.Ok:
+                body = result.Body;
+                break;
+            default:
+                AuditLog.UpstreamApiCallFailed($"GET /pulls/{number}", result.StatusCode, _opts.Owner, _opts.Repository);
                 return null;
-            }
-            else
-            {
-                body = await resp.Content.ReadAsStringAsync(ct);
-                etag = resp.Headers.ETag?.Tag;
-            }
         }
-
         if (body is null)
             return null;
+
         GitHubPrDetailMergeable? detail;
         try
         {
@@ -815,13 +812,42 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
             && detail.Mergeable is not null
             && _readCache is not null
             && headSha is not null
-            && baseSha is not null
-            && body is not null)
+            && baseSha is not null)
         {
             _readCache.SetPullRequest(RepoKey(), number,
-                new GitHubUpstreamReadCache.CachedPullRequest(headSha, baseSha, etag, body));
+                new GitHubUpstreamReadCache.CachedPullRequest(headSha, baseSha, result.ETag, body));
         }
         return detail;
+    }
+
+    private enum ConditionalGetStatus { Ok, NotModified, NotFound, Failed }
+
+    private sealed record ConditionalGetResult(
+        ConditionalGetStatus Status, int StatusCode, string? Body, string? ETag);
+
+    /// <summary>
+    /// Shared conditional-GET skeleton for the sweep's read cache: sends
+    /// <c>If-None-Match</c> when an ETag is known and classifies the response
+    /// so the 304/non-2xx/cache-update rules live in one place. <see
+    /// cref="ConditionalGetResult.Body"/> is populated only for
+    /// <see cref="ConditionalGetStatus.Ok"/>; callers decide how to treat
+    /// each status (log, fall back, skip).
+    /// </summary>
+    private async Task<ConditionalGetResult> SendConditionalGetAsync(
+        string url, string? etag, CancellationToken ct)
+    {
+        using var req = await BuildRequestAsync(HttpMethod.Get, url, ct);
+        if (etag is { } known)
+            req.Headers.IfNoneMatch.Add(new EntityTagHeaderValue(known));
+        using var resp = await SendAsync(req, ct, GitHubRequestClass.Background);
+        if (resp.StatusCode == HttpStatusCode.NotModified)
+            return new(ConditionalGetStatus.NotModified, (int)resp.StatusCode, null, null);
+        if (resp.StatusCode == HttpStatusCode.NotFound)
+            return new(ConditionalGetStatus.NotFound, (int)resp.StatusCode, null, null);
+        if (!resp.IsSuccessStatusCode)
+            return new(ConditionalGetStatus.Failed, (int)resp.StatusCode, null, null);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        return new(ConditionalGetStatus.Ok, (int)resp.StatusCode, body, resp.Headers.ETag?.Tag);
     }
 
     private async Task<GitHubPrDetailMergeable?> FetchPullRequestDetailAsync(int number, CancellationToken ct)
@@ -3041,12 +3067,20 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     }
 
     /// <inheritdoc />
-    public async Task<UpstreamReadDeferral?> GetBackgroundReadDeferralAsync(CancellationToken ct = default)
+    public Task<UpstreamReadDeferral?> GetBackgroundReadDeferralAsync(CancellationToken ct = default)
     {
+        // Cheap by contract (IUpstreamBackgroundReadGate): a lookup against
+        // already-observed rate-limit state only. Resolving the token here
+        // could POST an App installation-token exchange — network I/O and a
+        // thrown failure would escape to callers that never expected the
+        // gate to fail. Before the credential's first send no budget key is
+        // registered, so the gate reports "proceed" and the send itself
+        // enforces the budget.
         if (_apiBudget is null)
-            return null;
-        var token = await _tokenProvider.GetTokenAsync(ct);
-        return _apiBudget.CheckBackgroundRead(GitHubApiBudgetTracker.BudgetKeyForToken(token));
+            return Task.FromResult<UpstreamReadDeferral?>(null);
+        var budgetKey = _apiBudget.BudgetKeyForCredential(_tokenProvider.CredentialFingerprint);
+        return Task.FromResult(
+            budgetKey is null ? null : _apiBudget.CheckBackgroundRead(budgetKey));
     }
 
     private string RepoKey() => $"{_opts.Owner}/{_opts.Repository}";
@@ -3062,6 +3096,10 @@ public sealed class GitHubUpstreamRemote : IUpstreamRemote, IUpstreamBackgroundR
     {
         var req = new HttpRequestMessage(method, url);
         var token = await _tokenProvider.GetTokenAsync(cancellationToken);
+        // Register the credential→budget-key mapping so the background-read
+        // gate (and any other remote instance for this credential) can check
+        // the shared budget without resolving the token again.
+        _apiBudget?.RegisterCredentialToken(_tokenProvider.CredentialFingerprint, token);
         req.Headers.Authorization = new AuthenticationHeaderValue("token", token);
         return req;
     }
@@ -3211,6 +3249,8 @@ public sealed record GitHubUpstreamOptions
 
 internal sealed class FixedGitHubTokenProvider(string token) : IGitHubTokenProvider
 {
+    public string CredentialFingerprint => "pat:" + GitHubApiBudgetTracker.BudgetKeyForToken(token);
+
     public ValueTask<string> GetTokenAsync(CancellationToken cancellationToken = default) =>
         ValueTask.FromResult(token);
 }
