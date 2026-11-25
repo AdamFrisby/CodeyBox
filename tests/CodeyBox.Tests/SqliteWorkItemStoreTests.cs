@@ -702,7 +702,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             TransientRetryFirstFailedAt = firstFailedAt,
             TransientRetryFrom = "merge",
             TransientRetryParkedAt = parkedAt,
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(3).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(3),
             UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
         };
 
@@ -721,7 +721,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Equal(firstFailedAt, read.TransientRetryFirstFailedAt);
         Assert.Equal("merge", read.TransientRetryFrom);
         Assert.Equal(parkedAt, read.TransientRetryParkedAt);
-        Assert.Equal(TimeSpan.FromMinutes(3).Ticks, read.TransientRetryParkedTicks);
+        Assert.Equal(TimeSpan.FromMinutes(3), read.TransientRetryParkedDuration);
     }
 
     [Fact]

@@ -233,6 +233,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal("transient-exhausted", stored.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryParkedAt);
         Assert.Equal(5, stored.TransientRetryAttempts);
         Assert.Contains("attempts=5; max=5", stored.LastError);
         Assert.Equal(0, fixture.Queue.Count);
@@ -354,6 +355,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.NotNull(stored);
         Assert.Equal("transient-exhausted", stored!.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryParkedAt);
         Assert.Contains("attempts=5; max=5", stored.LastError);
         var failed = Assert.Single(webhooks.Events, e => e.Event == "work_item.failed");
         Assert.Equal(stored.Id, failed.WorkItem?.Id);
@@ -426,6 +428,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal("transient-exhausted", stored.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryParkedAt);
         Assert.Contains("attempts=5; max=5", stored.LastError);
     }
 
@@ -447,7 +450,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             // 59 minutes of scheduled backoff already accrued; the 2-minute
             // delay for the next park would push the cumulative total past
             // the 1-hour cap. Wall-clock stamps are irrelevant to the cap.
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(59).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(59),
             TransientRetryFirstFailedAt = _time.GetUtcNow().AddHours(-2),
         };
         await fixture.Store.CreateAsync(item);
@@ -458,6 +461,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.NotNull(stored);
         Assert.Equal("transient-exhausted", stored!.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryParkedAt);
         Assert.Contains("parked backoff would exceed", stored.LastError);
     }
 
@@ -525,7 +529,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             TransientRetryFirstFailedAt = _time.GetUtcNow().AddHours(-3),
             // 11 minutes of scheduled backoff already accrued — over the
             // 10-minute cap even though wall-clock says only hours passed.
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(11).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(11),
         };
         await fixture.Store.CreateAsync(item);
 
@@ -536,6 +540,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal("transient-exhausted", stored.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryParkedAt);
         Assert.Contains("parked=", stored.LastError);
         Assert.Equal(0, fixture.Queue.Count);
     }
@@ -569,6 +574,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal("transient-exhausted", stored.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
+        Assert.Null(stored.TransientRetryParkedAt);
         Assert.Contains("parked=", stored.LastError);
         Assert.Equal(0, fixture.Queue.Count);
     }
@@ -779,7 +785,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(firstFailedAt, retried.TransientRetryFirstFailedAt);
         // The consumed park folded only its scheduled backoff into the
         // accumulator — 3min - 1s = 179s.
-        Assert.Equal(TimeSpan.FromSeconds(179).Ticks, retried.TransientRetryParkedTicks);
+        Assert.Equal(TimeSpan.FromSeconds(179), retried.TransientRetryParkedDuration);
         Assert.Null(retried.TransientRetryParkedAt);
 
         // ~40 min queued + ~147 min running, then the same transient
@@ -799,7 +805,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal("transient", rescheduled.FailureKind);
         Assert.Equal(1, rescheduled.TransientRetryAttempts);
         Assert.Equal(firstFailedAt, rescheduled.TransientRetryFirstFailedAt);
-        Assert.Equal(TimeSpan.FromSeconds(179).Ticks, rescheduled.TransientRetryParkedTicks);
+        Assert.Equal(TimeSpan.FromSeconds(179), rescheduled.TransientRetryParkedDuration);
         Assert.Equal(_time.GetUtcNow(), rescheduled.TransientRetryParkedAt);
         Assert.Equal(_time.GetUtcNow().AddMinutes(2), rescheduled.NextTransientRetryAt);
     }
@@ -840,7 +846,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.NotNull(retried);
         Assert.Equal(WorkItemState.WorkComplete, retried!.State);
         Assert.Equal(1, retried.TransientRetryAttempts);
-        Assert.Equal(TimeSpan.FromSeconds(179).Ticks, retried.TransientRetryParkedTicks);
+        Assert.Equal(TimeSpan.FromSeconds(179), retried.TransientRetryParkedDuration);
 
         // ~6h20m waiting in WorkComplete for a worker + ~54 min audit run.
         _time.Advance(TimeSpan.FromMinutes(6 * 60 + 20 + 54));
@@ -962,7 +968,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             Assert.NotNull(retried);
             Assert.Equal(WorkItemState.Queued, retried!.State);
             Assert.Equal(cycle + 1, retried.TransientRetryAttempts);
-            Assert.Equal(TimeSpan.FromSeconds(cycle + 1).Ticks, retried.TransientRetryParkedTicks);
+            Assert.Equal(TimeSpan.FromSeconds(cycle + 1), retried.TransientRetryParkedDuration);
 
             var failedAgain = retried.With(
                 WorkItemState.WaitingForTransientRetry,
@@ -980,6 +986,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal("transient-exhausted", exhausted!.FailureKind);
         Assert.Equal(3, exhausted.TransientRetryAttempts);
         Assert.Null(exhausted.NextTransientRetryAt);
+        Assert.Null(exhausted.TransientRetryParkedAt);
         Assert.Contains("attempts=3; max=3", exhausted.LastError);
     }
 

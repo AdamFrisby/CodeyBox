@@ -72,8 +72,8 @@ public sealed partial class PipelineRunner
                 current.State,
                 state);
             // A phase completion also closes the transient retry window: the
-            // next transient park starts a new elapsed series instead of
-            // inheriting wall-clock from an unrelated earlier blip.
+            // next transient park starts a new backoff series instead of
+            // inheriting accrued park time from an unrelated earlier blip.
             // (WorkItem.With already drops the window for most completion
             // targets; this enforces it uniformly for the preserved ones
             // such as PlanApproved.) No-op for dispatch/running targets, so
@@ -198,7 +198,7 @@ public sealed partial class PipelineRunner
     /// closes the transient auto-retry window (a produced audit verdict, a
     /// completed rework turn, or an advanced conflict branch proves the
     /// retried run did real work, so the next transient park starts a new
-    /// elapsed series). Both resets share one read-modify-write so neither
+    /// retry series). Both resets share one read-modify-write so neither
     /// is lost to the other.
     /// </summary>
     private async Task ResetProgressCountersAfterRealProgressEventAsync(
@@ -220,7 +220,7 @@ public sealed partial class PipelineRunner
                 && next.TransientRetryAttempts == current.TransientRetryAttempts
                 && next.TransientRetryFirstFailedAt == current.TransientRetryFirstFailedAt
                 && next.TransientRetryParkedAt == current.TransientRetryParkedAt
-                && next.TransientRetryParkedTicks == current.TransientRetryParkedTicks)
+                && next.TransientRetryParkedDuration == current.TransientRetryParkedDuration)
             {
                 return;
             }

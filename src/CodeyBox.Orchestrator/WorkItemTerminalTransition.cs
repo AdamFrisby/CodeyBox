@@ -175,6 +175,7 @@ public sealed class WorkItemTerminalTransition : IWorkItemTerminalTransition, IW
             failed = failed with
             {
                 NextTransientRetryAt = null,
+                TransientRetryParkedAt = null,
                 TransientRetryFirstFailedAt =
                     transientRetryExhaustion.FirstFailedAt ?? failed.TransientRetryFirstFailedAt,
             };

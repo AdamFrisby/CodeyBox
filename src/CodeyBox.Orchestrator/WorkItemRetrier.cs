@@ -403,9 +403,9 @@ public sealed class WorkItemRetrier
             // the series — every other accounting resets it like the attempt
             // counters above. Queue wait and run time are never added; only
             // the configured backoff between failure and dispatch counts.
-            TransientRetryParkedTicks = accounting == RetryAccounting.TransientAutoRetry
-                ? item.TransientRetryParkedTicks + WorkItemRecoveryPolicy.OpenTransientParkTicks(item)
-                : 0,
+            TransientRetryParkedDuration = accounting == RetryAccounting.TransientAutoRetry
+                ? item.TransientRetryParkedDuration + WorkItemRecoveryPolicy.OpenTransientParkDuration(item)
+                : TimeSpan.Zero,
             TransientRetryParkedAt = null,
             TerminalRetryAttempts = isOperatorRetry ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
@@ -954,7 +954,7 @@ public sealed class WorkItemRetrier
             TransientRetryFirstFailedAt = null,
             TransientRetryFrom = null,
             TransientRetryParkedAt = null,
-            TransientRetryParkedTicks = 0,
+            TransientRetryParkedDuration = TimeSpan.Zero,
             AgentPauseRetryFrom = null,
             StartedAt = null,
         });
@@ -1161,7 +1161,7 @@ public sealed class WorkItemRetrier
             TransientRetryFirstFailedAt = null,
             TransientRetryFrom = null,
             TransientRetryParkedAt = null,
-            TransientRetryParkedTicks = 0,
+            TransientRetryParkedDuration = TimeSpan.Zero,
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             ConsecutiveInfrastructureRecoveries = 0,

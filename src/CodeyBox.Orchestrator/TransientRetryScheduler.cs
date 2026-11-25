@@ -390,7 +390,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             return new TransientRetryAttemptResult("skipped:project-not-found", $"projectId={item.ProjectId.Value}");
         }
 
-        if (ShouldExhaustTransientRetry(item, retryOptions, _time.GetUtcNow(), out var capReason))
+        if (ShouldExhaustTransientRetry(item, retryOptions, out var capReason))
             return await TransitionTransientItemAtRetryCapAsync(item, capReason, ct, item.UpdatedAt);
 
         return await PerformTransientRetryAsync(item, trigger, ct);
@@ -535,7 +535,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             return WorkItemAutoRetryScheduleResult.Skipped(current, "state-changed");
 
         item = current;
-        if (ShouldExhaustTransientRetry(item, retryOptions, now, out var capReason))
+        if (ShouldExhaustTransientRetry(item, retryOptions, out var capReason))
         {
             await TransitionTransientItemAtRetryCapAsync(item, capReason, ct, item.UpdatedAt);
             return await GetTransientScheduleResultAfterCapAsync(item, capReason, ct);
@@ -573,8 +573,8 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
                 // Open the new park: fold any still-open previous park into
                 // the accumulator (defensive — the retrier normally closes
                 // it when the retry fires), then stamp the wait start.
-                TransientRetryParkedTicks = item.TransientRetryParkedTicks
-                    + WorkItemRecoveryPolicy.OpenTransientParkTicks(item),
+                TransientRetryParkedDuration = item.TransientRetryParkedDuration
+                    + WorkItemRecoveryPolicy.OpenTransientParkDuration(item),
                 TransientRetryParkedAt = now,
                 UpdatedAt = now,
             };
@@ -620,7 +620,6 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
     private bool ShouldExhaustTransientRetry(
         WorkItem item,
         AutoRetryOnTransientFailureOptions retryOptions,
-        DateTimeOffset now,
         out string reason)
     {
         if (item.TransientRetryAttempts >= retryOptions.MaxAutoRetriesPerWorkItem)

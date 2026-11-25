@@ -4691,7 +4691,7 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$transient_retry_attempts", item.TransientRetryAttempts);
         cmd.Parameters.AddWithValue("$transient_retry_first_failed_at", (object?)item.TransientRetryFirstFailedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_retry_from", (object?)item.TransientRetryFrom ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$transient_retry_parked_ticks", item.TransientRetryParkedTicks);
+        cmd.Parameters.AddWithValue("$transient_retry_parked_ticks", item.TransientRetryParkedDuration.Ticks);
         cmd.Parameters.AddWithValue("$transient_retry_parked_at", (object?)item.TransientRetryParkedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_target", (object?)item.AgentPauseTarget?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_retry_from", (object?)item.AgentPauseRetryFrom ?? DBNull.Value);
@@ -4842,7 +4842,7 @@ public sealed class SqliteWorkItemStore :
         TransientRetryFirstFailedAt = ReadNullableDateTimeOffset(r, "transient_retry_first_failed_at"),
         TransientRetryFrom = ReadNullableString(r, "transient_retry_from"),
         TransientRetryParkedAt = ReadNullableDateTimeOffset(r, "transient_retry_parked_at"),
-        TransientRetryParkedTicks = ReadInt64OrDefault(r, "transient_retry_parked_ticks", defaultValue: 0),
+        TransientRetryParkedDuration = new TimeSpan(ReadInt64OrDefault(r, "transient_retry_parked_ticks", defaultValue: 0)),
         AgentPauseTarget = ReadNullableAgentKind(r, "agent_pause_target"),
         AgentPauseRetryFrom = ReadNullableString(r, "agent_pause_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),

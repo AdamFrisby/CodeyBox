@@ -939,7 +939,7 @@ public sealed class WorkItemRecoveryPolicyTests
             TransientRetryAttempts = 1,
             TransientRetryFirstFailedAt = firstFailedAt,
             TransientRetryParkedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(4).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(4),
         };
 
         var reset = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
@@ -948,7 +948,7 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(0, reset.TransientRetryAttempts);
         Assert.Null(reset.TransientRetryFirstFailedAt);
         Assert.Null(reset.TransientRetryParkedAt);
-        Assert.Equal(0, reset.TransientRetryParkedTicks);
+        Assert.Equal(TimeSpan.Zero, reset.TransientRetryParkedDuration);
     }
 
     [Theory]
@@ -1003,7 +1003,7 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
-    public void ResetTransientRetryBudget_PreservesParkSchedule()
+    public void ResetTransientRetryBudget_PreservesScheduleFieldsButClearsParkAccounting()
     {
         var retryAt = DateTimeOffset.UtcNow.AddMinutes(2);
         var item = MakeItem(WorkItemState.Auditing) with
@@ -1013,7 +1013,7 @@ public sealed class WorkItemRecoveryPolicyTests
             NextTransientRetryAt = retryAt,
             TransientRetryFrom = "audit",
             TransientRetryParkedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(4).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(4),
         };
 
         var reset = item.ResetTransientRetryBudget();
@@ -1021,7 +1021,7 @@ public sealed class WorkItemRecoveryPolicyTests
         Assert.Equal(0, reset.TransientRetryAttempts);
         Assert.Null(reset.TransientRetryFirstFailedAt);
         Assert.Null(reset.TransientRetryParkedAt);
-        Assert.Equal(0, reset.TransientRetryParkedTicks);
+        Assert.Equal(TimeSpan.Zero, reset.TransientRetryParkedDuration);
         Assert.Equal(retryAt, reset.NextTransientRetryAt);
         Assert.Equal("audit", reset.TransientRetryFrom);
     }
@@ -1032,7 +1032,7 @@ public sealed class WorkItemRecoveryPolicyTests
         var now = DateTimeOffset.UtcNow;
         var item = MakeItem(WorkItemState.WaitingForTransientRetry) with
         {
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(10).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(10),
             TransientRetryParkedAt = now.AddMinutes(-4),
             NextTransientRetryAt = now.AddMinutes(6),
         };
@@ -1064,7 +1064,7 @@ public sealed class WorkItemRecoveryPolicyTests
         var now = DateTimeOffset.UtcNow;
         var item = MakeItem(WorkItemState.WaitingForTransientRetry) with
         {
-            TransientRetryParkedTicks = TimeSpan.FromMinutes(2).Ticks,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(2),
             TransientRetryParkedAt = now.AddMinutes(-1),
             NextTransientRetryAt = now.AddMinutes(-2),
         };

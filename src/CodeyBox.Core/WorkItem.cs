@@ -193,13 +193,12 @@ public sealed record WorkItem
     public int TransientRetryAttempts { get; init; }
 
     /// <summary>
-    /// First failure timestamp in the current transient transport retry series.
-    /// Starts a new window on every transient park; cleared when the retried
-    /// phase makes demonstrable progress (a retried agent/auditor run
-    /// completes or the item advances to a later phase), so productive work
-    /// between two unrelated blips never counts toward the elapsed cap.
-    /// Consecutive failures with no progress in between keep this stamp and
-    /// keep counting toward both caps.
+    /// First failure timestamp in the current transient transport retry
+    /// series. This is series/diagnostic metadata: the elapsed cap is bounded
+    /// by <see cref="TransientRetryParkedDuration"/> and the open park, not by
+    /// wall-clock time since this stamp. Consecutive failures with no
+    /// demonstrable progress keep the stamp; a retried phase completion or
+    /// durable progress event clears it with the rest of the transient budget.
     /// </summary>
     public DateTimeOffset? TransientRetryFirstFailedAt { get; init; }
 
@@ -215,21 +214,31 @@ public sealed record WorkItem
     /// opened (the moment <see cref="NextTransientRetryAt"/> was stamped).
     /// Null when no transient retry is parked. Together with
     /// <see cref="NextTransientRetryAt"/> it delimits the open park whose
-    /// scheduled duration feeds <see cref="TransientRetryParkedTicks"/> when
+    /// scheduled duration feeds <see cref="TransientRetryParkedDuration"/> when
     /// the retry fires.
     /// </summary>
     public DateTimeOffset? TransientRetryParkedAt { get; init; }
 
+    private TimeSpan _transientRetryParkedDuration = TimeSpan.Zero;
+
     /// <summary>
-    /// Cumulative scheduled transient-backoff time (in
-    /// <see cref="TimeSpan.Ticks"/>) already consumed by completed parks in
-    /// the current transient retry series. Queue wait and retried-attempt run
-    /// time are never added: only the configured backoff delay between a
-    /// transient failure and its retry dispatch counts toward the
-    /// <c>MaxElapsedTime</c> cap. Reset together with the rest of the
+    /// Cumulative scheduled transient-backoff time already consumed by
+    /// completed parks in the current transient retry series. Queue wait and
+    /// retried-attempt run time are never added: only the configured backoff
+    /// delay between a transient failure and its retry dispatch counts toward
+    /// the <c>MaxElapsedTime</c> cap. Reset together with the rest of the
     /// transient budget on demonstrable progress.
     /// </summary>
-    public long TransientRetryParkedTicks { get; init; }
+    public TimeSpan TransientRetryParkedDuration
+    {
+        get => _transientRetryParkedDuration;
+        init => _transientRetryParkedDuration = value >= TimeSpan.Zero
+            ? value
+            : throw new ArgumentOutOfRangeException(
+                nameof(TransientRetryParkedDuration),
+                value,
+                "Transient retry parked duration cannot be negative.");
+    }
 
     /// <summary>
     /// Agent kind whose operator pause parked this item in
@@ -966,11 +975,12 @@ public sealed record WorkItem
 
     /// <summary>
     /// Returns a copy with the transient auto-retry budget window cleared: a
-    /// fresh <see cref="TransientRetryAttempts"/> count and no
-    /// <see cref="TransientRetryFirstFailedAt"/> stamp, so the next transient
-    /// park starts a new elapsed series. The park schedule itself
+    /// fresh <see cref="TransientRetryAttempts"/> count, no
+    /// <see cref="TransientRetryFirstFailedAt"/> stamp, and no accrued or
+    /// open transient-backoff accounting, so the next transient park starts a
+    /// new retry series. The schedule fields
     /// (<see cref="NextTransientRetryAt"/>, <see cref="TransientRetryFrom"/>)
-    /// is untouched: callers invoke this on demonstrable progress in an
+    /// are untouched: callers invoke this on demonstrable progress in an
     /// active phase, where no retry is scheduled. Identity-preserving when
     /// the window is already empty, so progress sites may apply it
     /// unconditionally.
@@ -979,14 +989,14 @@ public sealed record WorkItem
         TransientRetryAttempts == 0
             && TransientRetryFirstFailedAt is null
             && TransientRetryParkedAt is null
-            && TransientRetryParkedTicks == 0
+            && TransientRetryParkedDuration == TimeSpan.Zero
             ? this
             : this with
             {
                 TransientRetryAttempts = 0,
                 TransientRetryFirstFailedAt = null,
                 TransientRetryParkedAt = null,
-                TransientRetryParkedTicks = 0,
+                TransientRetryParkedDuration = TimeSpan.Zero,
             };
 
     public WorkItem With(
@@ -1063,8 +1073,8 @@ public sealed record WorkItem
             NextTransientRetryAt = carriesTransientRetry ? NextTransientRetryAt : null,
             TransientRetryAttempts = preservesTransientHistory ? TransientRetryAttempts : 0,
             TransientRetryFirstFailedAt = preservesTransientHistory ? TransientRetryFirstFailedAt : null,
-            TransientRetryParkedAt = preservesTransientHistory ? TransientRetryParkedAt : null,
-            TransientRetryParkedTicks = preservesTransientHistory ? TransientRetryParkedTicks : 0,
+            TransientRetryParkedAt = carriesTransientRetry ? TransientRetryParkedAt : null,
+            TransientRetryParkedDuration = preservesTransientHistory ? TransientRetryParkedDuration : TimeSpan.Zero,
             TransientRetryFrom = carriesTransientRetry ? TransientRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,

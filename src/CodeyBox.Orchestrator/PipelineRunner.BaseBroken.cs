@@ -158,6 +158,7 @@ public sealed partial class PipelineRunner
                     QuotaRetryPhase = null,
                     NextTransientRetryAt = null,
                     TransientRetryFrom = null,
+                    TransientRetryParkedAt = null,
                     AgentPauseTarget = null,
                     AgentPauseRetryFrom = null,
                     DelegationRequested = false,
