@@ -211,6 +211,27 @@ public sealed record WorkItem
     public string? TransientRetryFrom { get; init; }
 
     /// <summary>
+    /// UTC timestamp at which the currently scheduled transient backoff wait
+    /// opened (the moment <see cref="NextTransientRetryAt"/> was stamped).
+    /// Null when no transient retry is parked. Together with
+    /// <see cref="NextTransientRetryAt"/> it delimits the open park whose
+    /// scheduled duration feeds <see cref="TransientRetryParkedTicks"/> when
+    /// the retry fires.
+    /// </summary>
+    public DateTimeOffset? TransientRetryParkedAt { get; init; }
+
+    /// <summary>
+    /// Cumulative scheduled transient-backoff time (in
+    /// <see cref="TimeSpan.Ticks"/>) already consumed by completed parks in
+    /// the current transient retry series. Queue wait and retried-attempt run
+    /// time are never added: only the configured backoff delay between a
+    /// transient failure and its retry dispatch counts toward the
+    /// <c>MaxElapsedTime</c> cap. Reset together with the rest of the
+    /// transient budget on demonstrable progress.
+    /// </summary>
+    public long TransientRetryParkedTicks { get; init; }
+
+    /// <summary>
     /// Agent kind whose operator pause parked this item in
     /// <see cref="WorkItemState.WaitingForAgentResume"/>. Separate from
     /// <see cref="Agent"/> because later phases can be blocked by an audit,
@@ -955,9 +976,18 @@ public sealed record WorkItem
     /// unconditionally.
     /// </summary>
     public WorkItem ResetTransientRetryBudget() =>
-        TransientRetryAttempts == 0 && TransientRetryFirstFailedAt is null
+        TransientRetryAttempts == 0
+            && TransientRetryFirstFailedAt is null
+            && TransientRetryParkedAt is null
+            && TransientRetryParkedTicks == 0
             ? this
-            : this with { TransientRetryAttempts = 0, TransientRetryFirstFailedAt = null };
+            : this with
+            {
+                TransientRetryAttempts = 0,
+                TransientRetryFirstFailedAt = null,
+                TransientRetryParkedAt = null,
+                TransientRetryParkedTicks = 0,
+            };
 
     public WorkItem With(
         WorkItemState state,
@@ -1033,6 +1063,8 @@ public sealed record WorkItem
             NextTransientRetryAt = carriesTransientRetry ? NextTransientRetryAt : null,
             TransientRetryAttempts = preservesTransientHistory ? TransientRetryAttempts : 0,
             TransientRetryFirstFailedAt = preservesTransientHistory ? TransientRetryFirstFailedAt : null,
+            TransientRetryParkedAt = preservesTransientHistory ? TransientRetryParkedAt : null,
+            TransientRetryParkedTicks = preservesTransientHistory ? TransientRetryParkedTicks : 0,
             TransientRetryFrom = carriesTransientRetry ? TransientRetryFrom : null,
             AgentPauseTarget = state == WorkItemState.WaitingForAgentResume ? AgentPauseTarget : null,
             AgentPauseRetryFrom = state == WorkItemState.WaitingForAgentResume ? AgentPauseRetryFrom : null,

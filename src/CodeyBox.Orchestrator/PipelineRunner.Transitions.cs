@@ -218,7 +218,9 @@ public sealed partial class PipelineRunner
             if (next.RecoveryAttempts == current.RecoveryAttempts
                 && next.RecoveryAttemptSourceState == current.RecoveryAttemptSourceState
                 && next.TransientRetryAttempts == current.TransientRetryAttempts
-                && next.TransientRetryFirstFailedAt == current.TransientRetryFirstFailedAt)
+                && next.TransientRetryFirstFailedAt == current.TransientRetryFirstFailedAt
+                && next.TransientRetryParkedAt == current.TransientRetryParkedAt
+                && next.TransientRetryParkedTicks == current.TransientRetryParkedTicks)
             {
                 return;
             }

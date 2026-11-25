@@ -444,7 +444,11 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         });
         var item = NewTransientItem() with
         {
-            TransientRetryFirstFailedAt = _time.GetUtcNow().AddMinutes(-59),
+            // 59 minutes of scheduled backoff already accrued; the 2-minute
+            // delay for the next park would push the cumulative total past
+            // the 1-hour cap. Wall-clock stamps are irrelevant to the cap.
+            TransientRetryParkedTicks = TimeSpan.FromMinutes(59).Ticks,
+            TransientRetryFirstFailedAt = _time.GetUtcNow().AddHours(-2),
         };
         await fixture.Store.CreateAsync(item);
 
@@ -454,7 +458,7 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.NotNull(stored);
         Assert.Equal("transient-exhausted", stored!.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
-        Assert.Contains("elapsed would exceed", stored.LastError);
+        Assert.Contains("parked backoff would exceed", stored.LastError);
     }
 
     [Fact]
@@ -518,7 +522,10 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         var item = NewTransientItem() with
         {
             NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
-            TransientRetryFirstFailedAt = _time.GetUtcNow().AddMinutes(-11),
+            TransientRetryFirstFailedAt = _time.GetUtcNow().AddHours(-3),
+            // 11 minutes of scheduled backoff already accrued — over the
+            // 10-minute cap even though wall-clock says only hours passed.
+            TransientRetryParkedTicks = TimeSpan.FromMinutes(11).Ticks,
         };
         await fixture.Store.CreateAsync(item);
 
@@ -529,7 +536,40 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Failed, stored!.State);
         Assert.Equal("transient-exhausted", stored.FailureKind);
         Assert.Null(stored.NextTransientRetryAt);
-        Assert.Contains("elapsed=", stored.LastError);
+        Assert.Contains("parked=", stored.LastError);
+        Assert.Equal(0, fixture.Queue.Count);
+    }
+
+    [Fact]
+    public async Task PeriodicSweep_WhenOpenParkAloneExceedsElapsedCap_MarksTransientExhausted()
+    {
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromSeconds(30),
+            MaxDelay = TimeSpan.FromMinutes(15),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromMinutes(10),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var item = NewTransientItem() with
+        {
+            // Park opened 11 minutes ago and is 1 second overdue: the open
+            // park's scheduled ~11-minute backoff alone exceeds the cap.
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryParkedAt = _time.GetUtcNow().AddMinutes(-11),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var stored = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(WorkItemState.Failed, stored!.State);
+        Assert.Equal("transient-exhausted", stored.FailureKind);
+        Assert.Null(stored.NextTransientRetryAt);
+        Assert.Contains("parked=", stored.LastError);
         Assert.Equal(0, fixture.Queue.Count);
     }
 
@@ -702,8 +742,13 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryThenSecondTransientFailure_UsesOriginalElapsedCap()
+    public async Task LongRetriedRunThenSecondTransientFailure_ReparksDespiteWallClock()
     {
+        // Incident d80a3bf9: the work phase failed transiently, the retry
+        // waited ~40 min for pickup, ran 147 min, then failed the same way.
+        // Under the old wall-clock cap (now - firstFailedAt > MaxElapsedTime)
+        // the second failure exhausted the budget after ONE retry. Queue
+        // wait and run time must never count toward the elapsed cap.
         using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
         {
             Enabled = true,
@@ -714,11 +759,14 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
             MaxElapsedTime = TimeSpan.FromHours(1),
             JitterMode = TransientRetryJitterMode.None,
         });
-        var firstFailedAt = _time.GetUtcNow().AddMinutes(-59);
+        var firstFailedAt = _time.GetUtcNow().AddHours(-3);
         var item = NewTransientItem() with
         {
             NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
             TransientRetryFirstFailedAt = firstFailedAt,
+            // Park opened 3 minutes ago; its scheduled ~2-3 minute backoff is
+            // consumed by the due retry below.
+            TransientRetryParkedAt = _time.GetUtcNow().AddMinutes(-3),
         };
         await fixture.Store.CreateAsync(item);
 
@@ -729,7 +777,14 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         Assert.Equal(WorkItemState.Queued, retried!.State);
         Assert.Equal(1, retried.TransientRetryAttempts);
         Assert.Equal(firstFailedAt, retried.TransientRetryFirstFailedAt);
+        // The consumed park folded only its scheduled backoff into the
+        // accumulator — 3min - 1s = 179s.
+        Assert.Equal(TimeSpan.FromSeconds(179).Ticks, retried.TransientRetryParkedTicks);
+        Assert.Null(retried.TransientRetryParkedAt);
 
+        // ~40 min queued + ~147 min running, then the same transient
+        // failure: over 3 hours of wall-clock since the first failure.
+        _time.Advance(TimeSpan.FromMinutes(187));
         var failedAgain = retried.With(
             WorkItemState.WaitingForTransientRetry,
             "Agent claude reported transient transport failure again",
@@ -738,12 +793,73 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
 
         await fixture.Scheduler.NotifyTransientFailureAsync(failedAgain);
 
-        var exhausted = await fixture.Store.GetAsync(item.Id);
-        Assert.NotNull(exhausted);
-        Assert.Equal("transient-exhausted", exhausted!.FailureKind);
-        Assert.Equal(firstFailedAt, exhausted.TransientRetryFirstFailedAt);
-        Assert.Null(exhausted.NextTransientRetryAt);
-        Assert.Contains("elapsed would exceed", exhausted.LastError);
+        var rescheduled = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(rescheduled);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, rescheduled!.State);
+        Assert.Equal("transient", rescheduled.FailureKind);
+        Assert.Equal(1, rescheduled.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, rescheduled.TransientRetryFirstFailedAt);
+        Assert.Equal(TimeSpan.FromSeconds(179).Ticks, rescheduled.TransientRetryParkedTicks);
+        Assert.Equal(_time.GetUtcNow(), rescheduled.TransientRetryParkedAt);
+        Assert.Equal(_time.GetUtcNow().AddMinutes(2), rescheduled.NextTransientRetryAt);
+    }
+
+    [Fact]
+    public async Task LongAuditRunAfterWorkCompleteQueueWait_SecondTransientFailure_Reparks()
+    {
+        // Incident 7d60d36f: the audit phase failed transiently, the retry
+        // sat in WorkComplete ~6h20m with no worker, the audit then ran
+        // ~54 min producing auditor results and failed transiently again —
+        // the old cap recorded elapsed=07:28:56 and went terminal. Neither
+        // the WorkComplete queue wait nor the audit run may count.
+        using var fixture = BuildScheduler(new AutoRetryOnTransientFailureOptions
+        {
+            Enabled = true,
+            BaseDelay = TimeSpan.FromMinutes(2),
+            MaxDelay = TimeSpan.FromMinutes(2),
+            Multiplier = 2,
+            MaxAutoRetriesPerWorkItem = 5,
+            MaxElapsedTime = TimeSpan.FromHours(1),
+            JitterMode = TransientRetryJitterMode.None,
+        });
+        var firstFailedAt = _time.GetUtcNow().AddHours(-7);
+        var item = NewTransientItem() with
+        {
+            WorkBranch = "codeybox/audit-incident",
+            BaseBranch = "main",
+            TransientRetryFrom = "audit",
+            NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
+            TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryParkedAt = _time.GetUtcNow().AddMinutes(-3),
+        };
+        await fixture.Store.CreateAsync(item);
+
+        await RunTransientPeriodicSweepAsync(fixture.Scheduler);
+
+        var retried = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(retried);
+        Assert.Equal(WorkItemState.WorkComplete, retried!.State);
+        Assert.Equal(1, retried.TransientRetryAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(179).Ticks, retried.TransientRetryParkedTicks);
+
+        // ~6h20m waiting in WorkComplete for a worker + ~54 min audit run.
+        _time.Advance(TimeSpan.FromMinutes(6 * 60 + 20 + 54));
+        var failedAgain = retried.With(
+            WorkItemState.WaitingForTransientRetry,
+            "Agent claude reported transient transport failure again",
+            failureKind: "transient");
+        await fixture.Store.UpdateAsync(failedAgain);
+
+        await fixture.Scheduler.NotifyTransientFailureAsync(failedAgain);
+
+        var rescheduled = await fixture.Store.GetAsync(item.Id);
+        Assert.NotNull(rescheduled);
+        Assert.Equal(WorkItemState.WaitingForTransientRetry, rescheduled!.State);
+        Assert.Equal("transient", rescheduled.FailureKind);
+        Assert.Equal(1, rescheduled.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, rescheduled.TransientRetryFirstFailedAt);
+        Assert.Equal(_time.GetUtcNow().AddMinutes(2), rescheduled.NextTransientRetryAt);
+        Assert.NotEqual("transient-exhausted", rescheduled.FailureKind);
     }
 
     [Fact]
@@ -830,30 +946,29 @@ public sealed class TransientNetworkAutoRetryTests : IDisposable
         var item = NewTransientItem();
         await fixture.Store.CreateAsync(item);
 
-        // Three rapid park → retry cycles with no progress in between.
+        // Three rapid park → retry cycles with no progress in between. Each
+        // cycle lets the 1-second scheduled backoff actually elapse so the
+        // parks accrue real parked time — still far under the 1-hour
+        // elapsed cap, so exhaustion must come from the attempts cap.
         for (var cycle = 0; cycle < 3; cycle++)
         {
             var current = await fixture.Store.GetAsync(item.Id);
             Assert.NotNull(current);
             await fixture.Scheduler.NotifyTransientFailureAsync(current!);
-            var due = (await fixture.Store.GetAsync(item.Id))! with
-            {
-                NextTransientRetryAt = _time.GetUtcNow().AddSeconds(-1),
-            };
-            await fixture.Store.UpdateAsync(due);
+            _time.Advance(TimeSpan.FromSeconds(1));
             await RunTransientPeriodicSweepAsync(fixture.Scheduler);
 
             var retried = await fixture.Store.GetAsync(item.Id);
             Assert.NotNull(retried);
             Assert.Equal(WorkItemState.Queued, retried!.State);
             Assert.Equal(cycle + 1, retried.TransientRetryAttempts);
+            Assert.Equal(TimeSpan.FromSeconds(cycle + 1).Ticks, retried.TransientRetryParkedTicks);
 
             var failedAgain = retried.With(
                 WorkItemState.WaitingForTransientRetry,
                 $"Agent claude reported transient transport failure #{cycle + 2}",
                 failureKind: "transient");
             await fixture.Store.UpdateAsync(failedAgain);
-            _time.Advance(TimeSpan.FromSeconds(1));
         }
 
         var currentFinal = await fixture.Store.GetAsync(item.Id);

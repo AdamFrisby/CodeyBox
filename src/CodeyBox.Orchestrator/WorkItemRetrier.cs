@@ -397,6 +397,16 @@ public sealed class WorkItemRetrier
             TransientRetryFrom = accounting == RetryAccounting.TransientAutoRetry
                 ? item.TransientRetryFrom
                 : null,
+            // The transient park that scheduled this retry is now consumed:
+            // fold its scheduled backoff into the episode accumulator and
+            // close the open park. Only the transient auto-retry path keeps
+            // the series — every other accounting resets it like the attempt
+            // counters above. Queue wait and run time are never added; only
+            // the configured backoff between failure and dispatch counts.
+            TransientRetryParkedTicks = accounting == RetryAccounting.TransientAutoRetry
+                ? item.TransientRetryParkedTicks + WorkItemRecoveryPolicy.OpenTransientParkTicks(item)
+                : 0,
+            TransientRetryParkedAt = null,
             TerminalRetryAttempts = isOperatorRetry ? 0 : item.TerminalRetryAttempts,
             NextTerminalRetryAt = null,
             StartedAt = null,
@@ -943,6 +953,8 @@ public sealed class WorkItemRetrier
             TransientRetryAttempts = 0,
             TransientRetryFirstFailedAt = null,
             TransientRetryFrom = null,
+            TransientRetryParkedAt = null,
+            TransientRetryParkedTicks = 0,
             AgentPauseRetryFrom = null,
             StartedAt = null,
         });
@@ -1148,6 +1160,8 @@ public sealed class WorkItemRetrier
             TransientRetryAttempts = 0,
             TransientRetryFirstFailedAt = null,
             TransientRetryFrom = null,
+            TransientRetryParkedAt = null,
+            TransientRetryParkedTicks = 0,
             RecoveryAttempts = 0,
             RecoveryAttemptSourceState = null,
             ConsecutiveInfrastructureRecoveries = 0,
