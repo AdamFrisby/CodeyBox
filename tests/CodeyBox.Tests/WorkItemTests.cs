@@ -162,6 +162,8 @@ public sealed class WorkItemTests
             TransientRetryFirstFailedAt = firstFailedAt,
             NextTransientRetryAt = DateTimeOffset.UtcNow.AddMinutes(5),
             TransientRetryFrom = "audit",
+            TransientRetryParkedAt = DateTimeOffset.UtcNow,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(2),
         };
 
         var transitioned = item.With(to);
@@ -170,6 +172,8 @@ public sealed class WorkItemTests
         Assert.Null(transitioned.TransientRetryFirstFailedAt);
         Assert.Null(transitioned.NextTransientRetryAt);
         Assert.Null(transitioned.TransientRetryFrom);
+        Assert.Null(transitioned.TransientRetryParkedAt);
+        Assert.Equal(TimeSpan.Zero, transitioned.TransientRetryParkedDuration);
     }
 
     [Theory]
@@ -197,5 +201,44 @@ public sealed class WorkItemTests
 
         Assert.Equal(2, transitioned.TransientRetryAttempts);
         Assert.Equal(firstFailedAt, transitioned.TransientRetryFirstFailedAt);
+    }
+
+    [Fact]
+    public void With_TransientExhaustedFailedPreservesHistoryButClosesOpenPark()
+    {
+        var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-30);
+        var parkedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var item = Sample() with
+        {
+            State = WorkItemState.WaitingForTransientRetry,
+            FailureKind = "transient",
+            NextTransientRetryAt = DateTimeOffset.UtcNow.AddMinutes(3),
+            TransientRetryFrom = "audit",
+            TransientRetryAttempts = 2,
+            TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryParkedAt = parkedAt,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(4),
+        };
+
+        var exhausted = item.With(
+            WorkItemState.Failed,
+            "transient network auto-retry exhausted",
+            failureKind: "transient-exhausted");
+
+        Assert.Equal(2, exhausted.TransientRetryAttempts);
+        Assert.Equal(firstFailedAt, exhausted.TransientRetryFirstFailedAt);
+        Assert.Equal(TimeSpan.FromMinutes(4), exhausted.TransientRetryParkedDuration);
+        Assert.Null(exhausted.NextTransientRetryAt);
+        Assert.Null(exhausted.TransientRetryFrom);
+        Assert.Null(exhausted.TransientRetryParkedAt);
+    }
+
+    [Fact]
+    public void TransientRetryParkedDuration_RejectsNegativeValues()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => _ = Sample() with
+        {
+            TransientRetryParkedDuration = TimeSpan.FromSeconds(-1),
+        });
     }
 }

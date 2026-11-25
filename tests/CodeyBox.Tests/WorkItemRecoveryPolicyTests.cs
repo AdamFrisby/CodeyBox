@@ -938,6 +938,8 @@ public sealed class WorkItemRecoveryPolicyTests
         {
             TransientRetryAttempts = 1,
             TransientRetryFirstFailedAt = firstFailedAt,
+            TransientRetryParkedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(4),
         };
 
         var reset = WorkItemRecoveryPolicy.ResetTransientRetryBudgetAfterRealProgress(
@@ -945,6 +947,8 @@ public sealed class WorkItemRecoveryPolicyTests
 
         Assert.Equal(0, reset.TransientRetryAttempts);
         Assert.Null(reset.TransientRetryFirstFailedAt);
+        Assert.Null(reset.TransientRetryParkedAt);
+        Assert.Equal(TimeSpan.Zero, reset.TransientRetryParkedDuration);
     }
 
     [Theory]
@@ -999,7 +1003,7 @@ public sealed class WorkItemRecoveryPolicyTests
     }
 
     [Fact]
-    public void ResetTransientRetryBudget_PreservesParkSchedule()
+    public void ResetTransientRetryBudget_PreservesScheduleFieldsButClearsParkAccounting()
     {
         var retryAt = DateTimeOffset.UtcNow.AddMinutes(2);
         var item = MakeItem(WorkItemState.Auditing) with
@@ -1008,14 +1012,64 @@ public sealed class WorkItemRecoveryPolicyTests
             TransientRetryFirstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-3),
             NextTransientRetryAt = retryAt,
             TransientRetryFrom = "audit",
+            TransientRetryParkedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(4),
         };
 
         var reset = item.ResetTransientRetryBudget();
 
         Assert.Equal(0, reset.TransientRetryAttempts);
         Assert.Null(reset.TransientRetryFirstFailedAt);
+        Assert.Null(reset.TransientRetryParkedAt);
+        Assert.Equal(TimeSpan.Zero, reset.TransientRetryParkedDuration);
         Assert.Equal(retryAt, reset.NextTransientRetryAt);
         Assert.Equal("audit", reset.TransientRetryFrom);
+    }
+
+    [Fact]
+    public void TransientRetryParkedElapsed_SumsCompletedParksPlusOpenPark()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var item = MakeItem(WorkItemState.WaitingForTransientRetry) with
+        {
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(10),
+            TransientRetryParkedAt = now.AddMinutes(-4),
+            NextTransientRetryAt = now.AddMinutes(6),
+        };
+
+        // Open park = 10 scheduled minutes (6 - (-4)); plus 10 completed.
+        Assert.Equal(TimeSpan.FromMinutes(20), WorkItemRecoveryPolicy.TransientRetryParkedElapsed(item));
+    }
+
+    [Fact]
+    public void TransientRetryParkedElapsed_IgnoresWallClockAndMissingStamps()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var noStamps = MakeItem(WorkItemState.WaitingForTransientRetry) with
+        {
+            TransientRetryFirstFailedAt = now.AddDays(-30),
+        };
+        Assert.Equal(TimeSpan.Zero, WorkItemRecoveryPolicy.TransientRetryParkedElapsed(noStamps));
+
+        var onlyParkedAt = MakeItem(WorkItemState.WaitingForTransientRetry) with
+        {
+            TransientRetryParkedAt = now.AddHours(-5),
+        };
+        Assert.Equal(TimeSpan.Zero, WorkItemRecoveryPolicy.TransientRetryParkedElapsed(onlyParkedAt));
+    }
+
+    [Fact]
+    public void TransientRetryParkedElapsed_ClampsNegativeOpenParkAtZero()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var item = MakeItem(WorkItemState.WaitingForTransientRetry) with
+        {
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(2),
+            TransientRetryParkedAt = now.AddMinutes(-1),
+            NextTransientRetryAt = now.AddMinutes(-2),
+        };
+
+        Assert.Equal(TimeSpan.FromMinutes(2), WorkItemRecoveryPolicy.TransientRetryParkedElapsed(item));
     }
 
     private static WorkItem MakeItem(WorkItemState state) => new()

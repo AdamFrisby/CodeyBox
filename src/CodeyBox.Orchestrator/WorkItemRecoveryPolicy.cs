@@ -66,13 +66,15 @@ public static class WorkItemRecoveryPolicy
 
     /// <summary>
     /// Clears the transient auto-retry budget window
-    /// (<see cref="WorkItem.TransientRetryAttempts"/> and
-    /// <see cref="WorkItem.TransientRetryFirstFailedAt"/>) once the retried
-    /// phase makes demonstrable progress: the item advances to a phase
+    /// (<see cref="WorkItem.TransientRetryAttempts"/>,
+    /// <see cref="WorkItem.TransientRetryFirstFailedAt"/>, and the parked
+    /// backoff accounting) once the retried phase makes demonstrable
+    /// progress: the item advances to a phase
     /// completion (<c>WorkComplete</c>, <c>PlanApproved</c>,
     /// <c>AuditPassed</c>, <c>Merged</c>, <c>Done</c>). Any such advance
     /// proves the item is healthy again, so the next transient park starts a
-    /// new elapsed series instead of inheriting the old window's wall-clock.
+    /// new backoff series instead of inheriting the old window's accrued
+    /// park time.
     /// Transitions that merely dispatch or run the retried attempt
     /// (<c>Queued</c>, <c>Working</c>, <c>Auditing</c>, …) preserve the
     /// window, so consecutive failures with no progress in between keep
@@ -108,6 +110,38 @@ public static class WorkItemRecoveryPolicy
         _ = progressEvent;
         return item.ResetTransientRetryBudget();
     }
+
+    /// <summary>
+    /// Scheduled duration of the transient backoff park currently open on
+    /// <paramref name="item"/>: <see cref="WorkItem.NextTransientRetryAt"/>
+    /// minus <see cref="WorkItem.TransientRetryParkedAt"/>, clamped at zero.
+    /// Zero when either stamp is missing (legacy rows, or a park already
+    /// consumed by the retrier). Only the configured backoff counts — queue
+    /// wait and retried-attempt run time are never part of a park.
+    /// </summary>
+    public static TimeSpan OpenTransientParkDuration(WorkItem item)
+    {
+        if (item.TransientRetryParkedAt is not { } parkedAt
+            || item.NextTransientRetryAt is not { } nextRetryAt)
+        {
+            return TimeSpan.Zero;
+        }
+
+        var open = nextRetryAt - parkedAt;
+        return open > TimeSpan.Zero ? open : TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// Total transient-backoff time accrued by the item's current retry
+    /// series: completed parks persisted on
+    /// <see cref="WorkItem.TransientRetryParkedDuration"/> plus the still-open
+    /// park's scheduled duration. This is the elapsed quantity the
+    /// <c>MaxElapsedTime</c> cap bounds — deliberately NOT wall-clock since
+    /// <see cref="WorkItem.TransientRetryFirstFailedAt"/>, so queue wait and
+    /// long retried runs cannot exhaust the budget.
+    /// </summary>
+    public static TimeSpan TransientRetryParkedElapsed(WorkItem item) =>
+        item.TransientRetryParkedDuration + OpenTransientParkDuration(item);
 
     public static WorkItem ClearPlanFieldsIfQueued(WorkItem item)
     {
@@ -823,6 +857,8 @@ public static class WorkItemRecoveryPolicy
         TransientRetryAttempts = 0,
         TransientRetryFirstFailedAt = null,
         TransientRetryFrom = null,
+        TransientRetryParkedAt = null,
+        TransientRetryParkedDuration = TimeSpan.Zero,
         CancellationReason = null,
         CancellationSource = null,
         UpdatedAt = now,

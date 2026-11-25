@@ -243,6 +243,15 @@ public sealed class SqliteWorkItemStore :
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_attempts INTEGER NOT NULL DEFAULT 0;");
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_first_failed_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_from TEXT;");
+            // Additive migration: transient-retry elapsed accounting. The
+            // MaxElapsedTime cap bounds cumulative scheduled backoff
+            // (transient_retry_parked_ticks), not wall-clock since the first
+            // failure — queue wait and retried-run time never count.
+            // transient_retry_parked_at opens the currently scheduled park;
+            // the retrier folds next_transient_retry_at - parked_at into the
+            // ticks accumulator when the retry fires.
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_parked_ticks INTEGER NOT NULL DEFAULT 0;");
+            RunMigration("ALTER TABLE work_items ADD COLUMN transient_retry_parked_at TEXT;");
             RunMigration("ALTER TABLE work_items ADD COLUMN agent_pause_target TEXT;");
             // Resume entry-point for WaitingForAgentResume rows. Separate from
             // quota_retry_from so agent-pause parking does not have to overload
@@ -1471,6 +1480,7 @@ public sealed class SqliteWorkItemStore :
                         quota_retry_phase,
                         quota_retry_scope,
                         next_transient_retry_at, transient_retry_attempts, transient_retry_first_failed_at, transient_retry_from,
+                        transient_retry_parked_ticks, transient_retry_parked_at,
                         agent_pause_target, agent_pause_retry_from, auditor_profile, priority,
                         audit_max_iterations, audit_complexity,
                         cancellation_source, transient_cancel_retries, prompt_revision, conflict_rework_attempts, merge_attempts, merge_retry_reason, baseline_image_ref, baseline_image_agent, baseline_image_model,
@@ -1492,6 +1502,7 @@ public sealed class SqliteWorkItemStore :
                         $quota_retry_phase,
                         $quota_retry_scope,
                         $next_transient_retry_at, $transient_retry_attempts, $transient_retry_first_failed_at, $transient_retry_from,
+                        $transient_retry_parked_ticks, $transient_retry_parked_at,
                         $agent_pause_target, $agent_pause_retry_from, $auditor_profile, $priority,
                         $audit_max_iterations, $audit_complexity,
                         $cancellation_source, $transient_cancel_retries, $prompt_revision, $conflict_rework_attempts, $merge_attempts, $merge_retry_reason, $baseline_image_ref, $baseline_image_agent, $baseline_image_model,
@@ -1840,6 +1851,8 @@ public sealed class SqliteWorkItemStore :
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
                     transient_retry_from = $transient_retry_from,
+                    transient_retry_parked_ticks = $transient_retry_parked_ticks,
+                    transient_retry_parked_at = $transient_retry_parked_at,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -1949,6 +1962,8 @@ public sealed class SqliteWorkItemStore :
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
                     transient_retry_from = $transient_retry_from,
+                    transient_retry_parked_ticks = $transient_retry_parked_ticks,
+                    transient_retry_parked_at = $transient_retry_parked_at,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -2060,6 +2075,8 @@ public sealed class SqliteWorkItemStore :
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
                     transient_retry_from = $transient_retry_from,
+                    transient_retry_parked_ticks = $transient_retry_parked_ticks,
+                    transient_retry_parked_at = $transient_retry_parked_at,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -2540,6 +2557,8 @@ public sealed class SqliteWorkItemStore :
                     transient_retry_attempts = $transient_retry_attempts,
                     transient_retry_first_failed_at = $transient_retry_first_failed_at,
                     transient_retry_from = $transient_retry_from,
+                    transient_retry_parked_ticks = $transient_retry_parked_ticks,
+                    transient_retry_parked_at = $transient_retry_parked_at,
                     agent_pause_target = $agent_pause_target,
                     agent_pause_retry_from = $agent_pause_retry_from,
                     auditor_profile = $auditor_profile,
@@ -2987,6 +3006,8 @@ public sealed class SqliteWorkItemStore :
                         transient_retry_attempts = $transient_retry_attempts,
                         transient_retry_first_failed_at = $transient_retry_first_failed_at,
                         transient_retry_from = $transient_retry_from,
+                        transient_retry_parked_ticks = $transient_retry_parked_ticks,
+                        transient_retry_parked_at = $transient_retry_parked_at,
                         agent_pause_target = $agent_pause_target,
                         agent_pause_retry_from = $agent_pause_retry_from,
                         auditor_profile = $auditor_profile,
@@ -4670,6 +4691,8 @@ public sealed class SqliteWorkItemStore :
         cmd.Parameters.AddWithValue("$transient_retry_attempts", item.TransientRetryAttempts);
         cmd.Parameters.AddWithValue("$transient_retry_first_failed_at", (object?)item.TransientRetryFirstFailedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$transient_retry_from", (object?)item.TransientRetryFrom ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$transient_retry_parked_ticks", item.TransientRetryParkedDuration.Ticks);
+        cmd.Parameters.AddWithValue("$transient_retry_parked_at", (object?)item.TransientRetryParkedAt?.ToString("O") ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_target", (object?)item.AgentPauseTarget?.Value ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$agent_pause_retry_from", (object?)item.AgentPauseRetryFrom ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$auditor_profile", (object?)item.AuditorProfile ?? DBNull.Value);
@@ -4818,6 +4841,8 @@ public sealed class SqliteWorkItemStore :
         TransientRetryAttempts = ReadInt32OrDefault(r, "transient_retry_attempts", defaultValue: 0),
         TransientRetryFirstFailedAt = ReadNullableDateTimeOffset(r, "transient_retry_first_failed_at"),
         TransientRetryFrom = ReadNullableString(r, "transient_retry_from"),
+        TransientRetryParkedAt = ReadNullableDateTimeOffset(r, "transient_retry_parked_at"),
+        TransientRetryParkedDuration = new TimeSpan(ReadInt64OrDefault(r, "transient_retry_parked_ticks", defaultValue: 0)),
         AgentPauseTarget = ReadNullableAgentKind(r, "agent_pause_target"),
         AgentPauseRetryFrom = ReadNullableString(r, "agent_pause_retry_from"),
         AuditorProfile = r.IsDBNull(r.GetOrdinal("auditor_profile")) ? null : r.GetString(r.GetOrdinal("auditor_profile")),
@@ -5061,6 +5086,12 @@ public sealed class SqliteWorkItemStore :
     {
         var ord = r.GetOrdinal(column);
         return r.IsDBNull(ord) ? defaultValue : r.GetInt32(ord);
+    }
+
+    private static long ReadInt64OrDefault(SqliteDataReader r, string column, long defaultValue)
+    {
+        var ord = r.GetOrdinal(column);
+        return r.IsDBNull(ord) ? defaultValue : r.GetInt64(ord);
     }
 
     private static int? ReadNullableInt32(SqliteDataReader r, string column)

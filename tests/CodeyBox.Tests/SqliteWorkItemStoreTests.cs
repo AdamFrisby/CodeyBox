@@ -691,6 +691,7 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
 
         var firstFailedAt = DateTimeOffset.UtcNow.AddMinutes(-2);
         var nextRetryAt = DateTimeOffset.UtcNow.AddMinutes(5);
+        var parkedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
         var updated = persisted! with
         {
             State = WorkItemState.WaitingForTransientRetry,
@@ -700,6 +701,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
             TransientRetryAttempts = 2,
             TransientRetryFirstFailedAt = firstFailedAt,
             TransientRetryFrom = "merge",
+            TransientRetryParkedAt = parkedAt,
+            TransientRetryParkedDuration = TimeSpan.FromMinutes(3),
             UpdatedAt = persisted.UpdatedAt.AddSeconds(1),
         };
 
@@ -717,6 +720,8 @@ public sealed class SqliteWorkItemStoreTests : IDisposable
         Assert.Equal(2, read.TransientRetryAttempts);
         Assert.Equal(firstFailedAt, read.TransientRetryFirstFailedAt);
         Assert.Equal("merge", read.TransientRetryFrom);
+        Assert.Equal(parkedAt, read.TransientRetryParkedAt);
+        Assert.Equal(TimeSpan.FromMinutes(3), read.TransientRetryParkedDuration);
     }
 
     [Fact]

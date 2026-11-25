@@ -390,7 +390,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             return new TransientRetryAttemptResult("skipped:project-not-found", $"projectId={item.ProjectId.Value}");
         }
 
-        if (ShouldExhaustTransientRetry(item, retryOptions, _time.GetUtcNow(), out var capReason))
+        if (ShouldExhaustTransientRetry(item, retryOptions, out var capReason))
             return await TransitionTransientItemAtRetryCapAsync(item, capReason, ct, item.UpdatedAt);
 
         return await PerformTransientRetryAsync(item, trigger, ct);
@@ -535,7 +535,7 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             return WorkItemAutoRetryScheduleResult.Skipped(current, "state-changed");
 
         item = current;
-        if (ShouldExhaustTransientRetry(item, retryOptions, now, out var capReason))
+        if (ShouldExhaustTransientRetry(item, retryOptions, out var capReason))
         {
             await TransitionTransientItemAtRetryCapAsync(item, capReason, ct, item.UpdatedAt);
             return await GetTransientScheduleResultAfterCapAsync(item, capReason, ct);
@@ -544,17 +544,23 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
         var firstFailedAt = item.TransientRetryFirstFailedAt ?? now;
         var delay = ComputeTransientRetryDelay(item.TransientRetryAttempts + 1, retryOptions);
         var nextRetryAt = now + delay;
+        // The elapsed cap bounds cumulative scheduled backoff for the retry
+        // series — never queue wait or retried-run time. Reject the new park
+        // up front when its own delay would push the accrued total over the
+        // cap, mirroring the old "would exceed" pre-check.
+        var accruedParked = WorkItemRecoveryPolicy.TransientRetryParkedElapsed(item) + delay;
         if (retryOptions.MaxElapsedTime > TimeSpan.Zero
-            && nextRetryAt > firstFailedAt + retryOptions.MaxElapsedTime)
+            && accruedParked > retryOptions.MaxElapsedTime)
         {
+            var reason = $"parked backoff would exceed max={retryOptions.MaxElapsedTime}";
             await TransitionTransientItemAtRetryCapAsync(
                 item with { TransientRetryFirstFailedAt = firstFailedAt },
-                $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
+                reason,
                 ct,
                 item.UpdatedAt);
             return await GetTransientScheduleResultAfterCapAsync(
                 item with { TransientRetryFirstFailedAt = firstFailedAt },
-                $"elapsed would exceed max={retryOptions.MaxElapsedTime}",
+                reason,
                 ct);
         }
 
@@ -564,6 +570,12 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             {
                 NextTransientRetryAt = nextRetryAt,
                 TransientRetryFirstFailedAt = firstFailedAt,
+                // Open the new park: fold any still-open previous park into
+                // the accumulator (defensive — the retrier normally closes
+                // it when the retry fires), then stamp the wait start.
+                TransientRetryParkedDuration = item.TransientRetryParkedDuration
+                    + WorkItemRecoveryPolicy.OpenTransientParkDuration(item),
+                TransientRetryParkedAt = now,
                 UpdatedAt = now,
             };
             var updated = await _store.TryUpdateIfStateAndUpdatedAtAsync(
@@ -608,7 +620,6 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
     private bool ShouldExhaustTransientRetry(
         WorkItem item,
         AutoRetryOnTransientFailureOptions retryOptions,
-        DateTimeOffset now,
         out string reason)
     {
         if (item.TransientRetryAttempts >= retryOptions.MaxAutoRetriesPerWorkItem)
@@ -617,11 +628,17 @@ public sealed class TransientRetryScheduler : BackgroundService, IDisposable, IT
             return true;
         }
 
+        // Elapsed = cumulative scheduled transient backoff for the series
+        // (completed parks plus the park that just fired), NOT wall-clock
+        // since the first failure. Queue wait and the retried attempt's run
+        // time never count, so a long-running phase that fails transiently
+        // again is re-parked instead of exhausting the budget — the attempts
+        // cap above remains the bound on genuinely repeated failures.
+        var parkedElapsed = WorkItemRecoveryPolicy.TransientRetryParkedElapsed(item);
         if (retryOptions.MaxElapsedTime > TimeSpan.Zero
-            && item.TransientRetryFirstFailedAt is { } firstFailedAt
-            && now - firstFailedAt >= retryOptions.MaxElapsedTime)
+            && parkedElapsed >= retryOptions.MaxElapsedTime)
         {
-            reason = $"elapsed={now - firstFailedAt}; max={retryOptions.MaxElapsedTime}";
+            reason = $"parked={parkedElapsed}; max={retryOptions.MaxElapsedTime}";
             return true;
         }
 

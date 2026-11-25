@@ -1013,26 +1013,30 @@ build/test/quality failures are not retried.
 | `Multiplier` | `2.0` | Exponential backoff multiplier applied per retry attempt. |
 | `MaxDelay` | `00:15:00` (15 min) | Per-attempt backoff cap before jitter. |
 | `MaxAutoRetriesPerWorkItem` | `5` | Consecutive-failure cap. After this many transient auto-retries with no progress in between, the item remains `Failed` with `FailureKind="transient-exhausted"`. |
-| `MaxElapsedTime` | `01:00:00` (1 h) | Elapsed cap for one consecutive transient retry series, measured from `TransientRetryFirstFailedAt`. A retry that would fire after this window is not scheduled. The window resets on demonstrable progress (see below), so it bounds one burst of consecutive failures — not wall-clock since the first-ever blip. |
+| `MaxElapsedTime` | `01:00:00` (1 h) | Elapsed cap for one consecutive transient retry series, measured as **cumulative scheduled backoff** — the sum of the `NextTransientRetryAt` delays the series has already parked for (exposed as `TransientRetryParkedDuration`, stored as `transient_retry_parked_ticks`). Queue wait and the retried attempt's run time never count, so a long-running phase that fails transiently again is re-parked rather than exhausted; the attempts cap bounds genuinely repeated failures. A retry whose own backoff would push the accrued total over this budget is not scheduled. The budget resets on demonstrable progress (see below). |
 | `JitterMode` | `Full` | `None`, `Full`, or `Decorrelated`. Use jitter to spread retries during provider or ISP incidents. |
 
 `TransientRetryScheduler` persists `FailureKind="transient"`,
-`NextTransientRetryAt`, `TransientRetryAttempts`, and
-`TransientRetryFirstFailedAt` on the work item. When the timer fires, it calls
+`NextTransientRetryAt`, `TransientRetryAttempts`,
+`TransientRetryFirstFailedAt`, `TransientRetryParkedAt`, and
+`TransientRetryParkedDuration` on the work item. When the timer fires, it calls
 the shared `WorkItemRetrier` with auto-pick enabled, so items with prior work
 commits resume at audit instead of discarding the work branch. Quota retry
 remains owned by `QuotaRetryScheduler`; `IWorkItemAutoRetryScheduler` is only a
 small notification facade that delegates to the two policy schedulers.
 
-Budget-window resets: `TransientRetryFirstFailedAt`/`TransientRetryAttempts`
-measure one *consecutive* failure series, not lifetime wall-clock. The window
-resets once the retried phase makes demonstrable progress — a retried
-agent/auditor run completes (work completes, an audit verdict lands, a rework
-turn finishes, conflict rework advances the branch, a plan is approved) or the
-item advances to a later phase (`WorkComplete`, `PlanApproved`,
-`AuditPassed`, `Merged`, `Done`). A second, unrelated transient blip after
-productive work therefore starts a fresh window and retries normally, while
-repeated transients with no progress in between still exhaust via either cap.
+Budget-window resets: `TransientRetryAttempts`,
+`TransientRetryParkedDuration`, and `TransientRetryParkedAt` form the
+consecutive failure series' retry budget; `TransientRetryFirstFailedAt` is
+diagnostic metadata for that series, not the clock the elapsed cap reads. The
+budget resets once the retried phase makes
+demonstrable progress — a retried agent/auditor run completes (work completes,
+an audit verdict lands, a rework turn finishes, conflict rework advances the
+branch, a plan is approved) or the item advances to a later phase
+(`WorkComplete`, `PlanApproved`, `AuditPassed`, `Merged`, `Done`). A second,
+unrelated transient blip after productive work therefore starts a fresh
+series and retries normally, while repeated transients with no progress in
+between still exhaust via either cap.
 Implemented centrally in `WorkItemRecoveryPolicy`
 (`ResetTransientRetryBudgetAfterRealProgress*`, mirroring the dead-worker
 recovery-attempt resets) and applied on every pipeline phase transition and
